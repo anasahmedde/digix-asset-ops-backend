@@ -1,0 +1,85 @@
+from rest_framework import serializers
+
+from .models import AssetCode, Brand, Device, DeviceLifecycleEvent, DeviceModel, MaterialType
+
+
+class BrandSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Brand
+        fields = ["id", "name", "website", "logo", "is_active", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class DeviceModelSerializer(serializers.ModelSerializer):
+    brand_name = serializers.CharField(source="brand.name", read_only=True)
+
+    class Meta:
+        model = DeviceModel
+        fields = [
+            "id", "brand", "brand_name", "name", "model_number",
+            "screen_type", "screen_size", "specifications", "is_active", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+
+class MaterialTypeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MaterialType
+        fields = ["id", "name", "category", "unit", "description", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class DeviceListSerializer(serializers.ModelSerializer):
+    device_model_name = serializers.CharField(source="device_model.__str__", read_only=True)
+    site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
+    client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+
+    class Meta:
+        model = Device
+        fields = [
+            "id", "asset_code", "serial_number", "device_model", "device_model_name",
+            "status", "current_site", "site_name", "assigned_client", "client_name",
+            "installation_date", "created_at",
+        ]
+
+
+class DeviceDetailSerializer(serializers.ModelSerializer):
+    device_model_name = serializers.CharField(source="device_model.__str__", read_only=True)
+    lifecycle_events = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Device
+        fields = [
+            "id", "asset_code", "serial_number", "mobile_id", "mac_address", "imei",
+            "device_model", "device_model_name", "firmware_version", "hardware_revision",
+            "status", "purchase_date", "purchase_price", "supplier", "invoice_reference",
+            "batch_number", "current_site", "assigned_client", "assigned_technician",
+            "installation_date", "notes", "lifecycle_events", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "asset_code", "created_at", "updated_at"]
+
+    def get_lifecycle_events(self, obj):
+        events = obj.lifecycle_events.order_by("-created_at")[:10]
+        return DeviceLifecycleEventSerializer(events, many=True).data
+
+
+class DeviceLifecycleEventSerializer(serializers.ModelSerializer):
+    performed_by_name = serializers.CharField(source="performed_by.get_full_name", read_only=True, default=None)
+
+    class Meta:
+        model = DeviceLifecycleEvent
+        fields = [
+            "id", "device", "event_type", "from_value", "to_value",
+            "description", "performed_by", "performed_by_name", "metadata", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+
+class AssetCodeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AssetCode
+        fields = [
+            "id", "device", "format", "label_size", "generated_file",
+            "is_current", "printed_at", "created_at",
+        ]
+        read_only_fields = ["id", "generated_file", "created_at"]

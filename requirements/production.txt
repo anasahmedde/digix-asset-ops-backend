@@ -1,0 +1,2 @@
+-r base.txt
+sentry-sdk[django]>=2.14,<3.0

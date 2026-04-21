@@ -1,0 +1,88 @@
+from django.conf import settings
+from django.db import models
+
+from common.models import TimeStampedModel
+from common.utils import upload_to_path
+
+
+class Site(TimeStampedModel):
+    name = models.CharField(max_length=300)
+    address = models.TextField()
+    city = models.CharField(max_length=100, blank=True)
+    country = models.CharField(max_length=100, default="UAE")
+    latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+    contact_person = models.CharField(max_length=200, blank=True)
+    contact_phone = models.CharField(max_length=20, blank=True)
+    contact_email = models.EmailField(blank=True)
+    access_instructions = models.TextField(blank=True)
+    operating_hours = models.CharField(max_length=200, blank=True)
+    client = models.ForeignKey(
+        "clients.Client", on_delete=models.CASCADE, related_name="client_sites", null=True, blank=True
+    )
+    floor_plan = models.ImageField(upload_to=upload_to_path, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class SiteZone(TimeStampedModel):
+    """Named zone/position within a site (e.g. Entrance, Aisle 3)."""
+
+    site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="zones")
+    name = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    floor = models.CharField(max_length=50, blank=True)
+
+    class Meta:
+        unique_together = ["site", "name"]
+
+    def __str__(self):
+        return f"{self.site.name} - {self.name}"
+
+
+class DeviceInstallation(TimeStampedModel):
+    """Records a device being installed at a specific site zone."""
+
+    device = models.ForeignKey("assets.Device", on_delete=models.CASCADE, related_name="installations")
+    site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="installations")
+    zone = models.ForeignKey(SiteZone, on_delete=models.SET_NULL, null=True, blank=True, related_name="installations")
+    installed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="installations_done"
+    )
+    installed_at = models.DateTimeField()
+    removed_at = models.DateTimeField(null=True, blank=True)
+    position_label = models.CharField(max_length=200, blank=True)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-installed_at"]
+
+    def __str__(self):
+        return f"{self.device.asset_code} @ {self.site.name}"
+
+
+class InstallationPhoto(TimeStampedModel):
+    class PhotoType(models.TextChoices):
+        PRE_INSTALL = "pre_install", "Pre-Installation"
+        POST_INSTALL = "post_install", "Post-Installation"
+        VERIFICATION = "verification", "Verification"
+
+    installation = models.ForeignKey(
+        DeviceInstallation, on_delete=models.CASCADE, related_name="photos"
+    )
+    photo_type = models.CharField(max_length=20, choices=PhotoType.choices)
+    image = models.ImageField(upload_to=upload_to_path)
+    caption = models.CharField(max_length=300, blank=True)
+    latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+    taken_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True
+    )
+
+    def __str__(self):
+        return f"{self.photo_type} - {self.installation}"
