@@ -1,3 +1,12 @@
-from django.urls import path  # noqa: F401
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
 
-urlpatterns = []
+from .views import MaintenanceRecordViewSet, MaintenanceScheduleViewSet
+
+router = DefaultRouter()
+router.register("schedules", MaintenanceScheduleViewSet, basename="schedule")
+router.register("records", MaintenanceRecordViewSet, basename="record")
+
+urlpatterns = [
+    path("", include(router.urls)),
+]
