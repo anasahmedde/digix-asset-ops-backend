@@ -3,6 +3,8 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from common.permissions import AdminManagerWriteElseRead
+
 from .models import AssetCode, Brand, Device, DeviceLifecycleEvent, DeviceModel, MaterialType
 from .serializers import (
     AssetCodeSerializer,
@@ -18,7 +20,7 @@ from .serializers import (
 class BrandViewSet(viewsets.ModelViewSet):
     queryset = Brand.objects.all()
     serializer_class = BrandSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["is_active"]
     search_fields = ["name"]
 
@@ -26,7 +28,7 @@ class BrandViewSet(viewsets.ModelViewSet):
 class DeviceModelViewSet(viewsets.ModelViewSet):
     queryset = DeviceModel.objects.select_related("brand").all()
     serializer_class = DeviceModelSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["brand", "is_active"]
     search_fields = ["name", "model_number"]
 
@@ -34,7 +36,7 @@ class DeviceModelViewSet(viewsets.ModelViewSet):
 class MaterialTypeViewSet(viewsets.ModelViewSet):
     queryset = MaterialType.objects.all()
     serializer_class = MaterialTypeSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["category"]
     search_fields = ["name", "category"]
 
@@ -43,7 +45,7 @@ class DeviceViewSet(viewsets.ModelViewSet):
     queryset = Device.objects.select_related(
         "device_model", "device_model__brand", "current_site", "assigned_client"
     ).all()
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["status", "device_model", "current_site", "assigned_client", "assigned_technician"]
     search_fields = ["asset_code", "serial_number", "mobile_id", "mac_address"]
     ordering_fields = ["created_at", "asset_code", "status", "installation_date"]
@@ -76,7 +78,7 @@ class DeviceViewSet(viewsets.ModelViewSet):
 class DeviceLifecycleEventViewSet(viewsets.ModelViewSet):
     queryset = DeviceLifecycleEvent.objects.select_related("device", "performed_by").all()
     serializer_class = DeviceLifecycleEventSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["device", "event_type"]
     ordering_fields = ["created_at"]
 
@@ -84,5 +86,5 @@ class DeviceLifecycleEventViewSet(viewsets.ModelViewSet):
 class AssetCodeViewSet(viewsets.ModelViewSet):
     queryset = AssetCode.objects.select_related("device").all()
     serializer_class = AssetCodeSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["device", "format", "is_current"]

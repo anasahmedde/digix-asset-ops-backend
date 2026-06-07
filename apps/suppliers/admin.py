@@ -1,1 +1,10 @@
-from django.contrib import admin  # noqa: F401
+from django.contrib import admin
+
+from .models import Supplier
+
+
+@admin.register(Supplier)
+class SupplierAdmin(admin.ModelAdmin):
+    list_display = ["name", "code", "contact_person", "contact_email", "is_active"]
+    list_filter = ["is_active"]
+    search_fields = ["name", "code", "contact_person", "contact_email"]
