@@ -61,9 +61,17 @@ class WarehouseWriteElseRead(BasePermission):
 
 class TechnicianCanCreate(BasePermission):
     """
-    Admin/Manager full access. Technicians can list, retrieve, and create.
+    Admin/Manager full access. Technicians can list, retrieve, create,
+    and use ticket workflow actions (transition, submit-completion,
+    comments, attachments).
     Everyone else is read-only.
     """
+
+    TECHNICIAN_ALLOWED_ACTIONS = (
+        "create", "partial_update", "update",
+        "transition", "submit_completion",
+        "ticket_comments", "ticket_attachments",
+    )
 
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
@@ -73,7 +81,7 @@ class TechnicianCanCreate(BasePermission):
         role = _role(request.user)
         if role in MANAGER_ROLES:
             return True
-        if role == "technician" and view.action in ("create", "partial_update", "update"):
+        if role == "technician" and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
             return True
         return False
 

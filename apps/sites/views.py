@@ -4,10 +4,12 @@ from rest_framework.permissions import IsAuthenticated
 
 from common.permissions import AdminManagerWriteElseRead
 
-from .models import DeviceInstallation, InstallationPhoto, Site, SiteZone
+from .models import DeviceInstallation, InstallationPhoto, InstallationStep, Site, SiteZone
 from .serializers import (
-    DeviceInstallationSerializer,
+    DeviceInstallationDetailSerializer,
+    DeviceInstallationListSerializer,
     InstallationPhotoSerializer,
+    InstallationStepSerializer,
     SiteDetailSerializer,
     SiteListSerializer,
     SiteZoneSerializer,
@@ -16,8 +18,8 @@ from .serializers import (
 
 class SiteViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
-    filterset_fields = ["client", "city", "country", "is_active"]
-    search_fields = ["name", "address", "city"]
+    filterset_fields = ["client", "city", "state_province", "country", "is_active"]
+    search_fields = ["name", "address", "city", "state_province"]
     ordering_fields = ["name", "created_at"]
 
     def get_queryset(self):
@@ -38,11 +40,28 @@ class SiteZoneViewSet(viewsets.ModelViewSet):
 
 
 class DeviceInstallationViewSet(viewsets.ModelViewSet):
-    queryset = DeviceInstallation.objects.select_related("device", "site", "zone").prefetch_related("photos").all()
-    serializer_class = DeviceInstallationSerializer
+    queryset = (
+        DeviceInstallation.objects
+        .select_related("device", "device__device_model", "device__device_model__brand", "site", "zone")
+        .prefetch_related("photos", "steps")
+        .all()
+    )
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["device", "site", "installed_by"]
     ordering_fields = ["installed_at"]
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return DeviceInstallationListSerializer
+        return DeviceInstallationDetailSerializer
+
+
+class InstallationStepViewSet(viewsets.ModelViewSet):
+    queryset = InstallationStep.objects.select_related("installation").all()
+    serializer_class = InstallationStepSerializer
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    filterset_fields = ["installation", "step_type", "status"]
+    ordering_fields = ["step_number"]
 
 
 class InstallationPhotoViewSet(viewsets.ModelViewSet):

@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import AssetCode, Brand, Device, DeviceLifecycleEvent, DeviceModel, MaterialType
+from .models import AssetCode, Brand, Device, DeviceImage, DeviceLifecycleEvent, DeviceModel, MaterialType
 
 
 @admin.register(Brand)
@@ -23,12 +23,24 @@ class MaterialTypeAdmin(admin.ModelAdmin):
     search_fields = ["name"]
 
 
+class DeviceImageInline(admin.TabularInline):
+    model = DeviceImage
+    extra = 0
+
+
 @admin.register(Device)
 class DeviceAdmin(admin.ModelAdmin):
     list_display = ["asset_code", "serial_number", "device_model", "status", "current_site"]
     list_filter = ["status", "device_model__brand"]
     search_fields = ["asset_code", "serial_number", "mobile_id"]
     readonly_fields = ["asset_code"]
+    inlines = [DeviceImageInline]
+
+
+@admin.register(DeviceImage)
+class DeviceImageAdmin(admin.ModelAdmin):
+    list_display = ["device", "caption", "is_primary", "sort_order", "created_at"]
+    list_filter = ["is_primary"]
 
 
 @admin.register(DeviceLifecycleEvent)

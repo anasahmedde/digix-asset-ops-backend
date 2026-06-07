@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import AssetCode, Brand, Device, DeviceLifecycleEvent, DeviceModel, MaterialType
+from .models import AssetCode, Brand, Device, DeviceImage, DeviceLifecycleEvent, DeviceModel, MaterialType
 
 
 class BrandSerializer(serializers.ModelSerializer):
@@ -29,6 +29,13 @@ class MaterialTypeSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
+class DeviceImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DeviceImage
+        fields = ["id", "device", "image", "caption", "is_primary", "sort_order", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
 class DeviceListSerializer(serializers.ModelSerializer):
     device_model_name = serializers.CharField(source="device_model.__str__", read_only=True)
     site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
@@ -38,22 +45,35 @@ class DeviceListSerializer(serializers.ModelSerializer):
         model = Device
         fields = [
             "id", "asset_code", "serial_number", "device_model", "device_model_name",
-            "status", "current_site", "site_name", "assigned_client", "client_name",
+            "status", "image", "current_site", "site_name", "assigned_client", "client_name",
             "installation_date", "created_at",
         ]
 
 
 class DeviceDetailSerializer(serializers.ModelSerializer):
     device_model_name = serializers.CharField(source="device_model.__str__", read_only=True)
+    brand_name = serializers.CharField(source="device_model.brand.name", read_only=True, default=None)
+    screen_type = serializers.CharField(source="device_model.screen_type", read_only=True, default=None)
+    screen_size = serializers.CharField(source="device_model.screen_size", read_only=True, default=None)
+    specifications = serializers.JSONField(source="device_model.specifications", read_only=True, default=dict)
+    site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
+    client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+    supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
+    technician_name = serializers.CharField(source="assigned_technician.get_full_name", read_only=True, default=None)
+    images = DeviceImageSerializer(many=True, read_only=True)
     lifecycle_events = serializers.SerializerMethodField()
 
     class Meta:
         model = Device
         fields = [
             "id", "asset_code", "serial_number", "mobile_id", "mac_address", "imei",
-            "device_model", "device_model_name", "firmware_version", "hardware_revision",
-            "status", "purchase_date", "purchase_price", "supplier", "invoice_reference",
-            "batch_number", "current_site", "assigned_client", "assigned_technician",
+            "device_model", "device_model_name", "brand_name", "screen_type", "screen_size",
+            "specifications", "firmware_version", "hardware_revision",
+            "status", "image", "images",
+            "purchase_date", "purchase_price", "supplier", "supplier_name",
+            "invoice_reference", "batch_number",
+            "current_site", "site_name", "assigned_client", "client_name",
+            "assigned_technician", "technician_name",
             "installation_date", "notes", "lifecycle_events", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "asset_code", "created_at", "updated_at"]

@@ -70,6 +70,8 @@ class Device(TimeStampedModel):
 
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROCURED)
 
+    image = models.ImageField(upload_to=upload_to_path, blank=True, help_text="Primary device photo")
+
     purchase_date = models.DateField(null=True, blank=True)
     purchase_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     supplier = models.ForeignKey(
@@ -132,6 +134,22 @@ class DeviceLifecycleEvent(TimeStampedModel):
 
     def __str__(self):
         return f"{self.device.asset_code} - {self.event_type}"
+
+
+class DeviceImage(TimeStampedModel):
+    """Gallery of images for a device."""
+
+    device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name="images")
+    image = models.ImageField(upload_to=upload_to_path)
+    caption = models.CharField(max_length=300, blank=True)
+    is_primary = models.BooleanField(default=False)
+    sort_order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ["sort_order", "-created_at"]
+
+    def __str__(self):
+        return f"{self.device.asset_code} - image {self.sort_order}"
 
 
 class AssetCode(TimeStampedModel):
