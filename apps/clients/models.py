@@ -1,11 +1,12 @@
 from django.db import models
 
+from common.codes import generate_code
 from common.models import TimeStampedModel
 
 
 class Client(TimeStampedModel):
     name = models.CharField(max_length=300)
-    code = models.CharField(max_length=50, unique=True)
+    code = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
     contact_person = models.CharField(max_length=200, blank=True)
     contact_email = models.EmailField(blank=True)
     contact_phone = models.CharField(max_length=20, blank=True)
@@ -17,3 +18,8 @@ class Client(TimeStampedModel):
 
     def __str__(self):
         return self.name
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            self.code = generate_code("client", model=type(self), field="code")
+        super().save(*args, **kwargs)

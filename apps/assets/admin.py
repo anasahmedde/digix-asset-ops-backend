@@ -1,6 +1,22 @@
 from django.contrib import admin
 
-from .models import AssetCode, Brand, Device, DeviceImage, DeviceLifecycleEvent, DeviceModel, MaterialType
+from .models import (
+    AssetCode,
+    AssetType,
+    Brand,
+    Device,
+    DeviceImage,
+    DeviceLifecycleEvent,
+    DeviceModel,
+    MaterialType,
+)
+
+
+@admin.register(AssetType)
+class AssetTypeAdmin(admin.ModelAdmin):
+    list_display = ["name", "code", "has_dimensions", "has_diagonal", "is_active"]
+    list_filter = ["is_active", "has_dimensions", "has_diagonal"]
+    search_fields = ["name", "code"]
 
 
 @admin.register(Brand)
@@ -30,9 +46,9 @@ class DeviceImageInline(admin.TabularInline):
 
 @admin.register(Device)
 class DeviceAdmin(admin.ModelAdmin):
-    list_display = ["asset_code", "serial_number", "device_model", "status", "current_site"]
-    list_filter = ["status", "device_model__brand"]
-    search_fields = ["asset_code", "serial_number", "mobile_id"]
+    list_display = ["asset_code", "display_name", "asset_type", "serial_number", "device_model", "status", "current_site"]
+    list_filter = ["status", "asset_type", "device_model__brand"]
+    search_fields = ["asset_code", "serial_number", "mobile_id", "display_name"]
     readonly_fields = ["asset_code"]
     inlines = [DeviceImageInline]
 

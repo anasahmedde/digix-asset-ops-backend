@@ -2,10 +2,15 @@ from rest_framework.permissions import SAFE_METHODS, BasePermission
 
 ADMIN_ROLES = ("super_admin",)
 MANAGER_ROLES = ("super_admin", "ops_manager")
-FIELD_ROLES = ("super_admin", "ops_manager", "technician")
+# Supervisors sit between managers and technicians: they run field crews,
+# can act on tickets and review/approve their team's work.
+SUPERVISOR_ROLES = ("super_admin", "ops_manager", "supervisor")
+FIELD_ROLES = ("super_admin", "ops_manager", "supervisor", "technician")
 FINANCE_ROLES = ("super_admin", "finance")
 WAREHOUSE_ROLES = ("super_admin", "ops_manager", "warehouse")
-ALL_INTERNAL_ROLES = ("super_admin", "ops_manager", "technician", "finance", "warehouse")
+ALL_INTERNAL_ROLES = (
+    "super_admin", "ops_manager", "supervisor", "technician", "finance", "warehouse",
+)
 
 
 def _role(user):
@@ -81,7 +86,7 @@ class TechnicianCanCreate(BasePermission):
         role = _role(request.user)
         if role in MANAGER_ROLES:
             return True
-        if role == "technician" and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
+        if role in ("technician", "supervisor") and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
             return True
         return False
 

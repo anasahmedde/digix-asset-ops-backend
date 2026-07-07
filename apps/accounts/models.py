@@ -10,6 +10,7 @@ class User(AbstractUser):
     class Role(models.TextChoices):
         SUPER_ADMIN = "super_admin", "Super Admin"
         OPS_MANAGER = "ops_manager", "Operations Manager"
+        SUPERVISOR = "supervisor", "Supervisor"
         TECHNICIAN = "technician", "Technician"
         FINANCE = "finance", "Finance"
         WAREHOUSE = "warehouse", "Warehouse Staff"

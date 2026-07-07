@@ -60,6 +60,7 @@ class TicketViewSet(viewsets.ModelViewSet):
             Ticket.Status.IN_PROGRESS,
             Ticket.Status.ON_HOLD,
             Ticket.Status.BLOCKED,
+            Ticket.Status.ALIGNMENT_PENDING,
         }
         if new_status in assignee_transitions and not is_assignee and not is_manager:
             return Response(

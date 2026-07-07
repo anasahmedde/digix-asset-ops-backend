@@ -1,6 +1,7 @@
 from django.conf import settings
 from django.db import models
 
+from common.codes import generate_code
 from common.models import TimeStampedModel
 
 
@@ -23,7 +24,7 @@ class PurchaseOrder(TimeStampedModel):
         EUR = "EUR", "Euro"
         GBP = "GBP", "British Pound"
 
-    po_number = models.CharField(max_length=50, unique=True)
+    po_number = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
     supplier = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.PROTECT, related_name="purchase_orders"
     )
@@ -45,6 +46,11 @@ class PurchaseOrder(TimeStampedModel):
 
     def __str__(self):
         return f"{self.po_number} - {self.supplier.name}"
+
+    def save(self, *args, **kwargs):
+        if not self.po_number:
+            self.po_number = generate_code("purchase_order", model=type(self), field="po_number")
+        super().save(*args, **kwargs)
 
 
 class PurchaseOrderItem(TimeStampedModel):

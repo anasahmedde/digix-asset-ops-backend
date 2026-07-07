@@ -31,6 +31,24 @@ class Site(TimeStampedModel):
         return self.name
 
 
+class SiteContact(TimeStampedModel):
+    """Point-of-contact (POC) at a site — name and contact details."""
+
+    site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="contacts")
+    name = models.CharField(max_length=200)
+    designation = models.CharField(max_length=150, blank=True)
+    phone = models.CharField(max_length=20, blank=True)
+    email = models.EmailField(blank=True)
+    is_primary = models.BooleanField(default=False)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-is_primary", "name"]
+
+    def __str__(self):
+        return f"{self.name} @ {self.site.name}"
+
+
 class SiteZone(TimeStampedModel):
     """Named zone/position within a site (e.g. Entrance, Aisle 3)."""
 

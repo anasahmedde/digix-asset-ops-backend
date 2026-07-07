@@ -6,9 +6,19 @@ from rest_framework.response import Response
 
 from common.permissions import AdminManagerWriteElseRead
 
-from .models import AssetCode, Brand, Device, DeviceImage, DeviceLifecycleEvent, DeviceModel, MaterialType
+from .models import (
+    AssetCode,
+    AssetType,
+    Brand,
+    Device,
+    DeviceImage,
+    DeviceLifecycleEvent,
+    DeviceModel,
+    MaterialType,
+)
 from .serializers import (
     AssetCodeSerializer,
+    AssetTypeSerializer,
     BrandSerializer,
     DeviceDetailSerializer,
     DeviceImageSerializer,
@@ -17,6 +27,15 @@ from .serializers import (
     DeviceModelSerializer,
     MaterialTypeSerializer,
 )
+
+
+class AssetTypeViewSet(viewsets.ModelViewSet):
+    queryset = AssetType.objects.all()
+    serializer_class = AssetTypeSerializer
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    filterset_fields = ["is_active"]
+    search_fields = ["name", "code"]
+    ordering_fields = ["name", "created_at"]
 
 
 class BrandViewSet(viewsets.ModelViewSet):
@@ -45,12 +64,15 @@ class MaterialTypeViewSet(viewsets.ModelViewSet):
 
 class DeviceViewSet(viewsets.ModelViewSet):
     queryset = Device.objects.select_related(
-        "device_model", "device_model__brand", "current_site", "assigned_client",
-        "supplier", "assigned_technician",
-    ).prefetch_related("images").all()
+        "asset_type", "device_model", "device_model__brand", "current_site",
+        "assigned_client", "supplier", "assigned_technician", "installed_by",
+    ).prefetch_related("images", "warranties").all()
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
-    filterset_fields = ["status", "device_model", "current_site", "assigned_client", "assigned_technician"]
-    search_fields = ["asset_code", "serial_number", "mobile_id", "mac_address"]
+    filterset_fields = [
+        "status", "asset_type", "device_model", "current_site",
+        "assigned_client", "assigned_technician",
+    ]
+    search_fields = ["asset_code", "serial_number", "mobile_id", "mac_address", "display_name"]
     ordering_fields = ["created_at", "asset_code", "status", "installation_date"]
 
     def get_serializer_class(self):
@@ -105,6 +127,7 @@ class DeviceViewSet(viewsets.ModelViewSet):
         return Response({
             "total": total,
             "working": active_count,
+            "installed": by_status.get("installed", 0) + by_status.get("active", 0),
             "out_of_order": by_status.get("decommissioned", 0) + by_status.get("lost_stolen", 0),
             "under_maintenance": by_status.get("under_maintenance", 0),
             "in_stock": by_status.get("in_stock", 0),

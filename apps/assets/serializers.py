@@ -1,6 +1,37 @@
+from django.utils import timezone
 from rest_framework import serializers
 
-from .models import AssetCode, Brand, Device, DeviceImage, DeviceLifecycleEvent, DeviceModel, MaterialType
+from .models import (
+    AssetCode,
+    AssetType,
+    Brand,
+    Device,
+    DeviceImage,
+    DeviceLifecycleEvent,
+    DeviceModel,
+    MaterialType,
+)
+
+
+def _warranty_status(device) -> str:
+    """none / active / expired for the device's warranties (prefetch-friendly)."""
+    warranties = list(device.warranties.all())
+    if not warranties:
+        return "none"
+    today = timezone.now().date()
+    if any(w.status == "active" and w.end_date >= today for w in warranties):
+        return "active"
+    return "expired"
+
+
+class AssetTypeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AssetType
+        fields = [
+            "id", "name", "code", "description", "has_dimensions",
+            "has_diagonal", "icon", "is_active", "created_at",
+        ]
+        read_only_fields = ["id", "code", "created_at"]
 
 
 class BrandSerializer(serializers.ModelSerializer):
@@ -38,20 +69,29 @@ class DeviceImageSerializer(serializers.ModelSerializer):
 
 class DeviceListSerializer(serializers.ModelSerializer):
     device_model_name = serializers.CharField(source="device_model.__str__", read_only=True)
+    asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
     client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+    warranty_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Device
         fields = [
-            "id", "asset_code", "serial_number", "device_model", "device_model_name",
-            "status", "image", "current_site", "site_name", "assigned_client", "client_name",
-            "installation_date", "created_at",
+            "id", "asset_code", "serial_number", "display_name",
+            "asset_type", "asset_type_name",
+            "device_model", "device_model_name",
+            "status", "image", "current_site", "site_name",
+            "assigned_client", "client_name",
+            "installation_date", "warranty_status", "created_at",
         ]
+
+    def get_warranty_status(self, obj):
+        return _warranty_status(obj)
 
 
 class DeviceDetailSerializer(serializers.ModelSerializer):
     device_model_name = serializers.CharField(source="device_model.__str__", read_only=True)
+    asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     brand_name = serializers.CharField(source="device_model.brand.name", read_only=True, default=None)
     screen_type = serializers.CharField(source="device_model.screen_type", read_only=True, default=None)
     screen_size = serializers.CharField(source="device_model.screen_size", read_only=True, default=None)
@@ -60,27 +100,57 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     technician_name = serializers.CharField(source="assigned_technician.get_full_name", read_only=True, default=None)
+    installed_by_name = serializers.CharField(source="installed_by.get_full_name", read_only=True, default=None)
     images = DeviceImageSerializer(many=True, read_only=True)
     lifecycle_events = serializers.SerializerMethodField()
+    warranty_status = serializers.SerializerMethodField()
+    active_warranty = serializers.SerializerMethodField()
 
     class Meta:
         model = Device
         fields = [
             "id", "asset_code", "serial_number", "mobile_id", "mac_address", "imei",
+            "display_name", "asset_type", "asset_type_name",
             "device_model", "device_model_name", "brand_name", "screen_type", "screen_size",
+            "length_cm", "width_cm", "diagonal_inches",
             "specifications", "firmware_version", "hardware_revision",
             "status", "image", "images",
             "purchase_date", "purchase_price", "supplier", "supplier_name",
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
             "assigned_technician", "technician_name",
-            "installation_date", "notes", "lifecycle_events", "created_at", "updated_at",
+            "installation_date", "installed_by", "installed_by_name",
+            "warranty_status", "active_warranty",
+            "notes", "lifecycle_events", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "asset_code", "created_at", "updated_at"]
 
     def get_lifecycle_events(self, obj):
         events = obj.lifecycle_events.order_by("-created_at")[:10]
         return DeviceLifecycleEventSerializer(events, many=True).data
+
+    def get_warranty_status(self, obj):
+        return _warranty_status(obj)
+
+    def get_active_warranty(self, obj):
+        today = timezone.now().date()
+        warranties = list(obj.warranties.all())
+        current = next(
+            (w for w in warranties if w.status == "active" and w.end_date >= today), None
+        )
+        w = current or (sorted(warranties, key=lambda x: x.end_date, reverse=True)[0] if warranties else None)
+        if w is None:
+            return None
+        return {
+            "id": str(w.id),
+            "warranty_type": w.warranty_type,
+            "status": w.status,
+            "start_date": w.start_date,
+            "end_date": w.end_date,
+            "supplier": str(w.supplier_id) if w.supplier_id else None,
+            "supplier_name": w.supplier.name if w.supplier_id else None,
+            "is_expired": w.is_expired,
+        }
 
 
 class DeviceLifecycleEventSerializer(serializers.ModelSerializer):

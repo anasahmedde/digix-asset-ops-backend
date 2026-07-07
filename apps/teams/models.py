@@ -34,6 +34,10 @@ class Project(TimeStampedModel):
     )
     budget = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
     notes = models.TextField(blank=True)
+    source_work_order = models.ForeignKey(
+        "workorders.WorkOrder", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="projects", help_text="Work order this project was created from",
+    )
 
     class Meta:
         ordering = ["-created_at"]
