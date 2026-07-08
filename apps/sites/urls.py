@@ -5,12 +5,14 @@ from .views import (
     DeviceInstallationViewSet,
     InstallationPhotoViewSet,
     InstallationStepViewSet,
+    SiteContactViewSet,
     SiteViewSet,
     SiteZoneViewSet,
 )
 
 router = DefaultRouter()
 router.register("sites", SiteViewSet, basename="site")
+router.register("site-contacts", SiteContactViewSet, basename="site-contact")
 router.register("zones", SiteZoneViewSet)
 router.register("installations", DeviceInstallationViewSet)
 router.register("installation-steps", InstallationStepViewSet)

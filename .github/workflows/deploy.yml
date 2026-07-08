@@ -27,5 +27,6 @@ jobs:
             docker compose --env-file .env up -d backend celery
             docker compose --env-file .env exec -T backend python manage.py migrate --noinput
             docker compose --env-file .env exec -T backend python manage.py collectstatic --noinput
+            docker compose --env-file .env restart nginx
 
             echo "Backend deployed successfully!"

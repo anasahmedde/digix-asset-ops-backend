@@ -1,6 +1,7 @@
 from django.conf import settings
 from django.db import models
 
+from common.codes import generate_code
 from common.models import TimeStampedModel
 
 
@@ -26,7 +27,7 @@ class Invoice(TimeStampedModel):
         EUR = "EUR", "Euro"
         GBP = "GBP", "British Pound"
 
-    invoice_number = models.CharField(max_length=50, unique=True)
+    invoice_number = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
     invoice_type = models.CharField(max_length=15, choices=InvoiceType.choices)
     status = models.CharField(max_length=15, choices=Status.choices, default=Status.DRAFT)
     currency = models.CharField(max_length=3, choices=Currency.choices, default=Currency.PKR)
@@ -55,6 +56,11 @@ class Invoice(TimeStampedModel):
 
     def __str__(self):
         return f"{self.invoice_number} - {self.get_invoice_type_display()}"
+
+    def save(self, *args, **kwargs):
+        if not self.invoice_number:
+            self.invoice_number = generate_code("invoice", model=type(self), field="invoice_number")
+        super().save(*args, **kwargs)
 
     @property
     def balance_due(self):

@@ -34,6 +34,12 @@ class Document(TimeStampedModel):
     installation = models.ForeignKey(
         "sites.DeviceInstallation", on_delete=models.CASCADE, null=True, blank=True, related_name="documents"
     )
+    ticket = models.ForeignKey(
+        "tickets.Ticket", on_delete=models.CASCADE, null=True, blank=True, related_name="documents"
+    )
+    work_order = models.ForeignKey(
+        "workorders.WorkOrder", on_delete=models.CASCADE, null=True, blank=True, related_name="documents"
+    )
 
     uploaded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="uploaded_documents"

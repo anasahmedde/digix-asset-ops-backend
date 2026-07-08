@@ -1,10 +1,22 @@
 from django.contrib import admin
 
-from .models import DeviceInstallation, InstallationPhoto, InstallationStep, Site, SiteZone
+from .models import (
+    DeviceInstallation,
+    InstallationPhoto,
+    InstallationStep,
+    Site,
+    SiteContact,
+    SiteZone,
+)
 
 
 class SiteZoneInline(admin.TabularInline):
     model = SiteZone
+    extra = 0
+
+
+class SiteContactInline(admin.TabularInline):
+    model = SiteContact
     extra = 0
 
 
@@ -13,7 +25,14 @@ class SiteAdmin(admin.ModelAdmin):
     list_display = ["name", "city", "state_province", "country", "client", "is_active"]
     list_filter = ["city", "state_province", "country", "is_active"]
     search_fields = ["name", "address"]
-    inlines = [SiteZoneInline]
+    inlines = [SiteContactInline, SiteZoneInline]
+
+
+@admin.register(SiteContact)
+class SiteContactAdmin(admin.ModelAdmin):
+    list_display = ["name", "site", "designation", "phone", "is_primary"]
+    list_filter = ["is_primary"]
+    search_fields = ["name", "email", "phone"]
 
 
 class InstallationStepInline(admin.TabularInline):

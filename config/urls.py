@@ -13,10 +13,12 @@ urlpatterns = [
     path("api/auth/token/", CustomTokenObtainPairView.as_view(), name="token_obtain_pair"),
     path("api/auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     # API modules
+    path("api/setup/", include("apps.setup.urls")),
     path("api/accounts/", include("apps.accounts.urls")),
     path("api/assets/", include("apps.assets.urls")),
     path("api/sites/", include("apps.sites.urls")),
     path("api/tickets/", include("apps.tickets.urls")),
+    path("api/work-orders/", include("apps.workorders.urls")),
     path("api/teams/", include("apps.teams.urls")),
     path("api/warranties/", include("apps.warranties.urls")),
     path("api/maintenance/", include("apps.maintenance.urls")),
@@ -27,6 +29,7 @@ urlpatterns = [
     path("api/procurement/", include("apps.procurement.urls")),
     path("api/finance/", include("apps.finance.urls")),
     path("api/analytics/", include("apps.analytics.urls")),
+    path("api/reports/", include("apps.reports.urls")),
     path("api/chat/", include("apps.chat.urls")),
     path("api/notifications/", include("apps.notifications.urls")),
     # API docs

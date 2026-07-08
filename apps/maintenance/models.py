@@ -18,6 +18,14 @@ class MaintenanceSchedule(TimeStampedModel):
         YEARLY = "yearly", "Yearly"
         ONE_TIME = "one_time", "One-Time"
 
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        PENDING = "pending", "Pending"
+        IN_PROCESS = "in_process", "In Process"
+        ON_HOLD = "on_hold", "On Hold"
+        OVERDUE = "overdue", "Over Due"
+        COMPLETED = "completed", "Completed"
+
     title = models.CharField(max_length=300)
     maintenance_type = models.CharField(max_length=15, choices=MaintenanceType.choices, default=MaintenanceType.PREVENTIVE)
     frequency = models.CharField(max_length=15, choices=Frequency.choices, default=Frequency.MONTHLY)
@@ -32,6 +40,7 @@ class MaintenanceSchedule(TimeStampedModel):
     )
     next_due = models.DateField()
     instructions = models.TextField(blank=True)
+    status = models.CharField(max_length=15, choices=Status.choices, default=Status.ACTIVE)
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -39,6 +48,17 @@ class MaintenanceSchedule(TimeStampedModel):
 
     def __str__(self):
         return f"{self.title} ({self.frequency})"
+
+    @property
+    def effective_status(self):
+        """Auto-flag overdue schedules that aren't completed or on hold."""
+        from django.utils import timezone
+
+        if self.status in (self.Status.COMPLETED, self.Status.ON_HOLD):
+            return self.status
+        if self.next_due and self.next_due < timezone.now().date():
+            return self.Status.OVERDUE
+        return self.status
 
 
 class MaintenanceRecord(TimeStampedModel):

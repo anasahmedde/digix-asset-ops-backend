@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     AssetCodeViewSet,
+    AssetTypeViewSet,
     BrandViewSet,
     DeviceImageViewSet,
     DeviceLifecycleEventViewSet,
@@ -12,6 +13,7 @@ from .views import (
 )
 
 router = DefaultRouter()
+router.register("asset-types", AssetTypeViewSet)
 router.register("brands", BrandViewSet)
 router.register("device-models", DeviceModelViewSet)
 router.register("material-types", MaterialTypeViewSet)

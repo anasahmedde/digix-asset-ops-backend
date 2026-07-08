@@ -16,7 +16,7 @@ class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
     serializer_class = MaintenanceScheduleSerializer
     permission_classes = [IsAuthenticated, TechnicianCanCreate]
     filterset_fields = [
-        "maintenance_type", "frequency", "is_active", "assigned_to", "device",
+        "maintenance_type", "frequency", "status", "is_active", "assigned_to", "device",
     ]
     search_fields = ["title"]
     ordering_fields = ["next_due", "created_at"]

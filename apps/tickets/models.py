@@ -17,6 +17,7 @@ class Ticket(TimeStampedModel):
         IN_PROGRESS = "in_progress", "In Progress"
         ON_HOLD = "on_hold", "On Hold"
         BLOCKED = "blocked", "Blocked"
+        ALIGNMENT_PENDING = "alignment_pending", "Alignment Pending"
         PENDING_REVIEW = "pending_review", "Pending Review"
         APPROVED = "approved", "Approved"
         REJECTED = "rejected", "Rejected"
@@ -72,9 +73,10 @@ class Ticket(TimeStampedModel):
 
     VALID_TRANSITIONS = {
         Status.OPEN: (Status.IN_PROGRESS,),
-        Status.IN_PROGRESS: (Status.ON_HOLD, Status.BLOCKED, Status.PENDING_REVIEW),
+        Status.IN_PROGRESS: (Status.ON_HOLD, Status.BLOCKED, Status.ALIGNMENT_PENDING, Status.PENDING_REVIEW),
         Status.ON_HOLD: (Status.IN_PROGRESS,),
         Status.BLOCKED: (Status.IN_PROGRESS,),
+        Status.ALIGNMENT_PENDING: (Status.IN_PROGRESS, Status.PENDING_REVIEW),
         Status.PENDING_REVIEW: (Status.APPROVED, Status.REJECTED),
         Status.REJECTED: (Status.IN_PROGRESS,),
         Status.APPROVED: (Status.CLOSED,),
