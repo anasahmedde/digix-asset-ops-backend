@@ -67,7 +67,7 @@ def tickets_report(request, date_from, date_to):
             qs = qs.filter(**{f: v})
 
     rows = [{
-        "id": str(t.id)[:8],
+        "id": t.ticket_number or str(t.id)[:8],
         "title": t.title,
         "status": t.get_status_display(),
         "priority": t.get_priority_display(),
