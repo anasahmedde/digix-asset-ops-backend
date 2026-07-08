@@ -1,6 +1,13 @@
 from django.contrib import admin
 
-from .models import DeviceInstallation, InstallationPhoto, Site, SiteZone
+from .models import (
+    DeviceInstallation,
+    InstallationPhoto,
+    InstallationStep,
+    Site,
+    SiteContact,
+    SiteZone,
+)
 
 
 class SiteZoneInline(admin.TabularInline):
@@ -8,18 +15,43 @@ class SiteZoneInline(admin.TabularInline):
     extra = 0
 
 
+class SiteContactInline(admin.TabularInline):
+    model = SiteContact
+    extra = 0
+
+
 @admin.register(Site)
 class SiteAdmin(admin.ModelAdmin):
-    list_display = ["name", "city", "country", "client", "is_active"]
-    list_filter = ["city", "country", "is_active"]
+    list_display = ["name", "city", "state_province", "country", "client", "is_active"]
+    list_filter = ["city", "state_province", "country", "is_active"]
     search_fields = ["name", "address"]
-    inlines = [SiteZoneInline]
+    inlines = [SiteContactInline, SiteZoneInline]
+
+
+@admin.register(SiteContact)
+class SiteContactAdmin(admin.ModelAdmin):
+    list_display = ["name", "site", "designation", "phone", "is_primary"]
+    list_filter = ["is_primary"]
+    search_fields = ["name", "email", "phone"]
+
+
+class InstallationStepInline(admin.TabularInline):
+    model = InstallationStep
+    extra = 0
+    ordering = ["step_number"]
 
 
 @admin.register(DeviceInstallation)
 class DeviceInstallationAdmin(admin.ModelAdmin):
     list_display = ["device", "site", "installed_by", "installed_at"]
     list_filter = ["site"]
+    inlines = [InstallationStepInline]
+
+
+@admin.register(InstallationStep)
+class InstallationStepAdmin(admin.ModelAdmin):
+    list_display = ["installation", "step_number", "step_type", "status", "assigned_team"]
+    list_filter = ["step_type", "status"]
 
 
 @admin.register(InstallationPhoto)

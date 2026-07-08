@@ -1,8 +1,9 @@
 from django.conf import settings
 from django.db import models
 
+from common.codes import generate_code
 from common.models import TimeStampedModel
-from common.utils import generate_asset_code, upload_to_path
+from common.utils import upload_to_path
 
 
 class Brand(TimeStampedModel):
@@ -45,6 +46,34 @@ class MaterialType(TimeStampedModel):
         return self.name
 
 
+class AssetType(TimeStampedModel):
+    """
+    Category of asset shown in the registry and details
+    (SMD Screen, Standee, Talker, Digital Display, Tokenomo, …).
+
+    Data-driven so new types can be added from the Setup screens without a
+    code change.
+    """
+
+    name = models.CharField(max_length=150, unique=True)
+    code = models.CharField(max_length=30, blank=True, db_index=True)
+    description = models.TextField(blank=True)
+    has_dimensions = models.BooleanField(
+        default=False, help_text="Uses length × width (e.g. SMD screens)"
+    )
+    has_diagonal = models.BooleanField(
+        default=False, help_text="Uses diagonal size in inches (e.g. digital displays)"
+    )
+    icon = models.CharField(max_length=50, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
 class Device(TimeStampedModel):
     class Status(models.TextChoices):
         PROCURED = "procured", "Procured"
@@ -64,11 +93,23 @@ class Device(TimeStampedModel):
     mac_address = models.CharField(max_length=17, blank=True)
     imei = models.CharField(max_length=20, blank=True)
 
+    asset_type = models.ForeignKey(
+        AssetType, on_delete=models.PROTECT, null=True, blank=True, related_name="devices",
+        help_text="Asset category (SMD Screen, Standee, Digital Display, …)",
+    )
     device_model = models.ForeignKey(DeviceModel, on_delete=models.PROTECT, related_name="devices")
+    display_name = models.CharField(max_length=200, blank=True, help_text="Friendly asset name")
     firmware_version = models.CharField(max_length=100, blank=True)
     hardware_revision = models.CharField(max_length=100, blank=True)
 
+    # Physical size: length × width (e.g. SMD screens) and/or diagonal (displays).
+    length_cm = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    width_cm = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    diagonal_inches = models.DecimalField(max_digits=5, decimal_places=1, null=True, blank=True)
+
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROCURED)
+
+    image = models.ImageField(upload_to=upload_to_path, blank=True, help_text="Primary device photo")
 
     purchase_date = models.DateField(null=True, blank=True)
     purchase_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
@@ -88,6 +129,10 @@ class Device(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="assigned_devices"
     )
     installation_date = models.DateField(null=True, blank=True)
+    installed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installed_devices", help_text="Who installed this asset",
+    )
 
     notes = models.TextField(blank=True)
 
@@ -104,7 +149,7 @@ class Device(TimeStampedModel):
 
     def save(self, *args, **kwargs):
         if not self.asset_code:
-            self.asset_code = generate_asset_code()
+            self.asset_code = generate_code("asset", model=type(self), field="asset_code")
         super().save(*args, **kwargs)
 
 
@@ -132,6 +177,22 @@ class DeviceLifecycleEvent(TimeStampedModel):
 
     def __str__(self):
         return f"{self.device.asset_code} - {self.event_type}"
+
+
+class DeviceImage(TimeStampedModel):
+    """Gallery of images for a device."""
+
+    device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name="images")
+    image = models.ImageField(upload_to=upload_to_path)
+    caption = models.CharField(max_length=300, blank=True)
+    is_primary = models.BooleanField(default=False)
+    sort_order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ["sort_order", "-created_at"]
+
+    def __str__(self):
+        return f"{self.device.asset_code} - image {self.sort_order}"
 
 
 class AssetCode(TimeStampedModel):

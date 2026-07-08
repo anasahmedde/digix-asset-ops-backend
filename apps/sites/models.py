@@ -9,7 +9,8 @@ class Site(TimeStampedModel):
     name = models.CharField(max_length=300)
     address = models.TextField()
     city = models.CharField(max_length=100, blank=True)
-    country = models.CharField(max_length=100, default="UAE")
+    state_province = models.CharField(max_length=150, blank=True, help_text="State, province, or emirate")
+    country = models.CharField(max_length=100, default="Pakistan")
     latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
     longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
     contact_person = models.CharField(max_length=200, blank=True)
@@ -28,6 +29,24 @@ class Site(TimeStampedModel):
 
     def __str__(self):
         return self.name
+
+
+class SiteContact(TimeStampedModel):
+    """Point-of-contact (POC) at a site — name and contact details."""
+
+    site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="contacts")
+    name = models.CharField(max_length=200)
+    designation = models.CharField(max_length=150, blank=True)
+    phone = models.CharField(max_length=20, blank=True)
+    email = models.EmailField(blank=True)
+    is_primary = models.BooleanField(default=False)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-is_primary", "name"]
+
+    def __str__(self):
+        return f"{self.name} @ {self.site.name}"
 
 
 class SiteZone(TimeStampedModel):
@@ -64,6 +83,42 @@ class DeviceInstallation(TimeStampedModel):
 
     def __str__(self):
         return f"{self.device.asset_code} @ {self.site.name}"
+
+
+class InstallationStep(TimeStampedModel):
+    """Tracks individual steps in a device installation pipeline."""
+
+    class StepType(models.TextChoices):
+        SURVEY = "survey", "Survey"
+        WIRING = "wiring", "Wiring"
+        STRUCTURE = "structure", "Metal Structure Installation"
+        PROGRAMMING = "programming", "Programming"
+        TESTING = "testing", "Testing & Commissioning"
+        HANDOVER = "handover", "Handover"
+
+    class StepStatus(models.TextChoices):
+        NOT_STARTED = "not_started", "Not Started Yet"
+        IN_PROGRESS = "in_progress", "In Progress"
+        COMPLETED = "completed", "Completed"
+        SKIPPED = "skipped", "Skipped"
+
+    installation = models.ForeignKey(
+        DeviceInstallation, on_delete=models.CASCADE, related_name="steps"
+    )
+    step_type = models.CharField(max_length=20, choices=StepType.choices)
+    step_number = models.PositiveSmallIntegerField()
+    status = models.CharField(max_length=20, choices=StepStatus.choices, default=StepStatus.NOT_STARTED)
+    assigned_team = models.CharField(max_length=200, blank=True)
+    description = models.TextField(blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["step_number"]
+        unique_together = ["installation", "step_number"]
+
+    def __str__(self):
+        return f"{self.installation} - Step {self.step_number}: {self.get_step_type_display()}"
 
 
 class InstallationPhoto(TimeStampedModel):
