@@ -1,10 +1,12 @@
 from django.db.models import Count, F
-from rest_framework import viewsets
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from common.permissions import AdminManagerWriteElseRead
+
+from .labels import render_label
 
 from .models import (
     AssetCode,
@@ -156,6 +158,34 @@ class DeviceViewSet(viewsets.ModelViewSet):
             )
         )
         return Response(list(devices))
+
+    @action(detail=True, methods=["post"], url_path="label")
+    def label(self, request, pk=None):
+        """Generate (or refresh) the printable QR/barcode label for this device.
+
+        The label encodes ``asset_code``, which the mobile scanner resolves via
+        the device search endpoint. Re-generating reuses the current AssetCode
+        row so repeated prints don't stack duplicate records.
+        """
+        device = self.get_object()
+        fmt = request.data.get("format", AssetCode.LabelFormat.QR)
+        if fmt not in AssetCode.LabelFormat.values:
+            return Response(
+                {"format": [f"Must be one of: {', '.join(AssetCode.LabelFormat.values)}."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        code_obj = AssetCode.objects.filter(
+            device=device, format=fmt, is_current=True
+        ).first()
+        if code_obj is None:
+            code_obj = AssetCode(device=device, format=fmt)
+        code_obj.label_size = request.data.get("label_size", code_obj.label_size or "60x30")
+
+        content = render_label(device, fmt)
+        code_obj.generated_file.save(content.name, content, save=True)
+
+        return Response(AssetCodeSerializer(code_obj, context={"request": request}).data)
 
 
 class DeviceImageViewSet(viewsets.ModelViewSet):
