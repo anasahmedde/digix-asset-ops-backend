@@ -1,4 +1,4 @@
-from django.db.models import Count, Q
+from django.utils import timezone
 
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -47,6 +47,15 @@ class ChatRoomViewSet(viewsets.ModelViewSet):
             return self.get_paginated_response(serializer.data)
         serializer = ChatMessageSerializer(messages, many=True, context={"request": request})
         return Response(serializer.data)
+
+    @action(detail=True, methods=["post"])
+    def mark_read(self, request, pk=None):
+        """Mark all messages in this room as read for the current user."""
+        room = self.get_object()
+        ChatRoomMembership.objects.filter(room=room, user=request.user).update(
+            last_read_at=timezone.now()
+        )
+        return Response({"status": "ok"})
 
     @action(detail=False, methods=["get"])
     def total_unread(self, request):

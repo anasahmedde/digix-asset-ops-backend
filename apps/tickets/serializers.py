@@ -12,7 +12,7 @@ class TicketAttachmentSerializer(serializers.ModelSerializer):
             "id", "ticket", "uploaded_by", "uploaded_by_name",
             "file", "caption", "attachment_type", "created_at",
         ]
-        read_only_fields = ["id", "uploaded_by", "created_at"]
+        read_only_fields = ["id", "ticket", "uploaded_by", "created_at"]
 
 
 class TicketCommentSerializer(serializers.ModelSerializer):
@@ -25,7 +25,7 @@ class TicketCommentSerializer(serializers.ModelSerializer):
             "id", "ticket", "author", "author_name", "author_avatar",
             "content", "comment_type", "old_status", "new_status", "created_at",
         ]
-        read_only_fields = ["id", "author", "comment_type", "old_status", "new_status", "created_at"]
+        read_only_fields = ["id", "ticket", "author", "comment_type", "old_status", "new_status", "created_at"]
 
 
 class TicketSerializer(serializers.ModelSerializer):
@@ -43,7 +43,7 @@ class TicketSerializer(serializers.ModelSerializer):
     class Meta:
         model = Ticket
         fields = [
-            "id", "title", "description", "priority", "status", "category",
+            "id", "ticket_number", "title", "description", "priority", "status", "category",
             "device", "device_code", "site", "site_name",
             "assigned_to", "assigned_to_name", "reported_by", "reported_by_name",
             "due_date", "resolved_at", "resolution_notes",
@@ -54,7 +54,7 @@ class TicketSerializer(serializers.ModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "created_at", "updated_at",
+            "id", "ticket_number", "created_at", "updated_at",
             "completed_by", "completed_at", "reviewed_by", "reviewed_at",
         ]
 
@@ -72,7 +72,7 @@ class TicketListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Ticket
         fields = [
-            "id", "title", "description", "priority", "status", "category",
+            "id", "ticket_number", "title", "description", "priority", "status", "category",
             "device", "device_code", "site", "site_name",
             "assigned_to", "assigned_to_name", "reported_by", "reported_by_name",
             "due_date", "resolved_at", "completion_notes", "completed_at",
@@ -80,7 +80,7 @@ class TicketListSerializer(serializers.ModelSerializer):
             "attachment_count", "comment_count",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        read_only_fields = ["id", "ticket_number", "created_at", "updated_at"]
 
 
 class TicketTransitionSerializer(serializers.Serializer):

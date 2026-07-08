@@ -1,6 +1,7 @@
 from django.conf import settings
 from django.db import models
 
+from common.codes import generate_code
 from common.models import TimeStampedModel
 from common.utils import upload_to_path
 
@@ -31,6 +32,7 @@ class Ticket(TimeStampedModel):
         RELOCATION = "relocation", "Relocation"
         OTHER = "other", "Other"
 
+    ticket_number = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
     title = models.CharField(max_length=300)
     description = models.TextField(blank=True)
     priority = models.CharField(max_length=10, choices=Priority.choices, default=Priority.MEDIUM)
@@ -92,7 +94,12 @@ class Ticket(TimeStampedModel):
         ]
 
     def __str__(self):
-        return f"#{self.id.__str__()[:8]} - {self.title}"
+        return f"{self.ticket_number or str(self.id)[:8]} - {self.title}"
+
+    def save(self, *args, **kwargs):
+        if not self.ticket_number:
+            self.ticket_number = generate_code("ticket", model=type(self), field="ticket_number")
+        super().save(*args, **kwargs)
 
     def can_transition_to(self, new_status: str) -> bool:
         allowed = self.VALID_TRANSITIONS.get(self.status, ())

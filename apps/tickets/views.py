@@ -28,7 +28,7 @@ class TicketViewSet(viewsets.ModelViewSet):
     filterset_fields = [
         "status", "priority", "category", "assigned_to", "site", "device",
     ]
-    search_fields = ["title", "description"]
+    search_fields = ["ticket_number", "title", "description"]
     ordering_fields = ["created_at", "due_date", "priority", "status"]
 
     def get_serializer_class(self):
