@@ -42,10 +42,13 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        # No index on the AddField: on Postgres, adding db_index here and then
+        # altering to unique would create the same *_like pattern index twice.
+        # The final AlterField applies index + unique constraint in one step.
         migrations.AddField(
             model_name="ticket",
             name="ticket_number",
-            field=models.CharField(blank=True, db_index=True, max_length=50),
+            field=models.CharField(blank=True, max_length=50),
         ),
         migrations.RunPython(backfill, noop),
         migrations.AlterField(
