@@ -8,7 +8,7 @@ User = get_user_model()
 
 
 class ChatMessageSerializer(serializers.ModelSerializer):
-    sender_name = serializers.CharField(source="sender.get_full_name", read_only=True)
+    sender_name = serializers.SerializerMethodField()
     sender_avatar = serializers.SerializerMethodField()
 
     class Meta:
@@ -19,6 +19,9 @@ class ChatMessageSerializer(serializers.ModelSerializer):
             "is_edited", "edited_at", "created_at",
         ]
         read_only_fields = ["id", "sender", "is_edited", "edited_at", "created_at"]
+
+    def get_sender_name(self, obj):
+        return obj.sender.get_full_name().strip() or obj.sender.username
 
     def get_sender_avatar(self, obj):
         if obj.sender.avatar:
@@ -33,13 +36,29 @@ class ChatRoomSerializer(serializers.ModelSerializer):
     last_message = serializers.SerializerMethodField()
     unread_count = serializers.SerializerMethodField()
     participant_names = serializers.SerializerMethodField()
+    display_name = serializers.SerializerMethodField()
 
     class Meta:
         model = ChatRoom
         fields = [
-            "id", "name", "room_type", "participants", "participant_names",
+            "id", "name", "display_name", "room_type", "participants", "participant_names",
             "last_message", "unread_count", "is_active", "created_at",
         ]
+
+    def _name(self, user):
+        return (user.get_full_name() or "").strip() or user.username
+
+    def get_display_name(self, obj):
+        """Title shown in the conversation list: the room name, or (for a
+        direct chat) the other participant(s), from the viewer's perspective."""
+        if obj.name:
+            return obj.name
+        request = self.context.get("request")
+        participants = list(obj.participants.all())
+        if request:
+            participants = [u for u in participants if u.id != request.user.id] or participants
+        names = [self._name(u) for u in participants]
+        return ", ".join(names) or "Chat"
 
     def get_last_message(self, obj):
         message = obj.messages.order_by("-created_at").first()
@@ -57,7 +76,7 @@ class ChatRoomSerializer(serializers.ModelSerializer):
         return obj.messages.filter(created_at__gt=membership.last_read_at).count()
 
     def get_participant_names(self, obj):
-        return list(obj.participants.values_list("first_name", flat=True))
+        return [self._name(u) for u in obj.participants.all()]
 
 
 class ChatRoomCreateSerializer(serializers.Serializer):
