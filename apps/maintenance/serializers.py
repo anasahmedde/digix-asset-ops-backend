@@ -7,6 +7,8 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     assigned_to_name = serializers.CharField(source="assigned_to.get_full_name", read_only=True, default=None)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    effective_status = serializers.CharField(read_only=True)
 
     class Meta:
         model = MaintenanceSchedule
@@ -14,7 +16,8 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
             "id", "title", "maintenance_type", "frequency",
             "device", "device_code", "site", "site_name",
             "assigned_to", "assigned_to_name",
-            "next_due", "instructions", "is_active",
+            "next_due", "instructions", "status", "status_display",
+            "effective_status", "is_active",
             "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
