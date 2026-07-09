@@ -91,3 +91,27 @@ class WebhookLog(TimeStampedModel):
 
     class Meta:
         ordering = ["-created_at"]
+
+
+class PushToken(TimeStampedModel):
+    """An Expo push token for one of a user's devices (for OS-level push)."""
+
+    class Platform(models.TextChoices):
+        IOS = "ios", "iOS"
+        ANDROID = "android", "Android"
+        WEB = "web", "Web"
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="push_tokens",
+    )
+    token = models.CharField(max_length=255, unique=True)
+    platform = models.CharField(max_length=10, choices=Platform.choices, blank=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+        indexes = [models.Index(fields=["user"])]
+
+    def __str__(self):
+        return f"{self.user} · {self.token[:24]}…"

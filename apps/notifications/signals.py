@@ -10,9 +10,11 @@ from django.utils import timezone
 
 from apps.accounts.models import User
 from apps.analytics.models import Alert
+from apps.chat.models import ChatMessage
 from apps.tickets.models import Ticket
 
 from .models import Notification
+from .push import send_push_to_user
 from .serializers import NotificationSerializer
 
 logger = logging.getLogger(__name__)
@@ -22,19 +24,53 @@ RESOLVED_STATUSES = (Ticket.Status.APPROVED, Ticket.Status.CLOSED)
 
 def _push_ws(notification: Notification):
     channel_layer = get_channel_layer()
-    if channel_layer is None:
-        return
-    group_name = f"notifications_{notification.recipient_id}"
+    if channel_layer is not None:
+        group_name = f"notifications_{notification.recipient_id}"
+        try:
+            async_to_sync(channel_layer.group_send)(
+                group_name,
+                {
+                    "type": "send_notification",
+                    "notification": NotificationSerializer(notification).data,
+                },
+            )
+        except Exception:
+            logger.exception("Failed to send WS notification to %s", group_name)
+
+    # Also deliver an OS-level push to the recipient's registered devices.
     try:
-        async_to_sync(channel_layer.group_send)(
-            group_name,
-            {
-                "type": "send_notification",
-                "notification": NotificationSerializer(notification).data,
-            },
+        send_push_to_user(
+            notification.recipient_id,
+            notification.title,
+            notification.message,
+            {**(notification.data or {}), "notification_type": notification.notification_type},
         )
     except Exception:
-        logger.exception("Failed to send WS notification to %s", group_name)
+        logger.exception("Failed push to %s", notification.recipient_id)
+
+
+# ── Chat message → push to the other participants ────────────────────
+
+@receiver(post_save, sender=ChatMessage)
+def push_chat_message(sender, instance: ChatMessage, created: bool, **kwargs):
+    if not created or instance.message_type == ChatMessage.MessageType.SYSTEM:
+        return
+    try:
+        sender_name = instance.sender.get_full_name().strip() or instance.sender.username
+        recipient_ids = (
+            instance.room.participants.exclude(id=instance.sender_id)
+            .values_list("id", flat=True)
+        )
+        preview = instance.content if instance.message_type == ChatMessage.MessageType.TEXT else "📎 Attachment"
+        for uid in recipient_ids:
+            send_push_to_user(
+                uid,
+                sender_name,
+                preview[:140],
+                {"notification_type": "chat_message", "room_id": str(instance.room_id)},
+            )
+    except Exception:
+        logger.exception("Failed chat push for message %s", instance.pk)
 
 
 # ── Alert → Notification ─────────────────────────────────────────────
