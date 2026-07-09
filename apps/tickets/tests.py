@@ -178,3 +178,31 @@ def test_comment_with_image(people):
     r = c.post(f"/api/tickets/{tid}/comments/", {"image": _png()}, format="multipart")
     assert r.status_code == 201
     assert c.post(f"/api/tickets/{tid}/comments/", {"content": ""}, format="json").status_code == 400
+
+
+@pytest.mark.django_db
+def test_technician_sees_only_own_tickets(people):
+    ops, mkt, tech = people["ops"], people["marketing"], people["tech"]
+    other = User.objects.create_user(username="wf-tech2", password="x", role="technician")
+
+    c_mkt = _client(mkt)
+    mine = c_mkt.post("/api/tickets/", {"title": "for tech"}, format="json").json()["id"]
+    theirs = c_mkt.post("/api/tickets/", {"title": "for other"}, format="json").json()["id"]
+    c_ops = _client(ops)
+    c_ops.post(f"/api/tickets/{mine}/assign/", {"assigned_to": str(tech.id)}, format="json")
+    c_ops.post(f"/api/tickets/{theirs}/assign/", {"assigned_to": str(other.id)}, format="json")
+
+    c_tech = _client(tech)
+    ids = [t["id"] for t in c_tech.get("/api/tickets/").json()["results"]]
+    assert mine in ids and theirs not in ids
+    # detail access to someone else's ticket is denied too
+    assert c_tech.get(f"/api/tickets/{theirs}/").status_code == 404
+    # tickets a technician raises themselves stay visible
+    raised = c_tech.post("/api/tickets/", {"title": "raised by tech"}, format="json").json()["id"]
+    ids = [t["id"] for t in c_tech.get("/api/tickets/").json()["results"]]
+    assert raised in ids
+
+    # oversight + marketing see everything
+    for c in (c_ops, c_mkt):
+        ids = [t["id"] for t in c.get("/api/tickets/").json()["results"]]
+        assert mine in ids and theirs in ids
