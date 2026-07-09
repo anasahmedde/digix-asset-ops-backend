@@ -164,3 +164,17 @@ def test_escalation_task(people):
     assert Notification.objects.filter(ticket=t, notification_type="ticket_escalated", recipient=people["ops"]).exists()
     # Second run is a no-op (escalate once).
     assert escalate_overdue_tickets() == 0
+
+
+@pytest.mark.django_db
+def test_comment_with_image(people):
+    c = _client(people["marketing"])
+    tid = c.post("/api/tickets/", {"title": "img comment"}, format="json").json()["id"]
+    r = c.post(f"/api/tickets/{tid}/comments/", {"content": "see photo", "image": _png()}, format="multipart")
+    assert r.status_code == 201, r.content
+    assert r.json()["image"], "image URL missing"
+    # text-only and image-only still work; empty rejected
+    assert c.post(f"/api/tickets/{tid}/comments/", {"content": "plain"}, format="json").status_code == 201
+    r = c.post(f"/api/tickets/{tid}/comments/", {"image": _png()}, format="multipart")
+    assert r.status_code == 201
+    assert c.post(f"/api/tickets/{tid}/comments/", {"content": ""}, format="json").status_code == 400

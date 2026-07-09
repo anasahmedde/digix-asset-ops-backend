@@ -32,7 +32,7 @@ class TicketCommentSerializer(serializers.ModelSerializer):
         model = TicketComment
         fields = [
             "id", "ticket", "author", "author_name", "author_avatar",
-            "content", "comment_type", "old_status", "new_status", "created_at",
+            "content", "image", "comment_type", "old_status", "new_status", "created_at",
         ]
         read_only_fields = ["id", "ticket", "author", "comment_type", "old_status", "new_status", "created_at"]
 
