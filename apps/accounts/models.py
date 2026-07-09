@@ -12,6 +12,7 @@ class User(AbstractUser):
         OPS_MANAGER = "ops_manager", "Operations Manager"
         SUPERVISOR = "supervisor", "Supervisor"
         TECHNICIAN = "technician", "Technician"
+        MARKETING = "marketing", "Marketing"
         FINANCE = "finance", "Finance"
         WAREHOUSE = "warehouse", "Warehouse Staff"
         CLIENT_VIEWER = "client_viewer", "Client Viewer"

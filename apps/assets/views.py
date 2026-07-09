@@ -1,4 +1,4 @@
-from django.db.models import Count, F
+from django.db.models import Count, F, Q
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -149,8 +149,14 @@ class DeviceViewSet(viewsets.ModelViewSet):
                 current_site__longitude__isnull=False,
             )
             .select_related("current_site")
+            .annotate(
+                open_tickets=Count(
+                    "tickets",
+                    filter=~Q(tickets__status__in=["closed", "approved", "rejected"]),
+                )
+            )
             .values(
-                "id", "asset_code", "status",
+                "id", "asset_code", "status", "open_tickets",
                 "current_site__id",
                 "current_site__name", "current_site__city",
                 "current_site__state_province", "current_site__country",

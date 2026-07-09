@@ -86,7 +86,7 @@ class TechnicianCanCreate(BasePermission):
         role = _role(request.user)
         if role in MANAGER_ROLES:
             return True
-        if role in ("technician", "supervisor") and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
+        if role in ("technician", "supervisor", "marketing") and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
             return True
         return False
 
