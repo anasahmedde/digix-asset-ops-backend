@@ -1,3 +1,4 @@
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -43,6 +44,19 @@ class TicketViewSet(viewsets.ModelViewSet):
     ]
     search_fields = ["ticket_number", "title", "description"]
     ordering_fields = ["created_at", "due_date", "response_due_at", "priority", "status"]
+
+    def get_queryset(self):
+        """Role-scoped visibility.
+
+        Field staff (technicians) only see tickets assigned to them or that
+        they raised. Oversight roles (admin/ops/supervisor) and marketing
+        (who relay client decisions and close tickets) see everything.
+        """
+        qs = super().get_queryset()
+        user = self.request.user
+        if getattr(user, "role", "") == "technician" and not user.is_superuser:
+            return qs.filter(Q(assigned_to=user) | Q(reported_by=user))
+        return qs
 
     def get_serializer_class(self):
         if self.action == "list":
