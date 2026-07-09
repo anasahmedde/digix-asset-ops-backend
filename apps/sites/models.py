@@ -117,6 +117,19 @@ class InstallationStep(TimeStampedModel):
         ordering = ["step_number"]
         unique_together = ["installation", "step_number"]
 
+    def save(self, *args, **kwargs):
+        from django.utils import timezone
+
+        # Stamp the timeline automatically as the step advances.
+        if self.status == self.StepStatus.IN_PROGRESS and not self.started_at:
+            self.started_at = timezone.now()
+        if self.status == self.StepStatus.COMPLETED:
+            if not self.started_at:
+                self.started_at = timezone.now()
+            if not self.completed_at:
+                self.completed_at = timezone.now()
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.installation} - Step {self.step_number}: {self.get_step_type_display()}"
 

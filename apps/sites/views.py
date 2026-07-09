@@ -83,13 +83,26 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
 class InstallationStepViewSet(viewsets.ModelViewSet):
     queryset = InstallationStep.objects.select_related("installation").all()
     serializer_class = InstallationStepSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["installation", "step_type", "status"]
     ordering_fields = ["step_number"]
+
+    def get_permissions(self):
+        # Field techs may advance a step's status; only managers add/remove steps.
+        if self.action in ("update", "partial_update"):
+            return [IsAuthenticated()]
+        return [IsAuthenticated(), AdminManagerWriteElseRead()]
 
 
 class InstallationPhotoViewSet(viewsets.ModelViewSet):
     queryset = InstallationPhoto.objects.select_related("installation").all()
     serializer_class = InstallationPhotoSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["installation", "photo_type"]
+
+    def get_permissions(self):
+        # Field techs may attach installation photos; managers can also edit/remove.
+        if self.action == "create":
+            return [IsAuthenticated()]
+        return [IsAuthenticated(), AdminManagerWriteElseRead()]
+
+    def perform_create(self, serializer):
+        serializer.save(taken_by=self.request.user)
