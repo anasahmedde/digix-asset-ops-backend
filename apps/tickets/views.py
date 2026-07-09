@@ -5,12 +5,14 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import MANAGER_ROLES, TechnicianCanCreate
+from common.permissions import MANAGER_ROLES, AdminManagerWriteElseRead, TechnicianCanCreate
 
-from .models import Ticket, TicketAttachment, TicketComment
+from .models import Ticket, TicketAttachment, TicketComment, TicketIssueType
 from .serializers import (
+    TicketAssignSerializer,
     TicketAttachmentSerializer,
     TicketCommentSerializer,
+    TicketIssueTypeSerializer,
     TicketListSerializer,
     TicketReviewSerializer,
     TicketSerializer,
@@ -19,17 +21,28 @@ from .serializers import (
 )
 
 
+class TicketIssueTypeViewSet(viewsets.ModelViewSet):
+    """Fault catalogue (Module Burnt, HDMI Cable Issue, …) managed from Setup."""
+
+    queryset = TicketIssueType.objects.all()
+    serializer_class = TicketIssueTypeSerializer
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    filterset_fields = ["is_active"]
+    search_fields = ["name"]
+
+
 class TicketViewSet(viewsets.ModelViewSet):
     queryset = Ticket.objects.select_related(
-        "device", "site", "assigned_to", "reported_by",
-        "completed_by", "reviewed_by",
+        "device", "site", "issue_type", "assigned_to", "assigned_vendor",
+        "reported_by", "completed_by", "reviewed_by",
     ).prefetch_related("attachments", "comments").all()
     permission_classes = [IsAuthenticated, TechnicianCanCreate]
     filterset_fields = [
-        "status", "priority", "category", "assigned_to", "site", "device",
+        "status", "priority", "category", "issue_type", "assigned_to",
+        "assigned_vendor", "site", "device", "escalated",
     ]
     search_fields = ["ticket_number", "title", "description"]
-    ordering_fields = ["created_at", "due_date", "priority", "status"]
+    ordering_fields = ["created_at", "due_date", "response_due_at", "priority", "status"]
 
     def get_serializer_class(self):
         if self.action == "list":
@@ -38,6 +51,47 @@ class TicketViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(reported_by=self.request.user)
+
+    # ── Assignment (Operations only) ──────────────────────────────────
+
+    @action(detail=True, methods=["post"], url_path="assign")
+    def assign(self, request, pk=None):
+        """Assign the ticket to an employee and/or a vendor (in-warranty assets)."""
+        if getattr(request.user, "role", "") not in MANAGER_ROLES:
+            return Response(
+                {"detail": "Only Operations can assign tickets."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        ticket = self.get_object()
+        ser = TicketAssignSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        parts = []
+        if "assigned_to" in ser.validated_data:
+            from apps.accounts.models import User
+
+            user_id = ser.validated_data["assigned_to"]
+            assignee = User.objects.filter(pk=user_id).first() if user_id else None
+            ticket.assigned_to = assignee
+            parts.append(f"assignee → {assignee.get_full_name() or assignee.username}" if assignee else "assignee cleared")
+        if "assigned_vendor" in ser.validated_data:
+            from apps.suppliers.models import Supplier
+
+            vendor_id = ser.validated_data["assigned_vendor"]
+            vendor = Supplier.objects.filter(pk=vendor_id).first() if vendor_id else None
+            ticket.assigned_vendor = vendor
+            parts.append(f"vendor → {vendor.name}" if vendor else "vendor cleared")
+        ticket.save(update_fields=["assigned_to", "assigned_vendor", "updated_at"])
+
+        notes = ser.validated_data.get("notes", "")
+        TicketComment.objects.create(
+            ticket=ticket,
+            author=request.user,
+            content=(notes or f"Assignment updated: {', '.join(parts)}"),
+            comment_type=TicketComment.CommentType.STATUS_CHANGE,
+        )
+        ticket.refresh_from_db()
+        return Response(TicketSerializer(ticket).data)
 
     # ── Status transition ─────────────────────────────────────────────
 
@@ -56,30 +110,61 @@ class TicketViewSet(viewsets.ModelViewSet):
         new_status = ser.validated_data["status"]
         notes = ser.validated_data.get("notes", "")
 
+        is_marketing = role == "marketing"
+        is_reporter = ticket.reported_by_id == user.id
+
+        # Decisions OUT of an approval stage belong to the approver, not the assignee.
+        if old_status == Ticket.Status.PENDING_OPS_APPROVAL and not is_manager:
+            return Response(
+                {"detail": "Only Operations can decide on this approval request."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if old_status == Ticket.Status.PENDING_CLIENT_APPROVAL and not (is_manager or is_marketing):
+            return Response(
+                {"detail": "Only Marketing or Operations can relay the client's decision."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         assignee_transitions = {
             Ticket.Status.IN_PROGRESS,
             Ticket.Status.ON_HOLD,
             Ticket.Status.BLOCKED,
             Ticket.Status.ALIGNMENT_PENDING,
+            Ticket.Status.PENDING_OPS_APPROVAL,
         }
-        if new_status in assignee_transitions and not is_assignee and not is_manager:
+        approval_stages = (
+            Ticket.Status.PENDING_OPS_APPROVAL,
+            Ticket.Status.PENDING_CLIENT_APPROVAL,
+        )
+        if (
+            new_status in assignee_transitions
+            and old_status not in approval_stages
+            and not is_assignee
+            and not is_manager
+        ):
             return Response(
                 {"detail": "Only the assigned person can perform this action."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        reviewer_transitions = {
-            Ticket.Status.APPROVED,
-            Ticket.Status.REJECTED,
-            Ticket.Status.CLOSED,
-        }
-        if new_status in reviewer_transitions and not is_manager:
-            is_reporter = ticket.reported_by_id == user.id
-            if not is_reporter:
-                return Response(
-                    {"detail": "Only the reporter or a manager can perform this action."},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
+        if new_status in (Ticket.Status.APPROVED, Ticket.Status.REJECTED) and not is_manager and not is_reporter:
+            return Response(
+                {"detail": "Only the reporter or a manager can perform this action."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Closing is the final client sign-off: Marketing, a manager, or the reporter.
+        if new_status == Ticket.Status.CLOSED and not (is_manager or is_marketing or is_reporter):
+            return Response(
+                {"detail": "Only Marketing, Operations or the reporter can close a ticket."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if new_status == Ticket.Status.PENDING_OPS_APPROVAL and not notes.strip():
+            return Response(
+                {"notes": "Describe what needs approval (issue found, expected cost/parts)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if new_status == Ticket.Status.BLOCKED:
             if not notes.strip():
@@ -151,10 +236,11 @@ class TicketViewSet(viewsets.ModelViewSet):
 
         ticket.status = Ticket.Status.PENDING_REVIEW
         ticket.completion_notes = completion_notes
+        ticket.parts_used = ser.validated_data.get("parts_used", "")
         ticket.completed_by = request.user
         ticket.completed_at = now
         ticket.save(update_fields=[
-            "status", "completion_notes", "completed_by", "completed_at", "updated_at",
+            "status", "completion_notes", "parts_used", "completed_by", "completed_at", "updated_at",
         ])
 
         for i, image in enumerate(images):
