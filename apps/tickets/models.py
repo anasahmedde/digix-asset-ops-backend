@@ -210,7 +210,8 @@ class TicketComment(TimeStampedModel):
     author = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="ticket_comments"
     )
-    content = models.TextField()
+    content = models.TextField(blank=True)
+    image = models.ImageField(upload_to=upload_to_path, blank=True, help_text="Optional photo attached to the comment")
     comment_type = models.CharField(
         max_length=20, choices=CommentType.choices, default=CommentType.COMMENT,
     )

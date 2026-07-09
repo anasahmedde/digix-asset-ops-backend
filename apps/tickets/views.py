@@ -341,7 +341,10 @@ class TicketViewSet(viewsets.ModelViewSet):
 
     # ── Comments ──────────────────────────────────────────────────────
 
-    @action(detail=True, methods=["get", "post"], url_path="comments")
+    @action(
+        detail=True, methods=["get", "post"], url_path="comments",
+        parser_classes=[JSONParser, MultiPartParser, FormParser],
+    )
     def ticket_comments(self, request, pk=None):
         ticket = self.get_object()
 
@@ -351,6 +354,11 @@ class TicketViewSet(viewsets.ModelViewSet):
 
         ser = TicketCommentSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
+        if not ser.validated_data.get("content", "").strip() and not ser.validated_data.get("image"):
+            return Response(
+                {"content": "Add a message or a photo."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         ser.save(ticket=ticket, author=request.user, comment_type=TicketComment.CommentType.COMMENT)
         return Response(ser.data, status=status.HTTP_201_CREATED)
 
