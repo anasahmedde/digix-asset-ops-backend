@@ -118,14 +118,14 @@ class Ticket(TimeStampedModel):
     escalated_at = models.DateTimeField(null=True, blank=True)
 
     VALID_TRANSITIONS = {
-        Status.OPEN: (Status.IN_PROGRESS,),
+        Status.OPEN: (Status.IN_PROGRESS, Status.CLOSED),
         Status.IN_PROGRESS: (
             Status.ON_HOLD, Status.BLOCKED, Status.ALIGNMENT_PENDING,
-            Status.PENDING_OPS_APPROVAL, Status.PENDING_REVIEW,
+            Status.PENDING_OPS_APPROVAL, Status.PENDING_REVIEW, Status.CLOSED,
         ),
         Status.ON_HOLD: (Status.IN_PROGRESS, Status.CLOSED),
-        Status.BLOCKED: (Status.IN_PROGRESS,),
-        Status.ALIGNMENT_PENDING: (Status.IN_PROGRESS, Status.PENDING_REVIEW),
+        Status.BLOCKED: (Status.IN_PROGRESS, Status.CLOSED),
+        Status.ALIGNMENT_PENDING: (Status.IN_PROGRESS, Status.PENDING_REVIEW, Status.CLOSED),
         # Ops decide: approve rectification (back to work), need client approval,
         # or decline (hold).
         Status.PENDING_OPS_APPROVAL: (
