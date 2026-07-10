@@ -138,6 +138,19 @@ def handle_ticket_notifications(sender, instance: Ticket, created: bool, **kwarg
     if instance.assigned_to_id and (created or prev_assigned != instance.assigned_to_id):
         _create_ticket_assignment_notification(instance)
 
+    # New unassigned ticket: park centrally and route to Operations for assignment.
+    if created and not instance.assigned_to_id:
+        for ops in User.objects.filter(role__in=("super_admin", "ops_manager"), is_active=True):
+            notification = Notification.objects.create(
+                recipient=ops,
+                notification_type=Notification.Type.TICKET_UPDATE,
+                title=f"New ticket awaiting assignment: {instance.ticket_number}",
+                message=instance.title,
+                ticket=instance,
+                is_actionable=True,
+            )
+            _push_ws(notification)
+
     if not created and prev_status != instance.status:
         if instance.status == Ticket.Status.PENDING_REVIEW:
             _create_review_request_notification(instance)
