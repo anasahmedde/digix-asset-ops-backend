@@ -68,6 +68,8 @@ class Ticket(TimeStampedModel):
     )
     # Nth ticket ever raised against this device (1-based); 0 when no device.
     occurrence = models.PositiveIntegerField(default=0)
+    # Who complained — free text: client company, client's staff, or internal person.
+    complaint_by = models.CharField(max_length=200, blank=True)
 
     device = models.ForeignKey(
         "assets.Device", on_delete=models.SET_NULL, null=True, blank=True, related_name="tickets"
@@ -133,7 +135,7 @@ class Ticket(TimeStampedModel):
         # declined (hold — may later be closed).
         Status.PENDING_CLIENT_APPROVAL: (Status.IN_PROGRESS, Status.ON_HOLD),
         Status.PENDING_REVIEW: (Status.APPROVED, Status.REJECTED),
-        Status.REJECTED: (Status.IN_PROGRESS,),
+        Status.REJECTED: (Status.IN_PROGRESS, Status.PENDING_REVIEW),
         Status.APPROVED: (Status.CLOSED,),
         Status.CLOSED: (),
     }

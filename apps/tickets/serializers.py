@@ -69,7 +69,7 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
     class Meta:
         model = Ticket
         fields = [
-            "id", "ticket_number", "occurrence", "title", "description", "priority", "status", "category",
+            "id", "ticket_number", "occurrence", "complaint_by", "title", "description", "priority", "status", "category",
             "issue_type", "issue_type_name",
             "device", "device_code", "site", "site_name",
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
@@ -105,7 +105,7 @@ class TicketListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Ticket
         fields = [
-            "id", "ticket_number", "occurrence", "title", "description", "priority", "status", "category",
+            "id", "ticket_number", "occurrence", "complaint_by", "title", "description", "priority", "status", "category",
             "issue_type", "issue_type_name",
             "device", "device_code", "site", "site_name",
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
