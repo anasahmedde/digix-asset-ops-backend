@@ -1,6 +1,9 @@
 from django.db import transaction
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
 from rest_framework import viewsets
+from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 
 from common.permissions import WarehouseWriteElseRead
 
@@ -35,6 +38,34 @@ class InventoryItemViewSet(viewsets.ModelViewSet):
     filterset_fields = ["location", "category", "material_type"]
     search_fields = ["sku", "material_type__name"]
     ordering_fields = ["quantity", "created_at"]
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """In-hand stock totals for dashboard widgets.
+
+        ``total_value`` only counts items with a known unit_cost; ``unpriced_items``
+        tells the client how many items are excluded from the valuation.
+        """
+        agg = InventoryItem.objects.aggregate(
+            items=Count("id"),
+            total_quantity=Sum("quantity"),
+            total_value=Sum(
+                ExpressionWrapper(
+                    F("quantity") * F("unit_cost"),
+                    output_field=DecimalField(max_digits=14, decimal_places=2),
+                ),
+                filter=Q(unit_cost__isnull=False),
+            ),
+            unpriced_items=Count("id", filter=Q(unit_cost__isnull=True)),
+            low_stock=Count("id", filter=Q(quantity__lte=F("min_stock_level"))),
+        )
+        return Response({
+            "items": agg["items"] or 0,
+            "total_quantity": agg["total_quantity"] or 0,
+            "total_value": agg["total_value"] or 0,
+            "unpriced_items": agg["unpriced_items"] or 0,
+            "low_stock": agg["low_stock"] or 0,
+        })
 
 
 class StockMovementViewSet(viewsets.ModelViewSet):

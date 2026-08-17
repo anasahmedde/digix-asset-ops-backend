@@ -105,6 +105,8 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     lifecycle_events = serializers.SerializerMethodField()
     warranty_status = serializers.SerializerMethodField()
     active_warranty = serializers.SerializerMethodField()
+    tickets_total = serializers.SerializerMethodField()
+    tickets_open = serializers.SerializerMethodField()
 
     class Meta:
         model = Device
@@ -121,6 +123,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "assigned_technician", "technician_name",
             "installation_date", "installed_by", "installed_by_name",
             "warranty_status", "active_warranty",
+            "tickets_total", "tickets_open",
             "notes", "lifecycle_events", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "asset_code", "created_at", "updated_at"]
@@ -128,6 +131,12 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     def get_lifecycle_events(self, obj):
         events = obj.lifecycle_events.order_by("-created_at")[:10]
         return DeviceLifecycleEventSerializer(events, many=True).data
+
+    def get_tickets_total(self, obj):
+        return obj.tickets.count()
+
+    def get_tickets_open(self, obj):
+        return obj.tickets.exclude(status__in=["closed", "approved", "rejected"]).count()
 
     def get_warranty_status(self, obj):
         return _warranty_status(obj)
