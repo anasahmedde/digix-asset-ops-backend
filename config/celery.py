@@ -14,4 +14,8 @@ app.conf.beat_schedule = {
         "task": "apps.tickets.tasks.escalate_overdue_tickets",
         "schedule": 600.0,  # every 10 minutes
     },
+    "complete-expired-warranties": {
+        "task": "apps.warranties.tasks.complete_expired_warranties",
+        "schedule": 21600.0,  # every 6 hours
+    },
 }

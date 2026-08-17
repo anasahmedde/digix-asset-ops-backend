@@ -8,10 +8,14 @@ class Warranty(TimeStampedModel):
         MANUFACTURER = "manufacturer", "Manufacturer"
         EXTENDED = "extended", "Extended"
         SUPPLIER = "supplier", "Supplier"
+        CLIENT = "client", "Client Warranty"
 
     class Status(models.TextChoices):
         ACTIVE = "active", "Active"
-        EXPIRED = "expired", "Expired"
+        # "expired" is surfaced to the client as Warranty Completed; a beat
+        # task flips active warranties here once end_date passes.
+        EXPIRED = "expired", "Warranty Completed"
+        REISSUED = "reissued", "Reissued"
         CLAIMED = "claimed", "Claimed"
         VOID = "void", "Void"
 
@@ -25,6 +29,13 @@ class Warranty(TimeStampedModel):
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.ACTIVE)
     start_date = models.DateField()
     end_date = models.DateField()
+    months = models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="Term in months (client warranties: 3/6/12)"
+    )
+    reissued_from = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="reissues",
+        help_text="Original warranty this one was reissued from",
+    )
     coverage_details = models.TextField(blank=True)
     reference_number = models.CharField(max_length=200, blank=True)
     notes = models.TextField(blank=True)

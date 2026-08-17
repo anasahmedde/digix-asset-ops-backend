@@ -107,6 +107,11 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     active_warranty = serializers.SerializerMethodField()
     tickets_total = serializers.SerializerMethodField()
     tickets_open = serializers.SerializerMethodField()
+    # Client warranty term chosen at registration; creates a Warranty row
+    # (type=client) that the beat task auto-completes after the term lapses.
+    client_warranty_months = serializers.ChoiceField(
+        choices=[3, 6, 12], write_only=True, required=False, allow_null=True
+    )
 
     class Meta:
         model = Device
@@ -123,10 +128,33 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "assigned_technician", "technician_name",
             "installation_date", "installed_by", "installed_by_name",
             "warranty_status", "active_warranty",
-            "tickets_total", "tickets_open",
+            "tickets_total", "tickets_open", "client_warranty_months",
             "notes", "lifecycle_events", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "asset_code", "created_at", "updated_at"]
+
+    def create(self, validated_data):
+        months = validated_data.pop("client_warranty_months", None)
+        device = super().create(validated_data)
+        if months:
+            from dateutil.relativedelta import relativedelta
+
+            from apps.warranties.models import Warranty
+
+            start = device.installation_date or device.purchase_date or timezone.now().date()
+            Warranty.objects.create(
+                device=device,
+                supplier=device.supplier,
+                warranty_type=Warranty.WarrantyType.CLIENT,
+                start_date=start,
+                end_date=start + relativedelta(months=months),
+                months=months,
+            )
+        return device
+
+    def update(self, instance, validated_data):
+        validated_data.pop("client_warranty_months", None)
+        return super().update(instance, validated_data)
 
     def get_lifecycle_events(self, obj):
         events = obj.lifecycle_events.order_by("-created_at")[:10]
