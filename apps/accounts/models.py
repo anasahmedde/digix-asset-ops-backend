@@ -9,7 +9,9 @@ from common.models import TimeStampedModel
 class User(AbstractUser):
     class Role(models.TextChoices):
         SUPER_ADMIN = "super_admin", "Super Admin"
-        OPS_MANAGER = "ops_manager", "Operations Manager"
+        GROUP_HEAD = "group_head", "Group Head"
+        OPS_MANAGER = "ops_manager", "Operations Head"
+        MARKETING_HEAD = "marketing_head", "Marketing Head"
         SUPERVISOR = "supervisor", "Supervisor"
         TECHNICIAN = "technician", "Technician"
         MARKETING = "marketing", "Marketing"
@@ -19,6 +21,9 @@ class User(AbstractUser):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.TECHNICIAN)
+    # Display title within a role tier, e.g. "Production Supervisor" vs
+    # "Execution Supervisor" — permissions stay on `role`.
+    job_title = models.CharField(max_length=100, blank=True)
     phone = models.CharField(max_length=20, blank=True)
     avatar = models.ImageField(upload_to="avatars/", blank=True)
     is_field_staff = models.BooleanField(default=False)

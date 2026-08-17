@@ -2,6 +2,7 @@ from rest_framework import serializers
 
 from .models import (
     Company,
+    EscalationPolicy,
     NumberingScheme,
     PaymentTerms,
     TermsTemplate,
@@ -62,3 +63,16 @@ class WarrantyPeriodPresetSerializer(serializers.ModelSerializer):
         model = WarrantyPeriodPreset
         fields = ["id", "label", "months", "is_active", "created_at", "updated_at"]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class EscalationPolicySerializer(serializers.ModelSerializer):
+    trigger_display = serializers.CharField(source="get_trigger_display", read_only=True)
+
+    class Meta:
+        model = EscalationPolicy
+        fields = [
+            "id", "trigger", "trigger_display", "hours",
+            "escalate_to_role", "also_notify_role", "is_active",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "trigger_display", "created_at", "updated_at"]

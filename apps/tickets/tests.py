@@ -206,3 +206,102 @@ def test_technician_sees_only_own_tickets(people):
     for c in (c_ops, c_mkt):
         ids = [t["id"] for t in c.get("/api/tickets/").json()["results"]]
         assert mine in ids and theirs in ids
+
+
+# ── Escalation engine (policy-driven, three triggers) ─────────────────
+
+@pytest.fixture
+def heads(db):
+    return {
+        "group_head": User.objects.create_user(username="esc-gh", password="x", role="group_head"),
+        "ops": User.objects.create_user(username="esc-ops", password="x", role="ops_manager"),
+        "mkt": User.objects.create_user(username="esc-mkt", password="x", role="marketing"),
+    }
+
+
+def _mk_ticket(reporter, **kw):
+    defaults = dict(title="Esc test", description="d", priority="medium", reported_by=reporter)
+    defaults.update(kw)
+    return Ticket.objects.create(**defaults)
+
+
+@pytest.mark.django_db
+def test_response_sla_escalates_to_group_head(heads):
+    from apps.notifications.models import Notification
+
+    t = _mk_ticket(heads["mkt"])
+    Ticket.objects.filter(pk=t.pk).update(response_due_at=timezone.now() - timedelta(hours=1))
+
+    assert escalate_overdue_tickets() >= 1
+    t.refresh_from_db()
+    assert t.escalated is True
+    assert Notification.objects.filter(recipient=heads["group_head"], ticket=t, notification_type="ticket_escalated").exists()
+    assert Notification.objects.filter(recipient=heads["ops"], ticket=t).exists()
+
+    # one-shot: a second run must not re-escalate
+    assert escalate_overdue_tickets() == 0
+
+
+@pytest.mark.django_db
+def test_assignment_sla_escalates_after_24h(heads):
+    from apps.notifications.models import Notification
+
+    t = _mk_ticket(heads["mkt"])
+    # park it unassigned for 25h; keep response SLA satisfied so only the
+    # assignment trigger fires
+    Ticket.objects.filter(pk=t.pk).update(
+        created_at=timezone.now() - timedelta(hours=25),
+        response_due_at=timezone.now() + timedelta(hours=24),
+    )
+
+    assert escalate_overdue_tickets() == 1
+    t.refresh_from_db()
+    assert t.assignment_escalated is True
+    assert t.escalated is False
+    assert Notification.objects.filter(recipient=heads["group_head"], ticket=t).exists()
+
+
+@pytest.mark.django_db
+def test_assigned_ticket_not_assignment_escalated(heads, people):
+    t = _mk_ticket(heads["mkt"], assigned_to=people["tech"])
+    Ticket.objects.filter(pk=t.pk).update(
+        created_at=timezone.now() - timedelta(hours=48),
+        response_due_at=timezone.now() + timedelta(hours=24),
+    )
+    escalate_overdue_tickets()
+    t.refresh_from_db()
+    assert t.assignment_escalated is False
+
+
+@pytest.mark.django_db
+def test_due_date_escalates_active_only(heads):
+    t_active = _mk_ticket(heads["mkt"], due_date=timezone.now().date() - timedelta(days=1))
+    t_closed = _mk_ticket(heads["mkt"], due_date=timezone.now().date() - timedelta(days=1))
+    Ticket.objects.filter(pk__in=[t_active.pk, t_closed.pk]).update(
+        created_at=timezone.now(), response_due_at=timezone.now() + timedelta(hours=24)
+    )
+    Ticket.objects.filter(pk=t_closed.pk).update(status="closed")
+
+    escalate_overdue_tickets()
+    t_active.refresh_from_db(); t_closed.refresh_from_db()
+    assert t_active.due_date_escalated is True
+    assert t_closed.due_date_escalated is False
+
+
+@pytest.mark.django_db
+def test_assign_action_stamps_assigned_at(heads, people):
+    t = _mk_ticket(heads["mkt"])
+    c = _client(heads["ops"])
+    r = c.post(f"/api/tickets/{t.pk}/assign/", {"assigned_to": str(people["tech"].pk)}, format="json")
+    assert r.status_code == 200
+    t.refresh_from_db()
+    assert t.assigned_to == people["tech"]
+    assert t.assigned_at is not None
+
+
+@pytest.mark.django_db
+def test_group_head_can_assign(heads, people):
+    t = _mk_ticket(heads["mkt"])
+    c = _client(heads["group_head"])
+    r = c.post(f"/api/tickets/{t.pk}/assign/", {"assigned_to": str(people["tech"].pk)}, format="json")
+    assert r.status_code == 200

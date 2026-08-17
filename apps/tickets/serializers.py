@@ -2,7 +2,7 @@ from rest_framework import serializers
 
 from .models import Ticket, TicketAttachment, TicketComment, TicketIssueType
 
-MANAGER_ROLES = ("super_admin", "ops_manager")
+MANAGER_ROLES = ("super_admin", "group_head", "ops_manager")
 
 
 class TicketIssueTypeSerializer(serializers.ModelSerializer):
@@ -75,6 +75,7 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
             "reported_by", "reported_by_name",
             "due_date", "response_due_at", "escalated", "escalated_at", "is_response_overdue",
+            "assigned_at", "assignment_escalated", "due_date_escalated",
             "resolved_at", "resolution_notes",
             "completion_notes", "parts_used", "completed_by", "completed_by_name", "completed_at",
             "reviewed_by", "reviewed_by_name", "reviewed_at", "review_comments",
@@ -85,6 +86,7 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
         read_only_fields = [
             "id", "ticket_number", "occurrence", "status",
             "escalated", "escalated_at", "created_at", "updated_at",
+            "assigned_at", "assignment_escalated", "due_date_escalated",
             "completed_by", "completed_at", "reviewed_by", "reviewed_at",
         ]
 
@@ -111,12 +113,17 @@ class TicketListSerializer(serializers.ModelSerializer):
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
             "reported_by", "reported_by_name",
             "due_date", "response_due_at", "escalated", "is_response_overdue",
+            "assignment_escalated", "due_date_escalated",
             "resolved_at", "completion_notes", "parts_used", "completed_at",
             "reviewed_at", "review_comments", "blocked_reason", "hold_reason",
             "attachment_count", "comment_count",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "ticket_number", "occurrence", "status", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "ticket_number", "occurrence", "status",
+            "assignment_escalated", "due_date_escalated",
+            "created_at", "updated_at",
+        ]
 
 
 class TicketTransitionSerializer(serializers.Serializer):
