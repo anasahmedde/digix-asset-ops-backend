@@ -68,3 +68,45 @@ def test_label_requires_manager_role(device):
         f"/api/assets/devices/{device.id}/label/", {"format": "qr"}, format="json"
     )
     assert resp.status_code == 403
+
+
+# ── Asset composition (Project -> Asset -> Components) ────────────────
+
+import pytest as _pytest
+from rest_framework.test import APIClient as _APIClient
+
+from apps.accounts.models import User as _User
+
+
+@_pytest.mark.django_db
+def test_components_and_project_link():
+    from apps.assets.models import Brand, Device, DeviceModel
+    from apps.teams.models import Project
+
+    ops = _User.objects.create_user(username="cmp-ops", password="x", role="ops_manager")
+    brand = Brand.objects.create(name="CmpBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="C-1")
+    proj = Project.objects.create(name="Cmp Order")
+    dev = Device.objects.create(device_model=dm, asset_code="AST-CMP-1", serial_number="CMP-1", project=proj)
+
+    c = _APIClient()
+    c.force_authenticate(ops)
+
+    r = c.post("/api/assets/components/", {
+        "device": str(dev.pk), "name": "SMD Cabinet P3.9",
+        "component_type": "Cabinet", "quantity": 12,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    r = c.post("/api/assets/components/", {
+        "device": str(dev.pk), "name": "Media Player", "quantity": 1,
+    }, format="json")
+    assert r.status_code == 201
+
+    detail = c.get(f"/api/assets/devices/{dev.pk}/").json()
+    assert detail["project_name"] == "Cmp Order"
+    assert len(detail["components"]) == 2
+
+    projects = c.get("/api/teams/projects/").json()
+    rows = projects.get("results", projects)
+    row = next(p for p in rows if p["id"] == str(proj.pk))
+    assert row["assets_count"] == 1

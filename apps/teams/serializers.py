@@ -22,6 +22,7 @@ class ProjectMemberSerializer(serializers.ModelSerializer):
 
 
 class ProjectListSerializer(serializers.ModelSerializer):
+    assets_count = serializers.IntegerField(source="devices.count", read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     manager_name = serializers.CharField(source="manager.get_full_name", read_only=True, default=None)
@@ -35,7 +36,7 @@ class ProjectListSerializer(serializers.ModelSerializer):
             "site", "site_name", "status", "status_display", "progress",
             "start_date", "target_date", "completed_date",
             "manager", "manager_name", "bottleneck_count", "created_at",
-        ]
+         "assets_count",]
 
 
 class ProjectDetailSerializer(serializers.ModelSerializer):

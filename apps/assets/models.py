@@ -123,6 +123,11 @@ class Device(TimeStampedModel):
     current_site = models.ForeignKey(
         "sites.Site", on_delete=models.SET_NULL, null=True, blank=True, related_name="devices"
     )
+    # Client hierarchy: Project (client order) -> Assets (this record) ->
+    # Components. One order can span many assets across locations.
+    project = models.ForeignKey(
+        "teams.Project", on_delete=models.SET_NULL, null=True, blank=True, related_name="devices"
+    )
     assigned_client = models.ForeignKey(
         "clients.Client", on_delete=models.SET_NULL, null=True, blank=True, related_name="devices"
     )
@@ -178,6 +183,27 @@ class DeviceLifecycleEvent(TimeStampedModel):
 
     def __str__(self):
         return f"{self.device.asset_code} - {self.event_type}"
+
+
+class AssetComponent(TimeStampedModel):
+    """One piece of equipment inside a composed asset (the client's "Device").
+
+    An SMD wall asset = cabinets + media player + power supplies; a standee is
+    a single-component asset. Tickets/warranties stay at the asset level.
+    """
+
+    device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name="components")
+    name = models.CharField(max_length=200, help_text="e.g. SMD Cabinet P3.9")
+    component_type = models.CharField(max_length=100, blank=True, help_text="e.g. Cabinet, Media Player, PSU")
+    serial_number = models.CharField(max_length=200, blank=True)
+    quantity = models.PositiveIntegerField(default=1)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.device.asset_code} · {self.name} ×{self.quantity}"
 
 
 class DeviceImage(TimeStampedModel):
