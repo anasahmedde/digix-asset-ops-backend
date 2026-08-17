@@ -3,6 +3,7 @@ from rest_framework import serializers
 
 from .models import (
     AssetCode,
+    AssetComponent,
     AssetType,
     Brand,
     Device,
@@ -67,17 +68,28 @@ class DeviceImageSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
+class AssetComponentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AssetComponent
+        fields = [
+            "id", "device", "name", "component_type", "serial_number",
+            "quantity", "notes", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+
 class DeviceListSerializer(serializers.ModelSerializer):
     device_model_name = serializers.CharField(source="device_model.__str__", read_only=True)
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
     client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+    project_name = serializers.CharField(source="project.name", read_only=True, default=None)
     warranty_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Device
         fields = [
-            "id", "asset_code", "serial_number", "display_name",
+            "id", "asset_code", "serial_number", "display_name", "project", "project_name",
             "asset_type", "asset_type_name",
             "device_model", "device_model_name",
             "status", "image", "current_site", "site_name",
@@ -98,6 +110,8 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     specifications = serializers.JSONField(source="device_model.specifications", read_only=True, default=dict)
     site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
     client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+    project_name = serializers.CharField(source="project.name", read_only=True, default=None)
+    components = AssetComponentSerializer(many=True, read_only=True)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     technician_name = serializers.CharField(source="assigned_technician.get_full_name", read_only=True, default=None)
     installed_by_name = serializers.CharField(source="installed_by.get_full_name", read_only=True, default=None)
@@ -125,6 +139,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "purchase_date", "purchase_price", "supplier", "supplier_name",
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
+            "project", "project_name", "components",
             "assigned_technician", "technician_name",
             "installation_date", "installed_by", "installed_by_name",
             "warranty_status", "active_warranty",

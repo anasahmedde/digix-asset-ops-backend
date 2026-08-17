@@ -10,6 +10,7 @@ from .labels import render_label
 
 from .models import (
     AssetCode,
+    AssetComponent,
     AssetType,
     Brand,
     Device,
@@ -20,6 +21,7 @@ from .models import (
 )
 from .serializers import (
     AssetCodeSerializer,
+    AssetComponentSerializer,
     AssetTypeSerializer,
     BrandSerializer,
     DeviceDetailSerializer,
@@ -192,6 +194,14 @@ class DeviceViewSet(viewsets.ModelViewSet):
         code_obj.generated_file.save(content.name, content, save=True)
 
         return Response(AssetCodeSerializer(code_obj, context={"request": request}).data)
+
+
+class AssetComponentViewSet(viewsets.ModelViewSet):
+    queryset = AssetComponent.objects.select_related("device").all()
+    serializer_class = AssetComponentSerializer
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    filterset_fields = ["device", "component_type"]
+    search_fields = ["name", "serial_number"]
 
 
 class DeviceImageViewSet(viewsets.ModelViewSet):
