@@ -144,3 +144,41 @@ class WarrantyPeriodPreset(TimeStampedModel):
 
     def __str__(self):
         return self.label
+
+
+class EscalationPolicy(TimeStampedModel):
+    """Data-driven ticket escalation ladder (client hierarchy:
+    Group Head > Operations/Marketing Head > Supervisors > Technician).
+
+    One row per trigger. The beat task walks active policies and escalates
+    matching tickets once per trigger, notifying ``escalate_to_role`` users
+    (and optionally ``also_notify_role`` — e.g. operations always hears about
+    assignment breaches).
+    """
+
+    class Trigger(models.TextChoices):
+        ASSIGNMENT_SLA = "assignment_sla", "Unassigned beyond window"
+        RESPONSE_SLA = "response_sla", "No response within SLA"
+        DUE_DATE = "due_date", "Past due date"
+
+    trigger = models.CharField(max_length=20, choices=Trigger.choices, unique=True)
+    hours = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="Window in hours (assignment trigger). Blank = response SLA uses per-priority windows; due date fires the day after.",
+    )
+    escalate_to_role = models.CharField(
+        max_length=20, default="group_head",
+        help_text="Role that receives the escalation (accounts.User.Role value)",
+    )
+    also_notify_role = models.CharField(
+        max_length=20, blank=True, default="ops_manager",
+        help_text="Additional role notified alongside (blank = none)",
+    )
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["trigger"]
+        verbose_name_plural = "escalation policies"
+
+    def __str__(self):
+        return f"{self.get_trigger_display()} -> {self.escalate_to_role}"

@@ -4,6 +4,7 @@ from rest_framework.permissions import IsAuthenticated
 from common.permissions import AdminManagerWriteElseRead, IsAdminOrManager
 
 from .models import (
+    EscalationPolicy,
     Company,
     NumberingScheme,
     PaymentTerms,
@@ -11,6 +12,7 @@ from .models import (
     WarrantyPeriodPreset,
 )
 from .serializers import (
+    EscalationPolicySerializer,
     CompanySerializer,
     NumberingSchemeSerializer,
     PaymentTermsSerializer,
@@ -58,3 +60,10 @@ class WarrantyPeriodPresetViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["is_active"]
     ordering_fields = ["months", "label"]
+
+
+class EscalationPolicyViewSet(viewsets.ModelViewSet):
+    queryset = EscalationPolicy.objects.all()
+    serializer_class = EscalationPolicySerializer
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    filterset_fields = ["is_active", "trigger"]

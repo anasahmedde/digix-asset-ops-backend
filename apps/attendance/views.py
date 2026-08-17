@@ -7,7 +7,7 @@ from rest_framework.response import Response
 from .models import AttendanceRecord
 from .serializers import AttendanceRecordSerializer
 
-MANAGER_ROLES = ("super_admin", "ops_manager", "supervisor")
+MANAGER_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
 
 
 class AttendanceRecordViewSet(viewsets.ModelViewSet):

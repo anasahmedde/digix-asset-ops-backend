@@ -1,15 +1,18 @@
 from rest_framework.permissions import SAFE_METHODS, BasePermission
 
 ADMIN_ROLES = ("super_admin",)
-MANAGER_ROLES = ("super_admin", "ops_manager")
+# Group Head is the escalation apex (oversees operations AND marketing) and
+# carries full manager powers.
+MANAGER_ROLES = ("super_admin", "group_head", "ops_manager")
 # Supervisors sit between managers and technicians: they run field crews,
 # can act on tickets and review/approve their team's work.
-SUPERVISOR_ROLES = ("super_admin", "ops_manager", "supervisor")
-FIELD_ROLES = ("super_admin", "ops_manager", "supervisor", "technician")
+SUPERVISOR_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
+FIELD_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor", "technician")
 FINANCE_ROLES = ("super_admin", "finance")
-WAREHOUSE_ROLES = ("super_admin", "ops_manager", "warehouse")
+WAREHOUSE_ROLES = ("super_admin", "group_head", "ops_manager", "warehouse")
 ALL_INTERNAL_ROLES = (
-    "super_admin", "ops_manager", "supervisor", "technician", "finance", "warehouse",
+    "super_admin", "group_head", "ops_manager", "marketing_head", "supervisor",
+    "technician", "finance", "warehouse",
 )
 
 
@@ -86,7 +89,7 @@ class TechnicianCanCreate(BasePermission):
         role = _role(request.user)
         if role in MANAGER_ROLES:
             return True
-        if role in ("technician", "supervisor", "marketing") and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
+        if role in ("technician", "supervisor", "marketing", "marketing_head") and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
             return True
         return False
 

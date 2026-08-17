@@ -117,6 +117,15 @@ class Ticket(TimeStampedModel):
     escalated = models.BooleanField(default=False)
     escalated_at = models.DateTimeField(null=True, blank=True)
 
+    # Assignment SLA (ticket parked unassigned beyond the policy window) and
+    # due-date breaches escalate independently of the response SLA above.
+    # Each fires once; see setup.EscalationPolicy + tasks.escalate_overdue_tickets.
+    assigned_at = models.DateTimeField(null=True, blank=True)
+    assignment_escalated = models.BooleanField(default=False)
+    assignment_escalated_at = models.DateTimeField(null=True, blank=True)
+    due_date_escalated = models.BooleanField(default=False)
+    due_date_escalated_at = models.DateTimeField(null=True, blank=True)
+
     VALID_TRANSITIONS = {
         Status.OPEN: (Status.IN_PROGRESS, Status.CLOSED),
         Status.IN_PROGRESS: (

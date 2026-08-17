@@ -82,7 +82,7 @@ def create_notifications_for_alert(sender, instance: Alert, created: bool, **kwa
 
     recipients = User.objects.filter(
         is_active=True,
-        role__in=("super_admin", "ops_manager"),
+        role__in=("super_admin", "group_head", "ops_manager"),
     )
 
     alert_data = {
@@ -140,7 +140,7 @@ def handle_ticket_notifications(sender, instance: Ticket, created: bool, **kwarg
 
     # New unassigned ticket: park centrally and route to Operations for assignment.
     if created and not instance.assigned_to_id:
-        for ops in User.objects.filter(role__in=("super_admin", "ops_manager"), is_active=True):
+        for ops in User.objects.filter(role__in=("super_admin", "group_head", "ops_manager"), is_active=True):
             notification = Notification.objects.create(
                 recipient=ops,
                 notification_type=Notification.Type.TICKET_UPDATE,
@@ -221,7 +221,7 @@ def _create_review_request_notification(ticket: Ticket):
 
     admins = User.objects.filter(
         is_active=True,
-        role__in=("super_admin", "ops_manager"),
+        role__in=("super_admin", "group_head", "ops_manager"),
     ).exclude(id__in=recipients).values_list("id", flat=True)
     recipients.extend(admins)
 

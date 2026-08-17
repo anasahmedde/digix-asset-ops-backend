@@ -13,7 +13,7 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             "id", "username", "email", "first_name", "last_name",
-            "full_name", "role", "phone", "avatar", "is_field_staff",
+            "full_name", "role", "job_title", "phone", "avatar", "is_field_staff",
             "is_active", "date_joined",
         ]
         read_only_fields = ["id", "date_joined"]
@@ -29,7 +29,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             "id", "username", "email", "password", "first_name",
-            "last_name", "role", "phone", "is_field_staff",
+            "last_name", "role", "job_title", "phone", "is_field_staff",
         ]
         read_only_fields = ["id"]
 

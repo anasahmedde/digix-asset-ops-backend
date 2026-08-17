@@ -95,7 +95,9 @@ class TicketViewSet(viewsets.ModelViewSet):
             vendor = Supplier.objects.filter(pk=vendor_id).first() if vendor_id else None
             ticket.assigned_vendor = vendor
             parts.append(f"vendor → {vendor.name}" if vendor else "vendor cleared")
-        ticket.save(update_fields=["assigned_to", "assigned_vendor", "updated_at"])
+        if (ticket.assigned_to or ticket.assigned_vendor) and not ticket.assigned_at:
+            ticket.assigned_at = timezone.now()
+        ticket.save(update_fields=["assigned_to", "assigned_vendor", "assigned_at", "updated_at"])
 
         notes = ser.validated_data.get("notes", "")
         TicketComment.objects.create(
@@ -124,7 +126,7 @@ class TicketViewSet(viewsets.ModelViewSet):
         new_status = ser.validated_data["status"]
         notes = ser.validated_data.get("notes", "")
 
-        is_marketing = role == "marketing"
+        is_marketing = role in ("marketing", "marketing_head")
         is_reporter = ticket.reported_by_id == user.id
 
         # Decisions OUT of an approval stage belong to the approver, not the assignee.
