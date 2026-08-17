@@ -19,13 +19,14 @@ class InventoryCategorySerializer(serializers.ModelSerializer):
 class InventoryItemSerializer(serializers.ModelSerializer):
     material_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
     category_name = serializers.CharField(source="category.name", read_only=True, default=None)
+    unit = serializers.CharField(source="material_type.unit", read_only=True, default=None)
     is_low_stock = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = InventoryItem
         fields = [
             "id", "material_type", "material_name", "category", "category_name",
-            "sku", "quantity", "min_stock_level", "location",
+            "sku", "quantity", "min_stock_level", "unit", "location",
             "unit_cost", "notes", "is_low_stock", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "sku", "created_at", "updated_at"]

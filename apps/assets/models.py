@@ -82,6 +82,7 @@ class Device(TimeStampedModel):
         INSTALLED = "installed", "Installed"
         ACTIVE = "active", "Active"
         UNDER_MAINTENANCE = "under_maintenance", "Under Maintenance"
+        CLIENT_PROPERTY = "client_property", "Client Property"
         DECOMMISSIONED = "decommissioned", "Decommissioned"
         LOST_STOLEN = "lost_stolen", "Lost/Stolen"
         RMA = "rma", "RMA"
