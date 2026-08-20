@@ -14,6 +14,7 @@ class Notification(TimeStampedModel):
         TICKET_UPDATE = "ticket_update", "Ticket Update"
         TICKET_REVIEW = "ticket_review", "Ticket Review Request"
         TICKET_ESCALATED = "ticket_escalated", "Ticket Escalated"
+        INSTALLATION_ASSIGNED = "installation_assigned", "Installation Assigned"
         MAINTENANCE_REMINDER = "maintenance_reminder", "Maintenance Reminder"
         SYSTEM = "system", "System"
 

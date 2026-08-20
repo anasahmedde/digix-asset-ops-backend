@@ -11,6 +11,7 @@ from django.utils import timezone
 from apps.accounts.models import User
 from apps.analytics.models import Alert
 from apps.chat.models import ChatMessage
+from apps.sites.models import DeviceInstallation
 from apps.tickets.models import Ticket
 
 from .models import Notification
@@ -111,6 +112,49 @@ def create_notifications_for_alert(sender, instance: Alert, created: bool, **kwa
 
     for notif in notifications:
         _push_ws(notif)
+
+
+# ── Installation assignment → notify the installer ──────────────────
+
+@receiver(pre_save, sender=DeviceInstallation)
+def capture_installation_previous_state(sender, instance: DeviceInstallation, **kwargs):
+    if instance.pk:
+        try:
+            old = DeviceInstallation.objects.get(pk=instance.pk)
+            instance._prev_installed_by_id = old.installed_by_id
+        except DeviceInstallation.DoesNotExist:
+            instance._prev_installed_by_id = None
+    else:
+        instance._prev_installed_by_id = None
+
+
+@receiver(post_save, sender=DeviceInstallation)
+def notify_installer_on_assignment(sender, instance: DeviceInstallation, created: bool, **kwargs):
+    prev = getattr(instance, "_prev_installed_by_id", None)
+    if not instance.installed_by_id or (not created and prev == instance.installed_by_id):
+        return
+    try:
+        data = {
+            "installation_id": str(instance.id),
+            "device_id": str(instance.device_id),
+            "site_id": str(instance.site_id),
+        }
+        if instance.due_date:
+            data["due_date"] = str(instance.due_date)
+        notification = Notification.objects.create(
+            recipient=instance.installed_by,
+            notification_type=Notification.Type.INSTALLATION_ASSIGNED,
+            title="Installation assigned to you",
+            message=(
+                f"{instance.device.asset_code} at {instance.site.name}"
+                + (f" — due {instance.due_date}" if instance.due_date else "")
+            ),
+            data=data,
+            is_actionable=True,
+        )
+        _push_ws(notification)
+    except Exception:  # pragma: no cover - notification failure must not block saves
+        logger.exception("Failed installer notification for installation %s", instance.pk)
 
 
 # ── Ticket → Notification ────────────────────────────────────────────
