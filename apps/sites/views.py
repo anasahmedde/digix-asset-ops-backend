@@ -6,6 +6,7 @@ from common.permissions import AdminManagerWriteElseRead
 
 from .models import (
     DeviceInstallation,
+    InstallationDelay,
     InstallationPhoto,
     InstallationStep,
     Site,
@@ -15,6 +16,7 @@ from .models import (
 from .serializers import (
     DeviceInstallationDetailSerializer,
     DeviceInstallationListSerializer,
+    InstallationDelaySerializer,
     InstallationPhotoSerializer,
     InstallationStepSerializer,
     SiteContactSerializer,
@@ -65,14 +67,21 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         DeviceInstallation.objects
         .select_related(
             "device", "device__device_model", "device__device_model__brand",
-            "device__asset_type", "installed_by", "site", "zone",
+            "device__asset_type", "device__assigned_client", "device__project",
+            "installed_by", "site", "zone",
         )
-        .prefetch_related("photos", "steps")
+        .prefetch_related("photos", "steps", "delays", "device__clients")
         .all()
     )
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
-    filterset_fields = ["device", "site", "installed_by"]
-    ordering_fields = ["installed_at"]
+    filterset_fields = ["device", "site", "installed_by", "device__assigned_client", "device__project"]
+    search_fields = [
+        "device__asset_code", "device__display_name", "device__serial_number",
+        "device__assigned_client__name", "device__clients__name",
+        "installed_by__first_name", "installed_by__last_name", "installed_by__username",
+        "site__name", "position_label",
+    ]
+    ordering_fields = ["installed_at", "due_date", "completed_at", "created_at"]
 
     def get_serializer_class(self):
         if self.action == "list":
@@ -91,6 +100,24 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         if self.action in ("update", "partial_update"):
             return [IsAuthenticated()]
         return [IsAuthenticated(), AdminManagerWriteElseRead()]
+
+
+class InstallationDelayViewSet(viewsets.ModelViewSet):
+    queryset = InstallationDelay.objects.select_related(
+        "installation", "step", "reported_by"
+    ).all()
+    serializer_class = InstallationDelaySerializer
+    filterset_fields = ["installation", "step", "cause"]
+    ordering_fields = ["created_at"]
+
+    def get_permissions(self):
+        # Field techs may log a delay; managers can also edit/remove them.
+        if self.action == "create":
+            return [IsAuthenticated()]
+        return [IsAuthenticated(), AdminManagerWriteElseRead()]
+
+    def perform_create(self, serializer):
+        serializer.save(reported_by=self.request.user)
 
 
 class InstallationPhotoViewSet(viewsets.ModelViewSet):

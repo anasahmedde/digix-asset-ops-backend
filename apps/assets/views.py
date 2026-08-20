@@ -70,7 +70,7 @@ class DeviceViewSet(viewsets.ModelViewSet):
     queryset = Device.objects.select_related(
         "asset_type", "device_model", "device_model__brand", "current_site",
         "assigned_client", "supplier", "assigned_technician", "installed_by",
-    ).prefetch_related("images", "warranties").all()
+    ).prefetch_related("images", "warranties", "clients").all()
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = [
         "status", "asset_type", "device_model", "current_site",
