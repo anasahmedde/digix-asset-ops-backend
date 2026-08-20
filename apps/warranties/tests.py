@@ -85,3 +85,45 @@ def test_reissue_flow(ops, device):
     )
     r = c.post(f"/api/warranties/{w2.pk}/reissue/", {"months": 5}, format="json")
     assert r.status_code == 400
+
+
+@pytest.mark.django_db
+def test_device_immutable_on_update(ops, device):
+    other_brand = Brand.objects.create(name="WarBrand3")
+    other_dm = DeviceModel.objects.create(brand=other_brand, name="W-3")
+    other_device = Device.objects.create(
+        device_model=other_dm, asset_code="AST-WAR-OTHER", serial_number="WAR-OTHER"
+    )
+    w = Warranty.objects.create(
+        device=device, warranty_type="manufacturer", status="active",
+        start_date=timezone.now().date(),
+        end_date=timezone.now().date() + timedelta(days=365),
+    )
+    c = _client(ops)
+    r = c.patch(f"/api/warranties/{w.pk}/", {
+        "device": str(other_device.pk),
+        "notes": "updated",
+    }, format="json")
+    assert r.status_code == 200, r.content
+    w.refresh_from_db()
+    assert w.device_id == device.pk
+    assert w.notes == "updated"
+    # reissued_from cannot be forged through the API either
+    r = c.patch(f"/api/warranties/{w.pk}/", {"reissued_from": str(w.pk)}, format="json")
+    assert r.status_code == 200
+    w.refresh_from_db()
+    assert w.reissued_from_id is None
+
+
+@pytest.mark.django_db
+def test_device_name_exposed(ops, device):
+    device.display_name = "Lobby Screen"
+    device.save()
+    w = Warranty.objects.create(
+        device=device, warranty_type="manufacturer", status="active",
+        start_date=timezone.now().date(),
+        end_date=timezone.now().date() + timedelta(days=30),
+    )
+    r = _client(ops).get(f"/api/warranties/{w.pk}/")
+    assert r.data["device_name"] == "Lobby Screen"
+    assert r.data["device_code"] == device.asset_code
