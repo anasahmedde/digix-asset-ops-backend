@@ -5,6 +5,7 @@ from .models import Warranty
 
 class WarrantySerializer(serializers.ModelSerializer):
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
+    device_name = serializers.CharField(source="device.display_name", read_only=True, default=None)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     is_expired = serializers.BooleanField(read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
@@ -13,10 +14,16 @@ class WarrantySerializer(serializers.ModelSerializer):
     class Meta:
         model = Warranty
         fields = [
-            "id", "device", "device_code", "supplier", "supplier_name",
+            "id", "device", "device_code", "device_name", "supplier", "supplier_name",
             "warranty_type", "warranty_type_display", "status", "status_display",
             "start_date", "end_date", "months", "reissued_from",
             "coverage_details", "reference_number", "notes",
             "is_expired", "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        # reissued_from is set exclusively by the /reissue/ action.
+        read_only_fields = ["id", "reissued_from", "created_at", "updated_at"]
+
+    def update(self, instance, validated_data):
+        # A warranty is bound to its device for life; ignore reassignment attempts.
+        validated_data.pop("device", None)
+        return super().update(instance, validated_data)
