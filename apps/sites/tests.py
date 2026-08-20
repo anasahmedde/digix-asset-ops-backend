@@ -130,3 +130,38 @@ def test_delay_step_must_belong_to_installation(tech, installation):
         "cause": "client",
     }, format="json")
     assert r.status_code == 400
+
+
+@pytest.mark.django_db
+def test_installer_notified_on_assignment(tech, installation):
+    from apps.notifications.models import Notification
+
+    # Created with installed_by=tech (fixture) → one assignment notification.
+    notifs = Notification.objects.filter(
+        recipient=tech, notification_type="installation_assigned"
+    )
+    assert notifs.count() == 1
+    assert installation.device.asset_code in notifs.first().message
+
+    # Unrelated save must not re-notify.
+    installation.notes = "touched"
+    installation.save()
+    assert notifs.count() == 1
+
+    # Reassignment notifies the new installer.
+    other = User.objects.create_user(username="site-tech-2", password="x", role="technician")
+    installation.installed_by = other
+    installation.save()
+    assert Notification.objects.filter(
+        recipient=other, notification_type="installation_assigned"
+    ).count() == 1
+
+
+@pytest.mark.django_db
+def test_installer_phone_exposed(ops, tech, installation):
+    tech.phone = "0301-7654321"
+    tech.save()
+    r = _client(ops).get("/api/sites/installations/")
+    assert r.data["results"][0]["installed_by_phone"] == "0301-7654321"
+    r = _client(ops).get(f"/api/sites/installations/{installation.id}/")
+    assert r.data["installed_by_phone"] == "0301-7654321"

@@ -115,6 +115,7 @@ class _InstallationCommonMixin(serializers.Serializer):
     asset_type_name = serializers.CharField(source="device.asset_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True)
     installed_by_name = serializers.CharField(source="installed_by.get_full_name", read_only=True, default=None)
+    installed_by_phone = serializers.CharField(source="installed_by.phone", read_only=True, default=None)
     project_name = serializers.CharField(source="device.project.name", read_only=True, default=None)
     poc_name = serializers.CharField(source="device.assigned_client.contact_person", read_only=True, default=None)
     poc_phone = serializers.CharField(source="device.assigned_client.contact_phone", read_only=True, default=None)
@@ -148,7 +149,7 @@ class DeviceInstallationListSerializer(_InstallationCommonMixin, serializers.Mod
         fields = [
             "id", "device", "device_code", "device_name", "asset_name", "asset_type_name",
             "client_names", "project_name", "poc_name", "poc_phone",
-            "site", "site_name", "installed_by", "installed_by_name",
+            "site", "site_name", "installed_by", "installed_by_name", "installed_by_phone",
             "installed_at", "removed_at", "due_date", "completed_at",
             "progress", "client_delays", "created_at",
         ]
@@ -170,7 +171,7 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
             "device_image", "device_status",
             "client_names", "project_name", "poc_name", "poc_phone",
             "site", "site_name", "site_city", "zone",
-            "installed_by", "installed_by_name", "installed_at", "removed_at",
+            "installed_by", "installed_by_name", "installed_by_phone", "installed_at", "removed_at",
             "due_date", "completed_at",
             "position_label", "notes", "photos", "steps", "delays",
             "progress", "client_delays", "created_at",
