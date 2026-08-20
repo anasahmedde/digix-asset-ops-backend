@@ -34,7 +34,7 @@ class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
             .select_related("site")
             .values(
                 "id", "title", "maintenance_type", "frequency", "next_due",
-                "site__id", "site__name", "site__city",
+                "device", "site__id", "site__name", "site__city",
                 "site__state_province", "site__country",
                 "site__latitude", "site__longitude",
             )

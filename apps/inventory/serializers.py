@@ -21,15 +21,21 @@ class InventoryItemSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source="category.name", read_only=True, default=None)
     unit = serializers.CharField(source="material_type.unit", read_only=True, default=None)
     is_low_stock = serializers.BooleanField(read_only=True)
+    total_value = serializers.SerializerMethodField()
 
     class Meta:
         model = InventoryItem
         fields = [
             "id", "material_type", "material_name", "category", "category_name",
             "sku", "quantity", "min_stock_level", "unit", "location",
-            "unit_cost", "notes", "is_low_stock", "created_at", "updated_at",
+            "unit_cost", "total_value", "notes", "is_low_stock", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "sku", "created_at", "updated_at"]
+
+    def get_total_value(self, obj):
+        if obj.unit_cost is None:
+            return None
+        return obj.quantity * obj.unit_cost
 
 
 class StockMovementSerializer(serializers.ModelSerializer):

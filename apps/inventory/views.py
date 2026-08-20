@@ -1,5 +1,6 @@
 from django.db import transaction
-from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum, Value
+from django.db.models.functions import Coalesce
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -32,12 +33,26 @@ class InventoryCategoryViewSet(viewsets.ModelViewSet):
 
 
 class InventoryItemViewSet(viewsets.ModelViewSet):
-    queryset = InventoryItem.objects.select_related("material_type", "category").all()
+    # Coalesce so unpriced items sort as zero value instead of NULLs-first.
+    queryset = (
+        InventoryItem.objects.select_related("material_type", "category")
+        .annotate(
+            total_value=Coalesce(
+                ExpressionWrapper(
+                    F("quantity") * F("unit_cost"),
+                    output_field=DecimalField(max_digits=14, decimal_places=2),
+                ),
+                Value(0),
+                output_field=DecimalField(max_digits=14, decimal_places=2),
+            )
+        )
+        .all()
+    )
     serializer_class = InventoryItemSerializer
     permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
     filterset_fields = ["location", "category", "material_type"]
     search_fields = ["sku", "material_type__name"]
-    ordering_fields = ["quantity", "created_at"]
+    ordering_fields = ["quantity", "total_value", "material_type__name", "created_at"]
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
