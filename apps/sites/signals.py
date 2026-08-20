@@ -46,3 +46,27 @@ def create_default_installation_steps(sender, instance: DeviceInstallation, crea
         seed_steps(instance)
     except Exception:  # pragma: no cover - defensive
         logger.exception("Failed to seed installation steps for %s", instance.pk)
+
+
+@receiver(post_save, sender=InstallationStep)
+def stamp_installation_completion(sender, instance: InstallationStep, **kwargs):
+    """Keep DeviceInstallation.completed_at in sync with its step checklist.
+
+    Stamped when every step is completed or skipped (with at least one
+    completed); cleared again if a step is reopened afterwards.
+    """
+    from django.utils import timezone
+
+    installation = instance.installation
+    statuses = list(installation.steps.values_list("status", flat=True))
+    done = (
+        bool(statuses)
+        and all(s in (InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.SKIPPED) for s in statuses)
+        and any(s == InstallationStep.StepStatus.COMPLETED for s in statuses)
+    )
+    if done and installation.completed_at is None:
+        installation.completed_at = timezone.now()
+        installation.save(update_fields=["completed_at", "updated_at"])
+    elif not done and installation.completed_at is not None:
+        installation.completed_at = None
+        installation.save(update_fields=["completed_at", "updated_at"])

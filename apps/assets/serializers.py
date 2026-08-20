@@ -78,11 +78,23 @@ class AssetComponentSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
+def _client_names(device):
+    """Primary client first, then any additional shared clients."""
+    names = []
+    if device.assigned_client:
+        names.append(device.assigned_client.name)
+    for client in device.clients.all():
+        if client.name not in names:
+            names.append(client.name)
+    return names
+
+
 class DeviceListSerializer(serializers.ModelSerializer):
     device_model_name = serializers.CharField(source="device_model.__str__", read_only=True)
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
     client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+    client_names = serializers.SerializerMethodField()
     project_name = serializers.CharField(source="project.name", read_only=True, default=None)
     warranty_status = serializers.SerializerMethodField()
 
@@ -93,9 +105,12 @@ class DeviceListSerializer(serializers.ModelSerializer):
             "asset_type", "asset_type_name",
             "device_model", "device_model_name",
             "status", "image", "current_site", "site_name",
-            "assigned_client", "client_name",
+            "assigned_client", "client_name", "client_names",
             "installation_date", "warranty_status", "created_at",
         ]
+
+    def get_client_names(self, obj):
+        return _client_names(obj)
 
     def get_warranty_status(self, obj):
         return _warranty_status(obj)
@@ -110,6 +125,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     specifications = serializers.JSONField(source="device_model.specifications", read_only=True, default=dict)
     site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
     client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+    client_names = serializers.SerializerMethodField()
     project_name = serializers.CharField(source="project.name", read_only=True, default=None)
     components = AssetComponentSerializer(many=True, read_only=True)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
@@ -139,6 +155,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "purchase_date", "purchase_price", "supplier", "supplier_name",
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
+            "clients", "client_names",
             "project", "project_name", "components",
             "assigned_technician", "technician_name",
             "installation_date", "installed_by", "installed_by_name",
@@ -170,6 +187,9 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         validated_data.pop("client_warranty_months", None)
         return super().update(instance, validated_data)
+
+    def get_client_names(self, obj):
+        return _client_names(obj)
 
     def get_lifecycle_events(self, obj):
         events = obj.lifecycle_events.order_by("-created_at")[:10]

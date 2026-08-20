@@ -131,6 +131,11 @@ class Device(TimeStampedModel):
     assigned_client = models.ForeignKey(
         "clients.Client", on_delete=models.SET_NULL, null=True, blank=True, related_name="devices"
     )
+    # An asset can serve more than one client (e.g. a shared screen). The
+    # primary owner stays assigned_client; these are the additional ones.
+    clients = models.ManyToManyField(
+        "clients.Client", blank=True, related_name="shared_devices"
+    )
     assigned_technician = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="assigned_devices"
     )

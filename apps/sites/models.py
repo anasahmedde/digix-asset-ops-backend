@@ -75,6 +75,10 @@ class DeviceInstallation(TimeStampedModel):
     )
     installed_at = models.DateTimeField()
     removed_at = models.DateTimeField(null=True, blank=True)
+    due_date = models.DateField(null=True, blank=True, help_text="Agreed completion date for the installation")
+    completed_at = models.DateTimeField(
+        null=True, blank=True, help_text="Auto-stamped when every step is completed or skipped"
+    )
     position_label = models.CharField(max_length=200, blank=True)
     notes = models.TextField(blank=True)
 
@@ -132,6 +136,35 @@ class InstallationStep(TimeStampedModel):
 
     def __str__(self):
         return f"{self.installation} - Step {self.step_number}: {self.get_step_type_display()}"
+
+
+class InstallationDelay(TimeStampedModel):
+    """A logged delay during an installation, attributable to a cause (esp. the client)."""
+
+    class Cause(models.TextChoices):
+        CLIENT = "client", "Client"
+        INTERNAL = "internal", "Internal"
+        VENDOR = "vendor", "Vendor"
+        OTHER = "other", "Other"
+
+    installation = models.ForeignKey(
+        DeviceInstallation, on_delete=models.CASCADE, related_name="delays"
+    )
+    step = models.ForeignKey(
+        InstallationStep, on_delete=models.CASCADE, null=True, blank=True, related_name="delays"
+    )
+    cause = models.CharField(max_length=15, choices=Cause.choices)
+    description = models.TextField(blank=True)
+    reported_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="installation_delays_reported"
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.get_cause_display()} delay on {self.installation}"
 
 
 class InstallationPhoto(TimeStampedModel):
