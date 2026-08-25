@@ -63,6 +63,28 @@ class Project(TimeStampedModel):
     def __str__(self):
         return self.name
 
+    # The commercial ladder in delivery order (off-ramps excluded).
+    MAIN_PHASE_ORDER = (
+        "query", "quotation", "negotiation", "order_confirmation", "production",
+        "delivery", "installation", "handover", "under_warranty",
+        "extended_warranty", "decommissioned",
+    )
+
+    def computed_progress(self):
+        """Progress is derived, never hand-typed: % of completed milestones
+        when milestones exist, otherwise position along the phase ladder."""
+        milestones = list(self.milestones.all())
+        if milestones:
+            done = sum(1 for m in milestones if m.completed_at)
+            return round(done / len(milestones) * 100)
+        if self.status == self.Status.COMPLETED:
+            return 100
+        if self.phase in self.MAIN_PHASE_ORDER:
+            idx = self.MAIN_PHASE_ORDER.index(self.phase)
+            return round(idx / (len(self.MAIN_PHASE_ORDER) - 1) * 100)
+        # Off-ramp phases (on hold / lost): keep whatever was stored.
+        return self.progress or 0
+
 
 class ProjectScopeItem(TimeStampedModel):
     """One line of a project's scope: an asset (and optionally one of its

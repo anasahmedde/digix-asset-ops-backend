@@ -59,6 +59,7 @@ class ProjectListSerializer(serializers.ModelSerializer):
     bottleneck_count = serializers.IntegerField(read_only=True, default=0)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     phase_display = serializers.CharField(source="get_phase_display", read_only=True)
+    progress = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
@@ -69,6 +70,9 @@ class ProjectListSerializer(serializers.ModelSerializer):
             "start_date", "target_date", "completed_date",
             "manager", "manager_name", "bottleneck_count", "created_at",
          "assets_count",]
+
+    def get_progress(self, obj):
+        return obj.computed_progress()
 
 
 class ProjectDetailSerializer(serializers.ModelSerializer):
@@ -81,6 +85,7 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
     milestones = ProjectMilestoneSerializer(many=True, read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     phase_display = serializers.CharField(source="get_phase_display", read_only=True)
+    progress = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
@@ -94,3 +99,6 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def get_progress(self, obj):
+        return obj.computed_progress()

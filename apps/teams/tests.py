@@ -1,5 +1,6 @@
 # Tests will be added alongside model implementations.
 import pytest
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User
@@ -57,3 +58,26 @@ def test_project_scope_and_milestones():
     r = c.patch(f"/api/teams/projects/{project.pk}/", {"phase": "delivery"}, format="json")
     assert r.status_code == 200, r.content
     assert r.data["phase"] == "delivery"
+
+
+@pytest.mark.django_db
+def test_progress_is_computed():
+    ops = User.objects.create_user(username="team-ops2", password="x", role="ops_manager")
+    from apps.teams.models import ProjectMilestone
+
+    c = _client(ops)
+    # no milestones -> phase position along the 11-step ladder
+    p = Project.objects.create(name="Ladder", phase="production")  # index 4 of 10
+    assert c.get(f"/api/teams/projects/{p.pk}/").data["progress"] == 40
+
+    # milestones override the ladder: 2 of 4 done -> 50
+    for i in range(4):
+        ProjectMilestone.objects.create(project=p, title=f"M{i}", order=i)
+    for m in list(p.milestones.all())[:2]:
+        m.completed_at = timezone.now()
+        m.save()
+    assert c.get(f"/api/teams/projects/{p.pk}/").data["progress"] == 50
+
+    # completed project with no milestones -> 100
+    done = Project.objects.create(name="Done", status="completed", phase="handover")
+    assert c.get(f"/api/teams/projects/{done.pk}/").data["progress"] == 100
