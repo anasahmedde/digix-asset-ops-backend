@@ -197,7 +197,7 @@ class DeviceViewSet(viewsets.ModelViewSet):
 
 
 class AssetComponentViewSet(viewsets.ModelViewSet):
-    queryset = AssetComponent.objects.select_related("device").all()
+    queryset = AssetComponent.objects.select_related("device", "supplier").prefetch_related("warranties").all()
     serializer_class = AssetComponentSerializer
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["device", "component_type"]

@@ -103,9 +103,11 @@ class Device(TimeStampedModel):
     firmware_version = models.CharField(max_length=100, blank=True)
     hardware_revision = models.CharField(max_length=100, blank=True)
 
-    # Physical size: length × width (e.g. SMD screens) and/or diagonal (displays).
-    length_cm = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
-    width_cm = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    # Physical size in inches: length × width × depth (e.g. SMD screens)
+    # and/or diagonal (displays).
+    length_in = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    width_in = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    depth_in = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
     diagonal_inches = models.DecimalField(max_digits=5, decimal_places=1, null=True, blank=True)
 
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROCURED)
@@ -202,6 +204,9 @@ class AssetComponent(TimeStampedModel):
     component_type = models.CharField(max_length=100, blank=True, help_text="e.g. Cabinet, Media Player, PSU")
     serial_number = models.CharField(max_length=200, blank=True)
     quantity = models.PositiveIntegerField(default=1)
+    supplier = models.ForeignKey(
+        "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True, related_name="supplied_components"
+    )
     notes = models.TextField(blank=True)
 
     class Meta:

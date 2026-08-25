@@ -22,6 +22,10 @@ class Warranty(TimeStampedModel):
     device = models.ForeignKey(
         "assets.Device", on_delete=models.CASCADE, related_name="warranties"
     )
+    # Optional: a warranty can cover one specific component of the asset.
+    component = models.ForeignKey(
+        "assets.AssetComponent", on_delete=models.SET_NULL, null=True, blank=True, related_name="warranties"
+    )
     supplier = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True, related_name="warranties"
     )

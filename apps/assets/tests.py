@@ -110,3 +110,49 @@ def test_components_and_project_link():
     rows = projects.get("results", projects)
     row = next(p for p in rows if p["id"] == str(proj.pk))
     assert row["assets_count"] == 1
+
+
+@pytest.mark.django_db
+def test_component_with_supplier_and_warranty(db):
+    from datetime import date
+
+    from apps.suppliers.models import Supplier
+    from apps.warranties.models import Warranty
+
+    brand = Brand.objects.create(name="CompBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="C-1")
+    supplier = Supplier.objects.create(name="Comp Supplier")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-COMP-1", serial_number="COMP-1",
+        purchase_date=date(2026, 8, 1),
+    )
+    ops = User.objects.create_user(username="comp-ops", password="x", role="ops_manager")
+    client = APIClient()
+    client.force_authenticate(ops)
+    r = client.post("/api/assets/components/", {
+        "device": str(device.pk),
+        "name": "Receiving Card",
+        "component_type": "Card",
+        "quantity": 4,
+        "supplier": str(supplier.pk),
+        "warranty_type": "supplier",
+        "warranty_months": 12,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["supplier_name"] == "Comp Supplier"
+    w = Warranty.objects.get(component_id=r.data["id"])
+    assert w.device == device and w.supplier == supplier
+    assert w.warranty_type == "supplier" and w.months == 12
+    # anchored at the device purchase (delivery) date
+    assert str(w.start_date) == "2026-08-01" and str(w.end_date) == "2027-08-01"
+
+    # component from another device is rejected on warranty create
+    other = Device.objects.create(device_model=dm, asset_code="AST-COMP-2", serial_number="COMP-2")
+    r2 = client.post("/api/warranties/", {
+        "device": str(other.pk),
+        "component": r.data["id"],
+        "warranty_type": "supplier",
+        "start_date": "2026-08-01",
+        "end_date": "2027-08-01",
+    }, format="json")
+    assert r2.status_code == 400
