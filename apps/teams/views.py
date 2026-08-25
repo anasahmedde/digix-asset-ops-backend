@@ -42,11 +42,20 @@ class ProjectViewSet(viewsets.ModelViewSet):
         qs = Project.objects.all()
         total = qs.count()
         by_status = dict(qs.values_list("status").annotate(c=Count("id")).values_list("status", "c"))
-        flagged = list(
-            qs.filter(status__in=["at_risk", "delayed"])
-            .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
-            .values("id", "name", "progress", "status", "bottleneck_count")[:8]
-        )
+        flagged = [
+            {
+                "id": str(p.id),
+                "name": p.name,
+                "progress": p.computed_progress(),
+                "status": p.status,
+                "bottleneck_count": p.bottleneck_count,
+            }
+            for p in (
+                qs.filter(status__in=["at_risk", "delayed"])
+                .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
+                .prefetch_related("milestones")[:8]
+            )
+        ]
         top_bottlenecks = list(
             ProjectBottleneck.objects
             .filter(is_resolved=False)
