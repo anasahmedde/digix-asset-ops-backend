@@ -1,8 +1,21 @@
 from django.db.models import Count
 from rest_framework import viewsets
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import BasePermission, IsAuthenticated
 
 from common.permissions import AdminManagerWriteElseRead
+
+
+class IsSuperAdminOrAssignedInstaller(BasePermission):
+    """Step/delay actions: the assigned installer (mobile) or a super admin (desktop)."""
+
+    message = "Only the assigned installer or a super admin can do this."
+
+    def has_object_permission(self, request, view, obj):
+        installation = obj.installation if hasattr(obj, "installation") else obj
+        return (
+            getattr(request.user, "role", None) == "super_admin"
+            or installation.installed_by_id == request.user.id
+        )
 
 from .models import (
     DeviceInstallation,
@@ -96,9 +109,10 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
     ordering_fields = ["step_number"]
 
     def get_permissions(self):
-        # Field techs may advance a step's status; only managers add/remove steps.
+        # Only the assigned installer (mobile) or a super admin (desktop) may
+        # advance a step; only managers add/remove steps.
         if self.action in ("update", "partial_update"):
-            return [IsAuthenticated()]
+            return [IsAuthenticated(), IsSuperAdminOrAssignedInstaller()]
         return [IsAuthenticated(), AdminManagerWriteElseRead()]
 
 
@@ -111,13 +125,20 @@ class InstallationDelayViewSet(viewsets.ModelViewSet):
     ordering_fields = ["created_at"]
 
     def get_permissions(self):
-        # Field techs may log a delay; managers can also edit/remove them.
+        # Delays are logged by the assigned installer or a super admin;
+        # managers can edit/resolve/remove them.
         if self.action == "create":
             return [IsAuthenticated()]
         return [IsAuthenticated(), AdminManagerWriteElseRead()]
 
     def perform_create(self, serializer):
-        serializer.save(reported_by=self.request.user)
+        installation = serializer.validated_data["installation"]
+        user = self.request.user
+        if getattr(user, "role", None) != "super_admin" and installation.installed_by_id != user.id:
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied("Only the assigned installer or a super admin can flag a delay.")
+        serializer.save(reported_by=user)
 
 
 class InstallationPhotoViewSet(viewsets.ModelViewSet):

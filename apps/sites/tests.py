@@ -165,3 +165,42 @@ def test_installer_phone_exposed(ops, tech, installation):
     assert r.data["results"][0]["installed_by_phone"] == "0301-7654321"
     r = _client(ops).get(f"/api/sites/installations/{installation.id}/")
     assert r.data["installed_by_phone"] == "0301-7654321"
+
+
+@pytest.mark.django_db
+def test_step_update_restricted_to_installer_or_super_admin(ops, tech, installation):
+    step = installation.steps.first()
+    # ops manager may NOT advance steps from desktop
+    r = _client(ops).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 403
+    # assigned installer may
+    r = _client(tech).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 200, r.content
+    # super admin may (incl. the new on-hold status)
+    admin = User.objects.create_user(username="site-admin", password="x", role="super_admin")
+    r = _client(admin).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "on_hold"}, format="json")
+    assert r.status_code == 200, r.content
+    step.refresh_from_db()
+    assert step.status == "on_hold"
+
+
+@pytest.mark.django_db
+def test_delay_create_restricted(ops, installation):
+    r = _client(ops).post("/api/sites/installation-delays/", {
+        "installation": str(installation.id), "cause": "client",
+    }, format="json")
+    assert r.status_code == 403
+
+
+@pytest.mark.django_db
+def test_custom_step_pipeline(ops, installation):
+    r = _client(ops).post("/api/sites/installations/", {
+        "device": str(installation.device_id),
+        "site": str(installation.site_id),
+        "installed_at": timezone.now().isoformat(),
+        "step_types": ["survey", "programming", "handover"],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    steps = r.data["steps"]
+    assert [s["step_type"] for s in steps] == ["survey", "programming", "handover"]
+    assert [s["step_number"] for s in steps] == [1, 2, 3]
