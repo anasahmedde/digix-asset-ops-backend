@@ -26,7 +26,13 @@ class MaintenanceSchedule(TimeStampedModel):
         OVERDUE = "overdue", "Over Due"
         COMPLETED = "completed", "Completed"
 
+    class Priority(models.TextChoices):
+        LOW = "low", "Low"
+        MEDIUM = "medium", "Medium"
+        HIGH = "high", "High"
+
     title = models.CharField(max_length=300)
+    priority = models.CharField(max_length=10, choices=Priority.choices, default=Priority.MEDIUM)
     maintenance_type = models.CharField(max_length=15, choices=MaintenanceType.choices, default=MaintenanceType.PREVENTIVE)
     frequency = models.CharField(max_length=15, choices=Frequency.choices, default=Frequency.MONTHLY)
     device = models.ForeignKey(
@@ -48,6 +54,27 @@ class MaintenanceSchedule(TimeStampedModel):
 
     def __str__(self):
         return f"{self.title} ({self.frequency})"
+
+    def advance_after_completion(self, performed_date):
+        """Roll the schedule to its next cycle once a completed record lands."""
+        from dateutil.relativedelta import relativedelta
+
+        if self.frequency == self.Frequency.ONE_TIME:
+            self.status = self.Status.COMPLETED
+            self.is_active = False
+            self.save(update_fields=["status", "is_active", "updated_at"])
+            return
+        deltas = {
+            self.Frequency.DAILY: relativedelta(days=1),
+            self.Frequency.WEEKLY: relativedelta(weeks=1),
+            self.Frequency.MONTHLY: relativedelta(months=1),
+            self.Frequency.QUARTERLY: relativedelta(months=3),
+            self.Frequency.YEARLY: relativedelta(years=1),
+        }
+        base = max(self.next_due, performed_date) if self.next_due else performed_date
+        self.next_due = base + deltas[self.frequency]
+        self.status = self.Status.ACTIVE
+        self.save(update_fields=["next_due", "status", "updated_at"])
 
     @property
     def effective_status(self):
@@ -77,9 +104,25 @@ class MaintenanceRecord(TimeStampedModel):
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.COMPLETED)
     notes = models.TextField(blank=True)
     cost = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    # Which of the asset's components were serviced/replaced during the visit.
+    components_used = models.ManyToManyField(
+        "assets.AssetComponent", blank=True, related_name="maintenance_records"
+    )
 
     class Meta:
         ordering = ["-performed_at"]
 
     def __str__(self):
         return f"{self.schedule.title} - {self.performed_at.date()}"
+
+
+class MaintenanceRecordPhoto(TimeStampedModel):
+    record = models.ForeignKey(MaintenanceRecord, on_delete=models.CASCADE, related_name="photos")
+    image = models.ImageField(upload_to="maintenance/photos/")
+    caption = models.CharField(max_length=300, blank=True)
+    taken_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True
+    )
+
+    def __str__(self):
+        return f"Photo for {self.record}"

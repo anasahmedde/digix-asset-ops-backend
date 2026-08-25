@@ -11,6 +11,7 @@ from django.utils import timezone
 from apps.accounts.models import User
 from apps.analytics.models import Alert
 from apps.chat.models import ChatMessage
+from apps.maintenance.models import MaintenanceSchedule
 from apps.sites.models import DeviceInstallation
 from apps.tickets.models import Ticket
 
@@ -155,6 +156,48 @@ def notify_installer_on_assignment(sender, instance: DeviceInstallation, created
         _push_ws(notification)
     except Exception:  # pragma: no cover - notification failure must not block saves
         logger.exception("Failed installer notification for installation %s", instance.pk)
+
+
+# ── Maintenance assignment → notify the assignee ────────────────────
+
+@receiver(pre_save, sender=MaintenanceSchedule)
+def capture_schedule_previous_state(sender, instance: MaintenanceSchedule, **kwargs):
+    if instance.pk:
+        try:
+            old = MaintenanceSchedule.objects.get(pk=instance.pk)
+            instance._prev_assigned_to_id = old.assigned_to_id
+        except MaintenanceSchedule.DoesNotExist:
+            instance._prev_assigned_to_id = None
+    else:
+        instance._prev_assigned_to_id = None
+
+
+@receiver(post_save, sender=MaintenanceSchedule)
+def notify_maintenance_assignee(sender, instance: MaintenanceSchedule, created: bool, **kwargs):
+    prev = getattr(instance, "_prev_assigned_to_id", None)
+    if not instance.assigned_to_id or (not created and prev == instance.assigned_to_id):
+        return
+    try:
+        data = {"schedule_id": str(instance.id), "priority": instance.priority}
+        if instance.device_id:
+            data["device_id"] = str(instance.device_id)
+        if instance.site_id:
+            data["site_id"] = str(instance.site_id)
+        notification = Notification.objects.create(
+            recipient=instance.assigned_to,
+            notification_type=Notification.Type.MAINTENANCE_REMINDER,
+            title="Maintenance assigned to you",
+            message=(
+                f"{instance.title}"
+                + (f" — {instance.device.asset_code}" if instance.device_id else "")
+                + (f" · due {instance.next_due}" if instance.next_due else "")
+            ),
+            data=data,
+            is_actionable=True,
+        )
+        _push_ws(notification)
+    except Exception:  # pragma: no cover - notification failure must not block saves
+        logger.exception("Failed maintenance notification for schedule %s", instance.pk)
 
 
 # ── Ticket → Notification ────────────────────────────────────────────
