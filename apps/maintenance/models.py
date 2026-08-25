@@ -50,6 +50,10 @@ class MaintenanceSchedule(TimeStampedModel):
     )
     next_due = models.DateField()
     instructions = models.TextField(blank=True)
+    # What this maintenance needs on-site, entered freely at scheduling time:
+    # a list of {"name": str, "quantity": int} rows (not tied to the asset's
+    # registered components).
+    required_components = models.JSONField(default=list, blank=True)
     status = models.CharField(max_length=15, choices=Status.choices, default=Status.ACTIVE)
     is_active = models.BooleanField(default=True)
 
