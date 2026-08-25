@@ -127,3 +127,18 @@ def test_record_rejects_foreign_components(tech):
         "components_used": [str(foreign.pk)],
     }, format="json")
     assert r.status_code == 400
+
+
+@pytest.mark.django_db
+def test_schedule_supports_multiple_vendors(ops):
+    from apps.suppliers.models import Supplier
+
+    v1 = Supplier.objects.create(name="Vendor A")
+    v2 = Supplier.objects.create(name="Vendor B")
+    r = _client(ops).post("/api/maintenance/schedules/", {
+        "title": "Deep clean",
+        "next_due": str(timezone.now().date()),
+        "vendors": [str(v1.pk), str(v2.pk)],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert sorted(r.data["vendor_names"]) == ["Vendor A", "Vendor B"]

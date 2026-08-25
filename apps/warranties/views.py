@@ -26,7 +26,7 @@ class WarrantyViewSet(viewsets.ModelViewSet):
     serializer_class = WarrantySerializer
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["status", "warranty_type", "device", "supplier"]
-    search_fields = ["reference_number", "coverage_details"]
+    search_fields = ["reference_number", "coverage_details", "device__asset_code", "device__display_name"]
     ordering_fields = ["end_date", "start_date"]
 
     def get_queryset(self):

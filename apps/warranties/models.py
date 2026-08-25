@@ -16,7 +16,7 @@ class Warranty(TimeStampedModel):
         # task flips active warranties here once end_date passes.
         EXPIRED = "expired", "Warranty Completed"
         REISSUED = "reissued", "Reissued"
-        CLAIMED = "claimed", "Claimed"
+        CLAIMED = "claimed", "Pending"
         VOID = "void", "Void"
 
     device = models.ForeignKey(
