@@ -69,13 +69,68 @@ class DeviceImageSerializer(serializers.ModelSerializer):
 
 
 class AssetComponentSerializer(serializers.ModelSerializer):
+    supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
+    # Optional warranty registered together with the component; creates a
+    # component-scoped Warranty row anchored at the device's purchase date.
+    warranty_type = serializers.ChoiceField(
+        choices=["manufacturer", "extended", "supplier", "client"], write_only=True, required=False, allow_null=True
+    )
+    warranty_months = serializers.ChoiceField(
+        choices=[3, 6, 12, 24, 36], write_only=True, required=False, allow_null=True
+    )
+    active_warranty = serializers.SerializerMethodField()
+
     class Meta:
         model = AssetComponent
         fields = [
             "id", "device", "name", "component_type", "serial_number",
-            "quantity", "notes", "created_at",
+            "quantity", "supplier", "supplier_name",
+            "warranty_type", "warranty_months", "active_warranty",
+            "notes", "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+
+    def get_active_warranty(self, obj):
+        w = next((w for w in obj.warranties.all() if w.status in ("active", "reissued")), None) or next(
+            iter(obj.warranties.all()), None
+        )
+        if w is None:
+            return None
+        return {
+            "id": str(w.id),
+            "warranty_type": w.warranty_type,
+            "status": w.status,
+            "start_date": w.start_date,
+            "end_date": w.end_date,
+            "months": w.months,
+        }
+
+    def create(self, validated_data):
+        months = validated_data.pop("warranty_months", None)
+        warranty_type = validated_data.pop("warranty_type", None)
+        component = super().create(validated_data)
+        if months:
+            from dateutil.relativedelta import relativedelta
+
+            from apps.warranties.models import Warranty
+
+            device = component.device
+            start = device.purchase_date or timezone.now().date()
+            Warranty.objects.create(
+                device=device,
+                component=component,
+                supplier=component.supplier or device.supplier,
+                warranty_type=warranty_type or Warranty.WarrantyType.SUPPLIER,
+                start_date=start,
+                end_date=start + relativedelta(months=months),
+                months=months,
+            )
+        return component
+
+    def update(self, instance, validated_data):
+        validated_data.pop("warranty_months", None)
+        validated_data.pop("warranty_type", None)
+        return super().update(instance, validated_data)
 
 
 def _client_names(device):
@@ -149,7 +204,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "id", "asset_code", "serial_number", "mobile_id", "mac_address", "imei",
             "display_name", "asset_type", "asset_type_name",
             "device_model", "device_model_name", "brand_name", "screen_type", "screen_size",
-            "length_cm", "width_cm", "diagonal_inches",
+            "length_in", "width_in", "depth_in", "diagonal_inches",
             "specifications", "firmware_version", "hardware_revision",
             "status", "image", "images",
             "purchase_date", "purchase_price", "supplier", "supplier_name",

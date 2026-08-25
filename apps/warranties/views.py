@@ -15,7 +15,7 @@ REISSUE_TERMS = (3, 6, 12)
 
 
 class WarrantyViewSet(viewsets.ModelViewSet):
-    queryset = Warranty.objects.select_related("device", "supplier").all()
+    queryset = Warranty.objects.select_related("device", "supplier", "component").all()
     serializer_class = WarrantySerializer
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["status", "warranty_type", "device", "supplier"]
