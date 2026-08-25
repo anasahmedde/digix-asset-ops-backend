@@ -142,3 +142,26 @@ def test_schedule_supports_multiple_vendors(ops):
     }, format="json")
     assert r.status_code == 201, r.content
     assert sorted(r.data["vendor_names"]) == ["Vendor A", "Vendor B"]
+
+
+@pytest.mark.django_db
+def test_required_components_roundtrip(ops):
+    r = _client(ops).post("/api/maintenance/schedules/", {
+        "title": "Panel swap",
+        "next_due": str(timezone.now().date()),
+        "required_components": [
+            {"name": "SMD Module P3.9", "quantity": 6},
+            {"name": "Silicone sealant", "quantity": 2},
+        ],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["required_components"] == [
+        {"name": "SMD Module P3.9", "quantity": 6},
+        {"name": "Silicone sealant", "quantity": 2},
+    ]
+    # malformed rows rejected
+    bad = _client(ops).post("/api/maintenance/schedules/", {
+        "title": "Bad", "next_due": str(timezone.now().date()),
+        "required_components": [{"quantity": 3}],
+    }, format="json")
+    assert bad.status_code == 400
