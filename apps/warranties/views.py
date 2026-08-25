@@ -13,6 +13,13 @@ from .serializers import WarrantySerializer
 
 REISSUE_TERMS = (3, 6, 12)
 
+# Client-facing warranties belong to marketing; supplier-facing ones to
+# operations/production. Admin-level roles see both sides.
+CLIENT_TYPES = ("client",)
+SUPPLIER_TYPES = ("manufacturer", "extended", "supplier")
+CLIENT_SIDE_ROLES = ("marketing", "marketing_head", "client_viewer")
+SUPPLIER_SIDE_ROLES = ("ops_manager", "supervisor", "technician", "warehouse")
+
 
 class WarrantyViewSet(viewsets.ModelViewSet):
     queryset = Warranty.objects.select_related("device", "supplier", "component").all()
@@ -21,6 +28,15 @@ class WarrantyViewSet(viewsets.ModelViewSet):
     filterset_fields = ["status", "warranty_type", "device", "supplier"]
     search_fields = ["reference_number", "coverage_details"]
     ordering_fields = ["end_date", "start_date"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        role = getattr(self.request.user, "role", None)
+        if role in CLIENT_SIDE_ROLES:
+            return qs.filter(warranty_type__in=CLIENT_TYPES)
+        if role in SUPPLIER_SIDE_ROLES:
+            return qs.filter(warranty_type__in=SUPPLIER_TYPES)
+        return qs
 
     @action(detail=True, methods=["post"])
     def reissue(self, request, pk=None):

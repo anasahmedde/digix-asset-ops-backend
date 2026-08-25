@@ -67,6 +67,21 @@ def stamp_installation_completion(sender, instance: InstallationStep, **kwargs):
     if done and installation.completed_at is None:
         installation.completed_at = timezone.now()
         installation.save(update_fields=["completed_at", "updated_at"])
+        _anchor_client_warranties(installation)
     elif not done and installation.completed_at is not None:
         installation.completed_at = None
         installation.save(update_fields=["completed_at", "updated_at"])
+
+
+def _anchor_client_warranties(installation: DeviceInstallation) -> None:
+    """Client warranties run from handover: re-anchor active term-based ones."""
+    from dateutil.relativedelta import relativedelta
+
+    handover = installation.completed_at.date()
+    warranties = installation.device.warranties.filter(
+        warranty_type="client", status="active", months__isnull=False
+    )
+    for warranty in warranties:
+        warranty.start_date = handover
+        warranty.end_date = handover + relativedelta(months=warranty.months)
+        warranty.save(update_fields=["start_date", "end_date", "updated_at"])

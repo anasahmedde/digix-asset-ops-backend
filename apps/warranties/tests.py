@@ -63,13 +63,15 @@ def test_auto_complete_after_term(device):
 
 
 @pytest.mark.django_db
-def test_reissue_flow(ops, device):
+def test_reissue_flow(device):
+    # Client warranties are marketing/admin-side; ops roles no longer see them.
+    admin = User.objects.create_user(username="war-admin", password="x", role="super_admin")
     w = Warranty.objects.create(
         device=device, warranty_type="client", status="expired", months=3,
         start_date=timezone.now().date() - timedelta(days=120),
         end_date=timezone.now().date() - timedelta(days=1),
     )
-    c = _client(ops)
+    c = _client(admin)
     r = c.post(f"/api/warranties/{w.pk}/reissue/", {"months": 12}, format="json")
     assert r.status_code == 201, r.content
     w.refresh_from_db()
@@ -127,3 +129,65 @@ def test_device_name_exposed(ops, device):
     r = _client(ops).get(f"/api/warranties/{w.pk}/")
     assert r.data["device_name"] == "Lobby Screen"
     assert r.data["device_code"] == device.asset_code
+
+
+@pytest.mark.django_db
+def test_role_scoped_visibility(device):
+    Warranty.objects.create(
+        device=device, warranty_type="client", status="active", months=6,
+        start_date=timezone.now().date(), end_date=timezone.now().date() + timedelta(days=180),
+    )
+    Warranty.objects.create(
+        device=device, warranty_type="supplier", status="active",
+        start_date=timezone.now().date(), end_date=timezone.now().date() + timedelta(days=365),
+    )
+    def types_for(role):
+        u = User.objects.create_user(username=f"war-{role}", password="x", role=role)
+        r = _client(u).get("/api/warranties/")
+        return sorted({row["warranty_type"] for row in r.data["results"]})
+
+    assert types_for("marketing") == ["client"]
+    assert types_for("technician") == ["supplier"]
+    assert types_for("super_admin") == ["client", "supplier"]
+    assert types_for("group_head") == ["client", "supplier"]
+
+
+@pytest.mark.django_db
+def test_supplier_warranty_anchors_to_purchase_date(ops):
+    from datetime import date
+
+    brand = Brand.objects.create(name="WarBrand4")
+    dm = DeviceModel.objects.create(brand=brand, name="W-4")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-WAR-4", serial_number="WAR-4",
+        purchase_date=date(2026, 7, 1),
+    )
+    r = _client(ops).post("/api/warranties/", {
+        "device": str(device.pk),
+        "warranty_type": "supplier",
+        "months": 12,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["start_date"] == "2026-07-01"
+    assert r.data["end_date"] == "2027-07-01"
+
+
+@pytest.mark.django_db
+def test_client_warranty_reanchors_on_handover(device):
+    from apps.sites.models import DeviceInstallation, InstallationStep, Site
+
+    w = Warranty.objects.create(
+        device=device, warranty_type="client", status="active", months=6,
+        start_date=timezone.now().date() - timedelta(days=90),
+        end_date=timezone.now().date() + timedelta(days=90),
+    )
+    site = Site.objects.create(name="Handover Site", city="Karachi")
+    inst = DeviceInstallation.objects.create(device=device, site=site, installed_at=timezone.now())
+    for step in inst.steps.all():
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+    inst.refresh_from_db()
+    assert inst.completed_at is not None
+    w.refresh_from_db()
+    assert w.start_date == inst.completed_at.date()
+    assert (w.end_date - w.start_date).days >= 180
