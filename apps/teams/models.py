@@ -14,7 +14,25 @@ class Project(TimeStampedModel):
         COMPLETED = "completed", "Completed"
         ON_HOLD = "on_hold", "On Hold"
 
+    class Phase(models.TextChoices):
+        """Commercial lifecycle of a client order, from enquiry to retirement."""
+
+        QUERY = "query", "Query"
+        ON_HOLD = "on_hold", "On Hold"
+        QUOTATION = "quotation", "Quotation"
+        NEGOTIATION = "negotiation", "Negotiation"
+        ORDER_CONFIRMATION = "order_confirmation", "Order Confirmation"
+        LOST = "lost", "Lost"
+        PRODUCTION = "production", "Production"
+        DELIVERY = "delivery", "Delivery"
+        INSTALLATION = "installation", "Installation"
+        HANDOVER = "handover", "Handing Over"
+        UNDER_WARRANTY = "under_warranty", "Under Warranty"
+        EXTENDED_WARRANTY = "extended_warranty", "Extended Warranty"
+        DECOMMISSIONED = "decommissioned", "De-Commissioned"
+
     name = models.CharField(max_length=300)
+    phase = models.CharField(max_length=25, choices=Phase.choices, default=Phase.QUERY)
     description = models.TextField(blank=True)
     location = models.CharField(max_length=300, blank=True)
     image = models.ImageField(upload_to=upload_to_path, blank=True)
@@ -44,6 +62,47 @@ class Project(TimeStampedModel):
 
     def __str__(self):
         return self.name
+
+
+class ProjectScopeItem(TimeStampedModel):
+    """One line of a project's scope: an asset (and optionally one of its
+    components) deployed in some quantity at some location, possibly with its
+    own start date — one order can span many assets across many sites."""
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="scope_items")
+    device = models.ForeignKey(
+        "assets.Device", on_delete=models.CASCADE, related_name="project_scope_items"
+    )
+    component = models.ForeignKey(
+        "assets.AssetComponent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="project_scope_items",
+    )
+    quantity = models.PositiveIntegerField(default=1)
+    site = models.ForeignKey(
+        "sites.Site", on_delete=models.SET_NULL, null=True, blank=True, related_name="project_scope_items"
+    )
+    start_date = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.project.name}: {self.device.asset_code} ×{self.quantity}"
+
+
+class ProjectMilestone(TimeStampedModel):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="milestones")
+    title = models.CharField(max_length=300)
+    due_date = models.DateField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ["order", "due_date", "created_at"]
+
+    def __str__(self):
+        return f"{self.project.name} — {self.title}"
 
 
 class ProjectBottleneck(TimeStampedModel):

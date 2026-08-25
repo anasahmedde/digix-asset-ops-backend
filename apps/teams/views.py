@@ -6,18 +6,20 @@ from rest_framework.response import Response
 
 from common.permissions import AdminManagerWriteElseRead
 
-from .models import Project, ProjectBottleneck, ProjectMember
+from .models import Project, ProjectBottleneck, ProjectMember, ProjectMilestone, ProjectScopeItem
 from .serializers import (
     ProjectBottleneckSerializer,
     ProjectDetailSerializer,
     ProjectListSerializer,
     ProjectMemberSerializer,
+    ProjectMilestoneSerializer,
+    ProjectScopeItemSerializer,
 )
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
-    filterset_fields = ["status", "client", "site", "manager"]
+    filterset_fields = ["status", "phase", "client", "site", "manager"]
     search_fields = ["name", "location", "description"]
     ordering_fields = ["created_at", "start_date", "target_date", "progress"]
 
@@ -26,6 +28,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             Project.objects
             .select_related("client", "site", "manager")
             .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
+            .prefetch_related("scope_items", "milestones")
             .all()
         )
 
@@ -74,3 +77,20 @@ class ProjectMemberViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectMemberSerializer
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["project", "user", "role"]
+
+
+class ProjectScopeItemViewSet(viewsets.ModelViewSet):
+    queryset = ProjectScopeItem.objects.select_related(
+        "project", "device", "component", "site"
+    ).all()
+    serializer_class = ProjectScopeItemSerializer
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    filterset_fields = ["project", "device", "site"]
+
+
+class ProjectMilestoneViewSet(viewsets.ModelViewSet):
+    queryset = ProjectMilestone.objects.select_related("project").all()
+    serializer_class = ProjectMilestoneSerializer
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    filterset_fields = ["project"]
+    ordering_fields = ["order", "due_date"]
