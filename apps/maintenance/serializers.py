@@ -10,18 +10,22 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
     assigned_to_name = serializers.CharField(source="assigned_to.get_full_name", read_only=True, default=None)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     effective_status = serializers.CharField(read_only=True)
+    vendor_names = serializers.SerializerMethodField()
 
     class Meta:
         model = MaintenanceSchedule
         fields = [
             "id", "title", "maintenance_type", "frequency", "priority",
             "device", "device_code", "device_name", "site", "site_name",
-            "assigned_to", "assigned_to_name",
+            "assigned_to", "assigned_to_name", "vendors", "vendor_names",
             "next_due", "instructions", "status", "status_display",
             "effective_status", "is_active",
             "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def get_vendor_names(self, obj):
+        return [v.name for v in obj.vendors.all()]
 
 
 class MaintenanceRecordPhotoSerializer(serializers.ModelSerializer):

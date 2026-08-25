@@ -16,7 +16,7 @@ from .serializers import (
 class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
     queryset = MaintenanceSchedule.objects.select_related(
         "device", "site", "assigned_to"
-    ).all()
+    ).prefetch_related("vendors").all()
     serializer_class = MaintenanceScheduleSerializer
     permission_classes = [IsAuthenticated, TechnicianCanCreate]
     filterset_fields = [

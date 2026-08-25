@@ -204,3 +204,44 @@ def test_custom_step_pipeline(ops, installation):
     steps = r.data["steps"]
     assert [s["step_type"] for s in steps] == ["survey", "programming", "handover"]
     assert [s["step_number"] for s in steps] == [1, 2, 3]
+
+
+@pytest.mark.django_db
+def test_custom_named_steps_and_vendor(ops, installation):
+    from apps.suppliers.models import Supplier
+
+    vendor = Supplier.objects.create(name="Rigging Co")
+    r = _client(ops).post("/api/sites/installations/", {
+        "device": str(installation.device_id),
+        "site": str(installation.site_id),
+        "installed_at": timezone.now().isoformat(),
+        "vendor": str(vendor.pk),
+        "step_types": ["survey", "Crane lift", "handover"],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["vendor_name"] == "Rigging Co"
+    steps = r.data["steps"]
+    assert [s["step_type"] for s in steps] == ["survey", "other", "handover"]
+    assert steps[1]["step_type_display"] == "Crane lift"
+
+
+@pytest.mark.django_db
+def test_on_hold_steps_count_in_list(ops, installation):
+    step = installation.steps.first()
+    step.status = InstallationStep.StepStatus.ON_HOLD
+    step.save()
+    r = _client(ops).get("/api/sites/installations/")
+    row = next(x for x in r.data["results"] if x["id"] == str(installation.id))
+    assert row["on_hold_steps"] == 1
+
+
+@pytest.mark.django_db
+def test_completion_marks_device_installed(installation):
+    device = installation.device
+    device.status = "in_stock"
+    device.save()
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+    device.refresh_from_db()
+    assert device.status == "installed"

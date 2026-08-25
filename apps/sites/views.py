@@ -81,7 +81,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         .select_related(
             "device", "device__device_model", "device__device_model__brand",
             "device__asset_type", "device__assigned_client", "device__project",
-            "installed_by", "site", "zone",
+            "installed_by", "vendor", "site", "zone",
         )
         .prefetch_related("photos", "steps", "delays", "device__clients")
         .all()

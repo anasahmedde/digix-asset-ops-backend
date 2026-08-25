@@ -44,6 +44,10 @@ class MaintenanceSchedule(TimeStampedModel):
     assigned_to = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="maintenance_assignments"
     )
+    # External vendors involved in this maintenance (can be several).
+    vendors = models.ManyToManyField(
+        "suppliers.Supplier", blank=True, related_name="maintenance_schedules"
+    )
     next_due = models.DateField()
     instructions = models.TextField(blank=True)
     status = models.CharField(max_length=15, choices=Status.choices, default=Status.ACTIVE)

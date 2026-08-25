@@ -68,9 +68,19 @@ def stamp_installation_completion(sender, instance: InstallationStep, **kwargs):
         installation.completed_at = timezone.now()
         installation.save(update_fields=["completed_at", "updated_at"])
         _anchor_client_warranties(installation)
+        _mark_device_installed(installation)
     elif not done and installation.completed_at is not None:
         installation.completed_at = None
         installation.save(update_fields=["completed_at", "updated_at"])
+
+
+def _mark_device_installed(installation: DeviceInstallation) -> None:
+    """Handover flips a pre-install asset to Installed — the registry status
+    stays honest without anyone editing it by hand."""
+    device = installation.device
+    if device.status in ("procured", "in_transit", "in_stock", "assigned"):
+        device.status = "installed"
+        device.save(update_fields=["status", "updated_at"])
 
 
 def _anchor_client_warranties(installation: DeviceInstallation) -> None:

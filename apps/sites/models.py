@@ -73,6 +73,10 @@ class DeviceInstallation(TimeStampedModel):
     installed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="installations_done"
     )
+    vendor = models.ForeignKey(
+        "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installations", help_text="External vendor doing the installation work",
+    )
     installed_at = models.DateTimeField()
     removed_at = models.DateTimeField(null=True, blank=True)
     due_date = models.DateField(null=True, blank=True, help_text="Agreed completion date for the installation")
@@ -99,6 +103,7 @@ class InstallationStep(TimeStampedModel):
         PROGRAMMING = "programming", "Programming"
         TESTING = "testing", "Testing & Commissioning"
         HANDOVER = "handover", "Handover"
+        OTHER = "other", "Other"
 
     class StepStatus(models.TextChoices):
         NOT_STARTED = "not_started", "Not Started Yet"
@@ -111,6 +116,9 @@ class InstallationStep(TimeStampedModel):
         DeviceInstallation, on_delete=models.CASCADE, related_name="steps"
     )
     step_type = models.CharField(max_length=20, choices=StepType.choices)
+    custom_label = models.CharField(
+        max_length=200, blank=True, help_text="Display name for custom ('other') steps"
+    )
     step_number = models.PositiveSmallIntegerField()
     status = models.CharField(max_length=20, choices=StepStatus.choices, default=StepStatus.NOT_STARTED)
     assigned_team = models.CharField(max_length=200, blank=True)
