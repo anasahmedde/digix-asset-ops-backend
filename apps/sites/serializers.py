@@ -160,6 +160,14 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
     photos = InstallationPhotoSerializer(many=True, read_only=True)
     steps = InstallationStepSerializer(many=True, read_only=True)
     delays = InstallationDelaySerializer(many=True, read_only=True)
+    # Optional custom pipeline chosen at creation (subset/order of step types);
+    # when omitted the default six-step pipeline is seeded.
+    step_types = serializers.ListField(
+        child=serializers.ChoiceField(choices=InstallationStep.StepType.values),
+        write_only=True,
+        required=False,
+        allow_empty=False,
+    )
     device_image = serializers.ImageField(source="device.image", read_only=True)
     device_status = serializers.CharField(source="device.status", read_only=True)
     site_city = serializers.CharField(source="site.city", read_only=True)
@@ -173,7 +181,31 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
             "site", "site_name", "site_city", "zone",
             "installed_by", "installed_by_name", "installed_by_phone", "installed_at", "removed_at",
             "due_date", "completed_at",
-            "position_label", "notes", "photos", "steps", "delays",
+            "position_label", "notes", "photos", "steps", "delays", "step_types",
             "progress", "client_delays", "created_at",
         ]
         read_only_fields = ["id", "completed_at", "created_at"]
+
+    def create(self, validated_data):
+        step_types = validated_data.pop("step_types", None)
+        if not step_types:
+            return super().create(validated_data)
+        # Custom pipeline: suppress the default seed, create the chosen steps.
+        seen = []
+        for st in step_types:
+            if st not in seen:
+                seen.append(st)
+        installation = DeviceInstallation(**validated_data)
+        installation._skip_default_steps = True
+        installation.save()
+        InstallationStep.objects.bulk_create(
+            [
+                InstallationStep(installation=installation, step_type=st, step_number=i + 1)
+                for i, st in enumerate(seen)
+            ]
+        )
+        return installation
+
+    def update(self, instance, validated_data):
+        validated_data.pop("step_types", None)
+        return super().update(instance, validated_data)

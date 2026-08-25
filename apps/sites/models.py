@@ -103,6 +103,7 @@ class InstallationStep(TimeStampedModel):
     class StepStatus(models.TextChoices):
         NOT_STARTED = "not_started", "Not Started Yet"
         IN_PROGRESS = "in_progress", "In Progress"
+        ON_HOLD = "on_hold", "On Hold (Client)"
         COMPLETED = "completed", "Completed"
         SKIPPED = "skipped", "Skipped"
 

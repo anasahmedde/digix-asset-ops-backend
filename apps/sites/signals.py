@@ -40,7 +40,7 @@ def seed_steps(installation: DeviceInstallation) -> int:
 
 @receiver(post_save, sender=DeviceInstallation)
 def create_default_installation_steps(sender, instance: DeviceInstallation, created: bool, **kwargs):
-    if not created:
+    if not created or getattr(instance, "_skip_default_steps", False):
         return
     try:
         seed_steps(instance)
