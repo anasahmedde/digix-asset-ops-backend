@@ -288,6 +288,123 @@ def test_due_date_escalates_active_only(heads):
     assert t_closed.due_date_escalated is False
 
 
+# ── Wave 4: multi-stage escalation (ES-03/04) ──────────────────────────
+
+@pytest.mark.django_db
+def test_stage2_fires_only_after_own_offset(heads):
+    from apps.notifications.models import Notification
+
+    t = _mk_ticket(heads["mkt"])
+    Ticket.objects.filter(pk=t.pk).update(response_due_at=timezone.now() - timedelta(hours=1))
+
+    assert escalate_overdue_tickets() == 1  # stage 1 only
+    t.refresh_from_db()
+    assert t.escalated is True and t.escalated_at  # legacy booleans still sync
+    assert "response_sla:1" in t.escalation_state
+    assert "response_sla:2" not in t.escalation_state
+
+    # stage-2 threshold (anchor + 24h) not reached yet -> nothing new fires
+    assert escalate_overdue_tickets() == 0
+
+    Ticket.objects.filter(pk=t.pk).update(response_due_at=timezone.now() - timedelta(hours=25))
+    assert escalate_overdue_tickets() == 1  # stage 2
+    t.refresh_from_db()
+    assert "response_sla:2" in t.escalation_state
+    assert Notification.objects.filter(
+        ticket_id=t.pk, notification_type="ticket_escalated", title__contains="(stage 2)"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_stage_recipients_follow_each_stage_policy(heads):
+    from apps.notifications.models import Notification
+    from apps.setup.models import EscalationPolicy
+
+    EscalationPolicy.objects.filter(scope="ticket", trigger="response_sla", stage=2).update(
+        escalate_to_role="ops_manager", also_notify_role=""
+    )
+    t = _mk_ticket(heads["mkt"])
+    Ticket.objects.filter(pk=t.pk).update(response_due_at=timezone.now() - timedelta(hours=30))
+
+    # Both stage thresholds already elapsed -> both fire on one run.
+    assert escalate_overdue_tickets() == 2
+
+    stage2 = Notification.objects.filter(ticket_id=t.pk, title__contains="(stage 2)")
+    stage2_recipients = {n.recipient_id for n in stage2}
+    assert heads["ops"].id in stage2_recipients
+    assert heads["group_head"].id not in stage2_recipients
+    # stage 1 still followed its own policy (group head + ops)
+    stage1 = Notification.objects.filter(ticket_id=t.pk).exclude(title__contains="(stage 2)")
+    assert heads["group_head"].id in {n.recipient_id for n in stage1}
+
+
+@pytest.mark.django_db
+def test_escalation_state_recorded_once_and_rerun_noop(heads):
+    t = _mk_ticket(heads["mkt"])
+    Ticket.objects.filter(pk=t.pk).update(response_due_at=timezone.now() - timedelta(hours=48))
+
+    assert escalate_overdue_tickets() == 2
+    t.refresh_from_db()
+    first_state = dict(t.escalation_state)
+    assert set(first_state) == {"response_sla:1", "response_sla:2"}
+
+    assert escalate_overdue_tickets() == 0
+    t.refresh_from_db()
+    assert t.escalation_state == first_state  # keys and timestamps untouched
+
+
+@pytest.mark.django_db
+def test_legacy_escalated_ticket_not_refired(heads):
+    """Rows escalated before the escalation_state ledger existed carry only
+    the legacy boolean — stage 1 must not fire again for them."""
+    t = _mk_ticket(heads["mkt"])
+    Ticket.objects.filter(pk=t.pk).update(
+        response_due_at=timezone.now() - timedelta(hours=1), escalated=True
+    )
+    assert escalate_overdue_tickets() == 0
+    t.refresh_from_db()
+    assert t.escalation_state == {}
+
+
+@pytest.mark.django_db
+def test_due_date_multi_stage(heads):
+    t_old = _mk_ticket(heads["mkt"], due_date=timezone.now().date() - timedelta(days=3))
+    t_new = _mk_ticket(heads["mkt"], due_date=timezone.now().date() - timedelta(days=1))
+    Ticket.objects.filter(pk__in=[t_old.pk, t_new.pk]).update(
+        response_due_at=timezone.now() + timedelta(hours=24)
+    )
+
+    escalate_overdue_tickets()
+    t_old.refresh_from_db(); t_new.refresh_from_db()
+    # 3 days past due: stage 1 (day after) and stage 2 (24h later) both fired.
+    assert set(t_old.escalation_state) == {"due_date:1", "due_date:2"}
+    # 1 day past due: only stage 1 so far.
+    assert set(t_new.escalation_state) == {"due_date:1"}
+    assert t_old.due_date_escalated is True and t_new.due_date_escalated is True
+
+
+@pytest.mark.django_db
+def test_escalation_state_read_only_on_api(people):
+    c = _client(people["marketing"])
+    r = c.post(
+        "/api/tickets/",
+        {"title": "state ro", "escalation_state": {"response_sla:1": "boom"}},
+        format="json",
+    )
+    assert r.status_code == 201, r.content
+    body = r.json()
+    assert body["escalation_state"] == {}
+    tid = body["id"]
+
+    r = c.patch(f"/api/tickets/{tid}/", {"escalation_state": {"x": "y"}}, format="json")
+    assert r.status_code == 200
+    assert Ticket.objects.get(pk=tid).escalation_state == {}
+
+    # exposed on the list serializer too
+    listing = c.get("/api/tickets/").json()["results"]
+    assert listing and all("escalation_state" in row for row in listing)
+
+
 @pytest.mark.django_db
 def test_assign_action_stamps_assigned_at(heads, people):
     t = _mk_ticket(heads["mkt"])

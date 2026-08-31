@@ -130,6 +130,10 @@ class _InstallationCommonMixin(serializers.Serializer):
     progress = serializers.SerializerMethodField()
     client_delays = serializers.SerializerMethodField()
     on_hold_steps = serializers.SerializerMethodField()
+    escalated = serializers.SerializerMethodField()
+
+    def get_escalated(self, obj):
+        return bool(obj.escalation_state)
 
     def get_client_names(self, obj):
         names = []
@@ -163,9 +167,10 @@ class DeviceInstallationListSerializer(_InstallationCommonMixin, serializers.Mod
             "site", "site_name", "installed_by", "installed_by_name", "installed_by_phone",
             "vendor", "vendor_name",
             "installed_at", "removed_at", "due_date", "completed_at",
+            "escalated", "escalation_state",
             "progress", "client_delays", "on_hold_steps", "created_at",
         ]
-        read_only_fields = ["id", "completed_at", "created_at"]
+        read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
 
 
 class HandoverRecordSerializer(serializers.ModelSerializer):
@@ -225,10 +230,11 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
             "installed_by", "installed_by_name", "installed_by_phone", "installed_at", "removed_at",
             "vendor", "vendor_name",
             "due_date", "completed_at",
+            "escalated", "escalation_state",
             "position_label", "notes", "photos", "steps", "delays", "step_types",
             "handover", "progress", "client_delays", "on_hold_steps", "created_at",
         ]
-        read_only_fields = ["id", "completed_at", "created_at"]
+        read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
 
     def create(self, validated_data):
         step_types = validated_data.pop("step_types", None)

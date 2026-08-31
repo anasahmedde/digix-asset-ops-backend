@@ -180,6 +180,11 @@ class Ticket(TimeStampedModel):
     due_date_escalated = models.BooleanField(default=False)
     due_date_escalated_at = models.DateTimeField(null=True, blank=True)
 
+    # Multi-stage escalation ledger: "<trigger>:<stage>" -> ISO timestamp when
+    # that stage fired (e.g. {"response_sla:1": "2026-08-31T10:00:00+00:00"}).
+    # The legacy booleans above stay in sync when stage 1 fires (badges).
+    escalation_state = models.JSONField(default=dict, blank=True)
+
     VALID_TRANSITIONS = {
         Status.OPEN: (Status.IN_PROGRESS, Status.CLOSED),
         Status.IN_PROGRESS: (

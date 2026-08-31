@@ -1,4 +1,6 @@
 # Tests will be added alongside feature development.
+from datetime import timedelta
+
 import pytest
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -7,6 +9,7 @@ from apps.accounts.models import User
 from apps.assets.models import Brand, Device, DeviceModel
 from apps.clients.models import Client
 from apps.sites.models import DeviceInstallation, InstallationStep, Site
+from apps.sites.tasks import escalate_overdue_installations
 
 
 @pytest.fixture
@@ -402,3 +405,111 @@ def test_handover_reanchors_warranty_even_when_steps_already_done(installation, 
     assert r.status_code == 201, r.content
     warranty.refresh_from_db()
     assert str(warranty.start_date) == paper_date
+
+
+# ── Wave 4: installation due-date escalation (ES-05) ──────────────────
+#
+# Policies come from the setup seed migration: scope=installation /
+# trigger=due_date — stage 1 (hours=0) -> ops_manager, stage 2 (hours=24)
+# -> group_head + ops_manager. Anchor = local midnight ending the due date.
+
+
+@pytest.fixture
+def esc_users(db):
+    return {
+        "gh": User.objects.create_user(username="inst-esc-gh", password="x", role="group_head"),
+        "admin": User.objects.create_user(username="inst-esc-admin", password="x", role="super_admin"),
+    }
+
+
+def _overdue(installation, days):
+    DeviceInstallation.objects.filter(pk=installation.pk).update(
+        due_date=timezone.localdate() - timedelta(days=days)
+    )
+
+
+def _esc_notifs(installation):
+    from apps.notifications.models import Notification
+
+    return Notification.objects.filter(
+        installation=installation, notification_type="installation_escalated"
+    )
+
+
+@pytest.mark.django_db
+def test_overdue_installation_fires_stage1(ops, tech, installation, esc_users):
+    _overdue(installation, days=1)  # anchor = today 00:00 → stage 1 only
+
+    assert escalate_overdue_installations() == 1
+    installation.refresh_from_db()
+    assert set(installation.escalation_state) == {"due_date:1"}
+
+    notifs = _esc_notifs(installation)
+    assert notifs.filter(recipient=tech).exists()  # assigned installer
+    assert notifs.filter(recipient=ops).exists()  # escalate_to_role (stage 1)
+    assert notifs.filter(recipient=esc_users["admin"]).exists()  # super admin always
+    assert not notifs.filter(recipient=esc_users["gh"]).exists()  # group head = stage 2
+    assert all(n.is_actionable for n in notifs)
+
+
+@pytest.mark.django_db
+def test_stage2_fires_24h_later_to_group_head(ops, tech, installation, esc_users):
+    _overdue(installation, days=2)  # anchor = yesterday 00:00 → both stages elapsed
+
+    assert escalate_overdue_installations() == 2
+    installation.refresh_from_db()
+    assert set(installation.escalation_state) == {"due_date:1", "due_date:2"}
+    assert _esc_notifs(installation).filter(recipient=esc_users["gh"]).exists()
+
+
+@pytest.mark.django_db
+def test_completed_installations_skipped(installation, esc_users):
+    DeviceInstallation.objects.filter(pk=installation.pk).update(
+        due_date=timezone.localdate() - timedelta(days=5),
+        completed_at=timezone.now(),
+    )
+    assert escalate_overdue_installations() == 0
+    installation.refresh_from_db()
+    assert installation.escalation_state == {}
+    assert not _esc_notifs(installation).exists()
+
+
+@pytest.mark.django_db
+def test_escalation_rerun_is_idempotent(installation, esc_users):
+    _overdue(installation, days=3)
+    assert escalate_overdue_installations() == 2
+    installation.refresh_from_db()
+    first_state = dict(installation.escalation_state)
+    first_count = _esc_notifs(installation).count()
+
+    assert escalate_overdue_installations() == 0
+    installation.refresh_from_db()
+    assert installation.escalation_state == first_state  # keys and timestamps untouched
+    assert _esc_notifs(installation).count() == first_count
+
+
+@pytest.mark.django_db
+def test_escalated_filter_and_serializer_flag(ops, installation, esc_users):
+    _overdue(installation, days=1)
+    other = DeviceInstallation.objects.create(
+        device=installation.device,
+        site=installation.site,
+        installed_at=timezone.now(),
+    )
+    escalate_overdue_installations()
+
+    c = _client(ops)
+    hot = c.get("/api/sites/installations/", {"escalated": "true"})
+    assert [row["id"] for row in hot.data["results"]] == [str(installation.id)]
+    assert hot.data["results"][0]["escalated"] is True
+    assert "due_date:1" in hot.data["results"][0]["escalation_state"]
+
+    cold = c.get("/api/sites/installations/", {"escalated": "false"})
+    cold_ids = [row["id"] for row in cold.data["results"]]
+    assert str(other.id) in cold_ids and str(installation.id) not in cold_ids
+    row = next(r for r in cold.data["results"] if r["id"] == str(other.id))
+    assert row["escalated"] is False
+
+    detail = c.get(f"/api/sites/installations/{installation.id}/")
+    assert detail.data["escalated"] is True
+    assert "due_date:1" in detail.data["escalation_state"]

@@ -213,6 +213,36 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
+# Fail fast when the broker is unreachable — request paths queue emails
+# fire-and-forget and must never sit in kombu's reconnect loops.
+CELERY_TASK_PUBLISH_RETRY = False
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    "socket_connect_timeout": 2,
+    "socket_timeout": 2,
+    "max_retries": 0,
+}
+CELERY_RESULT_BACKEND_TRANSPORT_OPTIONS = {
+    "socket_connect_timeout": 2,
+    "socket_timeout": 2,
+    "retry_policy": {"max_retries": 0},
+}
+
+# ---------------------------------------------------------------------------
+# Email (XC-02) — SMTP when EMAIL_HOST is configured, console echo otherwise.
+# Everything reads from env with safe defaults so an unset environment keeps
+# working (local.py pins the console backend for dev regardless).
+# ---------------------------------------------------------------------------
+EMAIL_HOST = env("EMAIL_HOST", default="")
+EMAIL_BACKEND = (
+    "django.core.mail.backends.smtp.EmailBackend"
+    if EMAIL_HOST
+    else "django.core.mail.backends.console.EmailBackend"
+)
+EMAIL_PORT = env.int("EMAIL_PORT", default=587)
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
+EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=True)
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="alerts@localhost")
 
 # ---------------------------------------------------------------------------
 # AWS / S3
