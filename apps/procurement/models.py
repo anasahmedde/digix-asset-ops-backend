@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.conf import settings
 from django.db import models
 
@@ -41,6 +43,16 @@ class PurchaseOrder(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="approved_pos"
     )
 
+    VALID_TRANSITIONS = {
+        Status.DRAFT: (Status.PENDING_APPROVAL, Status.CANCELLED),
+        Status.PENDING_APPROVAL: (Status.APPROVED, Status.DRAFT, Status.CANCELLED),
+        Status.APPROVED: (Status.ORDERED, Status.CANCELLED),
+        Status.ORDERED: (Status.PARTIALLY_RECEIVED, Status.RECEIVED, Status.CANCELLED),
+        Status.PARTIALLY_RECEIVED: (Status.RECEIVED, Status.CANCELLED),
+        Status.RECEIVED: (),
+        Status.CANCELLED: (),
+    }
+
     class Meta:
         ordering = ["-created_at"]
 
@@ -52,10 +64,29 @@ class PurchaseOrder(TimeStampedModel):
             self.po_number = generate_code("purchase_order", model=type(self), field="po_number")
         super().save(*args, **kwargs)
 
+    def can_transition_to(self, new_status: str) -> bool:
+        return new_status in self.VALID_TRANSITIONS.get(self.status, ())
+
+    def recalc_total(self, save: bool = True):
+        total = sum((item.line_total for item in self.items.all()), Decimal("0"))
+        self.total_amount = total
+        if save:
+            super().save(update_fields=["total_amount", "updated_at"])
+        return total
+
 
 class PurchaseOrderItem(TimeStampedModel):
     purchase_order = models.ForeignKey(
         PurchaseOrder, on_delete=models.CASCADE, related_name="items"
+    )
+    asset_type = models.ForeignKey(
+        "assets.AssetType", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    device_model = models.ForeignKey(
+        "assets.DeviceModel", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    material_type = models.ForeignKey(
+        "assets.MaterialType", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
     )
     description = models.CharField(max_length=300)
     quantity = models.IntegerField(default=1)
