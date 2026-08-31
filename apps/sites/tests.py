@@ -236,6 +236,18 @@ def test_on_hold_steps_count_in_list(ops, installation):
 
 
 @pytest.mark.django_db
+def test_installation_creation_flips_device_to_installed(installation):
+    device = installation.device
+    device.refresh_from_db()
+    # fixture device starts as procured; creating the installation puts it
+    # on the installation track and the flip is journalled
+    assert device.status == "installed"
+    event = device.lifecycle_events.get(event_type="status_change", to_value="installed")
+    assert event.from_value == "procured"
+    assert "Install Site" in event.description
+
+
+@pytest.mark.django_db
 def test_completion_marks_device_installed(installation):
     device = installation.device
     device.status = "in_stock"

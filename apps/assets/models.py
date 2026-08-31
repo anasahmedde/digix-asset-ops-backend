@@ -77,6 +77,7 @@ class AssetType(TimeStampedModel):
 class Device(TimeStampedModel):
     class Status(models.TextChoices):
         PROCURED = "procured", "Procured"
+        IN_PRODUCTION = "in_production", "In Production"
         IN_STOCK = "in_stock", "In Stock"
         ASSIGNED = "assigned", "Assigned to Client"
         INSTALLED = "installed", "Installed"
@@ -87,6 +88,34 @@ class Device(TimeStampedModel):
         LOST_STOLEN = "lost_stolen", "Lost/Stolen"
         RMA = "rma", "RMA"
         IN_TRANSIT = "in_transit", "In Transit"
+
+    class Source(models.TextChoices):
+        INHOUSE = "inhouse", "In-house Production"
+        THIRD_PARTY = "third_party", "Third Party"
+
+    # Enforced status machine — status changes go through the /transition/
+    # action (see views.DeviceViewSet.transition); every flip is journalled
+    # as a DeviceLifecycleEvent + AuditLog entry by signals.py.
+    VALID_TRANSITIONS = {
+        Status.PROCURED: (Status.IN_PRODUCTION, Status.IN_STOCK, Status.IN_TRANSIT, Status.RMA),
+        Status.IN_PRODUCTION: (Status.IN_STOCK, Status.RMA),
+        Status.IN_TRANSIT: (Status.IN_STOCK, Status.PROCURED),
+        Status.IN_STOCK: (
+            Status.ASSIGNED, Status.IN_PRODUCTION, Status.IN_TRANSIT,
+            Status.DECOMMISSIONED, Status.LOST_STOLEN,
+        ),
+        Status.ASSIGNED: (Status.INSTALLED, Status.IN_STOCK, Status.IN_TRANSIT),
+        Status.INSTALLED: (Status.ACTIVE, Status.UNDER_MAINTENANCE, Status.ASSIGNED, Status.RMA),
+        Status.ACTIVE: (
+            Status.UNDER_MAINTENANCE, Status.RMA, Status.CLIENT_PROPERTY,
+            Status.IN_TRANSIT, Status.DECOMMISSIONED, Status.LOST_STOLEN,
+        ),
+        Status.UNDER_MAINTENANCE: (Status.ACTIVE, Status.INSTALLED, Status.RMA, Status.DECOMMISSIONED),
+        Status.RMA: (Status.IN_STOCK, Status.DECOMMISSIONED),
+        Status.CLIENT_PROPERTY: (Status.DECOMMISSIONED,),
+        Status.LOST_STOLEN: (Status.IN_STOCK,),
+        Status.DECOMMISSIONED: (),
+    }
 
     asset_code = models.CharField(max_length=50, unique=True, db_index=True)
     serial_number = models.CharField(max_length=200, unique=True)
@@ -111,6 +140,10 @@ class Device(TimeStampedModel):
     diagonal_inches = models.DecimalField(max_digits=5, decimal_places=1, null=True, blank=True)
 
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROCURED)
+    # Registration origin: built in-house or bought from a third party (WF-05).
+    source = models.CharField(
+        max_length=20, choices=Source.choices, default=Source.THIRD_PARTY, db_index=True
+    )
 
     image = models.ImageField(upload_to=upload_to_path, blank=True, help_text="Primary device photo")
 
@@ -164,6 +197,10 @@ class Device(TimeStampedModel):
         if not self.asset_code:
             self.asset_code = generate_code("asset", model=type(self), field="asset_code")
         super().save(*args, **kwargs)
+
+    def can_transition_to(self, new_status: str) -> bool:
+        allowed = self.VALID_TRANSITIONS.get(self.status, ())
+        return new_status in allowed
 
 
 class DeviceLifecycleEvent(TimeStampedModel):
