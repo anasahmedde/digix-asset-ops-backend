@@ -1,12 +1,12 @@
 from django.contrib.auth import get_user_model
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from common.permissions import IsSuperAdmin
+from common.permissions import ADMIN_ROLES, IsSuperAdmin
 
 from .models import AuditLog
 from .serializers import AuditLogSerializer, UserCreateSerializer, UserSerializer
@@ -59,9 +59,21 @@ class CustomTokenObtainPairView(TokenObtainPairView):
             )
 
 
+class IsSelfOrSuperAdmin(BasePermission):
+    """Writes may only target the requester's own record, unless super_admin."""
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in SAFE_METHODS:
+            return True
+        user = request.user
+        if user.is_superuser or getattr(user, "role", None) in ADMIN_ROLES:
+            return True
+        return obj.pk == user.pk
+
+
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsSelfOrSuperAdmin]
     filterset_fields = ["role", "is_active", "is_field_staff"]
     search_fields = ["username", "email", "first_name", "last_name"]
     ordering_fields = ["date_joined", "username"]
@@ -80,7 +92,7 @@ class UserViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def me(self, request):
-        serializer = UserSerializer(request.user)
+        serializer = UserSerializer(request.user, context=self.get_serializer_context())
         return Response(serializer.data)
 
     @action(detail=False, methods=["post"], url_path="change-password")
