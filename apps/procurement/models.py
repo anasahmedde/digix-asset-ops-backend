@@ -88,6 +88,11 @@ class PurchaseOrderItem(TimeStampedModel):
     material_type = models.ForeignKey(
         "assets.MaterialType", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
     )
+    bom_line = models.ForeignKey(
+        "teams.ProjectBOMLine", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="po_items",
+        help_text="Project BOM line this item was raised to cover (from-shortage flow)",
+    )
     description = models.CharField(max_length=300)
     quantity = models.IntegerField(default=1)
     unit_price = models.DecimalField(max_digits=10, decimal_places=2)

@@ -65,6 +65,10 @@ class Project(TimeStampedModel):
         "workorders.WorkOrder", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="projects", help_text="Work order this project was created from",
     )
+    source_quotation = models.ForeignKey(
+        "quotations.Quotation", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="spawned_projects", help_text="Quotation this project was created from",
+    )
 
     class Meta:
         ordering = ["-created_at"]
@@ -151,6 +155,92 @@ class ProjectBottleneck(TimeStampedModel):
 
     def __str__(self):
         return f"{self.project.name} - {self.title}"
+
+
+class ProjectBOMLine(TimeStampedModel):
+    """One bill-of-materials line on a project: what needs to be provided
+    (typed via asset_type / device_model / material_type), in what quantity,
+    at what price. Fulfilment is tracked through BOMAllocation rows."""
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="bom_lines")
+    asset_type = models.ForeignKey(
+        "assets.AssetType", on_delete=models.SET_NULL, null=True, blank=True, related_name="bom_lines"
+    )
+    device_model = models.ForeignKey(
+        "assets.DeviceModel", on_delete=models.SET_NULL, null=True, blank=True, related_name="bom_lines"
+    )
+    material_type = models.ForeignKey(
+        "assets.MaterialType", on_delete=models.SET_NULL, null=True, blank=True, related_name="bom_lines"
+    )
+    description = models.CharField(max_length=300)
+    quantity = models.PositiveIntegerField(default=1)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    source_quotation_item = models.ForeignKey(
+        "quotations.QuotationItem", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="bom_lines", help_text="Quotation line this BOM line was copied from",
+    )
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.project.name}: {self.description} x{self.quantity}"
+
+    # Computed fulfilment figures. Cancelled allocations never count; issued
+    # allocations stay "allocated" (the need is covered) and also count as
+    # issued. Iterate in python so a prefetch_related("allocations") queryset
+    # answers all three without extra queries.
+    @property
+    def allocated_quantity(self) -> int:
+        return sum(
+            a.quantity for a in self.allocations.all()
+            if a.status != BOMAllocation.Status.CANCELLED
+        )
+
+    @property
+    def issued_quantity(self) -> int:
+        return sum(
+            a.quantity for a in self.allocations.all()
+            if a.status == BOMAllocation.Status.ISSUED
+        )
+
+    @property
+    def shortage(self) -> int:
+        return max(0, self.quantity - self.allocated_quantity)
+
+
+class BOMAllocation(TimeStampedModel):
+    """Reserves a specific device (unique item) or a slice of warehouse stock
+    (generic item) against a BOM line. Stock allocations later flip to
+    ``issued`` via the issue endpoint; devices are issued through
+    installation, never here."""
+
+    class Status(models.TextChoices):
+        ALLOCATED = "allocated", "Allocated"
+        ISSUED = "issued", "Issued"
+        CANCELLED = "cancelled", "Cancelled"
+
+    bom_line = models.ForeignKey(ProjectBOMLine, on_delete=models.CASCADE, related_name="allocations")
+    device = models.ForeignKey(
+        "assets.Device", on_delete=models.SET_NULL, null=True, blank=True, related_name="bom_allocations"
+    )
+    inventory_item = models.ForeignKey(
+        "inventory.InventoryItem", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="bom_allocations",
+    )
+    quantity = models.PositiveIntegerField(default=1)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.ALLOCATED)
+    allocated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="bom_allocations",
+    )
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        target = self.device or self.inventory_item
+        return f"{self.bom_line}: {target} x{self.quantity} ({self.status})"
 
 
 class ProjectMember(TimeStampedModel):

@@ -1,5 +1,8 @@
 from rest_framework import serializers
 
+from apps.suppliers.models import Supplier
+from apps.teams.models import Project
+
 from .models import PurchaseOrder, PurchaseOrderItem
 
 
@@ -21,7 +24,7 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
         model = PurchaseOrderItem
         fields = [
             "id", "asset_type", "asset_type_name", "device_model", "device_model_name",
-            "material_type", "material_type_name", "description",
+            "material_type", "material_type_name", "bom_line", "description",
             "quantity", "unit_price", "received_quantity", "line_total",
         ]
         # received_quantity is owned by goods receiving — never writable via the API.
@@ -116,6 +119,57 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
 
         instance.recalc_total()
         return instance
+
+
+class PurchaseOrderFromShortageSerializer(serializers.Serializer):
+    """Input for POST /purchase-orders/from-shortage/ — raise a draft PO
+    covering a project's unallocated BOM quantities."""
+
+    project = serializers.PrimaryKeyRelatedField(queryset=Project.objects.all())
+    supplier = serializers.PrimaryKeyRelatedField(queryset=Supplier.objects.all())
+    currency = serializers.ChoiceField(choices=PurchaseOrder.Currency.choices, required=False)
+    line_ids = serializers.ListField(child=serializers.UUIDField(), required=False, allow_empty=False)
+
+    def validate(self, attrs):
+        project = attrs["project"]
+        lines = project.bom_lines.prefetch_related("allocations").all()
+        line_ids = attrs.get("line_ids")
+        if line_ids is not None:
+            by_id = {line.pk: line for line in lines}
+            missing = [str(pk) for pk in line_ids if pk not in by_id]
+            if missing:
+                raise serializers.ValidationError({
+                    "line_ids": f"BOM lines not on this project: {', '.join(missing)}."
+                })
+            lines = [by_id[pk] for pk in line_ids]
+        shortage_lines = [line for line in lines if line.shortage > 0]
+        if not shortage_lines:
+            raise serializers.ValidationError({
+                "line_ids": "Nothing to order — no BOM lines with a shortage."
+            })
+        attrs["shortage_lines"] = shortage_lines
+        return attrs
+
+
+class PurchaseOrderReceiveLineSerializer(serializers.Serializer):
+    """One received line in POST /purchase-orders/{id}/receive/."""
+
+    po_item = serializers.UUIDField()
+    quantity = serializers.IntegerField(min_value=1)
+    batch_number = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    serial_numbers = serializers.ListField(
+        child=serializers.CharField(max_length=200), required=False, default=list
+    )
+
+
+class PurchaseOrderReceiveSerializer(serializers.Serializer):
+    """Input for POST /purchase-orders/{id}/receive/ — record a goods receipt
+    against the PO. Business rules (status, quantities, serial uniqueness)
+    are enforced by services.receive_against_po."""
+
+    reference = serializers.CharField(required=False, allow_blank=True, max_length=200, default="")
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    lines = PurchaseOrderReceiveLineSerializer(many=True, allow_empty=False)
 
 
 class PurchaseOrderTransitionSerializer(serializers.Serializer):

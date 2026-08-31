@@ -2,6 +2,7 @@ from rest_framework import serializers
 
 from .models import (
     GoodsReceipt,
+    GoodsReceiptLine,
     InventoryCategory,
     InventoryItem,
     Issuance,
@@ -52,23 +53,51 @@ class StockMovementSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
+class GoodsReceiptLineSerializer(serializers.ModelSerializer):
+    po_item_description = serializers.CharField(source="po_item.description", read_only=True, default=None)
+    inventory_item_name = serializers.CharField(
+        source="inventory_item.material_type.name", read_only=True, default=None
+    )
+
+    class Meta:
+        model = GoodsReceiptLine
+        fields = [
+            "id", "po_item", "po_item_description", "inventory_item", "inventory_item_name",
+            "quantity", "batch_number", "serial_numbers", "created_at",
+        ]
+        read_only_fields = fields
+
+
 class GoodsReceiptSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.material_type.name", read_only=True, default=None)
     wo_number = serializers.CharField(source="work_order.wo_number", read_only=True, default=None)
+    po_number = serializers.CharField(source="purchase_order.po_number", read_only=True, default=None)
     received_by_name = serializers.CharField(source="received_by.get_full_name", read_only=True, default=None)
+    lines = GoodsReceiptLineSerializer(many=True, read_only=True)
 
     class Meta:
         model = GoodsReceipt
         fields = [
-            "id", "grn_number", "work_order", "wo_number", "item", "item_name",
-            "quantity", "reference", "received_by", "received_by_name", "notes", "created_at",
+            "id", "grn_number", "work_order", "wo_number",
+            "purchase_order", "po_number", "item", "item_name",
+            "quantity", "reference", "received_by", "received_by_name",
+            "notes", "lines", "created_at",
         ]
-        read_only_fields = ["id", "grn_number", "received_by", "created_at"]
+        # purchase_order receipts are created via POST /purchase-orders/{id}/receive/,
+        # never through this legacy endpoint — hence read-only here.
+        read_only_fields = ["id", "grn_number", "purchase_order", "received_by", "created_at"]
+        # The model made item/quantity nullable for PO-level receipts; the
+        # legacy endpoint still requires both so the old flow keeps working.
+        extra_kwargs = {
+            "item": {"required": True, "allow_null": False},
+            "quantity": {"required": True, "allow_null": False, "min_value": 1},
+        }
 
 
 class IssuanceSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.material_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="issued_to_site.name", read_only=True, default=None)
+    project_name = serializers.CharField(source="issued_to_project.name", read_only=True, default=None)
     issued_by_name = serializers.CharField(source="issued_by.get_full_name", read_only=True, default=None)
 
     class Meta:
@@ -76,6 +105,7 @@ class IssuanceSerializer(serializers.ModelSerializer):
         fields = [
             "id", "issue_number", "item", "item_name", "quantity",
             "issued_to_site", "site_name", "issued_to_work_order", "issued_to_user",
+            "issued_to_project", "project_name", "bom_line",
             "issued_by", "issued_by_name", "reason", "notes", "created_at",
         ]
         read_only_fields = ["id", "issue_number", "issued_by", "created_at"]

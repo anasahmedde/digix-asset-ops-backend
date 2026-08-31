@@ -1,6 +1,56 @@
 from rest_framework import serializers
 
-from .models import Project, ProjectBottleneck, ProjectMember, ProjectMilestone, ProjectScopeItem
+from .models import (
+    BOMAllocation,
+    Project,
+    ProjectBOMLine,
+    ProjectBottleneck,
+    ProjectMember,
+    ProjectMilestone,
+    ProjectScopeItem,
+)
+
+
+class BOMAllocationSerializer(serializers.ModelSerializer):
+    device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
+    device_serial = serializers.CharField(source="device.serial_number", read_only=True, default=None)
+    item_name = serializers.CharField(source="inventory_item.material_type.name", read_only=True, default=None)
+    allocated_by_name = serializers.CharField(source="allocated_by.get_full_name", read_only=True, default=None)
+
+    class Meta:
+        model = BOMAllocation
+        fields = [
+            "id", "bom_line", "device", "device_code", "device_serial",
+            "inventory_item", "item_name", "quantity", "status",
+            "allocated_by", "allocated_by_name", "created_at",
+        ]
+        read_only_fields = ["id", "status", "allocated_by", "created_at"]
+
+
+class ProjectBOMLineSerializer(serializers.ModelSerializer):
+    asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
+    device_model_name = serializers.CharField(source="device_model.name", read_only=True, default=None)
+    material_type_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
+    allocated_quantity = serializers.IntegerField(read_only=True)
+    issued_quantity = serializers.IntegerField(read_only=True)
+    shortage = serializers.IntegerField(read_only=True)
+    allocations = BOMAllocationSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ProjectBOMLine
+        fields = [
+            "id", "project", "asset_type", "asset_type_name",
+            "device_model", "device_model_name", "material_type", "material_type_name",
+            "description", "quantity", "unit_price",
+            "allocated_quantity", "issued_quantity", "shortage",
+            "allocations", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate_quantity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Quantity must be a positive integer.")
+        return value
 
 
 class ProjectBottleneckSerializer(serializers.ModelSerializer):

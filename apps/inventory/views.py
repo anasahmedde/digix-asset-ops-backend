@@ -22,6 +22,7 @@ from .serializers import (
     IssuanceSerializer,
     StockMovementSerializer,
 )
+from .services import apply_issuance_stock_out
 
 
 class InventoryCategoryViewSet(viewsets.ModelViewSet):
@@ -92,10 +93,14 @@ class StockMovementViewSet(viewsets.ModelViewSet):
 
 
 class GoodsReceiptViewSet(viewsets.ModelViewSet):
-    queryset = GoodsReceipt.objects.select_related("item", "work_order", "received_by").all()
+    queryset = (
+        GoodsReceipt.objects.select_related("item", "work_order", "purchase_order", "received_by")
+        .prefetch_related("lines", "lines__po_item", "lines__inventory_item__material_type")
+        .all()
+    )
     serializer_class = GoodsReceiptSerializer
     permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
-    filterset_fields = ["item", "work_order"]
+    filterset_fields = ["item", "work_order", "purchase_order"]
     ordering_fields = ["created_at"]
 
     def perform_create(self, serializer):
@@ -116,24 +121,14 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
 
 class IssuanceViewSet(viewsets.ModelViewSet):
     queryset = Issuance.objects.select_related(
-        "item", "issued_to_site", "issued_to_work_order", "issued_by"
+        "item", "issued_to_site", "issued_to_work_order", "issued_to_project", "issued_by"
     ).all()
     serializer_class = IssuanceSerializer
     permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
-    filterset_fields = ["item", "issued_to_site", "issued_to_work_order"]
+    filterset_fields = ["item", "issued_to_site", "issued_to_work_order", "issued_to_project", "bom_line"]
     ordering_fields = ["created_at"]
 
     def perform_create(self, serializer):
         with transaction.atomic():
             issuance = serializer.save(issued_by=self.request.user)
-            item = InventoryItem.objects.select_for_update().get(pk=issuance.item_id)
-            item.quantity -= issuance.quantity
-            item.save(update_fields=["quantity", "updated_at"])
-            StockMovement.objects.create(
-                item=item,
-                movement_type=StockMovement.MovementType.OUT,
-                quantity=issuance.quantity,
-                reference=issuance.issue_number,
-                performed_by=self.request.user,
-                notes=issuance.reason or f"Issued {issuance.issue_number}",
-            )
+            apply_issuance_stock_out(issuance, self.request.user)

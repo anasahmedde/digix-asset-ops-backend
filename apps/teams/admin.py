@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Project, ProjectBottleneck, ProjectMember
+from .models import BOMAllocation, Project, ProjectBOMLine, ProjectBottleneck, ProjectMember
 
 
 class ProjectMemberInline(admin.TabularInline):
@@ -31,3 +31,21 @@ class ProjectBottleneckAdmin(admin.ModelAdmin):
 class ProjectMemberAdmin(admin.ModelAdmin):
     list_display = ["project", "user", "role"]
     list_filter = ["role"]
+
+
+class BOMAllocationInline(admin.TabularInline):
+    model = BOMAllocation
+    extra = 0
+
+
+@admin.register(ProjectBOMLine)
+class ProjectBOMLineAdmin(admin.ModelAdmin):
+    list_display = ["project", "description", "quantity", "unit_price"]
+    search_fields = ["description", "project__name"]
+    inlines = [BOMAllocationInline]
+
+
+@admin.register(BOMAllocation)
+class BOMAllocationAdmin(admin.ModelAdmin):
+    list_display = ["bom_line", "device", "inventory_item", "quantity", "status"]
+    list_filter = ["status"]
