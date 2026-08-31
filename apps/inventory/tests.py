@@ -134,3 +134,124 @@ def test_legacy_goods_receipt_still_requires_item_and_increments_stock(ops, item
     # model now allows null for PO-level receipts
     assert c.post("/api/inventory/receipts/", {"quantity": 5}, format="json").status_code == 400
     assert c.post("/api/inventory/receipts/", {"item": str(cable.pk)}, format="json").status_code == 400
+
+
+# ── Excel export (XC-01) ──────────────────────────────────────────────
+
+import io as _io
+
+from openpyxl import load_workbook as _load_workbook
+
+from apps.accounts.models import AuditLog as _AuditLog
+
+
+def _sheet_rows(resp):
+    wb = _load_workbook(_io.BytesIO(resp.content), read_only=True)
+    return [list(row) for row in wb.active.iter_rows(values_only=True)]
+
+
+@pytest.mark.django_db
+def test_inventory_export_happy_path(ops, items):
+    resp = _client(ops).get("/api/inventory/items/export/")
+    assert resp.status_code == 200, resp.content
+    assert resp["Content-Type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    rows = _sheet_rows(resp)
+    assert rows[0] == [
+        "SKU", "Material", "Category", "Quantity", "Min Stock Level",
+        "Location", "Unit Cost", "Low Stock",
+    ]
+    assert len(rows) == 4  # header + 3 items
+    by_material = {r[1]: r for r in rows[1:]}
+    assert by_material["Inv Cable"][3] == 10
+    assert by_material["Inv Cable"][7] == "No"
+
+    log = _AuditLog.objects.filter(action="export", resource_type="inventory_item").latest("created_at")
+    assert log.detail["count"] == 3
+    assert log.user_id == ops.id
+
+
+@pytest.mark.django_db
+def test_inventory_export_applies_filters_and_low_stock_flag(ops, items):
+    transit_type = MaterialType.objects.create(name="Inv Transit Panel", unit="piece")
+    InventoryItem.objects.create(
+        material_type=transit_type, quantity=2, min_stock_level=5, location="in_transit"
+    )
+
+    resp = _client(ops).get("/api/inventory/items/export/", {"location": "in_transit"})
+    assert resp.status_code == 200, resp.content
+    rows = _sheet_rows(resp)
+    assert len(rows) == 2
+    assert rows[1][1] == "Inv Transit Panel"
+    assert rows[1][5] == "In Transit"
+    assert rows[1][7] == "Yes"  # 2 <= min_stock_level 5
+
+    log = _AuditLog.objects.filter(action="export", resource_type="inventory_item").latest("created_at")
+    assert log.detail == {"count": 1, "params": {"location": "in_transit"}}
+
+
+# ── Wave 5: ?low_stock= drill-down + category search parity ──────────
+
+
+@pytest.fixture
+def stocked_items(db):
+    low_type = MaterialType.objects.create(name="Inv Low Panel", unit="piece")
+    ok_type = MaterialType.objects.create(name="Inv OK Panel", unit="piece")
+    low = InventoryItem.objects.create(material_type=low_type, quantity=3, min_stock_level=5)
+    ok = InventoryItem.objects.create(material_type=ok_type, quantity=50, min_stock_level=5)
+    return low, ok
+
+
+@pytest.mark.django_db
+def test_items_low_stock_filter(ops, stocked_items):
+    c = _client(ops)
+    r = c.get("/api/inventory/items/", {"low_stock": "true", "page_size": 100})
+    assert r.status_code == 200, r.content
+    names = {row["material_name"] for row in r.data["results"]}
+    assert names == {"Inv Low Panel"}
+
+    r = c.get("/api/inventory/items/", {"low_stock": "false", "page_size": 100})
+    names = {row["material_name"] for row in r.data["results"]}
+    assert names == {"Inv OK Panel"}
+
+    # Unknown values are ignored — both rows come back.
+    r = c.get("/api/inventory/items/", {"low_stock": "maybe", "page_size": 100})
+    assert len(r.data["results"]) == 2
+
+
+@pytest.mark.django_db
+def test_items_low_stock_boundary_is_inclusive(ops, db):
+    edge_type = MaterialType.objects.create(name="Inv Edge Panel", unit="piece")
+    InventoryItem.objects.create(material_type=edge_type, quantity=5, min_stock_level=5)
+
+    r = _client(ops).get("/api/inventory/items/", {"low_stock": "true", "page_size": 100})
+    assert "Inv Edge Panel" in {row["material_name"] for row in r.data["results"]}
+
+
+@pytest.mark.django_db
+def test_items_low_stock_applies_to_export(ops, stocked_items):
+    resp = _client(ops).get("/api/inventory/items/export/", {"low_stock": "true"})
+    assert resp.status_code == 200, resp.content
+    rows = _sheet_rows(resp)
+    assert len(rows) == 2  # header + the one low item
+    assert rows[1][1] == "Inv Low Panel"
+    assert rows[1][7] == "Yes"
+
+    log = _AuditLog.objects.filter(action="export", resource_type="inventory_item").latest("created_at")
+    assert log.detail == {"count": 1, "params": {"low_stock": "true"}}
+
+
+@pytest.mark.django_db
+def test_items_search_by_category_name(ops, db):
+    from apps.inventory.models import InventoryCategory
+
+    cat = InventoryCategory.objects.create(name="Fasteners")
+    bolt = MaterialType.objects.create(name="Inv Bolt", unit="box")
+    InventoryItem.objects.create(material_type=bolt, category=cat, quantity=10)
+    other = MaterialType.objects.create(name="Inv Other", unit="box")
+    InventoryItem.objects.create(material_type=other, quantity=10)
+
+    r = _client(ops).get("/api/inventory/items/", {"search": "Fasteners", "page_size": 100})
+    assert r.status_code == 200, r.content
+    names = {row["material_name"] for row in r.data["results"]}
+    assert names == {"Inv Bolt"}

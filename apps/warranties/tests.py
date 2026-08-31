@@ -191,3 +191,136 @@ def test_client_warranty_reanchors_on_handover(device):
     w.refresh_from_db()
     assert w.start_date == inst.completed_at.date()
     assert (w.end_date - w.start_date).days >= 180
+
+
+# ── Excel export (XC-01) ──────────────────────────────────────────────
+
+import io as _io
+
+from openpyxl import load_workbook as _load_workbook
+
+from apps.accounts.models import AuditLog as _AuditLog
+
+
+def _sheet_rows(resp):
+    wb = _load_workbook(_io.BytesIO(resp.content), read_only=True)
+    return [list(row) for row in wb.active.iter_rows(values_only=True)]
+
+
+@pytest.fixture
+def mixed_warranties(db, device):
+    today = timezone.now().date()
+    client_w = Warranty.objects.create(
+        device=device, warranty_type="client", start_date=today,
+        end_date=today + timedelta(days=90), months=3, reference_number="REF-CL-1",
+    )
+    supplier_w = Warranty.objects.create(
+        device=device, warranty_type="manufacturer", start_date=today,
+        end_date=today + timedelta(days=365), months=12, reference_number="REF-MF-1",
+    )
+    return client_w, supplier_w
+
+
+@pytest.mark.django_db
+def test_warranties_export_happy_path(mixed_warranties):
+    admin = User.objects.create_user(username="war-admin", password="x", role="super_admin")
+    resp = _client(admin).get("/api/warranties/export/")
+    assert resp.status_code == 200, resp.content
+    assert resp["Content-Type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    rows = _sheet_rows(resp)
+    assert rows[0][:4] == ["Asset Code", "Component", "Warranty Type", "Status"]
+    assert len(rows) == 3  # header + both warranties (admin sees all)
+
+    log = _AuditLog.objects.filter(action="export", resource_type="warranty").latest("created_at")
+    assert log.detail["count"] == 2
+    assert log.user_id == admin.id
+
+
+@pytest.mark.django_db
+def test_warranties_export_role_scoped(mixed_warranties):
+    # Marketing only sees client warranties; ops only supplier-facing ones.
+    marketing = User.objects.create_user(username="war-mkt", password="x", role="marketing")
+    resp = _client(marketing).get("/api/warranties/export/")
+    rows = _sheet_rows(resp)
+    assert [r[8] for r in rows[1:]] == ["REF-CL-1"]
+
+    ops = User.objects.create_user(username="war-ops-x", password="x", role="ops_manager")
+    resp = _client(ops).get("/api/warranties/export/")
+    rows = _sheet_rows(resp)
+    assert [r[8] for r in rows[1:]] == ["REF-MF-1"]
+
+
+@pytest.mark.django_db
+def test_warranties_export_applies_filters(mixed_warranties):
+    admin = User.objects.create_user(username="war-admin2", password="x", role="super_admin")
+    resp = _client(admin).get("/api/warranties/export/", {"warranty_type": "client"})
+    assert resp.status_code == 200, resp.content
+    rows = _sheet_rows(resp)
+    assert len(rows) == 2
+    assert rows[1][8] == "REF-CL-1"
+
+    log = _AuditLog.objects.filter(action="export", resource_type="warranty").latest("created_at")
+    assert log.detail == {"count": 1, "params": {"warranty_type": "client"}}
+
+
+# ── Wave 5: ?side= drill-down (list + export) ─────────────────────────
+
+
+@pytest.fixture
+def all_sides(db, device):
+    """One warranty per type so ?side= grouping is fully exercised."""
+    today = timezone.now().date()
+    refs = {}
+    for wtype, ref in (
+        ("client", "REF-SIDE-CL"),
+        ("supplier", "REF-SIDE-SU"),
+        ("manufacturer", "REF-SIDE-MF"),
+        ("extended", "REF-SIDE-EX"),
+    ):
+        refs[wtype] = Warranty.objects.create(
+            device=device, warranty_type=wtype, start_date=today,
+            end_date=today + timedelta(days=365), months=12, reference_number=ref,
+        )
+    return refs
+
+
+@pytest.mark.django_db
+def test_side_filter_on_list(all_sides):
+    admin = User.objects.create_user(username="war-side-admin", password="x", role="super_admin")
+    c = _client(admin)
+
+    r = c.get("/api/warranties/", {"side": "client", "page_size": 100})
+    assert r.status_code == 200, r.content
+    refs = {row["reference_number"] for row in r.data["results"]}
+    assert refs == {"REF-SIDE-CL"}
+
+    r = c.get("/api/warranties/", {"side": "supplier", "page_size": 100})
+    refs = {row["reference_number"] for row in r.data["results"]}
+    assert refs == {"REF-SIDE-SU", "REF-SIDE-MF", "REF-SIDE-EX"}
+
+    # Unknown values are ignored — everything comes back.
+    r = c.get("/api/warranties/", {"side": "bogus", "page_size": 100})
+    assert len(r.data["results"]) == 4
+
+
+@pytest.mark.django_db
+def test_side_filter_respects_role_scope(all_sides):
+    # Marketing is already scoped to client warranties — asking for the
+    # supplier side must not widen their view.
+    marketing = User.objects.create_user(username="war-side-mkt", password="x", role="marketing")
+    r = _client(marketing).get("/api/warranties/", {"side": "supplier", "page_size": 100})
+    assert r.status_code == 200, r.content
+    assert r.data["results"] == []
+
+
+@pytest.mark.django_db
+def test_side_filter_applies_to_export(all_sides):
+    admin = User.objects.create_user(username="war-side-admin2", password="x", role="super_admin")
+    resp = _client(admin).get("/api/warranties/export/", {"side": "supplier"})
+    assert resp.status_code == 200, resp.content
+    rows = _sheet_rows(resp)
+    assert {r[8] for r in rows[1:]} == {"REF-SIDE-SU", "REF-SIDE-MF", "REF-SIDE-EX"}
+
+    log = _AuditLog.objects.filter(action="export", resource_type="warranty").latest("created_at")
+    assert log.detail == {"count": 3, "params": {"side": "supplier"}}
