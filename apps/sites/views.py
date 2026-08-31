@@ -13,15 +13,23 @@ from common.permissions import AdminManagerWriteElseRead
 
 
 class IsSuperAdminOrAssignedInstaller(BasePermission):
-    """Step/delay actions: the assigned installer (mobile) or a super admin (desktop)."""
+    """Step/delay actions: the assigned installer (mobile), the installation's
+    vendor (portal login, XC-04) or a super admin (desktop)."""
 
     message = "Only the assigned installer or a super admin can do this."
 
     def has_object_permission(self, request, view, obj):
         installation = obj.installation if hasattr(obj, "installation") else obj
-        return (
-            getattr(request.user, "role", None) == "super_admin"
-            or installation.installed_by_id == request.user.id
+        user = request.user
+        if getattr(user, "role", None) == "super_admin":
+            return True
+        if installation.installed_by_id == user.id:
+            return True
+        # Vendor-portal users may advance steps on their own installations.
+        return bool(
+            getattr(user, "role", None) == "vendor"
+            and getattr(user, "supplier_id", None)
+            and installation.vendor_id == user.supplier_id
         )
 
 from .models import (
@@ -107,6 +115,13 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        # Vendor scope (XC-04): portal users only see installations their
+        # supplier is doing; a vendor login without a supplier sees nothing.
+        user = self.request.user
+        if getattr(user, "role", "") == "vendor" and not user.is_superuser:
+            if not user.supplier_id:
+                return qs.none()
+            qs = qs.filter(vendor_id=user.supplier_id)
         # ?escalated=true|false — installations with a non-empty escalation ledger.
         escalated = self.request.query_params.get("escalated")
         if escalated is not None:
@@ -356,4 +371,12 @@ class InstallationPhotoViewSet(viewsets.ModelViewSet):
         return [IsAuthenticated(), AdminManagerWriteElseRead()]
 
     def perform_create(self, serializer):
-        serializer.save(taken_by=self.request.user)
+        user = self.request.user
+        if getattr(user, "role", "") == "vendor":
+            # Vendor-portal users may only photograph their own installations.
+            installation = serializer.validated_data["installation"]
+            if not user.supplier_id or installation.vendor_id != user.supplier_id:
+                from rest_framework.exceptions import PermissionDenied
+
+                raise PermissionDenied("Vendors can only add photos to their own installations.")
+        serializer.save(taken_by=user)

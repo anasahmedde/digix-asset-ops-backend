@@ -19,6 +19,7 @@ class User(AbstractUser):
         FINANCE = "finance", "Finance"
         WAREHOUSE = "warehouse", "Warehouse Staff"
         CLIENT_VIEWER = "client_viewer", "Client Viewer"
+        VENDOR = "vendor", "Vendor"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.TECHNICIAN)
@@ -37,6 +38,15 @@ class User(AbstractUser):
     )
     join_date = models.DateField(null=True, blank=True)
     leaving_date = models.DateField(null=True, blank=True)
+    # Vendor-portal accounts (XC-04): which supplier this login belongs to.
+    # Everything a role=vendor user can see/do is scoped to this supplier.
+    supplier = models.ForeignKey(
+        "suppliers.Supplier",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="portal_users",
+    )
 
     class Meta:
         ordering = ["-date_joined"]

@@ -666,3 +666,115 @@ def test_installation_bucket_applies_to_export(ops, bucket_installations):
 
     log = _AuditLog.objects.filter(action="export", resource_type="installation").latest("created_at")
     assert log.detail == {"count": 1, "params": {"bucket": "overdue"}}
+
+
+# ── Vendor access (XC-04) ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def vendor_install(db, installation):
+    """A second installation done by a vendor, plus vendor logins."""
+    from apps.suppliers.models import Supplier
+
+    supplier = Supplier.objects.create(name="Install Vendor")
+    other_supplier = Supplier.objects.create(name="Rival Vendor")
+    vendor_user = User.objects.create_user(
+        username="site-vendor", password="x", role="vendor", supplier=supplier
+    )
+    other_vendor_user = User.objects.create_user(
+        username="site-vendor-b", password="x", role="vendor", supplier=other_supplier
+    )
+    unlinked_vendor = User.objects.create_user(username="site-vendor-none", password="x", role="vendor")
+
+    site = Site.objects.create(name="Vendor Site", city="Lahore")
+    brand = Brand.objects.create(name="VendBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="V-1")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-VEND-1", serial_number="VEND-1",
+        display_name="Vendor Screen",
+    )
+    vendor_installation = DeviceInstallation.objects.create(
+        device=device, site=site, vendor=supplier, installed_at=timezone.now()
+    )
+    return {
+        "supplier": supplier,
+        "vendor_user": vendor_user,
+        "other_vendor_user": other_vendor_user,
+        "unlinked_vendor": unlinked_vendor,
+        "vendor_installation": vendor_installation,
+    }
+
+
+@pytest.mark.django_db
+def test_vendor_sees_only_own_installations(vendor_install, installation):
+    r = _client(vendor_install["vendor_user"]).get("/api/sites/installations/")
+    assert r.status_code == 200
+    assert r.data["count"] == 1
+    assert r.data["results"][0]["id"] == str(vendor_install["vendor_installation"].id)
+    # Detail of the tech-run installation is invisible to the vendor.
+    r = _client(vendor_install["vendor_user"]).get(f"/api/sites/installations/{installation.id}/")
+    assert r.status_code == 404
+    # Other supplier's vendor and an unlinked vendor login see nothing.
+    assert _client(vendor_install["other_vendor_user"]).get("/api/sites/installations/").data["count"] == 0
+    assert _client(vendor_install["unlinked_vendor"]).get("/api/sites/installations/").data["count"] == 0
+
+
+@pytest.mark.django_db
+def test_vendor_advances_own_step_403_on_others(vendor_install, installation):
+    c = _client(vendor_install["vendor_user"])
+    own_step = vendor_install["vendor_installation"].steps.first()
+    r = c.patch(f"/api/sites/installation-steps/{own_step.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 200, r.content
+    own_step.refresh_from_db()
+    assert own_step.status == "in_progress"
+
+    other_step = installation.steps.first()
+    r = c.patch(f"/api/sites/installation-steps/{other_step.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 403
+    r = _client(vendor_install["other_vendor_user"]).patch(
+        f"/api/sites/installation-steps/{own_step.id}/", {"status": "completed"}, format="json"
+    )
+    assert r.status_code == 403
+
+
+@pytest.mark.django_db
+def test_vendor_uploads_photos_own_installation_only(vendor_install, installation):
+    import io
+
+    from PIL import Image
+
+    def _png():
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8), "blue").save(buf, format="PNG")
+        buf.seek(0)
+        buf.name = "site.png"
+        return buf
+
+    c = _client(vendor_install["vendor_user"])
+    r = c.post("/api/sites/installation-photos/", {
+        "installation": str(vendor_install["vendor_installation"].id),
+        "photo_type": "pre_install",
+        "image": _png(),
+    }, format="multipart")
+    assert r.status_code == 201, r.content
+
+    r = c.post("/api/sites/installation-photos/", {
+        "installation": str(installation.id),
+        "photo_type": "pre_install",
+        "image": _png(),
+    }, format="multipart")
+    assert r.status_code == 403
+
+
+@pytest.mark.django_db
+def test_vendor_cannot_handover(vendor_install):
+    inst = vendor_install["vendor_installation"]
+    for step in inst.steps.exclude(step_type=InstallationStep.StepType.HANDOVER):
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+    r = _client(vendor_install["vendor_user"]).post(
+        f"/api/sites/installations/{inst.pk}/handover/",
+        {"accepted_by_name": "Client POC"},
+        format="multipart",
+    )
+    assert r.status_code == 403

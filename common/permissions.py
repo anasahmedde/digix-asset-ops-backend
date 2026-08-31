@@ -14,6 +14,10 @@ ALL_INTERNAL_ROLES = (
     "super_admin", "group_head", "ops_manager", "marketing_head", "supervisor",
     "technician", "finance", "warehouse",
 )
+# External vendor-portal logins (XC-04). Deliberately absent from every
+# write-role group above: vendors are read-only everywhere except the
+# explicit ticket/installation actions scoped to their own supplier.
+VENDOR_ROLES = ("vendor",)
 
 
 def _role(user):
@@ -80,6 +84,11 @@ class TechnicianCanCreate(BasePermission):
         "transition", "submit_completion",
         "ticket_comments", "ticket_attachments",
     )
+    # Vendors work tickets assigned to their supplier but never create or
+    # edit them; the view's object gates enforce the supplier match.
+    VENDOR_ALLOWED_ACTIONS = (
+        "transition", "submit_completion", "ticket_comments",
+    )
 
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
@@ -90,6 +99,8 @@ class TechnicianCanCreate(BasePermission):
         if role in MANAGER_ROLES:
             return True
         if role in ("technician", "supervisor", "marketing", "marketing_head") and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
+            return True
+        if role in VENDOR_ROLES and view.action in self.VENDOR_ALLOWED_ACTIONS:
             return True
         return False
 

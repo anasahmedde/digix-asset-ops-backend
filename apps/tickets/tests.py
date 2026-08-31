@@ -950,3 +950,81 @@ def test_ticket_search_by_site_and_assignee_names(people):
         assert r.status_code == 200, r.content
         titles = {row["title"] for row in r.data["results"]}
         assert titles == {"Search hit"}, term
+
+
+# ── Vendor access (XC-04) ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def vendor_setup(db, people):
+    """Two suppliers, a vendor login for each, and one ticket assigned to A."""
+    supplier_a = Supplier.objects.create(name="Vendor A")
+    supplier_b = Supplier.objects.create(name="Vendor B")
+    vendor_a = User.objects.create_user(username="wf-vendor-a", password="x", role="vendor", supplier=supplier_a)
+    vendor_b = User.objects.create_user(username="wf-vendor-b", password="x", role="vendor", supplier=supplier_b)
+    vendor_none = User.objects.create_user(username="wf-vendor-none", password="x", role="vendor")
+
+    c_mkt, c_ops = _client(people["marketing"]), _client(people["ops"])
+    assigned_id = c_mkt.post("/api/tickets/", {"title": "vendor job"}, format="json").json()["id"]
+    r = c_ops.post(f"/api/tickets/{assigned_id}/assign/", {"assigned_vendor": str(supplier_a.id)}, format="json")
+    assert r.status_code == 200, r.content
+    other_id = c_mkt.post("/api/tickets/", {"title": "internal job"}, format="json").json()["id"]
+    return {
+        "supplier_a": supplier_a, "supplier_b": supplier_b,
+        "vendor_a": vendor_a, "vendor_b": vendor_b, "vendor_none": vendor_none,
+        "assigned_id": assigned_id, "other_id": other_id,
+    }
+
+
+@pytest.mark.django_db
+def test_vendor_sees_only_own_supplier_tickets(vendor_setup):
+    r = _client(vendor_setup["vendor_a"]).get("/api/tickets/")
+    assert r.status_code == 200
+    assert [row["id"] for row in r.data["results"]] == [vendor_setup["assigned_id"]]
+
+    # Other supplier's vendor sees nothing; unlinked vendor login sees nothing.
+    assert _client(vendor_setup["vendor_b"]).get("/api/tickets/").data["count"] == 0
+    assert _client(vendor_setup["vendor_none"]).get("/api/tickets/").data["count"] == 0
+
+
+@pytest.mark.django_db
+def test_vendor_workflow_on_assigned_ticket(vendor_setup):
+    c = _client(vendor_setup["vendor_a"])
+    tid = vendor_setup["assigned_id"]
+
+    # Vendor counts as the assignee: start work, comment, submit completion.
+    assert c.post(f"/api/tickets/{tid}/transition/", {"status": "in_progress"}, format="json").status_code == 200
+    r = c.post(f"/api/tickets/{tid}/comments/", {"content": "on site now"}, format="json")
+    assert r.status_code == 201, r.content
+    r = c.post(
+        f"/api/tickets/{tid}/submit-completion/",
+        {"completion_notes": "Panel swapped", "images": [_png()]},
+        format="multipart",
+    )
+    assert r.status_code == 200, r.content
+    t = Ticket.objects.get(pk=tid)
+    assert t.status == "pending_review"
+    assert t.completed_by_id == vendor_setup["vendor_a"].id
+
+
+@pytest.mark.django_db
+def test_vendor_blocked_on_other_tickets(vendor_setup):
+    other = vendor_setup["other_id"]
+    for user in (vendor_setup["vendor_b"], vendor_setup["vendor_a"]):
+        c = _client(user)
+        # Out-of-scope tickets are invisible → 404 (never 200).
+        assert c.get(f"/api/tickets/{other}/").status_code == 404
+        assert c.post(f"/api/tickets/{other}/transition/", {"status": "in_progress"}, format="json").status_code in (403, 404)
+        r = c.post(
+            f"/api/tickets/{other}/submit-completion/",
+            {"completion_notes": "nope"}, format="multipart",
+        )
+        assert r.status_code in (403, 404)
+
+
+@pytest.mark.django_db
+def test_vendor_cannot_create_or_edit_tickets(vendor_setup):
+    c = _client(vendor_setup["vendor_a"])
+    assert c.post("/api/tickets/", {"title": "vendor raised"}, format="json").status_code == 403
+    r = c.patch(f"/api/tickets/{vendor_setup['assigned_id']}/", {"title": "renamed"}, format="json")
+    assert r.status_code == 403

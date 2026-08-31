@@ -25,6 +25,15 @@ from .serializers import (
 )
 
 
+def _is_assigned_vendor(user, ticket):
+    """Vendor-portal user whose supplier is this ticket's assigned vendor (XC-04)."""
+    return bool(
+        getattr(user, "role", "") == "vendor"
+        and getattr(user, "supplier_id", None)
+        and ticket.assigned_vendor_id == user.supplier_id
+    )
+
+
 class TicketIssueTypeViewSet(viewsets.ModelViewSet):
     """Fault catalogue (Module Burnt, HDMI Cable Issue, …) managed from Setup."""
 
@@ -55,7 +64,8 @@ class TicketViewSet(viewsets.ModelViewSet):
         """Role-scoped visibility.
 
         Field staff (technicians) only see tickets assigned to them or that
-        they raised. Oversight roles (admin/ops/supervisor) and marketing
+        they raised. Vendor-portal users only see tickets assigned to their
+        supplier. Oversight roles (admin/ops/supervisor) and marketing
         (who relay client decisions and close tickets) see everything.
         """
         qs = super().get_queryset()
@@ -92,8 +102,15 @@ class TicketViewSet(viewsets.ModelViewSet):
         elif flag == "in_review":
             qs = qs.filter(status=Ticket.Status.PENDING_REVIEW)
         user = self.request.user
-        if getattr(user, "role", "") == "technician" and not user.is_superuser:
+        role = getattr(user, "role", "")
+        if role == "technician" and not user.is_superuser:
             return qs.filter(Q(assigned_to=user) | Q(reported_by=user))
+        if role == "vendor" and not user.is_superuser:
+            # Vendor scope (XC-04): only tickets assigned to their supplier;
+            # a vendor login without a supplier link sees nothing.
+            if not user.supplier_id:
+                return qs.none()
+            return qs.filter(assigned_vendor_id=user.supplier_id)
         return qs
 
     def get_serializer_class(self):
@@ -188,7 +205,9 @@ class TicketViewSet(viewsets.ModelViewSet):
         ticket = self.get_object()
         user = request.user
         role = getattr(user, "role", "")
-        is_assignee = ticket.assigned_to_id == user.id
+        # A vendor-portal user counts as the assignee on tickets assigned to
+        # their supplier (XC-04) — same workflow powers, same restrictions.
+        is_assignee = ticket.assigned_to_id == user.id or _is_assigned_vendor(user, ticket)
         is_manager = role in MANAGER_ROLES
 
         ser = TicketTransitionSerializer(data=request.data, context={"ticket": ticket})
@@ -364,7 +383,7 @@ class TicketViewSet(viewsets.ModelViewSet):
     def submit_completion(self, request, pk=None):
         ticket = self.get_object()
 
-        if ticket.assigned_to_id != request.user.id:
+        if ticket.assigned_to_id != request.user.id and not _is_assigned_vendor(request.user, ticket):
             return Response(
                 {"detail": "Only the assigned person can submit completion."},
                 status=status.HTTP_403_FORBIDDEN,

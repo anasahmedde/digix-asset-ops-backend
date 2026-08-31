@@ -211,3 +211,47 @@ def test_super_admin_retains_full_read_write(admin, technician):
     r = c.get(f"/api/accounts/users/{technician.pk}/")
     assert r.status_code == 200
     assert r.data["cnic"] == "33333-3333333-3"
+
+
+# ── Vendor access (XC-04): supplier link is admin-only write ──────────
+
+
+@pytest.mark.django_db
+def test_supplier_field_admin_only_write(admin):
+    from apps.suppliers.models import Supplier
+
+    supplier = Supplier.objects.create(name="Portal Vendor Co")
+    other = Supplier.objects.create(name="Another Vendor Co")
+    c_admin = _client(admin)
+
+    # Admin can create a vendor login with a supplier link.
+    r = c_admin.post("/api/accounts/users/", {
+        "username": "acc-vendor",
+        "password": "password123",
+        "role": "vendor",
+        "supplier": str(supplier.id),
+    }, format="json")
+    assert r.status_code == 201, r.content
+    vendor = User.objects.get(username="acc-vendor")
+    assert vendor.supplier_id == supplier.id
+
+    # Serializer exposes supplier + read-only supplier_name.
+    r = c_admin.get(f"/api/accounts/users/{vendor.pk}/")
+    assert str(r.data["supplier"]) == str(supplier.id)
+    assert r.data["supplier_name"] == "Portal Vendor Co"
+
+    # The vendor cannot re-point their own supplier link (silently read-only).
+    c_vendor = _client(vendor)
+    r = c_vendor.patch(f"/api/accounts/users/{vendor.pk}/", {
+        "supplier": str(other.id), "first_name": "Vera",
+    }, format="json")
+    assert r.status_code == 200, r.content
+    vendor.refresh_from_db()
+    assert vendor.supplier_id == supplier.id  # unchanged
+    assert vendor.first_name == "Vera"  # self-writable field still applied
+
+    # Admin CAN re-point it.
+    r = c_admin.patch(f"/api/accounts/users/{vendor.pk}/", {"supplier": str(other.id)}, format="json")
+    assert r.status_code == 200, r.content
+    vendor.refresh_from_db()
+    assert vendor.supplier_id == other.id

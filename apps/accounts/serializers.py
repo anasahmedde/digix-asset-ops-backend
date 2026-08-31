@@ -18,8 +18,11 @@ def _is_super_admin(user):
 
 class UserSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
+    supplier_name = serializers.CharField(source="supplier.name", read_only=True)
 
     # The only fields a non-super_admin may write (on their own record).
+    # `supplier` is deliberately NOT here: linking a login to a vendor is a
+    # super_admin decision (it grants that supplier's portal scope).
     SELF_WRITABLE_FIELDS = ("first_name", "last_name", "email", "phone", "avatar")
 
     class Meta:
@@ -28,6 +31,7 @@ class UserSerializer(serializers.ModelSerializer):
             "id", "username", "email", "first_name", "last_name",
             "full_name", "role", "job_title", "phone", "avatar", "is_field_staff",
             "employee_id", "cnic", "join_date", "leaving_date",
+            "supplier", "supplier_name",
             "is_active", "date_joined",
         ]
         read_only_fields = ["id", "date_joined"]
@@ -69,6 +73,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
             "id", "username", "email", "password", "first_name",
             "last_name", "role", "job_title", "phone", "is_field_staff",
             "employee_id", "cnic", "join_date", "leaving_date",
+            "supplier",
         ]
         read_only_fields = ["id"]
 

@@ -620,3 +620,71 @@ def test_device_detail_exposes_project_contract(admin_client, device):
     body = r.json()
     assert body["project_contract_type"] == "rental"
     assert body["project_rental_end_date"] == "2027-01-31"
+
+
+# ── Vendor access (XC-04): device visibility is derived & read-only ──
+
+
+@pytest.fixture
+def vendor_devices(db):
+    from django.utils import timezone
+
+    from apps.sites.models import DeviceInstallation, Site
+    from apps.suppliers.models import Supplier
+    from apps.tickets.models import Ticket
+
+    supplier = Supplier.objects.create(name="Asset Vendor")
+    vendor_user = User.objects.create_user(
+        username="asset-vendor", password="x", role="vendor", supplier=supplier
+    )
+    unlinked_vendor = User.objects.create_user(username="asset-vendor-none", password="x", role="vendor")
+
+    brand = Brand.objects.create(name="VendAssetBrand")
+    model = DeviceModel.objects.create(brand=brand, name="VA-55")
+    dev_ticket = Device.objects.create(device_model=model, serial_number="SN-VEND-T")
+    dev_install = Device.objects.create(device_model=model, serial_number="SN-VEND-I")
+    dev_other = Device.objects.create(device_model=model, serial_number="SN-VEND-X")
+
+    Ticket.objects.create(title="vendor repair", device=dev_ticket, assigned_vendor=supplier)
+    site = Site.objects.create(name="Vendor Asset Site")
+    DeviceInstallation.objects.create(
+        device=dev_install, site=site, vendor=supplier, installed_at=timezone.now()
+    )
+    return {
+        "vendor_user": vendor_user,
+        "unlinked_vendor": unlinked_vendor,
+        "dev_ticket": dev_ticket,
+        "dev_install": dev_install,
+        "dev_other": dev_other,
+    }
+
+
+def _auth(user):
+    client = APIClient()
+    client.force_authenticate(user)
+    return client
+
+
+@pytest.mark.django_db
+def test_vendor_sees_only_devices_from_their_tickets_and_installations(vendor_devices):
+    c = _auth(vendor_devices["vendor_user"])
+    r = c.get("/api/assets/devices/")
+    assert r.status_code == 200
+    ids = {row["id"] for row in r.data["results"]}
+    assert ids == {str(vendor_devices["dev_ticket"].id), str(vendor_devices["dev_install"].id)}
+    # The unrelated device is invisible even by direct URL.
+    assert c.get(f"/api/assets/devices/{vendor_devices['dev_other'].id}/").status_code == 404
+    # A vendor login without a supplier sees no devices at all.
+    assert _auth(vendor_devices["unlinked_vendor"]).get("/api/assets/devices/").data["count"] == 0
+
+
+@pytest.mark.django_db
+def test_vendor_devices_are_read_only(vendor_devices):
+    c = _auth(vendor_devices["vendor_user"])
+    device = vendor_devices["dev_ticket"]
+    # No PATCH — vendors are in no write-role group.
+    r = c.patch(f"/api/assets/devices/{device.id}/", {"display_name": "hacked"}, format="json")
+    assert r.status_code == 403
+    # No status transitions either — the transition role gate excludes vendors.
+    r = c.post(f"/api/assets/devices/{device.id}/transition/", {"status": "active", "reason": "no"}, format="json")
+    assert r.status_code == 403
