@@ -8,6 +8,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from common.permissions import MANAGER_ROLES, AdminManagerWriteElseRead, TechnicianCanCreate
 
 from .models import Ticket, TicketAttachment, TicketComment, TicketIssueType
@@ -44,7 +45,10 @@ class TicketViewSet(viewsets.ModelViewSet):
         "status", "priority", "category", "issue_type", "assigned_to",
         "assigned_vendor", "site", "escalated", "is_billable",
     ]
-    search_fields = ["ticket_number", "title", "description"]
+    search_fields = [
+        "ticket_number", "title", "description",
+        "site__name", "assigned_to__first_name", "assigned_to__last_name",
+    ]
     ordering_fields = ["created_at", "due_date", "response_due_at", "priority", "status"]
 
     def get_queryset(self):
@@ -68,6 +72,25 @@ class TicketViewSet(viewsets.ModelViewSet):
             except (ValueError, AttributeError, TypeError):
                 raise DRFValidationError({"device": "Enter a valid UUID."})
             qs = qs.filter(Q(device_id=device_id) | Q(devices__id=device_id)).distinct()
+        # ?flag=unassigned|sla_breached|past_due|in_review — dashboard
+        # drill-downs; handled here so list AND export share them. Unknown
+        # values are ignored.
+        flag = self.request.query_params.get("flag")
+        if flag == "unassigned":
+            qs = qs.filter(
+                assigned_to__isnull=True, assigned_vendor__isnull=True
+            ).exclude(status=Ticket.Status.CLOSED)
+        elif flag == "sla_breached":
+            qs = qs.filter(
+                Q(escalated=True)
+                | Q(response_due_at__lt=timezone.now(), status=Ticket.Status.OPEN)
+            )
+        elif flag == "past_due":
+            qs = qs.filter(due_date__lt=timezone.localdate()).exclude(
+                status__in=[Ticket.Status.CLOSED, Ticket.Status.APPROVED]
+            )
+        elif flag == "in_review":
+            qs = qs.filter(status=Ticket.Status.PENDING_REVIEW)
         user = self.request.user
         if getattr(user, "role", "") == "technician" and not user.is_superuser:
             return qs.filter(Q(assigned_to=user) | Q(reported_by=user))
@@ -80,6 +103,40 @@ class TicketViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(reported_by=self.request.user)
+
+    # ── Excel export (XC-01) ──────────────────────────────────────────
+
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        """Excel export of tickets — role-scoped and filter-aware."""
+        qs = self.filter_queryset(self.get_queryset())[:EXPORT_MAX_ROWS]
+        columns = [
+            "Ticket #", "Title", "Category", "Priority", "Status",
+            "Asset Code", "Site", "Assigned To", "Vendor",
+            "Billable", "Charge To", "Repair Cost",
+            "Due Date", "Created At", "Closed At",
+        ]
+        rows = []
+        for t in qs:
+            rows.append([
+                t.ticket_number,
+                t.title,
+                t.get_category_display(),
+                t.get_priority_display(),
+                t.get_status_display(),
+                t.device.asset_code if t.device_id else "",
+                t.site.name if t.site_id else "",
+                (t.assigned_to.get_full_name() or t.assigned_to.username) if t.assigned_to_id else "",
+                t.assigned_vendor.name if t.assigned_vendor_id else "",
+                t.is_billable,
+                t.get_charge_to_display() if t.charge_to else "",
+                t.repair_cost,
+                t.due_date,
+                t.created_at,
+                t.closed_at,
+            ])
+        log_export(request.user, "ticket", len(rows), export_params(request))
+        return xlsx_response("tickets", "Tickets", columns, rows)
 
     # ── Assignment (Operations only) ──────────────────────────────────
 

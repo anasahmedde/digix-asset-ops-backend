@@ -6,6 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from common.permissions import AdminManagerWriteElseRead
 
 from .models import Warranty
@@ -33,10 +34,42 @@ class WarrantyViewSet(viewsets.ModelViewSet):
         qs = super().get_queryset()
         role = getattr(self.request.user, "role", None)
         if role in CLIENT_SIDE_ROLES:
-            return qs.filter(warranty_type__in=CLIENT_TYPES)
-        if role in SUPPLIER_SIDE_ROLES:
-            return qs.filter(warranty_type__in=SUPPLIER_TYPES)
+            qs = qs.filter(warranty_type__in=CLIENT_TYPES)
+        elif role in SUPPLIER_SIDE_ROLES:
+            qs = qs.filter(warranty_type__in=SUPPLIER_TYPES)
+        # ?side=client|supplier — lets dual-side roles narrow to one side of
+        # the ledger. Handled here so list AND export share it; unknown
+        # values are ignored.
+        side = self.request.query_params.get("side")
+        if side == "client":
+            qs = qs.filter(warranty_type__in=CLIENT_TYPES)
+        elif side == "supplier":
+            qs = qs.filter(warranty_type__in=SUPPLIER_TYPES)
         return qs
+
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        """Excel export of warranties — role-scoped and filter-aware (XC-01)."""
+        qs = self.filter_queryset(self.get_queryset())[:EXPORT_MAX_ROWS]
+        columns = [
+            "Asset Code", "Component", "Warranty Type", "Status",
+            "Start Date", "End Date", "Months", "Supplier", "Reference #",
+        ]
+        rows = []
+        for w in qs:
+            rows.append([
+                w.device.asset_code if w.device_id else "",
+                w.component.name if w.component_id else "",
+                w.get_warranty_type_display(),
+                w.get_status_display(),
+                w.start_date,
+                w.end_date,
+                w.months,
+                w.supplier.name if w.supplier_id else "",
+                w.reference_number,
+            ])
+        log_export(request.user, "warranty", len(rows), export_params(request))
+        return xlsx_response("warranties", "Warranties", columns, rows)
 
     @action(detail=True, methods=["post"])
     def reissue(self, request, pk=None):

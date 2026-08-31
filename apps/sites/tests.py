@@ -513,3 +513,156 @@ def test_escalated_filter_and_serializer_flag(ops, installation, esc_users):
     detail = c.get(f"/api/sites/installations/{installation.id}/")
     assert detail.data["escalated"] is True
     assert "due_date:1" in detail.data["escalation_state"]
+
+
+# ── Excel export (XC-01) ──────────────────────────────────────────────
+
+import io as _io
+
+from openpyxl import load_workbook as _load_workbook
+
+from apps.accounts.models import AuditLog as _AuditLog
+
+
+def _sheet_rows(resp):
+    wb = _load_workbook(_io.BytesIO(resp.content), read_only=True)
+    return [list(row) for row in wb.active.iter_rows(values_only=True)]
+
+
+@pytest.mark.django_db
+def test_installations_export_happy_path(ops, installation):
+    # New installations auto-seed the 6-step pipeline; complete half of it.
+    for step in installation.steps.order_by("step_number")[:3]:
+        step.status = "completed"
+        step.save()
+
+    resp = _client(ops).get("/api/sites/installations/export/")
+    assert resp.status_code == 200, resp.content
+    assert resp["Content-Type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    rows = _sheet_rows(resp)
+    assert rows[0][:4] == ["Asset Code", "Asset Name", "Site", "Clients"]
+    assert len(rows) == 2
+    row = rows[1]
+    assert row[0] == "AST-INST-1"
+    assert row[1] == "Mall Entrance Screen"
+    assert row[2] == "Install Site"
+    assert row[3] == "Primary Client, Second Client"
+    assert row[4] == "Tariq Installer"
+    assert row[8] == 50  # 1 of 2 steps completed
+    assert row[9] == "No"  # not escalated
+
+    log = _AuditLog.objects.filter(action="export", resource_type="installation").latest("created_at")
+    assert log.detail["count"] == 1
+    assert log.user_id == ops.id
+
+
+@pytest.mark.django_db
+def test_installations_export_applies_filters(ops, installation, tech):
+    other_site = Site.objects.create(name="Other Site", city="Lahore")
+    brand = Brand.objects.create(name="ExpBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="E-1")
+    other_device = Device.objects.create(
+        device_model=dm, asset_code="AST-EXP-2", serial_number="EXP-2"
+    )
+    DeviceInstallation.objects.create(
+        device=other_device, site=other_site, installed_by=tech, installed_at=timezone.now()
+    )
+
+    resp = _client(ops).get("/api/sites/installations/export/", {"site": str(other_site.id)})
+    assert resp.status_code == 200, resp.content
+    rows = _sheet_rows(resp)
+    assert [r[0] for r in rows[1:]] == ["AST-EXP-2"]
+
+    log = _AuditLog.objects.filter(action="export", resource_type="installation").latest("created_at")
+    assert log.detail == {"count": 1, "params": {"site": str(other_site.id)}}
+
+
+# ── Wave 5: ?bucket= tracker drill-downs ──────────────────────────────
+
+
+@pytest.fixture
+def bucket_installations(db, tech):
+    """One installation per progress bucket (default 6-step checklist each)."""
+    from apps.sites.models import InstallationDelay
+
+    site = Site.objects.create(name="Bucket Site", city="Karachi")
+    brand = Brand.objects.create(name="BucketBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="B-1")
+
+    def mk(name, **kwargs):
+        device = Device.objects.create(
+            device_model=dm, serial_number=f"BKT-{name}", display_name=f"Bucket {name}",
+        )
+        return DeviceInstallation.objects.create(
+            device=device, site=site, installed_by=tech, installed_at=timezone.now(), **kwargs
+        )
+
+    fresh = mk("fresh")
+
+    progress = mk("progress")  # two advanced steps — distinct must dedupe
+    for step, status in zip(progress.steps.order_by("step_number"), ("in_progress", "completed")):
+        step.status = status
+        step.save()
+
+    hold = mk("hold")  # two held steps — distinct must dedupe
+    for step in hold.steps.order_by("step_number")[:2]:
+        step.status = InstallationStep.StepStatus.ON_HOLD
+        step.save()
+
+    done = mk("done")
+    for step in done.steps.order_by("step_number"):
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+    done.refresh_from_db()
+    assert done.completed_at is not None  # signal stamped completion
+
+    late = mk("late", due_date=timezone.localdate() - timedelta(days=1))
+
+    delayed = mk("delayed")  # two client delays — distinct must dedupe
+    for i in range(2):
+        InstallationDelay.objects.create(
+            installation=delayed, cause=InstallationDelay.Cause.CLIENT,
+            description=f"Client kept the site closed ({i})", reported_by=tech,
+        )
+    # A non-client delay alone must NOT put an installation in the bucket.
+    InstallationDelay.objects.create(
+        installation=fresh, cause=InstallationDelay.Cause.VENDOR, description="Vendor late",
+    )
+
+    return {
+        "fresh": fresh, "progress": progress, "hold": hold,
+        "done": done, "late": late, "delayed": delayed,
+    }
+
+
+@pytest.mark.django_db
+def test_installation_bucket_filters(ops, bucket_installations):
+    c = _client(ops)
+
+    def names(bucket):
+        r = c.get("/api/sites/installations/", {"bucket": bucket, "page_size": 100})
+        assert r.status_code == 200, r.content
+        return [row["asset_name"] for row in r.data["results"]]
+
+    assert names("completed") == ["Bucket done"]
+    assert names("overdue") == ["Bucket late"]
+    assert names("on_hold") == ["Bucket hold"]  # deduped despite 2 held steps
+    assert names("in_progress") == ["Bucket progress"]  # deduped despite 2 steps
+    assert sorted(names("not_started")) == ["Bucket delayed", "Bucket fresh", "Bucket late"]
+    assert names("delayed") == ["Bucket delayed"]  # client-cause only, deduped
+
+    # Unknown values are ignored — the whole tracker comes back.
+    r = c.get("/api/sites/installations/", {"bucket": "bogus", "page_size": 100})
+    assert len(r.data["results"]) == len(bucket_installations)
+
+
+@pytest.mark.django_db
+def test_installation_bucket_applies_to_export(ops, bucket_installations):
+    resp = _client(ops).get("/api/sites/installations/export/", {"bucket": "overdue"})
+    assert resp.status_code == 200, resp.content
+    rows = _sheet_rows(resp)
+    assert [r[1] for r in rows[1:]] == ["Bucket late"]
+
+    log = _AuditLog.objects.filter(action="export", resource_type="installation").latest("created_at")
+    assert log.detail == {"count": 1, "params": {"bucket": "overdue"}}

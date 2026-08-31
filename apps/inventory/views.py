@@ -6,6 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from common.permissions import WarehouseWriteElseRead
 
 from .models import (
@@ -52,8 +53,45 @@ class InventoryItemViewSet(viewsets.ModelViewSet):
     serializer_class = InventoryItemSerializer
     permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
     filterset_fields = ["location", "category", "material_type"]
-    search_fields = ["sku", "material_type__name"]
+    search_fields = ["sku", "material_type__name", "category__name"]
     ordering_fields = ["quantity", "total_value", "material_type__name", "created_at"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # ?low_stock=true|false — quantity at/below the min stock level (or
+        # its complement). Handled here so list AND export share it; unknown
+        # values are ignored.
+        low_stock = self.request.query_params.get("low_stock")
+        if low_stock is not None:
+            value = low_stock.strip().lower()
+            if value in ("true", "1"):
+                qs = qs.filter(quantity__lte=F("min_stock_level"))
+            elif value in ("false", "0"):
+                qs = qs.filter(quantity__gt=F("min_stock_level"))
+        return qs
+
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        """Excel export of in-hand stock — filter-aware (XC-01)."""
+        qs = self.filter_queryset(self.get_queryset())[:EXPORT_MAX_ROWS]
+        columns = [
+            "SKU", "Material", "Category", "Quantity", "Min Stock Level",
+            "Location", "Unit Cost", "Low Stock",
+        ]
+        rows = []
+        for item in qs:
+            rows.append([
+                item.sku,
+                item.material_type.name if item.material_type_id else "",
+                item.category.name if item.category_id else "",
+                item.quantity,
+                item.min_stock_level,
+                item.get_location_display(),
+                item.unit_cost,
+                item.is_low_stock,
+            ])
+        log_export(request.user, "inventory_item", len(rows), export_params(request))
+        return xlsx_response("inventory", "Inventory", columns, rows)
 
     @action(detail=False, methods=["get"])
     def summary(self, request):

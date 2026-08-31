@@ -792,3 +792,161 @@ def test_update_keeps_primary_device_linked(people, warranty_device):
     assert r.status_code == 200, r.content
     codes = {d["asset_code"] for d in r.json()["devices_info"]}
     assert "AST-S-1" in codes
+
+
+# ── Excel export (XC-01) ──────────────────────────────────────────────
+
+import io as _io
+
+from openpyxl import load_workbook as _load_workbook
+
+from apps.accounts.models import AuditLog as _AuditLog
+
+XLSX_CT = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _sheet_rows(resp):
+    wb = _load_workbook(_io.BytesIO(resp.content), read_only=True)
+    return [list(row) for row in wb.active.iter_rows(values_only=True)]
+
+
+@pytest.mark.django_db
+def test_tickets_export_happy_path(people):
+    Ticket.objects.create(title="Export A", reported_by=people["ops"], priority="high")
+    Ticket.objects.create(title="Export B", reported_by=people["ops"])
+
+    resp = _client(people["ops"]).get("/api/tickets/export/")
+    assert resp.status_code == 200, resp.content
+    assert resp["Content-Type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    rows = _sheet_rows(resp)
+    assert rows[0][:3] == ["Ticket #", "Title", "Category"]
+    titles = {r[1] for r in rows[1:]}
+    assert {"Export A", "Export B"} <= titles
+
+    log = _AuditLog.objects.filter(action="export", resource_type="ticket").latest("created_at")
+    assert log.detail["count"] == len(rows) - 1
+    assert log.user_id == people["ops"].id
+
+
+@pytest.mark.django_db
+def test_tickets_export_role_scoped_for_technician(people):
+    Ticket.objects.create(title="Not mine", reported_by=people["ops"])
+    Ticket.objects.create(title="Assigned to me", reported_by=people["ops"], assigned_to=people["tech"])
+
+    resp = _client(people["tech"]).get("/api/tickets/export/")
+    assert resp.status_code == 200, resp.content
+    rows = _sheet_rows(resp)
+    titles = [r[1] for r in rows[1:]]
+    assert titles == ["Assigned to me"]
+
+    log = _AuditLog.objects.filter(action="export", resource_type="ticket").latest("created_at")
+    assert log.detail["count"] == 1
+
+
+@pytest.mark.django_db
+def test_tickets_export_applies_filters(people):
+    Ticket.objects.create(title="Critical one", reported_by=people["ops"], priority="critical")
+    Ticket.objects.create(title="Low one", reported_by=people["ops"], priority="low")
+
+    resp = _client(people["ops"]).get("/api/tickets/export/", {"priority": "critical"})
+    assert resp.status_code == 200, resp.content
+    rows = _sheet_rows(resp)
+    assert [r[1] for r in rows[1:]] == ["Critical one"]
+
+    log = _AuditLog.objects.filter(action="export", resource_type="ticket").latest("created_at")
+    assert log.detail["params"] == {"priority": "critical"}
+
+
+# ── Wave 5: ?flag= drill-downs + search parity ────────────────────────
+
+
+@pytest.fixture
+def flag_tickets(people):
+    """One ticket per drill-down bucket plus near-miss decoys.
+
+    response_due_at/due_date are passed explicitly so the SLA auto-stamp
+    on create never puts a decoy into a bucket by accident.
+    """
+    now = timezone.now()
+    future = now + timedelta(hours=8)
+    today = timezone.localdate()
+    ops, tech = people["ops"], people["tech"]
+
+    def mk(title, **kw):
+        kw.setdefault("response_due_at", future)
+        kw.setdefault("due_date", today + timedelta(days=5))
+        return Ticket.objects.create(title=title, reported_by=ops, **kw)
+
+    return {
+        "unassigned_open": mk("Flag unassigned"),
+        "unassigned_closed": mk("Flag unassigned closed", status="closed"),
+        "assigned_fresh": mk("Flag assigned fresh", assigned_to=tech),
+        "escalated": mk("Flag escalated", assigned_to=tech, escalated=True),
+        "response_overdue": mk(
+            "Flag response overdue", assigned_to=tech,
+            response_due_at=now - timedelta(hours=2),
+        ),
+        "past_due": mk(
+            "Flag past due", assigned_to=tech, status="in_progress",
+            due_date=today - timedelta(days=1),
+        ),
+        "past_due_closed": mk(
+            "Flag past due closed", status="closed", due_date=today - timedelta(days=1),
+        ),
+        "past_due_approved": mk(
+            "Flag past due approved", assigned_to=tech, status="approved",
+            due_date=today - timedelta(days=1),
+        ),
+        "in_review": mk("Flag in review", assigned_to=tech, status="pending_review"),
+    }
+
+
+@pytest.mark.django_db
+def test_ticket_flag_buckets(people, flag_tickets):
+    c = _client(people["ops"])
+
+    def titles(flag):
+        r = c.get("/api/tickets/", {"flag": flag, "page_size": 100})
+        assert r.status_code == 200, r.content
+        return {row["title"] for row in r.data["results"]}
+
+    assert titles("unassigned") == {"Flag unassigned"}
+    assert titles("sla_breached") == {"Flag escalated", "Flag response overdue"}
+    assert titles("past_due") == {"Flag past due"}
+    assert titles("in_review") == {"Flag in review"}
+
+    # Unknown values are ignored — the full ledger comes back.
+    r = c.get("/api/tickets/", {"flag": "bogus", "page_size": 100})
+    assert len(r.data["results"]) == len(flag_tickets)
+
+
+@pytest.mark.django_db
+def test_ticket_flag_applies_to_export(people, flag_tickets):
+    resp = _client(people["ops"]).get("/api/tickets/export/", {"flag": "sla_breached"})
+    assert resp.status_code == 200, resp.content
+    rows = _sheet_rows(resp)
+    assert {r[1] for r in rows[1:]} == {"Flag escalated", "Flag response overdue"}
+
+    log = _AuditLog.objects.filter(action="export", resource_type="ticket").latest("created_at")
+    assert log.detail == {"count": 2, "params": {"flag": "sla_breached"}}
+
+
+@pytest.mark.django_db
+def test_ticket_search_by_site_and_assignee_names(people):
+    from apps.sites.models import Site
+
+    site = Site.objects.create(name="Flagship Mall", city="Karachi")
+    assignee = User.objects.create_user(
+        username="wf-search-tech", password="x", role="technician",
+        first_name="Farhan", last_name="Fixer",
+    )
+    Ticket.objects.create(title="Search hit", reported_by=people["ops"], site=site, assigned_to=assignee)
+    Ticket.objects.create(title="Search miss", reported_by=people["ops"])
+
+    c = _client(people["ops"])
+    for term in ("Flagship Mall", "Farhan", "Fixer"):
+        r = c.get("/api/tickets/", {"search": term, "page_size": 100})
+        assert r.status_code == 200, r.content
+        titles = {row["title"] for row in r.data["results"]}
+        assert titles == {"Search hit"}, term

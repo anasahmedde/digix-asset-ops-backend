@@ -182,6 +182,13 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
     client_names = serializers.SerializerMethodField()
     project_name = serializers.CharField(source="project.name", read_only=True, default=None)
+    # Contract chip (PR-01): rental/sold context from the parent project.
+    project_contract_type = serializers.CharField(
+        source="project.contract_type", read_only=True, default=None
+    )
+    project_rental_end_date = serializers.DateField(
+        source="project.rental_end_date", read_only=True, default=None
+    )
     components = AssetComponentSerializer(many=True, read_only=True)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     technician_name = serializers.CharField(source="assigned_technician.get_full_name", read_only=True, default=None)
@@ -214,7 +221,8 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
             "clients", "client_names",
-            "project", "project_name", "components",
+            "project", "project_name", "project_contract_type", "project_rental_end_date",
+            "components",
             "assigned_technician", "technician_name",
             "installation_date", "installed_by", "installed_by_name",
             "warranty_status", "active_warranty",

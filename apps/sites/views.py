@@ -8,6 +8,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
+from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from common.permissions import AdminManagerWriteElseRead
 
 
@@ -114,6 +115,35 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 qs = qs.exclude(escalation_state={})
             elif value in ("false", "0"):
                 qs = qs.filter(escalation_state={})
+        # ?bucket=<progress bucket> — tracker drill-downs derived from the
+        # completion stamp and the step checklist. Handled here so list AND
+        # export share them; unknown values are ignored.
+        bucket = self.request.query_params.get("bucket")
+        if bucket == "completed":
+            qs = qs.filter(completed_at__isnull=False)
+        elif bucket == "overdue":
+            qs = qs.filter(completed_at__isnull=True, due_date__lt=timezone.localdate())
+        elif bucket == "on_hold":
+            qs = qs.filter(steps__status=InstallationStep.StepStatus.ON_HOLD).distinct()
+        elif bucket == "in_progress":
+            qs = qs.filter(
+                completed_at__isnull=True,
+                steps__status__in=[
+                    InstallationStep.StepStatus.IN_PROGRESS,
+                    InstallationStep.StepStatus.COMPLETED,
+                ],
+            ).distinct()
+        elif bucket == "not_started":
+            qs = qs.filter(completed_at__isnull=True).exclude(
+                steps__status__in=[
+                    InstallationStep.StepStatus.IN_PROGRESS,
+                    InstallationStep.StepStatus.ON_HOLD,
+                    InstallationStep.StepStatus.COMPLETED,
+                    InstallationStep.StepStatus.SKIPPED,
+                ]
+            )
+        elif bucket == "delayed":
+            qs = qs.filter(delays__cause=InstallationDelay.Cause.CLIENT).distinct()
         return qs
 
     def get_serializer_class(self):
@@ -130,6 +160,40 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         return super().get_permissions()
 
     HANDOVER_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
+
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request):
+        """Excel export of the installation tracker — filter-aware (XC-01)."""
+        qs = self.filter_queryset(self.get_queryset())[:EXPORT_MAX_ROWS]
+        columns = [
+            "Asset Code", "Asset Name", "Site", "Clients", "Installer",
+            "Vendor", "Due Date", "Completed At", "Progress %", "Escalated",
+        ]
+        rows = []
+        for inst in qs:
+            client_names = []
+            if inst.device.assigned_client:
+                client_names.append(inst.device.assigned_client.name)
+            for client in inst.device.clients.all():
+                if client.name not in client_names:
+                    client_names.append(client.name)
+            steps = list(inst.steps.all())
+            completed = sum(1 for s in steps if s.status == InstallationStep.StepStatus.COMPLETED)
+            progress = round((completed / len(steps)) * 100) if steps else 0
+            rows.append([
+                inst.device.asset_code,
+                inst.device.display_name,
+                inst.site.name if inst.site_id else "",
+                ", ".join(client_names),
+                (inst.installed_by.get_full_name() or inst.installed_by.username) if inst.installed_by_id else "",
+                inst.vendor.name if inst.vendor_id else "",
+                inst.due_date,
+                inst.completed_at,
+                progress,
+                bool(inst.escalation_state),
+            ])
+        log_export(request.user, "installation", len(rows), export_params(request))
+        return xlsx_response("installations", "Installations", columns, rows)
 
     @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
     def handover(self, request, pk=None):
