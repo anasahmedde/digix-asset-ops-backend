@@ -80,14 +80,22 @@ class StockMovement(TimeStampedModel):
 
 
 class GoodsReceipt(TimeStampedModel):
-    """Receiving stock into the warehouse — optionally against a Work Order."""
+    """Receiving stock into the warehouse — optionally against a Work Order
+    (legacy single-item flow) or a Purchase Order (line-level GRN, WF-04)."""
 
     grn_number = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
     work_order = models.ForeignKey(
         "workorders.WorkOrder", on_delete=models.SET_NULL, null=True, blank=True, related_name="goods_receipts"
     )
-    item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT, related_name="receipts")
-    quantity = models.PositiveIntegerField()
+    purchase_order = models.ForeignKey(
+        "procurement.PurchaseOrder", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="goods_receipts",
+    )
+    # Legacy single-item receipt fields; PO receipts use GoodsReceiptLine rows instead.
+    item = models.ForeignKey(
+        InventoryItem, on_delete=models.PROTECT, null=True, blank=True, related_name="receipts"
+    )
+    quantity = models.PositiveIntegerField(null=True, blank=True)
     reference = models.CharField(max_length=200, blank=True)
     received_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="goods_receipts"
@@ -98,12 +106,36 @@ class GoodsReceipt(TimeStampedModel):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"{self.grn_number} - {self.item}"
+        target = self.item or self.purchase_order or self.work_order or "receipt"
+        return f"{self.grn_number} - {target}"
 
     def save(self, *args, **kwargs):
         if not self.grn_number:
             self.grn_number = generate_code("goods_receipt", model=type(self), field="grn_number")
         super().save(*args, **kwargs)
+
+
+class GoodsReceiptLine(TimeStampedModel):
+    """One received PO line on a goods receipt: quantity plus the unique
+    serials/batch captured at the door (WF-04)."""
+
+    receipt = models.ForeignKey(GoodsReceipt, on_delete=models.CASCADE, related_name="lines")
+    po_item = models.ForeignKey(
+        "procurement.PurchaseOrderItem", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="receipt_lines",
+    )
+    inventory_item = models.ForeignKey(
+        InventoryItem, on_delete=models.SET_NULL, null=True, blank=True, related_name="receipt_lines"
+    )
+    quantity = models.PositiveIntegerField()
+    batch_number = models.CharField(max_length=100, blank=True)
+    serial_numbers = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.receipt.grn_number}: {self.po_item or self.inventory_item} x{self.quantity}"
 
 
 class Issuance(TimeStampedModel):
@@ -120,6 +152,12 @@ class Issuance(TimeStampedModel):
     )
     issued_to_user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="received_issuances"
+    )
+    issued_to_project = models.ForeignKey(
+        "teams.Project", on_delete=models.SET_NULL, null=True, blank=True, related_name="inventory_issuances"
+    )
+    bom_line = models.ForeignKey(
+        "teams.ProjectBOMLine", on_delete=models.SET_NULL, null=True, blank=True, related_name="issuances"
     )
     issued_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="issued_issuances"

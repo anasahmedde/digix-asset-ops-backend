@@ -2,6 +2,7 @@ from django.contrib import admin
 
 from .models import (
     GoodsReceipt,
+    GoodsReceiptLine,
     InventoryCategory,
     InventoryItem,
     Issuance,
@@ -32,12 +33,19 @@ class StockMovementAdmin(admin.ModelAdmin):
     raw_id_fields = ("item", "performed_by")
 
 
+class GoodsReceiptLineInline(admin.TabularInline):
+    model = GoodsReceiptLine
+    extra = 0
+    raw_id_fields = ("po_item", "inventory_item")
+
+
 @admin.register(GoodsReceipt)
 class GoodsReceiptAdmin(admin.ModelAdmin):
-    list_display = ("grn_number", "item", "quantity", "work_order", "received_by", "created_at")
-    search_fields = ("grn_number", "item__sku")
-    raw_id_fields = ("item", "work_order", "received_by")
+    list_display = ("grn_number", "item", "quantity", "work_order", "purchase_order", "received_by", "created_at")
+    search_fields = ("grn_number", "item__sku", "purchase_order__po_number")
+    raw_id_fields = ("item", "work_order", "purchase_order", "received_by")
     readonly_fields = ("grn_number",)
+    inlines = [GoodsReceiptLineInline]
 
 
 @admin.register(Issuance)

@@ -4,8 +4,16 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User
-from apps.assets.models import AssetComponent, Brand, Device, DeviceModel
-from apps.teams.models import Project
+from apps.assets.models import (
+    AssetComponent,
+    Brand,
+    Device,
+    DeviceLifecycleEvent,
+    DeviceModel,
+    MaterialType,
+)
+from apps.inventory.models import InventoryItem, Issuance, StockMovement
+from apps.teams.models import BOMAllocation, Project, ProjectBOMLine
 
 
 def _client(user):
@@ -117,3 +125,218 @@ def test_progress_is_computed():
     # completed project with no milestones -> 100
     done = Project.objects.create(name="Done", status="completed", phase="handover")
     assert c.get(f"/api/teams/projects/{done.pk}/").data["progress"] == 100
+
+
+# ── Wave 2: BOM allocation & issuance (WF-02) ────────────────────────
+
+@pytest.fixture
+def bom_setup(db):
+    ops = User.objects.create_user(username="bom-ops", password="x", role="ops_manager")
+    brand = Brand.objects.create(name="BOMBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="BOM-1")
+    material = MaterialType.objects.create(name="BOM Cable", unit="meter")
+    item = InventoryItem.objects.create(material_type=material, quantity=10, unit_cost=5)
+    project = Project.objects.create(name="BOM Project")
+    return {"ops": ops, "dm": dm, "item": item, "project": project}
+
+
+@pytest.mark.django_db
+def test_allocate_device_flips_status_and_journals(bom_setup):
+    dm, project, ops = bom_setup["dm"], bom_setup["project"], bom_setup["ops"]
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-BOM-1", serial_number="BOM-SN-1", status="in_stock",
+    )
+    line = ProjectBOMLine.objects.create(
+        project=project, device_model=dm, description="SMD Screen", quantity=2, unit_price=100,
+    )
+    c = _client(ops)
+
+    r = c.post(f"/api/teams/bom-lines/{line.pk}/allocate/", {"device": str(device.pk)}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["allocated_quantity"] == 1
+    assert r.data["issued_quantity"] == 0
+    assert r.data["shortage"] == 1
+    assert len(r.data["allocations"]) == 1
+    assert r.data["allocations"][0]["device_code"] == "AST-BOM-1"
+    assert r.data["allocations"][0]["status"] == "allocated"
+
+    device.refresh_from_db()
+    assert device.status == "assigned"
+    assert device.project_id == project.pk
+
+    # The Wave-1 machine journalled the flip with reason + user.
+    event = DeviceLifecycleEvent.objects.get(
+        device=device, from_value="in_stock", to_value="assigned"
+    )
+    assert event.description == "Allocated to project BOM Project"
+    assert event.performed_by == ops
+
+    # A device that is not in stock is rejected.
+    r = c.post(f"/api/teams/bom-lines/{line.pk}/allocate/", {"device": str(device.pk)}, format="json")
+    assert r.status_code == 400
+    assert line.allocations.count() == 1
+
+
+@pytest.mark.django_db
+def test_allocate_stock_guards_over_allocation_across_lines(bom_setup):
+    project, item, ops = bom_setup["project"], bom_setup["item"], bom_setup["ops"]
+    line1 = ProjectBOMLine.objects.create(project=project, description="Cable A", quantity=8)
+    line2 = ProjectBOMLine.objects.create(project=project, description="Cable B", quantity=5)
+    c = _client(ops)
+
+    # quantity is mandatory for stock allocations
+    r = c.post(f"/api/teams/bom-lines/{line1.pk}/allocate/", {"inventory_item": str(item.pk)}, format="json")
+    assert r.status_code == 400
+
+    # neither target given
+    r = c.post(f"/api/teams/bom-lines/{line1.pk}/allocate/", {}, format="json")
+    assert r.status_code == 400
+
+    r = c.post(
+        f"/api/teams/bom-lines/{line1.pk}/allocate/",
+        {"inventory_item": str(item.pk), "quantity": 6}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["allocated_quantity"] == 6
+    assert r.data["shortage"] == 2
+
+    # 6 of 10 already reserved by line1 → only 4 left for ANY line
+    r = c.post(
+        f"/api/teams/bom-lines/{line2.pk}/allocate/",
+        {"inventory_item": str(item.pk), "quantity": 5}, format="json",
+    )
+    assert r.status_code == 400
+
+    r = c.post(
+        f"/api/teams/bom-lines/{line2.pk}/allocate/",
+        {"inventory_item": str(item.pk), "quantity": 4}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["allocated_quantity"] == 4
+
+
+@pytest.mark.django_db
+def test_issue_stock_allocation_decrements_and_journals(bom_setup):
+    project, item, ops = bom_setup["project"], bom_setup["item"], bom_setup["ops"]
+    line = ProjectBOMLine.objects.create(project=project, description="Cable", quantity=6)
+    c = _client(ops)
+
+    r = c.post(
+        f"/api/teams/bom-lines/{line.pk}/allocate/",
+        {"inventory_item": str(item.pk), "quantity": 6}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    alloc_id = r.data["allocations"][0]["id"]
+
+    r = c.post(f"/api/teams/bom-lines/{line.pk}/issue/", {"allocation": alloc_id}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["allocated_quantity"] == 6
+    assert r.data["issued_quantity"] == 6
+    assert r.data["shortage"] == 0
+    assert r.data["allocations"][0]["status"] == "issued"
+
+    item.refresh_from_db()
+    assert item.quantity == 4
+
+    issuance = Issuance.objects.get(bom_line=line)
+    assert issuance.issued_to_project_id == project.pk
+    assert issuance.quantity == 6
+    assert issuance.issued_by == ops
+    movement = StockMovement.objects.get(item=item, movement_type="out")
+    assert movement.quantity == 6
+    assert movement.reference == issuance.issue_number
+
+    # Issuing the same allocation twice is rejected.
+    r = c.post(f"/api/teams/bom-lines/{line.pk}/issue/", {"allocation": alloc_id}, format="json")
+    assert r.status_code == 400
+    item.refresh_from_db()
+    assert item.quantity == 4
+
+    # Once issued, the reservation is released: the remaining 4 can be allocated.
+    line2 = ProjectBOMLine.objects.create(project=project, description="More cable", quantity=4)
+    r = c.post(
+        f"/api/teams/bom-lines/{line2.pk}/allocate/",
+        {"inventory_item": str(item.pk), "quantity": 4}, format="json",
+    )
+    assert r.status_code == 200, r.content
+
+
+@pytest.mark.django_db
+def test_issue_device_allocation_is_rejected(bom_setup):
+    dm, project, ops = bom_setup["dm"], bom_setup["project"], bom_setup["ops"]
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-BOM-2", serial_number="BOM-SN-2", status="in_stock",
+    )
+    line = ProjectBOMLine.objects.create(project=project, device_model=dm, description="Screen", quantity=1)
+    c = _client(ops)
+
+    r = c.post(f"/api/teams/bom-lines/{line.pk}/allocate/", {"device": str(device.pk)}, format="json")
+    assert r.status_code == 200, r.content
+    alloc_id = r.data["allocations"][0]["id"]
+
+    r = c.post(f"/api/teams/bom-lines/{line.pk}/issue/", {"allocation": alloc_id}, format="json")
+    assert r.status_code == 400
+    assert "installation" in r.data["detail"]
+    assert BOMAllocation.objects.get(pk=alloc_id).status == "allocated"
+
+
+@pytest.mark.django_db
+def test_bom_summary_totals_and_shortage_math(bom_setup):
+    dm, project, item, ops = (
+        bom_setup["dm"], bom_setup["project"], bom_setup["item"], bom_setup["ops"],
+    )
+    line1 = ProjectBOMLine.objects.create(project=project, description="Cable", quantity=5, unit_price=10)
+    line2 = ProjectBOMLine.objects.create(project=project, device_model=dm, description="Screen", quantity=2, unit_price=500)
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-BOM-3", serial_number="BOM-SN-3", status="in_stock",
+    )
+    c = _client(ops)
+
+    r = c.post(
+        f"/api/teams/bom-lines/{line1.pk}/allocate/",
+        {"inventory_item": str(item.pk), "quantity": 3}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    alloc_id = r.data["allocations"][0]["id"]
+    assert c.post(
+        f"/api/teams/bom-lines/{line1.pk}/issue/", {"allocation": alloc_id}, format="json"
+    ).status_code == 200
+    assert c.post(
+        f"/api/teams/bom-lines/{line2.pk}/allocate/", {"device": str(device.pk)}, format="json"
+    ).status_code == 200
+
+    r = c.get(f"/api/teams/projects/{project.pk}/bom-summary/")
+    assert r.status_code == 200, r.content
+    by_desc = {row["description"]: row for row in r.data["lines"]}
+    assert by_desc["Cable"]["quantity"] == 5
+    assert by_desc["Cable"]["allocated_quantity"] == 3
+    assert by_desc["Cable"]["issued_quantity"] == 3
+    assert by_desc["Cable"]["shortage"] == 2
+    assert by_desc["Screen"]["allocated_quantity"] == 1
+    assert by_desc["Screen"]["issued_quantity"] == 0
+    assert by_desc["Screen"]["shortage"] == 1
+    assert r.data["totals"] == {"required": 7, "allocated": 4, "issued": 3, "shortage": 3}
+
+
+@pytest.mark.django_db
+def test_bom_lines_crud_and_project_filter(bom_setup):
+    project, ops = bom_setup["project"], bom_setup["ops"]
+    other = Project.objects.create(name="Other Project")
+    ProjectBOMLine.objects.create(project=other, description="Elsewhere", quantity=1)
+    c = _client(ops)
+
+    r = c.post("/api/teams/bom-lines/", {
+        "project": str(project.pk), "description": "Bracket", "quantity": 3, "unit_price": "12.50",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["shortage"] == 3
+
+    r = c.get("/api/teams/bom-lines/", {"project": str(project.pk)})
+    assert r.status_code == 200
+    assert [row["description"] for row in r.data["results"]] == ["Bracket"]
+
+    # quantity must stay positive
+    r = c.post("/api/teams/bom-lines/", {
+        "project": str(project.pk), "description": "Broken", "quantity": 0,
+    }, format="json")
+    assert r.status_code == 400
