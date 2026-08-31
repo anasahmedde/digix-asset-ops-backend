@@ -59,6 +59,14 @@ class TicketViewSet(viewsets.ModelViewSet):
         # handled here rather than filterset_fields so both paths hit).
         device_id = self.request.query_params.get("device")
         if device_id:
+            import uuid as _uuid
+
+            from rest_framework.exceptions import ValidationError as DRFValidationError
+
+            try:
+                _uuid.UUID(device_id)
+            except (ValueError, AttributeError, TypeError):
+                raise DRFValidationError({"device": "Enter a valid UUID."})
             qs = qs.filter(Q(device_id=device_id) | Q(devices__id=device_id)).distinct()
         user = self.request.user
         if getattr(user, "role", "") == "technician" and not user.is_superuser:
@@ -258,6 +266,15 @@ class TicketViewSet(viewsets.ModelViewSet):
                     warranty.save(update_fields=["status", "updated_at"])
         elif is_reopen:
             ticket.closed_at = None
+            # Reopening a warranty claim puts the warranty back into its
+            # "claim pending" state — mirror of the close branch above.
+            if ticket.category == Ticket.Category.WARRANTY_CLAIM and ticket.warranty_id:
+                from apps.warranties.models import Warranty
+
+                warranty = ticket.warranty
+                if warranty.status in (Warranty.Status.ACTIVE, Warranty.Status.EXPIRED):
+                    warranty.status = Warranty.Status.CLAIMED
+                    warranty.save(update_fields=["status", "updated_at"])
 
         ticket.status = new_status
         ticket.save(update_fields=[

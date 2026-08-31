@@ -613,3 +613,65 @@ def test_multi_asset_ticket(people, warranty_device):
     listing = c.get("/api/tickets/", {"device": str(second.pk)})
     assert listing.status_code == 200
     assert listing.json()["count"] == 1
+
+
+def test_warranty_must_belong_to_ticket_device(people, warranty_device):
+    from apps.assets.models import Brand, Device, DeviceModel
+
+    foreign_brand = Brand.objects.create(name="ForeignBrand")
+    foreign_dm = DeviceModel.objects.create(brand=foreign_brand, name="F-1")
+    foreign_device = Device.objects.create(
+        device_model=foreign_dm, asset_code="AST-F-1", serial_number="F-1"
+    )
+    foreign_warranty = _make_warranty(foreign_device)
+    c = _client(people["tech"])
+    r = c.post("/api/tickets/", {
+        "title": "Hijack attempt", "category": "warranty_claim",
+        "device": str(warranty_device.pk), "warranty": str(foreign_warranty.pk),
+    }, format="json")
+    assert r.status_code == 400
+    assert "warranty" in r.json()
+    foreign_warranty.refresh_from_db()
+    assert foreign_warranty.status == "active"
+
+
+def test_device_filter_rejects_malformed_uuid(people):
+    r = _client(people["ops"]).get("/api/tickets/", {"device": "not-a-uuid"})
+    assert r.status_code == 400
+
+
+def test_reopen_reclaims_warranty(people, warranty_device):
+    from apps.warranties.models import Warranty
+
+    warranty = _make_warranty(warranty_device)
+    c = _client(people["ops"])
+    ticket_id = c.post("/api/tickets/", {
+        "title": "Claim cycle", "category": "warranty_claim",
+        "device": str(warranty_device.pk),
+    }, format="json").json()["id"]
+    c.post(f"/api/tickets/{ticket_id}/transition/", {"status": "closed"}, format="json")
+    warranty.refresh_from_db()
+    assert warranty.status == Warranty.Status.ACTIVE
+    r = c.post(f"/api/tickets/{ticket_id}/transition/", {
+        "status": "in_progress", "notes": "closed by mistake",
+    }, format="json")
+    assert r.status_code == 200, r.content
+    warranty.refresh_from_db()
+    assert warranty.status == Warranty.Status.CLAIMED
+
+
+def test_update_keeps_primary_device_linked(people, warranty_device):
+    from apps.assets.models import Brand, Device, DeviceModel
+
+    c = _client(people["ops"])
+    ticket_id = c.post("/api/tickets/", {
+        "title": "Sync check", "category": "inspection",
+        "device": str(warranty_device.pk),
+    }, format="json").json()["id"]
+    brand = Brand.objects.create(name="SyncBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="S-1")
+    new_primary = Device.objects.create(device_model=dm, asset_code="AST-S-1", serial_number="S-1")
+    r = c.patch(f"/api/tickets/{ticket_id}/", {"device": str(new_primary.pk)}, format="json")
+    assert r.status_code == 200, r.content
+    codes = {d["asset_code"] for d in r.json()["devices_info"]}
+    assert "AST-S-1" in codes

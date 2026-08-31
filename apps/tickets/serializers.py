@@ -83,6 +83,30 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
             "end_date": w.end_date, "status": w.status,
         }
 
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # A ticket may only claim against a warranty of its own asset —
+        # otherwise any ticket-creator could flip unrelated warranties to
+        # "claim pending" (and skew their billability).
+        warranty = attrs.get("warranty")
+        if warranty is not None:
+            device = attrs.get("device") or (self.instance.device if self.instance else None)
+            if not attrs.get("device") and attrs.get("devices"):
+                device = attrs["devices"][0]
+            if device is None or warranty.device_id != device.pk:
+                raise serializers.ValidationError(
+                    {"warranty": "The warranty must belong to the ticket's asset."}
+                )
+        return attrs
+
+    def update(self, instance, validated_data):
+        ticket = super().update(instance, validated_data)
+        # Keep the invariant from create(): the primary asset is always in
+        # the linked set, even when device/devices are edited later.
+        if ticket.device_id:
+            ticket.devices.add(ticket.device)
+        return ticket
+
     def create(self, validated_data):
         from apps.warranties.models import Warranty
         from apps.warranties.services import derive_billability

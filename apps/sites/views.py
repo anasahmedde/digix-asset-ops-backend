@@ -109,6 +109,14 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             return DeviceInstallationListSerializer
         return DeviceInstallationDetailSerializer
 
+    def get_permissions(self):
+        # The handover action carries its own gate (assigned installer or
+        # HANDOVER_ROLES) — the viewset's manager-write permission would
+        # otherwise reject the installer/supervisor before it ever runs.
+        if self.action == "handover":
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
     HANDOVER_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
 
     @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
@@ -152,6 +160,19 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             )
 
         with transaction.atomic():
+            # Row-lock and re-check under the lock: two concurrent submits
+            # must yield one record and one clean 400, not an IntegrityError.
+            installation = (
+                DeviceInstallation.objects.select_for_update()
+                .select_related("device", "site")
+                .get(pk=installation.pk)
+            )
+            if getattr(installation, "handover", None):
+                return Response(
+                    {"detail": "This installation has already been handed over."},
+                    status=drf_status.HTTP_400_BAD_REQUEST,
+                )
+            device = installation.device
             record = HandoverRecord.objects.create(
                 installation=installation,
                 device=device,
@@ -184,6 +205,14 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             ):
                 step.status = InstallationStep.StepStatus.COMPLETED
                 step.save()
+
+            # The step-save signal only anchors while completed_at is unset —
+            # when the checklist was already closed out (mobile flow) the
+            # formal record's date must still win, so re-anchor explicitly.
+            from .signals import _anchor_client_warranties
+
+            installation.refresh_from_db()
+            _anchor_client_warranties(installation)
 
             device.refresh_from_db()
             if device.status != "active":

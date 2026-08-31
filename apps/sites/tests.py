@@ -345,3 +345,60 @@ def test_handover_requires_client_when_device_has_none(installation, ops):
     )
     assert resp.status_code == 400
     assert "client" in resp.json()
+
+
+def test_assigned_installer_and_supervisor_can_handover(installation, tech):
+    _complete_non_handover_steps(installation)
+    r = _client(tech).post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Installer Handover"},
+        format="multipart",
+    )
+    assert r.status_code == 201, r.content
+
+    # A supervisor on a fresh installation works too.
+    site2 = Site.objects.create(name="Second Site", city="Lahore")
+    device2 = Device.objects.create(
+        device_model=installation.device.device_model,
+        asset_code="AST-INST-2", serial_number="INST-2",
+        assigned_client=installation.device.assigned_client,
+    )
+    inst2 = DeviceInstallation.objects.create(
+        device=device2, site=site2, installed_at=timezone.now()
+    )
+    _complete_non_handover_steps(inst2)
+    supervisor = User.objects.create_user(username="site-super", password="x", role="supervisor")
+    r2 = _client(supervisor).post(
+        f"/api/sites/installations/{inst2.pk}/handover/",
+        {"accepted_by_name": "Supervisor Handover"},
+        format="multipart",
+    )
+    assert r2.status_code == 201, r2.content
+
+
+def test_handover_reanchors_warranty_even_when_steps_already_done(installation, ops):
+    from datetime import timedelta as td
+
+    from apps.warranties.models import Warranty
+
+    today = timezone.localdate()
+    warranty = Warranty.objects.create(
+        device=installation.device, warranty_type="client", status="active",
+        start_date=today, end_date=today + td(days=365), months=12,
+    )
+    # Close out the WHOLE checklist first (mobile flow), incl. handover step.
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+    installation.refresh_from_db()
+    assert installation.completed_at is not None
+
+    paper_date = (today - td(days=30)).isoformat()
+    r = _client(ops).post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Paper Acceptance", "handover_date": paper_date},
+        format="multipart",
+    )
+    assert r.status_code == 201, r.content
+    warranty.refresh_from_db()
+    assert str(warranty.start_date) == paper_date
