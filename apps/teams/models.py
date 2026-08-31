@@ -65,6 +65,10 @@ class Project(TimeStampedModel):
         "workorders.WorkOrder", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="projects", help_text="Work order this project was created from",
     )
+    source_quotation = models.ForeignKey(
+        "quotations.Quotation", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="spawned_projects", help_text="Quotation this project was created from",
+    )
 
     class Meta:
         ordering = ["-created_at"]
@@ -171,6 +175,10 @@ class ProjectBOMLine(TimeStampedModel):
     description = models.CharField(max_length=300)
     quantity = models.PositiveIntegerField(default=1)
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    source_quotation_item = models.ForeignKey(
+        "quotations.QuotationItem", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="bom_lines", help_text="Quotation line this BOM line was copied from",
+    )
 
     class Meta:
         ordering = ["created_at"]

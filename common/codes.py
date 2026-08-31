@@ -38,6 +38,7 @@ _FALLBACK_PREFIXES = {
     "supplier": "SUP",
     "client": "CLI",
     "purchase_order": "PO",
+    "quotation": "QT",
     "invoice": "INV",
     "work_order": "WO",
     "project": "PRJ",

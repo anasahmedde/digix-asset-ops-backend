@@ -61,6 +61,7 @@ class NumberingScheme(TimeStampedModel):
         SUPPLIER = "supplier", "Supplier"
         CLIENT = "client", "Client"
         PURCHASE_ORDER = "purchase_order", "Purchase Order"
+        QUOTATION = "quotation", "Quotation"
         INVOICE = "invoice", "Invoice"
         WORK_ORDER = "work_order", "Work Order"
         PROJECT = "project", "Project"

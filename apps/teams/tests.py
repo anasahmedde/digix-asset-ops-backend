@@ -340,3 +340,39 @@ def test_bom_lines_crud_and_project_filter(bom_setup):
         "project": str(project.pk), "description": "Broken", "quantity": 0,
     }, format="json")
     assert r.status_code == 400
+
+
+# ── Wave 2: quotation provenance (WF-01) ─────────────────────────────
+
+@pytest.mark.django_db
+def test_project_and_bom_line_link_back_to_quotation():
+    from apps.clients.models import Client
+    from apps.quotations.models import Quotation, QuotationItem
+
+    customer = Client.objects.create(name="Provenance Client")
+    quotation = Quotation.objects.create(title="Facade refresh", client=customer)
+    q_item = QuotationItem.objects.create(
+        quotation=quotation, description="Mesh screen", quantity=3, unit_price=750,
+    )
+
+    project = Project.objects.create(
+        name="Project: Facade refresh", phase="order_confirmation",
+        client=customer, source_quotation=quotation,
+    )
+    line = ProjectBOMLine.objects.create(
+        project=project, description="Mesh screen", quantity=3, unit_price=750,
+        source_quotation_item=q_item,
+    )
+
+    # forward + reverse accessors
+    assert project.source_quotation == quotation
+    assert quotation.spawned_projects.get() == project
+    assert line.source_quotation_item == q_item
+    assert q_item.bom_lines.get() == line
+
+    # provenance is advisory: deleting the quotation nulls, never cascades
+    quotation.delete()
+    project.refresh_from_db()
+    line.refresh_from_db()
+    assert project.source_quotation is None
+    assert line.source_quotation_item is None
