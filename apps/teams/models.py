@@ -14,6 +14,10 @@ class Project(TimeStampedModel):
         COMPLETED = "completed", "Completed"
         ON_HOLD = "on_hold", "On Hold"
 
+    class ContractType(models.TextChoices):
+        SOLD = "sold", "Sold Outright"
+        RENTAL = "rental", "Rental"
+
     class Phase(models.TextChoices):
         """Commercial lifecycle of a client order, from enquiry to retirement."""
 
@@ -42,6 +46,11 @@ class Project(TimeStampedModel):
     site = models.ForeignKey(
         "sites.Site", on_delete=models.SET_NULL, null=True, blank=True, related_name="projects"
     )
+    contract_type = models.CharField(
+        max_length=10, choices=ContractType.choices, blank=True, default="",
+        help_text="Whether the project is sold outright or rented",
+    )
+    rental_end_date = models.DateField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PLANNING)
     progress = models.PositiveSmallIntegerField(default=0, help_text="Percentage 0-100")
     start_date = models.DateField(null=True, blank=True)

@@ -61,6 +61,42 @@ def test_project_scope_and_milestones():
 
 
 @pytest.mark.django_db
+def test_contract_type_round_trip_and_filter():
+    ops = User.objects.create_user(username="team-ops3", password="x", role="ops_manager")
+    c = _client(ops)
+
+    # rental project with an end date round-trips through create + detail
+    r = c.post("/api/teams/projects/", {
+        "name": "Airport screens",
+        "contract_type": "rental",
+        "rental_end_date": "2027-06-30",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["contract_type"] == "rental"
+    assert r.data["contract_type_display"] == "Rental"
+    assert r.data["rental_end_date"] == "2027-06-30"
+
+    detail = c.get(f"/api/teams/projects/{r.data['id']}/")
+    assert detail.data["contract_type"] == "rental"
+    assert detail.data["rental_end_date"] == "2027-06-30"
+
+    # contract type is optional and defaults to blank
+    sold = Project.objects.create(name="Mall facade", contract_type="sold")
+    plain = Project.objects.create(name="Unclassified")
+    assert plain.contract_type == ""
+
+    # list filter narrows by contract_type
+    rentals = c.get("/api/teams/projects/", {"contract_type": "rental"})
+    assert rentals.status_code == 200, rentals.content
+    names = {p["name"] for p in rentals.data["results"]}
+    assert names == {"Airport screens"}
+
+    solds = c.get("/api/teams/projects/", {"contract_type": "sold"})
+    assert {p["name"] for p in solds.data["results"]} == {sold.name}
+    assert rentals.data["results"][0]["contract_type_display"] == "Rental"
+
+
+@pytest.mark.django_db
 def test_progress_is_computed():
     ops = User.objects.create_user(username="team-ops2", password="x", role="ops_manager")
     from apps.teams.models import ProjectMilestone
