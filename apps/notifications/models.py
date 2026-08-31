@@ -15,6 +15,7 @@ class Notification(TimeStampedModel):
         TICKET_REVIEW = "ticket_review", "Ticket Review Request"
         TICKET_ESCALATED = "ticket_escalated", "Ticket Escalated"
         INSTALLATION_ASSIGNED = "installation_assigned", "Installation Assigned"
+        INSTALLATION_ESCALATED = "installation_escalated", "Installation Escalated"
         MAINTENANCE_REMINDER = "maintenance_reminder", "Maintenance Reminder"
         SYSTEM = "system", "System"
 
@@ -35,6 +36,13 @@ class Notification(TimeStampedModel):
     )
     ticket = models.ForeignKey(
         "tickets.Ticket",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="notifications",
+    )
+    installation = models.ForeignKey(
+        "sites.DeviceInstallation",
         on_delete=models.CASCADE,
         null=True,
         blank=True,

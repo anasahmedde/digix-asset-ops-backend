@@ -14,6 +14,14 @@ app.conf.beat_schedule = {
         "task": "apps.tickets.tasks.escalate_overdue_tickets",
         "schedule": 600.0,  # every 10 minutes
     },
+    "escalate-overdue-installations": {
+        "task": "apps.sites.tasks.escalate_overdue_installations",
+        "schedule": 600.0,  # every 10 minutes
+    },
+    "generate-maintenance-due-alerts": {
+        "task": "apps.maintenance.tasks.generate_maintenance_due_alerts",
+        "schedule": 21600.0,  # every 6 hours
+    },
     "complete-expired-warranties": {
         "task": "apps.warranties.tasks.complete_expired_warranties",
         "schedule": 21600.0,  # every 6 hours

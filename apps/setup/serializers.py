@@ -67,12 +67,14 @@ class WarrantyPeriodPresetSerializer(serializers.ModelSerializer):
 
 class EscalationPolicySerializer(serializers.ModelSerializer):
     trigger_display = serializers.CharField(source="get_trigger_display", read_only=True)
+    scope_display = serializers.CharField(source="get_scope_display", read_only=True)
+    stage = serializers.IntegerField(min_value=1, max_value=3, default=1)
 
     class Meta:
         model = EscalationPolicy
         fields = [
-            "id", "trigger", "trigger_display", "hours",
-            "escalate_to_role", "also_notify_role", "is_active",
+            "id", "scope", "scope_display", "trigger", "trigger_display", "stage",
+            "hours", "escalate_to_role", "also_notify_role", "is_active",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "trigger_display", "created_at", "updated_at"]
+        read_only_fields = ["id", "scope_display", "trigger_display", "created_at", "updated_at"]

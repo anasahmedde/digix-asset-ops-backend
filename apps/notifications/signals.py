@@ -15,6 +15,7 @@ from apps.maintenance.models import MaintenanceSchedule
 from apps.sites.models import DeviceInstallation
 from apps.tickets.models import Ticket
 
+from . import tasks as notification_tasks
 from .models import Notification
 from .push import send_push_to_user
 from .serializers import NotificationSerializer
@@ -154,6 +155,7 @@ def notify_installer_on_assignment(sender, instance: DeviceInstallation, created
             is_actionable=True,
         )
         _push_ws(notification)
+        notification_tasks.queue_notification_email(notification)
     except Exception:  # pragma: no cover - notification failure must not block saves
         logger.exception("Failed installer notification for installation %s", instance.pk)
 
@@ -283,6 +285,7 @@ def _create_ticket_assignment_notification(ticket: Ticket):
         data=_build_ticket_data(ticket),
     )
     _push_ws(notif)
+    notification_tasks.queue_notification_email(notif)
 
 
 def _create_ticket_status_notification(ticket: Ticket):

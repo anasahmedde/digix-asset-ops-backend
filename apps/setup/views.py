@@ -66,4 +66,4 @@ class EscalationPolicyViewSet(viewsets.ModelViewSet):
     queryset = EscalationPolicy.objects.all()
     serializer_class = EscalationPolicySerializer
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
-    filterset_fields = ["is_active", "trigger"]
+    filterset_fields = ["is_active", "trigger", "scope", "stage"]

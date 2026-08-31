@@ -83,6 +83,10 @@ class DeviceInstallation(TimeStampedModel):
     completed_at = models.DateTimeField(
         null=True, blank=True, help_text="Auto-stamped when every step is completed or skipped"
     )
+    escalation_state = models.JSONField(
+        default=dict, blank=True,
+        help_text='Escalation ledger: "<trigger>:<stage>" -> ISO timestamp when that stage fired.',
+    )
     position_label = models.CharField(max_length=200, blank=True)
     notes = models.TextField(blank=True)
 

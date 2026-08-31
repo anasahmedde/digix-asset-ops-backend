@@ -104,6 +104,18 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
     ]
     ordering_fields = ["installed_at", "due_date", "completed_at", "created_at"]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # ?escalated=true|false — installations with a non-empty escalation ledger.
+        escalated = self.request.query_params.get("escalated")
+        if escalated is not None:
+            value = escalated.strip().lower()
+            if value in ("true", "1"):
+                qs = qs.exclude(escalation_state={})
+            elif value in ("false", "0"):
+                qs = qs.filter(escalation_state={})
+        return qs
+
     def get_serializer_class(self):
         if self.action == "list":
             return DeviceInstallationListSerializer

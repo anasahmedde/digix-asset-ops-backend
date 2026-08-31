@@ -150,7 +150,7 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
             "reported_by", "reported_by_name",
             "due_date", "response_due_at", "escalated", "escalated_at", "is_response_overdue",
-            "assigned_at", "assignment_escalated", "due_date_escalated",
+            "assigned_at", "assignment_escalated", "due_date_escalated", "escalation_state",
             "resolved_at", "closed_at", "resolution_notes",
             "completion_notes", "parts_used", "completed_by", "completed_by_name", "completed_at",
             "reviewed_by", "reviewed_by_name", "reviewed_at", "review_comments",
@@ -162,6 +162,7 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
             "id", "ticket_number", "occurrence", "status",
             "escalated", "escalated_at", "created_at", "updated_at",
             "assigned_at", "assignment_escalated", "due_date_escalated",
+            "escalation_state",
             "completed_by", "completed_at", "reviewed_by", "reviewed_at",
             "closed_at",
         ]
@@ -190,7 +191,7 @@ class TicketListSerializer(serializers.ModelSerializer):
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
             "reported_by", "reported_by_name",
             "due_date", "response_due_at", "escalated", "is_response_overdue",
-            "assignment_escalated", "due_date_escalated",
+            "assignment_escalated", "due_date_escalated", "escalation_state",
             "resolved_at", "closed_at", "completion_notes", "parts_used", "completed_at",
             "reviewed_at", "review_comments", "blocked_reason", "hold_reason",
             "attachment_count", "comment_count",
@@ -198,7 +199,7 @@ class TicketListSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "id", "ticket_number", "occurrence", "status",
-            "assignment_escalated", "due_date_escalated",
+            "assignment_escalated", "due_date_escalated", "escalation_state",
             "closed_at", "created_at", "updated_at",
         ]
 

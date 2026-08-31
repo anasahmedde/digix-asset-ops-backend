@@ -148,24 +148,37 @@ class WarrantyPeriodPreset(TimeStampedModel):
 
 
 class EscalationPolicy(TimeStampedModel):
-    """Data-driven ticket escalation ladder (client hierarchy:
+    """Data-driven escalation ladder (client hierarchy:
     Group Head > Operations/Marketing Head > Supervisors > Technician).
 
-    One row per trigger. The beat task walks active policies and escalates
-    matching tickets once per trigger, notifying ``escalate_to_role`` users
-    (and optionally ``also_notify_role`` — e.g. operations always hears about
-    assignment breaches).
+    One row per (scope, trigger, stage). The beat tasks walk active policies
+    grouped by trigger and fire each stage once per record, notifying
+    ``escalate_to_role`` users (and optionally ``also_notify_role`` — e.g.
+    operations always hears about assignment breaches).
+
+    ``hours`` is the offset in hours FROM THE TRIGGER ANCHOR for that stage —
+    stage 2 hours are absolute from the anchor, not relative to stage 1.
     """
+
+    class Scope(models.TextChoices):
+        TICKET = "ticket", "Ticket"
+        INSTALLATION = "installation", "Installation"
 
     class Trigger(models.TextChoices):
         ASSIGNMENT_SLA = "assignment_sla", "Unassigned beyond window"
         RESPONSE_SLA = "response_sla", "No response within SLA"
         DUE_DATE = "due_date", "Past due date"
 
-    trigger = models.CharField(max_length=20, choices=Trigger.choices, unique=True)
+    scope = models.CharField(max_length=20, choices=Scope.choices, default=Scope.TICKET)
+    trigger = models.CharField(max_length=20, choices=Trigger.choices)
+    stage = models.PositiveSmallIntegerField(default=1)
     hours = models.PositiveIntegerField(
         null=True, blank=True,
-        help_text="Window in hours (assignment trigger). Blank = response SLA uses per-priority windows; due date fires the day after.",
+        help_text=(
+            "Offset in hours from the trigger anchor for this stage "
+            "(stage hours are absolute from the anchor). Blank = 0 "
+            "(assignment trigger falls back to 24)."
+        ),
     )
     escalate_to_role = models.CharField(
         max_length=20, default="group_head",
@@ -178,8 +191,9 @@ class EscalationPolicy(TimeStampedModel):
     is_active = models.BooleanField(default=True)
 
     class Meta:
-        ordering = ["trigger"]
+        ordering = ["scope", "trigger", "stage"]
+        unique_together = [("scope", "trigger", "stage")]
         verbose_name_plural = "escalation policies"
 
     def __str__(self):
-        return f"{self.get_trigger_display()} -> {self.escalate_to_role}"
+        return f"[{self.scope}] {self.get_trigger_display()} (stage {self.stage}) -> {self.escalate_to_role}"
