@@ -116,6 +116,18 @@ class DeviceViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        # Vendor scope (XC-04): portal users only see devices that appear in
+        # tickets assigned to their supplier or installations their supplier
+        # is doing — read-only (vendors are in no write-role group).
+        user = self.request.user
+        if getattr(user, "role", "") == "vendor" and not user.is_superuser:
+            if not user.supplier_id:
+                return qs.none()
+            qs = qs.filter(
+                Q(tickets__assigned_vendor_id=user.supplier_id)
+                | Q(linked_tickets__assigned_vendor_id=user.supplier_id)
+                | Q(installations__vendor_id=user.supplier_id)
+            ).distinct()
         # ?flag=operational|warranty_expired — dashboard drill-downs; lives
         # here (not filterset_fields) so list AND export share it. Unknown
         # values are ignored.
