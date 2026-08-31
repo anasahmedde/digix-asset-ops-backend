@@ -62,7 +62,18 @@ class Ticket(TimeStampedModel):
         REPLACEMENT = "replacement", "Replacement"
         INSPECTION = "inspection", "Inspection"
         RELOCATION = "relocation", "Relocation"
+        WARRANTY_CLAIM = "warranty_claim", "Warranty Claim"
+        PREVENTIVE_MAINTENANCE = "preventive_maintenance", "Preventive Maintenance"
         OTHER = "other", "Other"
+
+    class ChargeTo(models.TextChoices):
+        COMPANY = "company", "Company"
+        CLIENT = "client", "Client"
+        VENDOR = "vendor", "Vendor"
+
+    # Service categories whose cost liability is derived from the device's
+    # warranty state at creation (WF-14/15).
+    WARRANTY_AWARE_CATEGORIES = ("repair", "replacement", "warranty_claim")
 
     # Response SLA per priority — a ticket still "open" past this window is
     # auto-escalated (see tasks.escalate_overdue_tickets).
@@ -87,7 +98,7 @@ class Ticket(TimeStampedModel):
     description = models.TextField(blank=True)
     priority = models.CharField(max_length=10, choices=Priority.choices, default=Priority.MEDIUM)
     status = models.CharField(max_length=30, choices=Status.choices, default=Status.OPEN)
-    category = models.CharField(max_length=20, choices=Category.choices, default=Category.OTHER)
+    category = models.CharField(max_length=30, choices=Category.choices, default=Category.OTHER)
     issue_type = models.ForeignKey(
         TicketIssueType, on_delete=models.SET_NULL, null=True, blank=True, related_name="tickets"
     )
@@ -99,6 +110,21 @@ class Ticket(TimeStampedModel):
     device = models.ForeignKey(
         "assets.Device", on_delete=models.SET_NULL, null=True, blank=True, related_name="tickets"
     )
+    # Additional assets covered by this ticket (preventive maintenance across
+    # common assets, MW-03). `device` stays the primary for occurrence counting
+    # and warranty detection; every linked asset (incl. the primary) lives here.
+    devices = models.ManyToManyField(
+        "assets.Device", blank=True, related_name="linked_tickets"
+    )
+    # The warranty this ticket claims against (WF-14); set automatically for
+    # warranty-aware categories when the device has an active client warranty.
+    warranty = models.ForeignKey(
+        "warranties.Warranty", on_delete=models.SET_NULL, null=True, blank=True, related_name="claims"
+    )
+    # Cost liability (WF-15): out-of-warranty work defaults to billable-to-client.
+    is_billable = models.BooleanField(default=False)
+    charge_to = models.CharField(max_length=10, choices=ChargeTo.choices, blank=True, default="")
+    repair_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     site = models.ForeignKey(
         "sites.Site", on_delete=models.SET_NULL, null=True, blank=True, related_name="tickets"
     )

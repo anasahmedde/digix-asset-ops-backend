@@ -38,11 +38,11 @@ class TicketViewSet(viewsets.ModelViewSet):
     queryset = Ticket.objects.select_related(
         "device", "site", "issue_type", "assigned_to", "assigned_vendor",
         "reported_by", "completed_by", "reviewed_by",
-    ).prefetch_related("attachments", "comments").all()
+    ).prefetch_related("attachments", "comments", "devices").all()
     permission_classes = [IsAuthenticated, TechnicianCanCreate]
     filterset_fields = [
         "status", "priority", "category", "issue_type", "assigned_to",
-        "assigned_vendor", "site", "device", "escalated",
+        "assigned_vendor", "site", "escalated", "is_billable",
     ]
     search_fields = ["ticket_number", "title", "description"]
     ordering_fields = ["created_at", "due_date", "response_due_at", "priority", "status"]
@@ -55,6 +55,19 @@ class TicketViewSet(viewsets.ModelViewSet):
         (who relay client decisions and close tickets) see everything.
         """
         qs = super().get_queryset()
+        # ?device= matches the primary asset OR any linked asset (MW-03 —
+        # handled here rather than filterset_fields so both paths hit).
+        device_id = self.request.query_params.get("device")
+        if device_id:
+            import uuid as _uuid
+
+            from rest_framework.exceptions import ValidationError as DRFValidationError
+
+            try:
+                _uuid.UUID(device_id)
+            except (ValueError, AttributeError, TypeError):
+                raise DRFValidationError({"device": "Enter a valid UUID."})
+            qs = qs.filter(Q(device_id=device_id) | Q(devices__id=device_id)).distinct()
         user = self.request.user
         if getattr(user, "role", "") == "technician" and not user.is_superuser:
             return qs.filter(Q(assigned_to=user) | Q(reported_by=user))
@@ -238,8 +251,30 @@ class TicketViewSet(viewsets.ModelViewSet):
         # Stamp closure time on close; clear it again when the ticket reopens.
         if new_status == Ticket.Status.CLOSED:
             ticket.closed_at = timezone.now()
+            # Closing a warranty claim releases the warranty from its
+            # "claim pending" state (WF-14).
+            if ticket.category == Ticket.Category.WARRANTY_CLAIM and ticket.warranty_id:
+                from apps.warranties.models import Warranty
+
+                warranty = ticket.warranty
+                if warranty.status == Warranty.Status.CLAIMED:
+                    warranty.status = (
+                        Warranty.Status.EXPIRED
+                        if warranty.end_date and warranty.end_date < timezone.localdate()
+                        else Warranty.Status.ACTIVE
+                    )
+                    warranty.save(update_fields=["status", "updated_at"])
         elif is_reopen:
             ticket.closed_at = None
+            # Reopening a warranty claim puts the warranty back into its
+            # "claim pending" state — mirror of the close branch above.
+            if ticket.category == Ticket.Category.WARRANTY_CLAIM and ticket.warranty_id:
+                from apps.warranties.models import Warranty
+
+                warranty = ticket.warranty
+                if warranty.status in (Warranty.Status.ACTIVE, Warranty.Status.EXPIRED):
+                    warranty.status = Warranty.Status.CLAIMED
+                    warranty.save(update_fields=["status", "updated_at"])
 
         ticket.status = new_status
         ticket.save(update_fields=[

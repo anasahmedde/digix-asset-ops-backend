@@ -257,3 +257,148 @@ def test_completion_marks_device_installed(installation):
         step.save()
     device.refresh_from_db()
     assert device.status == "installed"
+
+
+def _complete_non_handover_steps(installation):
+    for step in installation.steps.exclude(step_type=InstallationStep.StepType.HANDOVER):
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+
+
+def test_handover_happy_path(installation, ops):
+    _complete_non_handover_steps(installation)
+    client = _client(ops)
+    resp = client.post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Mr. Client POC", "acceptance_notes": "All good"},
+        format="multipart",
+    )
+    assert resp.status_code == 201, resp.data
+    body = resp.json()
+    assert body["handover"]["accepted_by_name"] == "Mr. Client POC"
+
+    device = installation.device
+    device.refresh_from_db()
+    installation.refresh_from_db()
+    assert device.status == "active"
+    assert device.assigned_client_id == installation.handover.client_id
+    assert device.current_site_id == installation.site_id
+    assert device.installation_date == installation.handover.handover_date
+    assert installation.completed_at is not None
+    assert installation.steps.get(step_type="handover").status == "completed"
+    # Journalled through the machine with the acceptance reason.
+    event = device.lifecycle_events.get(event_type="status_change", to_value="active")
+    assert "Mr. Client POC" in event.description
+
+
+def test_handover_blocked_while_steps_pending(installation, ops):
+    client = _client(ops)
+    resp = client.post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Early Bird"},
+        format="multipart",
+    )
+    assert resp.status_code == 400
+    assert "remaining steps" in resp.json()["detail"]
+
+
+def test_handover_twice_rejected(installation, ops):
+    _complete_non_handover_steps(installation)
+    client = _client(ops)
+    first = client.post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Once"},
+        format="multipart",
+    )
+    assert first.status_code == 201
+    again = client.post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Twice"},
+        format="multipart",
+    )
+    assert again.status_code == 400
+    assert "already" in again.json()["detail"]
+
+
+def test_handover_forbidden_for_unassigned_technician(installation):
+    _complete_non_handover_steps(installation)
+    stranger = User.objects.create_user(username="site-tech-x", password="x", role="technician")
+    client = _client(stranger)
+    resp = client.post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Nope"},
+        format="multipart",
+    )
+    assert resp.status_code == 403
+
+
+def test_handover_requires_client_when_device_has_none(installation, ops):
+    _complete_non_handover_steps(installation)
+    device = installation.device
+    device.assigned_client = None
+    device.save(update_fields=["assigned_client"])
+    client = _client(ops)
+    resp = client.post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "No Client"},
+        format="multipart",
+    )
+    assert resp.status_code == 400
+    assert "client" in resp.json()
+
+
+def test_assigned_installer_and_supervisor_can_handover(installation, tech):
+    _complete_non_handover_steps(installation)
+    r = _client(tech).post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Installer Handover"},
+        format="multipart",
+    )
+    assert r.status_code == 201, r.content
+
+    # A supervisor on a fresh installation works too.
+    site2 = Site.objects.create(name="Second Site", city="Lahore")
+    device2 = Device.objects.create(
+        device_model=installation.device.device_model,
+        asset_code="AST-INST-2", serial_number="INST-2",
+        assigned_client=installation.device.assigned_client,
+    )
+    inst2 = DeviceInstallation.objects.create(
+        device=device2, site=site2, installed_at=timezone.now()
+    )
+    _complete_non_handover_steps(inst2)
+    supervisor = User.objects.create_user(username="site-super", password="x", role="supervisor")
+    r2 = _client(supervisor).post(
+        f"/api/sites/installations/{inst2.pk}/handover/",
+        {"accepted_by_name": "Supervisor Handover"},
+        format="multipart",
+    )
+    assert r2.status_code == 201, r2.content
+
+
+def test_handover_reanchors_warranty_even_when_steps_already_done(installation, ops):
+    from datetime import timedelta as td
+
+    from apps.warranties.models import Warranty
+
+    today = timezone.localdate()
+    warranty = Warranty.objects.create(
+        device=installation.device, warranty_type="client", status="active",
+        start_date=today, end_date=today + td(days=365), months=12,
+    )
+    # Close out the WHOLE checklist first (mobile flow), incl. handover step.
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+    installation.refresh_from_db()
+    assert installation.completed_at is not None
+
+    paper_date = (today - td(days=30)).isoformat()
+    r = _client(ops).post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Paper Acceptance", "handover_date": paper_date},
+        format="multipart",
+    )
+    assert r.status_code == 201, r.content
+    warranty.refresh_from_db()
+    assert str(warranty.start_date) == paper_date

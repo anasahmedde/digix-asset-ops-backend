@@ -62,6 +62,7 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
             "id", "schedule", "schedule_title",
             "performed_by", "performed_by_name",
             "performed_at", "status", "notes", "cost",
+            "is_billable", "charge_to",
             "components_used", "component_names", "photos",
             "created_at",
         ]
@@ -69,6 +70,21 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
 
     def get_component_names(self, obj):
         return [c.name for c in obj.components_used.all()]
+
+    def create(self, validated_data):
+        # Warranty-aware billability defaults (MW-01/02) — explicit payload
+        # values win over the derived ones.
+        from apps.warranties.services import derive_billability
+
+        schedule = validated_data.get("schedule")
+        device = schedule.device if schedule else None
+        if device is not None:
+            _, billable, charge = derive_billability(device)
+            if "is_billable" not in validated_data:
+                validated_data["is_billable"] = billable
+            if not validated_data.get("charge_to"):
+                validated_data["charge_to"] = charge
+        return super().create(validated_data)
 
     def validate(self, attrs):
         schedule = attrs.get("schedule") or getattr(self.instance, "schedule", None)

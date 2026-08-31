@@ -98,10 +98,14 @@ def _mark_device_installed(installation: DeviceInstallation) -> None:
 
 
 def _anchor_client_warranties(installation: DeviceInstallation) -> None:
-    """Client warranties run from handover: re-anchor active term-based ones."""
+    """Client warranties run from handover: re-anchor active term-based ones.
+
+    The formal HandoverRecord date wins when one exists; step-completion time
+    is the fallback for installations closed without the handover action."""
     from dateutil.relativedelta import relativedelta
 
-    handover = installation.completed_at.date()
+    record = getattr(installation, "handover", None)
+    handover = record.handover_date if record else installation.completed_at.date()
     warranties = installation.device.warranties.filter(
         warranty_type="client", status="active", months__isnull=False
     )

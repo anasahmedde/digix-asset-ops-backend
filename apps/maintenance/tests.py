@@ -165,3 +165,51 @@ def test_required_components_roundtrip(ops):
         "required_components": [{"quantity": 3}],
     }, format="json")
     assert bad.status_code == 400
+
+
+@pytest.mark.django_db
+def test_record_billability_defaults_from_warranty(ops):
+    from datetime import timedelta as td
+
+    from apps.warranties.models import Warranty
+
+    brand = Brand.objects.create(name="MB-Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="MB-1")
+    covered = Device.objects.create(device_model=dm, asset_code="AST-MB-1", serial_number="MB-1")
+    uncovered = Device.objects.create(device_model=dm, asset_code="AST-MB-2", serial_number="MB-2")
+    today = timezone.localdate()
+    Warranty.objects.create(
+        device=covered, warranty_type="client", status="active",
+        start_date=today, end_date=today + td(days=365), months=12,
+    )
+    c = _client(ops)
+
+    def make_record(device):
+        schedule = MaintenanceSchedule.objects.create(
+            title=f"PM {device.asset_code}", maintenance_type="preventive",
+            frequency="monthly", device=device, next_due=today,
+        )
+        r = c.post("/api/maintenance/records/", {
+            "schedule": str(schedule.pk),
+            "performed_at": timezone.now().isoformat(),
+            "status": "completed",
+        }, format="json")
+        assert r.status_code == 201, r.content
+        return r.json()
+
+    under = make_record(covered)
+    assert under["is_billable"] is False and under["charge_to"] == "company"
+    out = make_record(uncovered)
+    assert out["is_billable"] is True and out["charge_to"] == "client"
+
+    # Explicit values override the derivation.
+    schedule = MaintenanceSchedule.objects.create(
+        title="PM override", maintenance_type="preventive",
+        frequency="monthly", device=covered, next_due=today,
+    )
+    r = c.post("/api/maintenance/records/", {
+        "schedule": str(schedule.pk), "performed_at": timezone.now().isoformat(),
+        "status": "completed", "is_billable": True, "charge_to": "client",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.json()["is_billable"] is True and r.json()["charge_to"] == "client"

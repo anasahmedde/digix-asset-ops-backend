@@ -1,7 +1,10 @@
 from rest_framework import serializers
 
+from apps.clients.models import Client
+
 from .models import (
     DeviceInstallation,
+    HandoverRecord,
     InstallationDelay,
     InstallationPhoto,
     InstallationStep,
@@ -165,7 +168,37 @@ class DeviceInstallationListSerializer(_InstallationCommonMixin, serializers.Mod
         read_only_fields = ["id", "completed_at", "created_at"]
 
 
+class HandoverRecordSerializer(serializers.ModelSerializer):
+    client_name = serializers.CharField(source="client.name", read_only=True)
+    site_name = serializers.CharField(source="site.name", read_only=True)
+    performed_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = HandoverRecord
+        fields = [
+            "id", "handover_date", "accepted_by_name", "acceptance_notes", "signature",
+            "client", "client_name", "site", "site_name", "performed_by_name", "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_performed_by_name(self, obj):
+        return obj.performed_by.get_full_name() or obj.performed_by.username if obj.performed_by else None
+
+
+class HandoverCreateSerializer(serializers.Serializer):
+    """Write payload for the installation handover action (multipart)."""
+
+    accepted_by_name = serializers.CharField(max_length=200)
+    acceptance_notes = serializers.CharField(required=False, allow_blank=True, default="")
+    handover_date = serializers.DateField(required=False)
+    client = serializers.PrimaryKeyRelatedField(
+        queryset=Client.objects.filter(is_active=True), required=False, allow_null=True
+    )
+    signature = serializers.ImageField(required=False, allow_null=True)
+
+
 class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.ModelSerializer):
+    handover = HandoverRecordSerializer(read_only=True)
     photos = InstallationPhotoSerializer(many=True, read_only=True)
     steps = InstallationStepSerializer(many=True, read_only=True)
     delays = InstallationDelaySerializer(many=True, read_only=True)
@@ -193,7 +226,7 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
             "vendor", "vendor_name",
             "due_date", "completed_at",
             "position_label", "notes", "photos", "steps", "delays", "step_types",
-            "progress", "client_delays", "on_hold_steps", "created_at",
+            "handover", "progress", "client_delays", "on_hold_steps", "created_at",
         ]
         read_only_fields = ["id", "completed_at", "created_at"]
 
