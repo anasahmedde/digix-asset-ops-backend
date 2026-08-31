@@ -112,6 +112,15 @@ class MaintenanceRecord(TimeStampedModel):
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.COMPLETED)
     notes = models.TextField(blank=True)
     cost = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    # Cost liability (MW-01/02): derived from the asset's warranty state when
+    # the record is created — expired warranty defaults to billable-to-client.
+    is_billable = models.BooleanField(default=False)
+    charge_to = models.CharField(
+        max_length=10,
+        choices=[("company", "Company"), ("client", "Client"), ("vendor", "Vendor")],
+        blank=True,
+        default="",
+    )
     # Which of the asset's components were serviced/replaced during the visit.
     components_used = models.ManyToManyField(
         "assets.AssetComponent", blank=True, related_name="maintenance_records"

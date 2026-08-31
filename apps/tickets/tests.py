@@ -495,3 +495,121 @@ def test_reopen_denied_for_technician(people):
         format="json",
     )
     assert r.status_code == 404
+
+
+@pytest.fixture
+def warranty_device(db):
+    from apps.assets.models import Brand, Device, DeviceModel
+
+    brand = Brand.objects.create(name="WtyBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="W-1")
+    return Device.objects.create(device_model=dm, asset_code="AST-WTY-1", serial_number="WTY-1")
+
+
+def _make_warranty(device, wtype="client", months=12, start_offset_days=0):
+    from datetime import timedelta as td
+
+    from apps.warranties.models import Warranty
+
+    start = timezone.localdate() - td(days=start_offset_days)
+    return Warranty.objects.create(
+        device=device, warranty_type=wtype, status="active",
+        start_date=start, end_date=start + td(days=30 * months), months=months,
+    )
+
+
+def test_billability_defaults_under_client_warranty(people, warranty_device):
+    warranty = _make_warranty(warranty_device)
+    c = _client(people["marketing"])
+    r = c.post("/api/tickets/", {
+        "title": "Panel flicker", "category": "repair",
+        "device": str(warranty_device.pk), "priority": "high",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    body = r.json()
+    assert body["is_billable"] is False
+    assert body["charge_to"] == "company"
+    assert body["warranty"] == str(warranty.pk)
+    assert body["warranty_info"]["status"] == "active"
+
+
+def test_billability_defaults_when_no_warranty(people, warranty_device):
+    c = _client(people["marketing"])
+    r = c.post("/api/tickets/", {
+        "title": "Out of cover repair", "category": "repair",
+        "device": str(warranty_device.pk),
+    }, format="json")
+    assert r.status_code == 201, r.content
+    body = r.json()
+    assert body["is_billable"] is True
+    assert body["charge_to"] == "client"
+    assert body["warranty"] is None
+
+
+def test_billability_vendor_when_supplier_warranty_active(people, warranty_device):
+    _make_warranty(warranty_device, wtype="client")
+    _make_warranty(warranty_device, wtype="supplier")
+    c = _client(people["marketing"])
+    r = c.post("/api/tickets/", {
+        "title": "Module burnt", "category": "warranty_claim",
+        "device": str(warranty_device.pk),
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.json()["charge_to"] == "vendor"
+
+
+def test_explicit_billability_overrides_defaults(people, warranty_device):
+    _make_warranty(warranty_device)
+    c = _client(people["marketing"])
+    r = c.post("/api/tickets/", {
+        "title": "Client-caused damage", "category": "repair",
+        "device": str(warranty_device.pk),
+        "is_billable": True, "charge_to": "client",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.json()["is_billable"] is True
+    assert r.json()["charge_to"] == "client"
+
+
+def test_warranty_claim_sets_claimed_and_close_restores(people, warranty_device):
+    from apps.warranties.models import Warranty
+
+    warranty = _make_warranty(warranty_device)
+    c = _client(people["ops"])
+    r = c.post("/api/tickets/", {
+        "title": "Claim: dead pixels", "category": "warranty_claim",
+        "device": str(warranty_device.pk),
+    }, format="json")
+    assert r.status_code == 201, r.content
+    warranty.refresh_from_db()
+    assert warranty.status == Warranty.Status.CLAIMED
+
+    ticket_id = r.json()["id"]
+    close = c.post(f"/api/tickets/{ticket_id}/transition/", {"status": "closed"}, format="json")
+    assert close.status_code == 200, close.content
+    warranty.refresh_from_db()
+    assert warranty.status == Warranty.Status.ACTIVE
+
+
+def test_multi_asset_ticket(people, warranty_device):
+    from apps.assets.models import Brand, Device, DeviceModel
+
+    brand = Brand.objects.create(name="MABrand")
+    dm = DeviceModel.objects.create(brand=brand, name="MA-1")
+    second = Device.objects.create(device_model=dm, asset_code="AST-MA-2", serial_number="MA-2")
+    c = _client(people["ops"])
+    r = c.post("/api/tickets/", {
+        "title": "Preventive: adapters batch", "category": "preventive_maintenance",
+        "devices": [str(warranty_device.pk), str(second.pk)],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    body = r.json()
+    # Primary derived from the first linked asset; both linked.
+    assert body["device"] == str(warranty_device.pk)
+    codes = {d["asset_code"] for d in body["devices_info"]}
+    assert codes == {"AST-WTY-1", "AST-MA-2"}
+
+    # ?device= matches via the M2M for the second asset too.
+    listing = c.get("/api/tickets/", {"device": str(second.pk)})
+    assert listing.status_code == 200
+    assert listing.json()["count"] == 1

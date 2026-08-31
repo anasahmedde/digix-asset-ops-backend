@@ -181,6 +181,7 @@ class InstallationPhoto(TimeStampedModel):
         PRE_INSTALL = "pre_install", "Pre-Installation"
         POST_INSTALL = "post_install", "Post-Installation"
         VERIFICATION = "verification", "Verification"
+        HANDOVER = "handover", "Handover"
 
     installation = models.ForeignKey(
         DeviceInstallation, on_delete=models.CASCADE, related_name="photos"
@@ -196,3 +197,32 @@ class InstallationPhoto(TimeStampedModel):
 
     def __str__(self):
         return f"{self.photo_type} - {self.installation}"
+
+
+class HandoverRecord(TimeStampedModel):
+    """Formal client acceptance of an installation (WF-12).
+
+    One handover per installation: captures who accepted, when, the signature
+    and notes. Creating it (via the installation's handover action) assigns
+    the client + site to the asset and moves it to Active.
+    """
+
+    installation = models.OneToOneField(
+        DeviceInstallation, on_delete=models.CASCADE, related_name="handover"
+    )
+    device = models.ForeignKey("assets.Device", on_delete=models.CASCADE, related_name="handovers")
+    client = models.ForeignKey("clients.Client", on_delete=models.PROTECT, related_name="handovers")
+    site = models.ForeignKey(Site, on_delete=models.PROTECT, related_name="handovers")
+    handover_date = models.DateField()
+    accepted_by_name = models.CharField(max_length=200)
+    acceptance_notes = models.TextField(blank=True)
+    signature = models.ImageField(upload_to=upload_to_path, blank=True)
+    performed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="handovers_performed"
+    )
+
+    class Meta:
+        ordering = ["-handover_date"]
+
+    def __str__(self):
+        return f"Handover of {self.device.asset_code} to {self.client.name} on {self.handover_date}"

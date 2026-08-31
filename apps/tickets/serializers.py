@@ -65,13 +65,64 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
     attachment_count = serializers.IntegerField(source="attachments.count", read_only=True)
     comment_count = serializers.IntegerField(source="comments.count", read_only=True)
     is_response_overdue = serializers.BooleanField(read_only=True)
+    devices_info = serializers.SerializerMethodField()
+    warranty_info = serializers.SerializerMethodField()
+
+    def get_devices_info(self, obj):
+        return [
+            {"id": str(d.pk), "asset_code": d.asset_code, "display_name": d.display_name}
+            for d in obj.devices.all()
+        ]
+
+    def get_warranty_info(self, obj):
+        w = obj.warranty
+        if w is None:
+            return None
+        return {
+            "id": str(w.pk), "warranty_type": w.warranty_type,
+            "end_date": w.end_date, "status": w.status,
+        }
+
+    def create(self, validated_data):
+        from apps.warranties.models import Warranty
+        from apps.warranties.services import derive_billability
+
+        devices = validated_data.get("devices") or []
+        if not validated_data.get("device") and devices:
+            validated_data["device"] = devices[0]
+
+        # Cost liability from the warranty state at creation (WF-14/15) —
+        # explicit payload values always win over the derived defaults.
+        device = validated_data.get("device")
+        category = validated_data.get("category", Ticket.Category.OTHER)
+        if device is not None and category in Ticket.WARRANTY_AWARE_CATEGORIES:
+            warranty, billable, charge = derive_billability(device)
+            if validated_data.get("warranty") is None:
+                validated_data["warranty"] = warranty
+            if "is_billable" not in validated_data:
+                validated_data["is_billable"] = billable
+            if not validated_data.get("charge_to"):
+                validated_data["charge_to"] = charge
+
+        ticket = super().create(validated_data)
+        if ticket.device_id:
+            ticket.devices.add(ticket.device)
+        if (
+            ticket.category == Ticket.Category.WARRANTY_CLAIM
+            and ticket.warranty
+            and ticket.warranty.status == Warranty.Status.ACTIVE
+        ):
+            ticket.warranty.status = Warranty.Status.CLAIMED
+            ticket.warranty.save(update_fields=["status", "updated_at"])
+        return ticket
 
     class Meta:
         model = Ticket
         fields = [
             "id", "ticket_number", "occurrence", "complaint_by", "title", "description", "priority", "status", "category",
             "issue_type", "issue_type_name",
-            "device", "device_code", "site", "site_name",
+            "device", "device_code", "devices", "devices_info", "site", "site_name",
+            "warranty", "warranty_info", "is_billable", "charge_to", "repair_cost",
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
             "reported_by", "reported_by_name",
             "due_date", "response_due_at", "escalated", "escalated_at", "is_response_overdue",
@@ -111,6 +162,7 @@ class TicketListSerializer(serializers.ModelSerializer):
             "id", "ticket_number", "occurrence", "complaint_by", "title", "description", "priority", "status", "category",
             "issue_type", "issue_type_name",
             "device", "device_code", "site", "site_name",
+            "is_billable", "charge_to",
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
             "reported_by", "reported_by_name",
             "due_date", "response_due_at", "escalated", "is_response_overdue",

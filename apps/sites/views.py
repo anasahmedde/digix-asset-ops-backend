@@ -1,6 +1,12 @@
+from django.db import transaction
 from django.db.models import Count
+from django.utils import timezone
+from rest_framework import status as drf_status
 from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import BasePermission, IsAuthenticated
+from rest_framework.response import Response
 
 from common.permissions import AdminManagerWriteElseRead
 
@@ -19,6 +25,7 @@ class IsSuperAdminOrAssignedInstaller(BasePermission):
 
 from .models import (
     DeviceInstallation,
+    HandoverRecord,
     InstallationDelay,
     InstallationPhoto,
     InstallationStep,
@@ -29,6 +36,7 @@ from .models import (
 from .serializers import (
     DeviceInstallationDetailSerializer,
     DeviceInstallationListSerializer,
+    HandoverCreateSerializer,
     InstallationDelaySerializer,
     InstallationPhotoSerializer,
     InstallationStepSerializer,
@@ -100,6 +108,96 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         if self.action == "list":
             return DeviceInstallationListSerializer
         return DeviceInstallationDetailSerializer
+
+    HANDOVER_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
+
+    @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
+    def handover(self, request, pk=None):
+        """Formal handover (WF-12): record acceptance, assign client + site to
+        the asset, complete the handover step and move the asset to Active."""
+        installation = self.get_object()
+        user = request.user
+        if (
+            getattr(user, "role", None) not in self.HANDOVER_ROLES
+            and installation.installed_by_id != user.id
+        ):
+            return Response(
+                {"detail": "Only the assigned installer or operations management can hand over."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+        if getattr(installation, "handover", None):
+            return Response(
+                {"detail": "This installation has already been handed over."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        pending = [
+            step.custom_label or step.get_step_type_display()
+            for step in installation.steps.exclude(step_type=InstallationStep.StepType.HANDOVER)
+            if step.status not in (InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.SKIPPED)
+        ]
+        if pending:
+            return Response(
+                {"detail": f"Complete the remaining steps before handover: {', '.join(pending)}."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        ser = HandoverCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        device = installation.device
+        client = ser.validated_data.get("client") or device.assigned_client
+        if client is None:
+            return Response(
+                {"client": "The asset has no client yet — pick the client receiving it."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            record = HandoverRecord.objects.create(
+                installation=installation,
+                device=device,
+                client=client,
+                site=installation.site,
+                handover_date=ser.validated_data.get("handover_date") or timezone.localdate(),
+                accepted_by_name=ser.validated_data["accepted_by_name"],
+                acceptance_notes=ser.validated_data.get("acceptance_notes", ""),
+                signature=ser.validated_data.get("signature"),
+                performed_by=user,
+            )
+            device.assigned_client = client
+            device.current_site = installation.site
+            device.installation_date = record.handover_date
+            device.save(update_fields=["assigned_client", "current_site", "installation_date", "updated_at"])
+
+            for image in request.FILES.getlist("photos"):
+                InstallationPhoto.objects.create(
+                    installation=installation,
+                    photo_type=InstallationPhoto.PhotoType.HANDOVER,
+                    image=image,
+                    taken_by=user,
+                )
+
+            # Completing the handover step stamps completed_at, re-anchors the
+            # client warranty to the record's date and journals the flip.
+            step = installation.steps.filter(step_type=InstallationStep.StepType.HANDOVER).first()
+            if step and step.status not in (
+                InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.SKIPPED
+            ):
+                step.status = InstallationStep.StepStatus.COMPLETED
+                step.save()
+
+            device.refresh_from_db()
+            if device.status != "active":
+                device._transition_user = user
+                device._transition_reason = f"Handover accepted by {record.accepted_by_name}"
+                device.status = "active"
+                device.save(update_fields=["status", "updated_at"])
+
+        installation.refresh_from_db()
+        installation._prefetched_objects_cache = {}
+        return Response(
+            DeviceInstallationDetailSerializer(installation, context=self.get_serializer_context()).data,
+            status=drf_status.HTTP_201_CREATED,
+        )
 
 
 class InstallationStepViewSet(viewsets.ModelViewSet):
