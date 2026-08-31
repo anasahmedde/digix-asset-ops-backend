@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
@@ -141,6 +143,36 @@ class TicketViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        # Reopening a closed ticket: Operations or the original reporter only,
+        # within the reopen window, and a reason is required.
+        is_reopen = old_status == Ticket.Status.CLOSED
+        if is_reopen:
+            if not (is_manager or is_reporter):
+                return Response(
+                    {"detail": "Only Operations or the reporter can reopen a closed ticket."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            # Legacy rows closed before closed_at existed fall back to the
+            # last update so the window never fails open.
+            closed_reference = ticket.closed_at or ticket.updated_at
+            deadline = (
+                closed_reference + timedelta(days=Ticket.REOPEN_WINDOW_DAYS)
+                if closed_reference else None
+            )
+            if deadline and timezone.now() > deadline:
+                return Response(
+                    {"detail": (
+                        f"Closed tickets can only be reopened within "
+                        f"{Ticket.REOPEN_WINDOW_DAYS} days of closure."
+                    )},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not notes.strip():
+                return Response(
+                    {"notes": "Reopen reason is required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         assignee_transitions = {
             Ticket.Status.IN_PROGRESS,
             Ticket.Status.ON_HOLD,
@@ -155,6 +187,7 @@ class TicketViewSet(viewsets.ModelViewSet):
         if (
             new_status in assignee_transitions
             and old_status not in approval_stages
+            and not is_reopen  # reopen has its own gate above
             and not is_assignee
             and not is_manager
         ):
@@ -202,17 +235,27 @@ class TicketViewSet(viewsets.ModelViewSet):
             ticket.blocked_reason = ""
             ticket.hold_reason = ""
 
+        # Stamp closure time on close; clear it again when the ticket reopens.
+        if new_status == Ticket.Status.CLOSED:
+            ticket.closed_at = timezone.now()
+        elif is_reopen:
+            ticket.closed_at = None
+
         ticket.status = new_status
         ticket.save(update_fields=[
-            "status", "blocked_reason", "hold_reason", "updated_at",
+            "status", "blocked_reason", "hold_reason", "closed_at", "updated_at",
         ])
 
         old_display = dict(Ticket.Status.choices).get(old_status, old_status)
         new_display = dict(Ticket.Status.choices).get(new_status, new_status)
+        if is_reopen:
+            content = f"Ticket reopened: {notes}"
+        else:
+            content = notes or f"Status changed from {old_display} to {new_display}"
         TicketComment.objects.create(
             ticket=ticket,
             author=request.user,
-            content=notes or f"Status changed from {old_display} to {new_display}",
+            content=content,
             comment_type=TicketComment.CommentType.STATUS_CHANGE,
             old_status=old_status,
             new_status=new_status,

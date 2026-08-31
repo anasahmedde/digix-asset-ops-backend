@@ -76,7 +76,7 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
             "reported_by", "reported_by_name",
             "due_date", "response_due_at", "escalated", "escalated_at", "is_response_overdue",
             "assigned_at", "assignment_escalated", "due_date_escalated",
-            "resolved_at", "resolution_notes",
+            "resolved_at", "closed_at", "resolution_notes",
             "completion_notes", "parts_used", "completed_by", "completed_by_name", "completed_at",
             "reviewed_by", "reviewed_by_name", "reviewed_at", "review_comments",
             "blocked_reason", "hold_reason",
@@ -88,6 +88,7 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
             "escalated", "escalated_at", "created_at", "updated_at",
             "assigned_at", "assignment_escalated", "due_date_escalated",
             "completed_by", "completed_at", "reviewed_by", "reviewed_at",
+            "closed_at",
         ]
 
 
@@ -114,7 +115,7 @@ class TicketListSerializer(serializers.ModelSerializer):
             "reported_by", "reported_by_name",
             "due_date", "response_due_at", "escalated", "is_response_overdue",
             "assignment_escalated", "due_date_escalated",
-            "resolved_at", "completion_notes", "parts_used", "completed_at",
+            "resolved_at", "closed_at", "completion_notes", "parts_used", "completed_at",
             "reviewed_at", "review_comments", "blocked_reason", "hold_reason",
             "attachment_count", "comment_count",
             "created_at", "updated_at",
@@ -122,7 +123,7 @@ class TicketListSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "ticket_number", "occurrence", "status",
             "assignment_escalated", "due_date_escalated",
-            "created_at", "updated_at",
+            "closed_at", "created_at", "updated_at",
         ]
 
 
