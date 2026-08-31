@@ -29,8 +29,13 @@ from .serializers import (
     DeviceLifecycleEventSerializer,
     DeviceListSerializer,
     DeviceModelSerializer,
+    DeviceTransitionSerializer,
     MaterialTypeSerializer,
 )
+
+# Who may move assets through the status machine: oversight roles plus the
+# warehouse team (who receive stock, dispatch and process RMAs).
+DEVICE_TRANSITION_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor", "warehouse")
 
 
 class AssetTypeViewSet(viewsets.ModelViewSet):
@@ -73,7 +78,7 @@ class DeviceViewSet(viewsets.ModelViewSet):
     ).prefetch_related("images", "warranties", "clients").all()
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = [
-        "status", "asset_type", "device_model", "current_site",
+        "status", "source", "asset_type", "device_model", "current_site",
         "assigned_client", "assigned_technician",
     ]
     search_fields = ["asset_code", "serial_number", "mobile_id", "mac_address", "display_name"]
@@ -83,6 +88,40 @@ class DeviceViewSet(viewsets.ModelViewSet):
         if self.action == "list":
             return DeviceListSerializer
         return DeviceDetailSerializer
+
+    def get_permissions(self):
+        # The transition action carries its own role gate (supervisor and
+        # warehouse may transition but are read-only elsewhere).
+        if self.action == "transition":
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
+    # ── Status transition (guarded state machine) ─────────────────────
+
+    @action(detail=True, methods=["post"], url_path="transition")
+    def transition(self, request, pk=None):
+        """Move the device through the status machine, journalling the flip.
+
+        The reason is mandatory — signals write it into the lifecycle event
+        and the audit trail alongside who performed the change.
+        """
+        device = self.get_object()
+        if getattr(request.user, "role", "") not in DEVICE_TRANSITION_ROLES:
+            return Response(
+                {"detail": "You do not have permission to change asset status."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        ser = DeviceTransitionSerializer(data=request.data, context={"device": device})
+        ser.is_valid(raise_exception=True)
+
+        device.status = ser.validated_data["status"]
+        device._transition_user = request.user
+        device._transition_reason = ser.validated_data["reason"]
+        device.save(update_fields=["status", "updated_at"])
+
+        device.refresh_from_db()
+        return Response(DeviceDetailSerializer(device, context={"request": request}).data)
 
     @action(detail=True, methods=["get"])
     def lifecycle(self, request, pk=None):

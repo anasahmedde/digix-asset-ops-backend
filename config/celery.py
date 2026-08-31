@@ -18,4 +18,8 @@ app.conf.beat_schedule = {
         "task": "apps.warranties.tasks.complete_expired_warranties",
         "schedule": 21600.0,  # every 6 hours
     },
+    "deactivate-left-employees": {
+        "task": "apps.accounts.tasks.deactivate_left_employees",
+        "schedule": 86400.0,  # daily
+    },
 }

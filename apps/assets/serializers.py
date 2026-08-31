@@ -159,7 +159,7 @@ class DeviceListSerializer(serializers.ModelSerializer):
             "id", "asset_code", "serial_number", "display_name", "project", "project_name",
             "asset_type", "asset_type_name",
             "device_model", "device_model_name",
-            "status", "image", "current_site", "site_name",
+            "status", "source", "image", "current_site", "site_name",
             "assigned_client", "client_name", "client_names",
             "installation_date", "warranty_status", "created_at",
         ]
@@ -197,6 +197,9 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     client_warranty_months = serializers.ChoiceField(
         choices=[3, 6, 12], write_only=True, required=False, allow_null=True
     )
+    # Legal next statuses from the machine — the UI renders these as guarded
+    # transition buttons instead of a free select.
+    allowed_transitions = serializers.SerializerMethodField()
 
     class Meta:
         model = Device
@@ -206,7 +209,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "device_model", "device_model_name", "brand_name", "screen_type", "screen_size",
             "length_in", "width_in", "depth_in", "diagonal_inches",
             "specifications", "firmware_version", "hardware_revision",
-            "status", "image", "images",
+            "status", "source", "allowed_transitions", "image", "images",
             "purchase_date", "purchase_price", "supplier", "supplier_name",
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
@@ -241,10 +244,16 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         validated_data.pop("client_warranty_months", None)
+        # Status changes must go through the /transition/ action so the
+        # machine is enforced and every flip is journalled with a reason.
+        validated_data.pop("status", None)
         return super().update(instance, validated_data)
 
     def get_client_names(self, obj):
         return _client_names(obj)
+
+    def get_allowed_transitions(self, obj):
+        return list(Device.VALID_TRANSITIONS.get(obj.status, ()))
 
     def get_lifecycle_events(self, obj):
         events = obj.lifecycle_events.order_by("-created_at")[:10]
@@ -278,6 +287,22 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "supplier_name": w.supplier.name if w.supplier_id else None,
             "is_expired": w.is_expired,
         }
+
+
+class DeviceTransitionSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=Device.Status.choices)
+    reason = serializers.CharField()
+
+    def validate_status(self, value):
+        device = self.context["device"]
+        if not device.can_transition_to(value):
+            current = device.get_status_display()
+            target = dict(Device.Status.choices).get(value, value)
+            allowed = ", ".join(Device.VALID_TRANSITIONS.get(device.status, ())) or "none"
+            raise serializers.ValidationError(
+                f"Cannot transition from '{current}' to '{target}'. Allowed: {allowed}."
+            )
+        return value
 
 
 class DeviceLifecycleEventSerializer(serializers.ModelSerializer):

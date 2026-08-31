@@ -48,6 +48,20 @@ def create_default_installation_steps(sender, instance: DeviceInstallation, crea
         logger.exception("Failed to seed installation steps for %s", instance.pk)
 
 
+@receiver(post_save, sender=DeviceInstallation)
+def mark_device_on_installation_track(sender, instance: DeviceInstallation, created: bool, **kwargs):
+    """Creating an installation puts a pre-install asset on the installation
+    track (WF-10) — the registry status flips without a manual edit. The
+    assets signals journal the change as a lifecycle event + audit entry."""
+    if not created:
+        return
+    device = instance.device
+    if device.status in ("procured", "in_transit", "in_stock", "assigned"):
+        device._transition_reason = f"Installation created at {instance.site.name}"
+        device.status = "installed"
+        device.save(update_fields=["status", "updated_at"])
+
+
 @receiver(post_save, sender=InstallationStep)
 def stamp_installation_completion(sender, instance: InstallationStep, **kwargs):
     """Keep DeviceInstallation.completed_at in sync with its step checklist.

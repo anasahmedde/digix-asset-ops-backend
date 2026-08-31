@@ -19,7 +19,7 @@ from .serializers import (
 
 class ProjectViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
-    filterset_fields = ["status", "phase", "client", "site", "manager"]
+    filterset_fields = ["status", "phase", "contract_type", "client", "site", "manager"]
     search_fields = ["name", "location", "description"]
     ordering_fields = ["created_at", "start_date", "target_date", "progress"]
 

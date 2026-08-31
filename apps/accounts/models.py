@@ -1,6 +1,7 @@
 import uuid
 
 from django.contrib.auth.models import AbstractUser
+from django.core.validators import RegexValidator
 from django.db import models
 
 from common.models import TimeStampedModel
@@ -27,6 +28,15 @@ class User(AbstractUser):
     phone = models.CharField(max_length=20, blank=True)
     avatar = models.ImageField(upload_to="avatars/", blank=True)
     is_field_staff = models.BooleanField(default=False)
+    # HR fields (EM-01): company employee number, national ID, employment dates.
+    employee_id = models.CharField(max_length=50, blank=True, db_index=True)
+    cnic = models.CharField(
+        max_length=15,
+        blank=True,
+        validators=[RegexValidator(r"^\d{5}-\d{7}-\d$", "CNIC must be in #####-#######-# format")],
+    )
+    join_date = models.DateField(null=True, blank=True)
+    leaving_date = models.DateField(null=True, blank=True)
 
     class Meta:
         ordering = ["-date_joined"]

@@ -59,6 +59,7 @@ class ProjectListSerializer(serializers.ModelSerializer):
     bottleneck_count = serializers.IntegerField(read_only=True, default=0)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     phase_display = serializers.CharField(source="get_phase_display", read_only=True)
+    contract_type_display = serializers.CharField(source="get_contract_type_display", read_only=True)
     progress = serializers.SerializerMethodField()
 
     class Meta:
@@ -67,6 +68,7 @@ class ProjectListSerializer(serializers.ModelSerializer):
             "id", "name", "location", "image", "client", "client_name",
             "site", "site_name", "status", "status_display",
             "phase", "phase_display", "progress",
+            "contract_type", "contract_type_display", "rental_end_date",
             "start_date", "target_date", "completed_date",
             "manager", "manager_name", "bottleneck_count", "created_at",
          "assets_count",]
@@ -85,6 +87,7 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
     milestones = ProjectMilestoneSerializer(many=True, read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     phase_display = serializers.CharField(source="get_phase_display", read_only=True)
+    contract_type_display = serializers.CharField(source="get_contract_type_display", read_only=True)
     progress = serializers.SerializerMethodField()
 
     class Meta:
@@ -93,6 +96,7 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
             "id", "name", "description", "location", "image",
             "client", "client_name", "site", "site_name",
             "status", "status_display", "phase", "phase_display",
+            "contract_type", "contract_type_display", "rental_end_date",
             "progress", "start_date", "target_date", "completed_date",
             "manager", "manager_name", "budget", "notes",
             "bottlenecks", "members", "scope_items", "milestones",

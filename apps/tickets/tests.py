@@ -8,7 +8,7 @@ from rest_framework.test import APIClient
 
 from apps.accounts.models import User
 from apps.suppliers.models import Supplier
-from apps.tickets.models import Ticket, TicketIssueType
+from apps.tickets.models import Ticket, TicketIssueType, add_business_days
 from apps.tickets.tasks import escalate_overdue_tickets
 
 
@@ -305,3 +305,193 @@ def test_group_head_can_assign(heads, people):
     c = _client(heads["group_head"])
     r = c.post(f"/api/tickets/{t.pk}/assign/", {"assigned_to": str(people["tech"].pk)}, format="json")
     assert r.status_code == 200
+
+
+# ── TK-01 refinements: resolution SLA due dates + reopen window ────────
+
+@pytest.mark.django_db
+def test_due_date_auto_set_per_priority(people):
+    c = _client(people["marketing"])
+    now = timezone.now()
+    expectations = {
+        "critical": (now + timedelta(hours=24)).date(),
+        "high": (now + timedelta(hours=48)).date(),
+        "medium": add_business_days(now.date(), 5),
+        "low": add_business_days(now.date(), 10),
+    }
+    for priority, expected in expectations.items():
+        r = c.post("/api/tickets/", {"title": f"sla {priority}", "priority": priority}, format="json")
+        assert r.status_code == 201, r.content
+        t = Ticket.objects.get(pk=r.json()["id"])
+        assert t.due_date == expected, priority
+
+
+@pytest.mark.django_db
+def test_explicit_due_date_not_overridden(people):
+    c = _client(people["marketing"])
+    explicit = (timezone.now() + timedelta(days=30)).date()
+    r = c.post(
+        "/api/tickets/",
+        {"title": "explicit due", "priority": "critical", "due_date": explicit.isoformat()},
+        format="json",
+    )
+    assert r.status_code == 201, r.content
+    assert Ticket.objects.get(pk=r.json()["id"]).due_date == explicit
+
+
+def test_add_business_days_skips_weekends():
+    from datetime import date
+
+    # Friday + 1 business day → Monday; Monday + 5 → next Monday.
+    assert add_business_days(date(2026, 8, 28), 1) == date(2026, 8, 31)
+    assert add_business_days(date(2026, 8, 31), 5) == date(2026, 9, 7)
+
+
+def _closed_ticket(people):
+    """Marketing raises, Operations closes — returns the ticket id."""
+    c_mkt, c_ops = _client(people["marketing"]), _client(people["ops"])
+    tid = c_mkt.post("/api/tickets/", {"title": "close me"}, format="json").json()["id"]
+    r = c_ops.post(f"/api/tickets/{tid}/transition/", {"status": "closed"}, format="json")
+    assert r.status_code == 200, r.content
+    return tid
+
+
+@pytest.mark.django_db
+def test_closed_at_stamped_on_close(people):
+    tid = _closed_ticket(people)
+    t = Ticket.objects.get(pk=tid)
+    assert t.status == "closed"
+    assert t.closed_at is not None
+    assert abs(timezone.now() - t.closed_at) < timedelta(minutes=1)
+
+
+@pytest.mark.django_db
+def test_reopen_within_window_by_ops(people):
+    tid = _closed_ticket(people)
+    c_ops = _client(people["ops"])
+
+    # Reopen reason is required.
+    r = c_ops.post(f"/api/tickets/{tid}/transition/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 400
+
+    r = c_ops.post(
+        f"/api/tickets/{tid}/transition/",
+        {"status": "in_progress", "notes": "Fault recurred on site"},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    t = Ticket.objects.get(pk=tid)
+    assert t.status == "in_progress"
+    assert t.closed_at is None  # cleared on reopen
+    comment = t.comments.filter(comment_type="status_change").last()
+    assert "reopen" in comment.content.lower()
+    assert comment.old_status == "closed" and comment.new_status == "in_progress"
+
+
+@pytest.mark.django_db
+def test_reopen_by_reporter_within_window(people):
+    tid = _closed_ticket(people)  # reported by marketing
+    c_mkt = _client(people["marketing"])
+    r = c_mkt.post(
+        f"/api/tickets/{tid}/transition/",
+        {"status": "in_progress", "notes": "Client says issue is back"},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert Ticket.objects.get(pk=tid).status == "in_progress"
+
+
+@pytest.mark.django_db
+def test_reopen_after_window_rejected(people):
+    tid = _closed_ticket(people)
+    Ticket.objects.filter(pk=tid).update(closed_at=timezone.now() - timedelta(days=8))
+    r = _client(people["ops"]).post(
+        f"/api/tickets/{tid}/transition/",
+        {"status": "in_progress", "notes": "too late"},
+        format="json",
+    )
+    assert r.status_code == 400
+    assert Ticket.objects.get(pk=tid).status == "closed"
+
+
+@pytest.mark.django_db
+def test_reopen_window_applies_to_legacy_closed_tickets(people):
+    """Rows closed before closed_at existed must not fail open — the window
+    falls back to updated_at."""
+    tid = _closed_ticket(people)
+    Ticket.objects.filter(pk=tid).update(
+        closed_at=None, updated_at=timezone.now() - timedelta(days=30)
+    )
+    r = _client(people["ops"]).post(
+        f"/api/tickets/{tid}/transition/",
+        {"status": "in_progress", "notes": "way too late"},
+        format="json",
+    )
+    assert r.status_code == 400
+    assert Ticket.objects.get(pk=tid).status == "closed"
+
+
+@pytest.mark.django_db
+def test_legacy_closed_ticket_reopens_within_updated_at_window(people):
+    tid = _closed_ticket(people)
+    Ticket.objects.filter(pk=tid).update(
+        closed_at=None, updated_at=timezone.now() - timedelta(days=2)
+    )
+    r = _client(people["ops"]).post(
+        f"/api/tickets/{tid}/transition/",
+        {"status": "in_progress", "notes": "fault recurred, legacy row"},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert Ticket.objects.get(pk=tid).status == "in_progress"
+
+
+@pytest.mark.django_db
+def test_migration_backfills_closed_at_from_updated_at(people):
+    import importlib
+
+    from django.apps import apps as global_apps
+    from django.db import connection
+
+    migration = importlib.import_module("apps.tickets.migrations.0012_backfill_closed_at")
+    backfill_closed_at = migration.backfill_closed_at
+
+    tid_closed = _closed_ticket(people)
+    stamp = timezone.now() - timedelta(days=10)
+    Ticket.objects.filter(pk=tid_closed).update(closed_at=None, updated_at=stamp)
+    t_open = _mk_ticket(people["marketing"])
+
+    # A real schema_editor can't open inside the test transaction on SQLite;
+    # the backfill only reads schema_editor.connection.alias.
+    schema_editor_stub = type("SchemaEditorStub", (), {"connection": connection})
+    backfill_closed_at(global_apps, schema_editor_stub)
+
+    assert Ticket.objects.get(pk=tid_closed).closed_at == stamp
+    assert Ticket.objects.get(pk=t_open.pk).closed_at is None
+
+
+@pytest.mark.django_db
+def test_reopen_denied_for_technician(people):
+    c_mkt, c_ops = _client(people["marketing"]), _client(people["ops"])
+    tid = c_mkt.post("/api/tickets/", {"title": "close me"}, format="json").json()["id"]
+    # Assign the technician so the ticket stays visible to them, then close.
+    c_ops.post(f"/api/tickets/{tid}/assign/", {"assigned_to": str(people["tech"].id)}, format="json")
+    assert c_ops.post(f"/api/tickets/{tid}/transition/", {"status": "closed"}, format="json").status_code == 200
+
+    # Even the assigned technician cannot reopen — only Operations or the reporter.
+    r = _client(people["tech"]).post(
+        f"/api/tickets/{tid}/transition/",
+        {"status": "in_progress", "notes": "let me back in"},
+        format="json",
+    )
+    assert r.status_code == 403
+    assert Ticket.objects.get(pk=tid).status == "closed"
+
+    # A completely unrelated technician cannot even see the ticket.
+    other = User.objects.create_user(username="wf-tech-x", password="x", role="technician")
+    r = _client(other).post(
+        f"/api/tickets/{tid}/transition/",
+        {"status": "in_progress", "notes": "n"},
+        format="json",
+    )
+    assert r.status_code == 404

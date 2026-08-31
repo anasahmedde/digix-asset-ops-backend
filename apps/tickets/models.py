@@ -9,6 +9,17 @@ from common.models import TimeStampedModel
 from common.utils import upload_to_path
 
 
+def add_business_days(start, days: int):
+    """Return the date `days` business days after `start`, skipping Sat/Sun."""
+    current = start
+    remaining = days
+    while remaining > 0:
+        current += timedelta(days=1)
+        if current.weekday() < 5:  # Mon=0 … Fri=4
+            remaining -= 1
+    return current
+
+
 class TicketIssueType(TimeStampedModel):
     """Data-driven fault catalogue for tickets (e.g. Module Burnt, HDMI Cable
     Issue). Managed from Setup so new fault types can be added without code."""
@@ -57,6 +68,20 @@ class Ticket(TimeStampedModel):
     # auto-escalated (see tasks.escalate_overdue_tickets).
     RESPONSE_SLA_HOURS = {"critical": 4, "high": 8, "medium": 24, "low": 48}
 
+    # Resolution SLA per priority — auto-sets due_date on creation when the
+    # reporter did not provide one. Urgent tiers are literal clock windows
+    # (timedelta); the rest are business days (Mon–Fri, see add_business_days).
+    RESOLUTION_SLA = {
+        "critical": timedelta(hours=24),
+        "high": timedelta(hours=48),
+        "medium": 5,  # business days
+        "low": 10,  # business days
+    }
+
+    # Closed tickets can be reopened (closed → in_progress) only within this
+    # window, by Operations or the original reporter (see views.transition).
+    REOPEN_WINDOW_DAYS = 7
+
     ticket_number = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
     title = models.CharField(max_length=300)
     description = models.TextField(blank=True)
@@ -90,6 +115,9 @@ class Ticket(TimeStampedModel):
 
     due_date = models.DateField(null=True, blank=True)
     resolved_at = models.DateTimeField(null=True, blank=True)
+    # Stamped when the ticket enters CLOSED; cleared again on reopen. Drives
+    # the reopen window (REOPEN_WINDOW_DAYS).
+    closed_at = models.DateTimeField(null=True, blank=True)
     resolution_notes = models.TextField(blank=True)
 
     # Completion / approval workflow
@@ -146,7 +174,9 @@ class Ticket(TimeStampedModel):
         Status.PENDING_REVIEW: (Status.APPROVED, Status.REJECTED),
         Status.REJECTED: (Status.IN_PROGRESS, Status.PENDING_REVIEW),
         Status.APPROVED: (Status.CLOSED,),
-        Status.CLOSED: (),
+        # Reopen: gated in the transition action (Operations or the reporter,
+        # within REOPEN_WINDOW_DAYS of closed_at, notes required).
+        Status.CLOSED: (Status.IN_PROGRESS,),
     }
 
     class Meta:
@@ -169,6 +199,12 @@ class Ticket(TimeStampedModel):
             if not self.response_due_at:
                 hours = self.RESPONSE_SLA_HOURS.get(self.priority, 24)
                 self.response_due_at = timezone.now() + timedelta(hours=hours)
+            if not self.due_date:
+                sla = self.RESOLUTION_SLA.get(self.priority)
+                if isinstance(sla, timedelta):
+                    self.due_date = (timezone.now() + sla).date()
+                elif sla:
+                    self.due_date = add_business_days(timezone.now().date(), sla)
         super().save(*args, **kwargs)
 
     @property
