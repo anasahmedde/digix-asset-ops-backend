@@ -778,3 +778,23 @@ def test_vendor_cannot_handover(vendor_install):
         format="multipart",
     )
     assert r.status_code == 403
+
+
+def test_handover_client_falls_back_to_project_then_site(installation, ops):
+    from apps.teams.models import Project
+
+    device = installation.device
+    project_client = Client.objects.create(name="Project Buyer")
+    project = Project.objects.create(name="Fallback Project", client=project_client)
+    device.assigned_client = None
+    device.project = project
+    device.save(update_fields=["assigned_client", "project"])
+    _complete_non_handover_steps(installation)
+    r = _client(ops).post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Fallback POC"},
+        format="multipart",
+    )
+    assert r.status_code == 201, r.content
+    device.refresh_from_db()
+    assert device.assigned_client_id == project_client.pk

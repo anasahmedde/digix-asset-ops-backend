@@ -243,7 +243,14 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         ser = HandoverCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         device = installation.device
-        client = ser.validated_data.get("client") or device.assigned_client
+        # Sensible defaults: the asset's own client, else the client its
+        # project was sold to, else the site's client — always overridable.
+        client = (
+            ser.validated_data.get("client")
+            or device.assigned_client
+            or (device.project.client if device.project_id else None)
+            or installation.site.client
+        )
         if client is None:
             return Response(
                 {"client": "The asset has no client yet — pick the client receiving it."},
