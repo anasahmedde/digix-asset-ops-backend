@@ -11,13 +11,18 @@ SUPPLIER_SIDE_TYPES = (
 )
 
 
+# A warranty with a claim in flight ("claimed"/Pending) still covers the
+# asset — only expiry/void ends the cover (WF-15: expired → client pays).
+LIVE_STATUSES = (Warranty.Status.ACTIVE, Warranty.Status.CLAIMED)
+
+
 def get_active_client_warranty(device):
-    """Newest active client-type warranty covering ``device``, or None."""
+    """Newest live client-type warranty covering ``device``, or None."""
     if device is None:
         return None
     return (
         device.warranties.filter(
-            warranty_type=Warranty.WarrantyType.CLIENT, status=Warranty.Status.ACTIVE
+            warranty_type=Warranty.WarrantyType.CLIENT, status__in=LIVE_STATUSES
         )
         .order_by("-end_date", "-created_at")
         .first()
@@ -25,12 +30,12 @@ def get_active_client_warranty(device):
 
 
 def get_active_supplier_warranty(device):
-    """Newest active supplier-side warranty (supplier/manufacturer/extended), or None."""
+    """Newest live supplier-side warranty (supplier/manufacturer/extended), or None."""
     if device is None:
         return None
     return (
         device.warranties.filter(
-            warranty_type__in=SUPPLIER_SIDE_TYPES, status=Warranty.Status.ACTIVE
+            warranty_type__in=SUPPLIER_SIDE_TYPES, status__in=LIVE_STATUSES
         )
         .order_by("-end_date", "-created_at")
         .first()
