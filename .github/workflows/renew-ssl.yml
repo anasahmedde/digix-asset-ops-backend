@@ -1,0 +1,31 @@
+name: Renew SSL Certificate
+
+# The cert is issued once by deploy.sh and the certbot compose service has no
+# renewal loop — this workflow is the renewal mechanism. Runs weekly (certbot
+# only actually renews within 30 days of expiry) and on demand.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Renew certificate on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd /opt/digix
+            docker compose --env-file .env run --rm certbot renew \
+              --webroot --webroot-path=/var/www/certbot
+            docker compose --env-file .env restart nginx
+
+            sleep 5
+            echo | openssl s_client -connect localhost:443 -servername ops.wizioners.com 2>/dev/null \
+              | openssl x509 -noout -dates
+            echo "Certificate renewal run complete."
