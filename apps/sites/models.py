@@ -77,6 +77,16 @@ class DeviceInstallation(TimeStampedModel):
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="installations", help_text="External vendor doing the installation work",
     )
+    # Not every third party is on the supplier register — a one-off crew can be
+    # named by hand instead. Exactly one of `vendor` / `external_vendor_name`
+    # is used (enforced in the serializer); `vendor_display` resolves whichever.
+    external_vendor_name = models.CharField(
+        max_length=200, blank=True,
+        help_text="Vendor named by hand when they are not a registered supplier",
+    )
+    external_vendor_contact = models.CharField(
+        max_length=100, blank=True, help_text="Phone or contact person for the manual vendor",
+    )
     installed_at = models.DateTimeField()
     removed_at = models.DateTimeField(null=True, blank=True)
     due_date = models.DateField(null=True, blank=True, help_text="Agreed completion date for the installation")
@@ -230,3 +240,49 @@ class HandoverRecord(TimeStampedModel):
 
     def __str__(self):
         return f"Handover of {self.device.asset_code} to {self.client.name} on {self.handover_date}"
+
+
+class InstallationRouteTemplate(TimeStampedModel):
+    """The standard installation checklist for an asset type.
+
+    The sibling of the production routing master: that one says how an asset
+    is built, this one says how it gets put up. Installing the first asset of
+    a type means working the sequence out; saving it means the next one starts
+    from it instead of falling back to the generic survey-to-handover list.
+    """
+
+    asset_type = models.OneToOneField(
+        "assets.AssetType", on_delete=models.CASCADE, related_name="installation_template"
+    )
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installation_templates",
+    )
+
+    class Meta:
+        ordering = ["asset_type__name"]
+
+    def __str__(self):
+        return f"Installation steps for {self.asset_type.name}"
+
+
+class InstallationRouteTemplateStep(TimeStampedModel):
+    """One step in a saved installation checklist."""
+
+    template = models.ForeignKey(
+        InstallationRouteTemplate, on_delete=models.CASCADE, related_name="steps"
+    )
+    step_number = models.PositiveSmallIntegerField()
+    step_type = models.CharField(max_length=20, choices=InstallationStep.StepType.choices)
+    custom_label = models.CharField(max_length=200, blank=True)
+    assigned_team = models.CharField(max_length=200, blank=True)
+    description = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["step_number"]
+        unique_together = ["template", "step_number"]
+
+    def __str__(self):
+        label = self.custom_label or self.get_step_type_display()
+        return f"{self.template.asset_type.name} · {self.step_number}. {label}"

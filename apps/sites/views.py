@@ -33,6 +33,8 @@ class IsSuperAdminOrAssignedInstaller(BasePermission):
         )
 
 from .models import (
+    InstallationRouteTemplate,
+    InstallationRouteTemplateStep,
     DeviceInstallation,
     HandoverRecord,
     InstallationDelay,
@@ -90,6 +92,27 @@ class SiteZoneViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["site"]
     search_fields = ["name"]
+
+
+def _attach_to_asset_gallery(device, image, user, caption: str) -> None:
+    """Put a photo taken on site into the asset's own gallery.
+
+    A picture of the installed asset belongs on the asset, not only inside the
+    installation record — the registry is where anyone looks for it. The first
+    one an asset ever gets becomes its primary image.
+    """
+    from apps.assets.models import DeviceImage
+
+    # The same file object is read twice (installation photo, then here), so
+    # rewind it or the second save writes an empty file.
+    if hasattr(image, "seek"):
+        image.seek(0)
+    DeviceImage.objects.create(
+        device=device,
+        image=image,
+        caption=caption,
+        is_primary=not device.images.exists(),
+    )
 
 
 class DeviceInstallationViewSet(viewsets.ModelViewSet):
@@ -170,7 +193,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         # The handover action carries its own gate (assigned installer or
         # HANDOVER_ROLES) — the viewset's manager-write permission would
         # otherwise reject the installer/supervisor before it ever runs.
-        if self.action == "handover":
+        if self.action in ("handover", "activate"):
             return [IsAuthenticated()]
         return super().get_permissions()
 
@@ -209,6 +232,156 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             ])
         log_export(request.user, "installation", len(rows), export_params(request))
         return xlsx_response("installations", "Installations", columns, rows)
+
+    @action(detail=True, methods=["post"], url_path="save-step-template")
+    def save_step_template(self, request, pk=None):
+        """Keep this job's checklist as the standard for the asset type."""
+        installation = self.get_object()
+        asset_type = installation.device.asset_type
+        if asset_type is None:
+            return Response(
+                {"detail": "Give the asset a type first — checklists are held per asset type."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        steps = list(installation.steps.all())
+        if not steps:
+            return Response(
+                {"detail": "There are no steps on this installation to save."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            template, _ = InstallationRouteTemplate.objects.get_or_create(
+                asset_type=asset_type, defaults={"created_by": request.user},
+            )
+            # Replace wholesale: the job in hand is the current definition.
+            template.steps.all().delete()
+            for index, step in enumerate(steps):
+                InstallationRouteTemplateStep.objects.create(
+                    template=template,
+                    step_number=index + 1,
+                    step_type=step.step_type,
+                    custom_label=step.custom_label,
+                    assigned_team=step.assigned_team,
+                    description=step.description,
+                )
+        return Response({
+            "asset_type": asset_type.name,
+            "saved_steps": len(steps),
+            "detail": f"Saved as the standard installation checklist for {asset_type.name}.",
+        })
+
+    @action(detail=True, methods=["post"], url_path="apply-step-template")
+    def apply_step_template(self, request, pk=None):
+        """Lay this job out from the standard checklist for its asset type."""
+        installation = self.get_object()
+        asset_type = installation.device.asset_type
+        if asset_type is None:
+            return Response(
+                {"detail": "Give the asset a type first — checklists are held per asset type."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        template = InstallationRouteTemplate.objects.filter(asset_type=asset_type).first()
+        if template is None or not template.steps.exists():
+            return Response(
+                {"detail": (
+                    f"No standard checklist saved for {asset_type.name} yet — lay the steps "
+                    f"out here and save them as the standard."
+                )},
+                status=drf_status.HTTP_404_NOT_FOUND,
+            )
+        if installation.steps.exclude(status=InstallationStep.StepStatus.NOT_STARTED).exists():
+            return Response(
+                {"detail": "Work has already started on this checklist; it cannot be replaced."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            installation.steps.all().delete()
+            lines = list(template.steps.all())
+            InstallationStep.objects.bulk_create([
+                InstallationStep(
+                    installation=installation,
+                    step_type=line.step_type,
+                    custom_label=line.custom_label,
+                    assigned_team=line.assigned_team,
+                    description=line.description,
+                    step_number=index + 1,
+                )
+                for index, line in enumerate(lines)
+            ])
+        installation.refresh_from_db()
+        installation._prefetched_objects_cache = {}
+        return Response({
+            "applied": len(lines),
+            "installation": DeviceInstallationDetailSerializer(
+                installation, context=self.get_serializer_context()
+            ).data,
+        })
+
+    @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
+    def activate(self, request, pk=None):
+        """Technician marks the installed asset live, with a photo of it.
+
+        The registry status is not something anyone types in: the person who
+        physically installed the asset says it is running, from the tracker,
+        and the photo they upload is the evidence. It lands in the asset's own
+        gallery as well as the installation record.
+        """
+        installation = self.get_object()
+        user = request.user
+        if (
+            getattr(user, "role", None) not in self.HANDOVER_ROLES
+            and installation.installed_by_id != user.id
+            and installation.device.assigned_technician_id != user.id
+        ):
+            return Response(
+                {"detail": "Only the assigned installer or operations management can activate this asset."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+
+        device = installation.device
+        if device.status == "active":
+            return Response({"detail": "This asset is already active."}, status=drf_status.HTTP_400_BAD_REQUEST)
+        if device.status != "installed":
+            return Response(
+                {"detail": (
+                    f"The asset is '{device.get_status_display()}'. It becomes Active once it is "
+                    f"installed — complete the installation steps first."
+                )},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        photos = request.FILES.getlist("photos")
+        if not photos:
+            return Response(
+                {"photos": "Upload a photo of the installed asset — it is the record that it is running."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            for image in photos:
+                InstallationPhoto.objects.create(
+                    installation=installation,
+                    photo_type=InstallationPhoto.PhotoType.POST_INSTALL,
+                    image=image,
+                    caption=request.data.get("notes", "") or "",
+                    taken_by=user,
+                )
+                _attach_to_asset_gallery(device, image, user, "Installed — Active")
+
+            device._transition_user = user
+            device._transition_reason = (
+                request.data.get("notes") or "Marked active from the installation tracker"
+            )
+            device.status = "active"
+            device.save(update_fields=["status", "updated_at"])
+
+        installation.refresh_from_db()
+        installation._prefetched_objects_cache = {}
+        return Response(
+            DeviceInstallationDetailSerializer(installation, context=self.get_serializer_context()).data
+        )
 
     @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
     def handover(self, request, pk=None):
@@ -294,6 +467,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                     image=image,
                     taken_by=user,
                 )
+                _attach_to_asset_gallery(device, image, user, "Handover")
 
             # Completing the handover step stamps completed_at, re-anchors the
             # client warranty to the record's date and journals the flip.

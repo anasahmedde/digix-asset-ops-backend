@@ -688,7 +688,12 @@ def test_explicit_billability_overrides_defaults(people, warranty_device):
     assert r.json()["charge_to"] == "client"
 
 
-def test_warranty_claim_sets_claimed_and_close_restores(people, warranty_device):
+def test_warranty_claim_leaves_the_warranty_status_alone(people, warranty_device):
+    """A claim is tracked on the claim; the cover itself is not moved.
+
+    The claim's progress is the ticket's status, so the warranty keeps saying
+    what it has always said about the asset's cover.
+    """
     from apps.warranties.models import Warranty
 
     warranty = _make_warranty(warranty_device)
@@ -699,7 +704,7 @@ def test_warranty_claim_sets_claimed_and_close_restores(people, warranty_device)
     }, format="json")
     assert r.status_code == 201, r.content
     warranty.refresh_from_db()
-    assert warranty.status == Warranty.Status.CLAIMED
+    assert warranty.status == Warranty.Status.ACTIVE
 
     ticket_id = r.json()["id"]
     close = c.post(f"/api/tickets/{ticket_id}/transition/", {"status": "closed"}, format="json")
@@ -757,7 +762,8 @@ def test_device_filter_rejects_malformed_uuid(people):
     assert r.status_code == 400
 
 
-def test_reopen_reclaims_warranty(people, warranty_device):
+def test_reopening_a_claim_still_leaves_the_warranty_alone(people, warranty_device):
+    """Closing and reopening a claim moves the claim, never the cover."""
     from apps.warranties.models import Warranty
 
     warranty = _make_warranty(warranty_device)
@@ -774,7 +780,7 @@ def test_reopen_reclaims_warranty(people, warranty_device):
     }, format="json")
     assert r.status_code == 200, r.content
     warranty.refresh_from_db()
-    assert warranty.status == Warranty.Status.CLAIMED
+    assert warranty.status == Warranty.Status.ACTIVE
 
 
 def test_update_keeps_primary_device_linked(people, warranty_device):

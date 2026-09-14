@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 import pytest
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User
@@ -566,11 +567,19 @@ def _receive(client, po_id, lines, **extra):
     return client.post(f"/api/procurement/purchase-orders/{po_id}/receive/", payload, format="json")
 
 
+def _inspect(client, line_id, **payload):
+    """Pass a received line through inspection — the only step that stocks it."""
+    return client.post(f"/api/inventory/receipt-lines/{line_id}/inspect/", payload, format="json")
+
+
+def _lines(body):
+    return {ln["po_item"]: ln["id"] for ln in body["lines"]}
+
+
 @pytest.mark.django_db
 def test_receive_serialized_line_creates_devices(people, supplier, receivable_po):
-    from datetime import date
-
-    from apps.assets.models import Device, DeviceLifecycleEvent
+    from apps.assets.models import Device
+    from apps.inventory.models import InventoryUnit
 
     po, serialized = receivable_po["po"], receivable_po["serialized"]
     c = _client(people["finance"])
@@ -581,30 +590,38 @@ def test_receive_serialized_line_creates_devices(people, supplier, receivable_po
     assert r.status_code == 201, r.content
     body = r.json()
 
-    # Response contract: id, grn_number, purchase_order, created_devices, lines
+    # Response contract: id, grn_number, purchase_order, lines. Goods are held
+    # for inspection — no assets and no stock yet.
     assert body["grn_number"].startswith("GRN")
     assert body["purchase_order"] == str(po.pk)
-    assert len(body["created_devices"]) == 3
-    assert all(d["asset_code"] for d in body["created_devices"])
-    assert {d["serial_number"] for d in body["created_devices"]} == {"GRN-SN-A", "GRN-SN-B", "GRN-SN-C"}
+    assert body["created_devices"] == []
+    assert body["pending_inspection"] == 1
     assert len(body["lines"]) == 1
     assert body["lines"][0]["po_item"] == str(serialized.pk)
     assert body["lines"][0]["serial_numbers"] == ["GRN-SN-A", "GRN-SN-B", "GRN-SN-C"]
+    assert body["lines"][0]["inspection_status"] == "pending"
+    assert not Device.objects.filter(serial_number__in=["GRN-SN-A", "GRN-SN-B", "GRN-SN-C"]).exists()
+    assert not InventoryUnit.objects.filter(serial_number="GRN-SN-A").exists()
 
-    device = Device.objects.get(serial_number="GRN-SN-A")
-    assert device.device_model == receivable_po["model"]
-    assert device.asset_type == receivable_po["asset_type"]
-    assert device.batch_number == "B-77"
-    assert device.supplier == supplier
-    assert device.purchase_price == Decimal("250.00")
-    assert device.purchase_date == date.today()
-    assert device.invoice_reference == body["grn_number"]
-    assert device.source == "third_party"
-    assert device.status == "procured"
-    assert device.project is None
-    # journalled by the Wave-1 signals
-    event = DeviceLifecycleEvent.objects.get(device=device, description="Registered")
-    assert event.to_value == "procured"
+    # A technician inspects and routes them into unique inventory.
+    line_id = body["lines"][0]["id"]
+    ins = _inspect(
+        _client(people["tech"]), line_id, route="unique", accepted_quantity=3,
+        units=[{"serial_number": sn} for sn in ["GRN-SN-A", "GRN-SN-B", "GRN-SN-C"]],
+    )
+    assert ins.status_code == 200, ins.content
+    assert ins.data["line"]["inspection_status"] == "passed"
+    assert len(ins.data["stocked_units"]) == 3
+
+    unit = InventoryUnit.objects.get(serial_number="GRN-SN-A")
+    assert unit.status == "in_stock"
+    assert unit.supplier == supplier
+    assert unit.purchase_price == Decimal("250.00")
+    assert unit.purchase_date == timezone.localdate()
+    # Batch + receipt link trace the unit back to the delivery and the PO.
+    assert unit.batch_number == "B-77"
+    assert unit.goods_receipt_line_id is not None
+    assert unit.goods_receipt_line.receipt.purchase_order_id == po.pk
 
     serialized.refresh_from_db()
     assert serialized.received_quantity == 3
@@ -616,6 +633,7 @@ def test_receive_serialized_line_creates_devices(people, supplier, receivable_po
 @pytest.mark.django_db
 def test_receive_partial_then_full_advances_status(people, receivable_po):
     from apps.assets.models import Device
+    from apps.inventory.models import GoodsReceiptLine
 
     po, serialized, consumable = (
         receivable_po["po"], receivable_po["serialized"], receivable_po["consumable"]
@@ -641,7 +659,9 @@ def test_receive_partial_then_full_advances_status(people, receivable_po):
     assert serialized.received_quantity == 3
     assert consumable.received_quantity == 10
     assert po.status == "received"
-    assert Device.objects.filter(serial_number__in=["PF-1", "PF-2", "PF-3"]).count() == 3
+    # Receipt drives the PO status; the goods are still awaiting inspection.
+    assert not Device.objects.filter(serial_number__in=["PF-1", "PF-2", "PF-3"]).exists()
+    assert GoodsReceiptLine.objects.filter(inspection_status="pending").count() == 4
 
 
 @pytest.mark.django_db
@@ -710,12 +730,23 @@ def test_receive_consumable_updates_stock_and_movement(people, receivable_po):
     body = r.json()
     assert body["created_devices"] == []
 
+    # Nothing is stocked until a technician inspects it.
+    stock.refresh_from_db()
+    assert stock.quantity == 5
+
+    ins = _inspect(
+        _client(people["tech"]), body["lines"][0]["id"],
+        route="generic", accepted_quantity=10,
+    )
+    assert ins.status_code == 200, ins.content
+
     stock.refresh_from_db()
     assert stock.quantity == 15  # existing item topped up, not duplicated
     assert InventoryItem.objects.filter(material_type=material).count() == 1
     movement = StockMovement.objects.get(item=stock, movement_type="in")
     assert movement.quantity == 10
     assert movement.reference == body["grn_number"]
+    assert str(movement.goods_receipt_line_id) == body["lines"][0]["id"]
 
     receipt = GoodsReceipt.objects.get(pk=body["id"])
     assert receipt.purchase_order == po
@@ -740,6 +771,14 @@ def test_receive_consumable_creates_inventory_item_when_missing(people, receivab
         "po_item": str(consumable.pk), "quantity": 7,
     }])
     assert r.status_code == 201, r.content
+    assert not InventoryItem.objects.filter(material_type=material).exists()
+
+    ins = _inspect(
+        _client(people["tech"]), r.json()["lines"][0]["id"],
+        route="generic", accepted_quantity=7,
+    )
+    assert ins.status_code == 200, ins.content
+
     item = InventoryItem.objects.get(material_type=material)
     assert item.quantity == 7
     assert item.sku  # auto-generated
@@ -749,7 +788,7 @@ def test_receive_consumable_creates_inventory_item_when_missing(people, receivab
 @pytest.mark.django_db
 def test_receive_mixed_po_single_call(people, receivable_po):
     from apps.assets.models import Device
-    from apps.inventory.models import GoodsReceipt, InventoryItem
+    from apps.inventory.models import GoodsReceipt, InventoryItem, InventoryUnit
 
     po, serialized, consumable = (
         receivable_po["po"], receivable_po["serialized"], receivable_po["consumable"]
@@ -761,9 +800,23 @@ def test_receive_mixed_po_single_call(people, receivable_po):
     ], notes="Full delivery")
     assert r.status_code == 201, r.content
     body = r.json()
-    assert len(body["created_devices"]) == 3
+    assert body["created_devices"] == []
     assert len(body["lines"]) == 2
-    assert Device.objects.filter(serial_number__startswith="MX-").count() == 3
+    assert body["pending_inspection"] == 2
+
+    tech = _client(people["tech"])
+    by_item = _lines(body)
+    ok = _inspect(tech, by_item[str(serialized.pk)], route="unique", accepted_quantity=3,
+                  units=[{"serial_number": sn} for sn in ["MX-A", "MX-B", "MX-C"]])
+    assert ok.status_code == 200, ok.content
+    ok = _inspect(tech, by_item[str(consumable.pk)], route="generic", accepted_quantity=10)
+    assert ok.status_code == 200, ok.content
+
+    # Serialized goods become unique inventory, not assets.
+    assert not Device.objects.filter(serial_number__startswith="MX-").exists()
+    assert InventoryUnit.objects.filter(serial_number__startswith="MX-").count() == 3
+    assert all(u.batch_number == "MX-1"
+               for u in InventoryUnit.objects.filter(serial_number__startswith="MX-"))
     assert InventoryItem.objects.get(material_type=receivable_po["material"]).quantity == 10
     po.refresh_from_db()
     assert po.status == "received"  # everything arrived in one delivery
@@ -814,7 +867,7 @@ def test_receive_line_without_type_400(people, supplier):
     )
     r = _receive(_client(people["finance"]), po.pk, [{"po_item": str(untyped.pk), "quantity": 2}])
     assert r.status_code == 400, r.content
-    assert "no device model or material type" in str(r.json())
+    assert "no unique product, device model or material type" in str(r.json())
 
 
 @pytest.mark.django_db
@@ -850,16 +903,23 @@ def test_receive_bom_line_sets_project_and_allocation(people, receivable_po):
     }])
     assert r.status_code == 201, r.content
 
-    devices = Device.objects.filter(serial_number__in=["BOM-1", "BOM-2"])
-    assert devices.count() == 2
-    assert all(d.project == project for d in devices)
+    # Allocation happens once the goods pass inspection, not at the door.
+    assert not BOMAllocation.objects.filter(bom_line=bom_line).exists()
 
+    tech_user = people["tech"]
+    ins = _inspect(
+        _client(tech_user), r.json()["lines"][0]["id"], route="unique", accepted_quantity=2,
+        units=[{"serial_number": sn} for sn in ["BOM-1", "BOM-2"]],
+    )
+    assert ins.status_code == 200, ins.content
+
+    assert not Device.objects.filter(serial_number__in=["BOM-1", "BOM-2"]).exists()
     allocations = BOMAllocation.objects.filter(bom_line=bom_line)
     assert allocations.count() == 2
-    assert all(a.status == "allocated" and a.quantity == 1 and a.device is not None
+    assert all(a.status == "allocated" and a.quantity == 1 and a.inventory_unit is not None
                for a in allocations)
-    assert {a.device.serial_number for a in allocations} == {"BOM-1", "BOM-2"}
-    assert all(a.allocated_by == people["finance"] for a in allocations)
+    assert {a.inventory_unit.serial_number for a in allocations} == {"BOM-1", "BOM-2"}
+    assert all(a.allocated_by == tech_user for a in allocations)
 
     bom_line.refresh_from_db()
     assert bom_line.allocated_quantity == 2
@@ -872,3 +932,220 @@ def test_receive_role_gated(people, receivable_po):
         "po_item": str(receivable_po["consumable"].pk), "quantity": 1,
     }])
     assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Requirements flagged for procurement become a purchase order
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def requisitions(db, supplier):
+    from apps.assets.models import AssetComponent, Brand, Device, DeviceModel, MaterialType
+    from apps.inventory.models import InventoryItem, InventoryUnitType
+    from apps.teams.models import Project
+
+    project = Project.objects.create(name="Req Project")
+    brand = Brand.objects.create(name="Req Brand")
+    model = DeviceModel.objects.create(brand=brand, name="R-1")
+    device = Device.objects.create(
+        device_model=model, serial_number="REQ-SN-1", project=project
+    )
+    material = MaterialType.objects.create(name="Req Cable")
+    item = InventoryItem.objects.create(material_type=material, quantity=100, unit_cost=25)
+    product = InventoryUnitType.objects.create(
+        name="Req Player", brand=brand, model_name="RP-1", unit_cost=4000,
+    )
+    generic = AssetComponent.objects.create(
+        device=device, name="Req Cable", quantity=20, inventory_item=item,
+        fulfilment=AssetComponent.Fulfilment.PROCUREMENT,
+    )
+    unique = AssetComponent.objects.create(
+        device=device, name="Req Player", quantity=3, inventory_unit_type=product,
+        fulfilment=AssetComponent.Fulfilment.PROCUREMENT,
+    )
+    return {
+        "project": project, "device": device, "generic": generic,
+        "unique": unique, "product": product, "item": item,
+    }
+
+
+@pytest.mark.django_db
+def test_flagged_requirements_appear_as_requisitions(people, requisitions):
+    r = _client(people["finance"]).get("/api/procurement/purchase-orders/requisitions/")
+    assert r.status_code == 200, r.content
+    assert r.data["count"] == 2
+    names = {row["name"] for row in r.data["results"]}
+    assert names == {"Req Cable", "Req Player"}
+    cable = next(row for row in r.data["results"] if row["name"] == "Req Cable")
+    # Plenty in stock, still listed — buying was the user's choice.
+    assert cable["available_quantity"] == 100
+    assert cable["outstanding_quantity"] == 20
+    assert cable["project_name"] == "Req Project"
+    assert cable["purchase_order_item"] is None
+
+
+@pytest.mark.django_db
+def test_raise_a_po_from_requisitions(people, requisitions, supplier):
+    c = _client(people["finance"])
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+        "supplier": str(supplier.pk),
+        "components": [str(requisitions["generic"].pk), str(requisitions["unique"].pk)],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["po_number"].startswith("PO")
+    assert len(r.data["items"]) == 2
+
+    by_desc = {i["description"]: i for i in r.data["items"]}
+    assert by_desc["Req Cable"]["quantity"] == 20
+    assert by_desc["Req Player"]["quantity"] == 3
+    # Prices default from the inventory records.
+    assert float(by_desc["Req Player"]["unit_price"]) == 4000
+
+    # Each requirement now points at its PO line.
+    requisitions["generic"].refresh_from_db()
+    assert requisitions["generic"].purchase_order_item_id is not None
+
+
+@pytest.mark.django_db
+def test_requisitions_can_be_filtered_to_unordered(people, requisitions, supplier):
+    c = _client(people["finance"])
+    c.post("/api/procurement/purchase-orders/raise-po/", {
+        "supplier": str(supplier.pk), "components": [str(requisitions["generic"].pk)],
+    }, format="json")
+
+    r = c.get("/api/procurement/purchase-orders/requisitions/", {"unordered": "true"})
+    assert r.status_code == 200, r.content
+    assert {row["name"] for row in r.data["results"]} == {"Req Player"}
+
+
+@pytest.mark.django_db
+def test_a_requirement_cannot_be_ordered_twice(people, requisitions, supplier):
+    c = _client(people["finance"])
+    payload = {"supplier": str(supplier.pk), "components": [str(requisitions["generic"].pk)]}
+    assert c.post("/api/procurement/purchase-orders/raise-po/", payload, format="json").status_code == 201
+    again = c.post("/api/procurement/purchase-orders/raise-po/", payload, format="json")
+    assert again.status_code == 400, again.content
+    assert "Already on a purchase order" in str(again.data["components"])
+
+
+@pytest.mark.django_db
+def test_raise_po_validates_its_input(people, requisitions, supplier):
+    c = _client(people["finance"])
+    assert c.post("/api/procurement/purchase-orders/raise-po/",
+                  {"components": [str(requisitions["generic"].pk)]}, format="json").status_code == 400
+    assert c.post("/api/procurement/purchase-orders/raise-po/",
+                  {"supplier": str(supplier.pk), "components": []}, format="json").status_code == 400
+
+
+@pytest.mark.django_db
+def test_receiving_a_product_line_only_needs_serials(people, requisitions, supplier):
+    """Full loop: requisition → PO → receive → inspect with serials only."""
+    from apps.inventory.models import InventoryUnit
+
+    c = _client(people["finance"])
+    po_resp = c.post("/api/procurement/purchase-orders/raise-po/", {
+        "supplier": str(supplier.pk), "components": [str(requisitions["unique"].pk)],
+    }, format="json")
+    assert po_resp.status_code == 201, po_resp.content
+    po_id = po_resp.data["id"]
+    item_id = po_resp.data["items"][0]["id"]
+
+    for st in ("pending_approval", "approved", "ordered"):
+        c.post(f"/api/procurement/purchase-orders/{po_id}/transition/", {"status": st}, format="json")
+
+    received = _receive(c, po_id, [{
+        "po_item": item_id, "quantity": 3, "batch_number": "REQ-B1",
+        "serial_numbers": ["RQ-1", "RQ-2", "RQ-3"],
+    }])
+    assert received.status_code == 201, received.content
+
+    line_id = received.json()["lines"][0]["id"]
+    # Serial only — the opened product on the PO line supplies the rest.
+    ins = _inspect(
+        _client(people["tech"]), line_id, route="unique", accepted_quantity=3,
+        units=[{"serial_number": s} for s in ["RQ-1", "RQ-2", "RQ-3"]],
+    )
+    assert ins.status_code == 200, ins.content
+    units = ins.data["stocked_units"]
+    assert len(units) == 3
+    assert all(u["model_name"] == "RP-1" for u in units)
+    assert all(u["batch_number"] == "REQ-B1" for u in units)
+    assert InventoryUnit.objects.filter(unit_type=requisitions["product"]).count() == 3
+
+
+@pytest.mark.django_db
+def test_requisitions_see_scope_linked_assets(people, requisitions):
+    """An asset on a project via Scope must still show its project here."""
+    from apps.teams.models import Project, ProjectScopeItem
+
+    device = requisitions["device"]
+    device.project = None
+    device.save(update_fields=["project"])
+    project = Project.objects.create(name="Scoped Req Project")
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+
+    r = _client(people["finance"]).get("/api/procurement/purchase-orders/requisitions/")
+    assert r.status_code == 200, r.content
+    row = next(x for x in r.data["results"] if x["name"] == "Req Cable")
+    assert row["project_name"] == "Scoped Req Project"
+
+    filtered = _client(people["finance"]).get(
+        "/api/procurement/purchase-orders/requisitions/", {"project": str(project.pk)}
+    )
+    assert filtered.status_code == 200, filtered.content
+    assert {x["name"] for x in filtered.data["results"]} == {"Req Cable", "Req Player"}
+
+
+@pytest.mark.django_db
+def test_clearing_a_decision_lets_it_be_procured_again(people, requisitions, supplier):
+    """Reset releases the PO link, so the line can be re-flagged and re-ordered."""
+    from rest_framework.test import APIClient
+
+    from apps.accounts.models import User as _U
+
+    component = requisitions["generic"]
+    c = _client(people["finance"])
+    assert c.post("/api/procurement/purchase-orders/raise-po/", {
+        "supplier": str(supplier.pk), "components": [str(component.pk)],
+    }, format="json").status_code == 201
+    component.refresh_from_db()
+    assert component.purchase_order_item_id is not None
+
+    admin = _U.objects.create_user(username="reset-admin", password="x", role="super_admin")
+    ac = APIClient(); ac.force_authenticate(admin)
+    reset = ac.post(f"/api/assets/components/{component.pk}/reset-fulfilment/", {}, format="json")
+    assert reset.status_code == 200, reset.content
+    assert reset.data["fulfilment"] == "pending"
+    assert reset.data["purchase_order_item"] is None, "the PO link must be released"
+
+    again = ac.post(f"/api/assets/components/{component.pk}/mark-for-procurement/", {}, format="json")
+    assert again.status_code == 200, again.content
+
+    # It is offerable again, even with the unordered filter on.
+    listed = c.get("/api/procurement/purchase-orders/requisitions/", {"unordered": "true"})
+    assert "Req Cable" in {x["name"] for x in listed.data["results"]}
+
+
+@pytest.mark.django_db
+def test_purchase_order_prints_as_a_document_with_its_own_terms(people, supplier):
+    """The order the supplier receives, on the terms it was agreed on."""
+    c = _client(people["finance"])
+    body = _create_po(c, supplier)
+
+    # A new order carries the house standard.
+    assert body["terms"], "a new PO should be seeded with the standard terms"
+    assert "quoted on all invoices" in body["terms"]
+
+    r = c.get(f"/api/procurement/purchase-orders/{body['id']}/document/")
+    assert r.status_code == 200, r.content
+    assert r["Content-Type"] == "application/pdf"
+    assert body["po_number"] in r["Content-Disposition"]
+    assert r.content[:5] == b"%PDF-"
+
+    # Terms travel on the order: an unusual deal prints its own wording.
+    r = c.patch(f"/api/procurement/purchase-orders/{body['id']}/",
+                {"terms": "Payment on delivery. No retention."}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["effective_terms"] == "Payment on delivery. No retention."
+
+    r = c.get(f"/api/procurement/purchase-orders/{body['id']}/document/")
+    assert r.status_code == 200 and r.content[:5] == b"%PDF-"

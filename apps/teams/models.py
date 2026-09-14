@@ -228,6 +228,12 @@ class BOMAllocation(TimeStampedModel):
         "inventory.InventoryItem", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="bom_allocations",
     )
+    # Goods now reach the warehouse as inventory (via receipt inspection)
+    # rather than as Devices, so a serialized allocation targets the unit.
+    inventory_unit = models.ForeignKey(
+        "inventory.InventoryUnit", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="bom_allocations",
+    )
     quantity = models.PositiveIntegerField(default=1)
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.ALLOCATED)
     allocated_by = models.ForeignKey(
@@ -239,7 +245,7 @@ class BOMAllocation(TimeStampedModel):
         ordering = ["created_at"]
 
     def __str__(self):
-        target = self.device or self.inventory_item
+        target = self.device or self.inventory_unit or self.inventory_item
         return f"{self.bom_line}: {target} x{self.quantity} ({self.status})"
 
 
@@ -260,3 +266,83 @@ class ProjectMember(TimeStampedModel):
 
     def __str__(self):
         return f"{self.user.get_full_name()} on {self.project.name}"
+
+
+class ProjectBudget(TimeStampedModel):
+    """The cost plan for a project, and whether it has been signed off.
+
+    Planning comes before execution: the estimate is built from what the
+    assets need (priced from inventory and past purchases), plus overheads and
+    a contingency, and the total goes up for approval. Only an approved budget
+    lets the project start drawing stock or raising purchases.
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        SUBMITTED = "submitted", "Awaiting Approval"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+
+    project = models.OneToOneField(Project, on_delete=models.CASCADE, related_name="cost_plan")
+    contingency_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, default=0,
+        help_text="Added on top of materials and overheads, as a percentage",
+    )
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.DRAFT)
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="budgets_submitted",
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="budgets_decided",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_notes = models.TextField(blank=True)
+    # What was signed off, frozen at approval — the estimate keeps moving as
+    # prices change, the approved figure must not.
+    approved_total = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+
+    def __str__(self):
+        return f"Budget for {self.project.name} ({self.get_status_display()})"
+
+    @property
+    def is_editable(self):
+        return self.status in (self.Status.DRAFT, self.Status.REJECTED)
+
+
+class ProjectCostLine(TimeStampedModel):
+    """An overhead on the project plan: travel, labour, transport, and so on.
+
+    The type is the user's own word for it rather than a fixed list — every
+    company slices overheads differently.
+    """
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="cost_lines")
+    cost_type = models.CharField(max_length=100)
+    description = models.CharField(max_length=300, blank=True)
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, default=1)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2)
+    # What it actually came to. The planned figures stay as they were
+    # approved; these move with reality during execution.
+    actual_quantity = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    actual_unit_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.cost_type}: {self.description or ''} ({self.amount})"
+
+    @property
+    def amount(self):
+        return (self.quantity or 0) * (self.unit_cost or 0)
+
+    @property
+    def actual_amount(self):
+        """None until someone records what it cost - not the same as zero."""
+        if self.actual_unit_cost is None:
+            return None
+        quantity = self.actual_quantity if self.actual_quantity is not None else 1
+        return quantity * self.actual_unit_cost

@@ -5,7 +5,10 @@ from .models import (
     GoodsReceiptLine,
     InventoryCategory,
     InventoryItem,
+    InventoryUnit,
+    InventoryUnitType,
     Issuance,
+    IssuanceRequest,
     StockMovement,
 )
 
@@ -28,7 +31,7 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         model = InventoryItem
         fields = [
             "id", "material_type", "material_name", "category", "category_name",
-            "sku", "quantity", "min_stock_level", "unit", "location",
+            "sku", "quantity", "min_stock_level", "unit", "location", "storage_location",
             "unit_cost", "total_value", "notes", "is_low_stock", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "sku", "created_at", "updated_at"]
@@ -38,16 +41,304 @@ class InventoryItemSerializer(serializers.ModelSerializer):
             return None
         return obj.quantity * obj.unit_cost
 
+    def validate_material_type(self, value):
+        """One stock record per material.
+
+        Opening a second row for a material that already has one splits its
+        stock in two: goods received land on one row while requirements watch
+        the other, and the quantity looks like it never moved.
+        """
+        clash = InventoryItem.objects.filter(material_type=value)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        existing = clash.first()
+        if existing is not None:
+            raise serializers.ValidationError(
+                f"{value.name} is already in inventory as {existing.sku} "
+                f"(quantity {existing.quantity}) — edit that item instead of opening a second one."
+            )
+        return value
+
+
+class InventoryUnitTypeSerializer(serializers.ModelSerializer):
+    """A unique product as opened in inventory — details now, serials later."""
+
+    material_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
+    category_name = serializers.CharField(source="category.name", read_only=True, default=None)
+    brand_name = serializers.CharField(source="brand.name", read_only=True, default=None)
+    supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
+    # Opened at zero and filled by goods receipt, so the count is derived.
+    # Uses the list queryset's annotation when present, else the model property.
+    in_stock_count = serializers.SerializerMethodField()
+    # Stock already on the shelf when the product is first opened. Serialized
+    # items need a serial each, so provisional ones are generated from the type
+    # code for the storekeeper to correct as the units are found.
+    opening_quantity = serializers.IntegerField(
+        write_only=True, required=False, min_value=0, max_value=500, default=0
+    )
+
+    class Meta:
+        model = InventoryUnitType
+        fields = [
+            "id", "type_code", "name",
+            "material_type", "material_name", "category", "category_name",
+            "brand", "brand_name", "model_name", "specifications",
+            "unit_cost", "min_stock_level", "is_high_value",
+            "default_has_warranty", "default_warranty_type", "default_warranty_months",
+            "supplier", "supplier_name",
+            "in_stock_count", "opening_quantity", "notes", "is_active", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "type_code", "created_at", "updated_at"]
+
+    def get_in_stock_count(self, obj):
+        return getattr(obj, "stock_count", None) or obj.in_stock_count
+
+    def create(self, validated_data):
+        opening = validated_data.pop("opening_quantity", 0) or 0
+        unit_type = super().create(validated_data)
+        if opening:
+            from .models import InventoryUnit
+
+            # Saved one at a time, not bulk_create: each unit's unit_code is
+            # generated in save(), and bulk_create would leave them all blank
+            # against a unique column.
+            for n in range(1, opening + 1):
+                InventoryUnit.objects.create(
+                    unit_type=unit_type,
+                    serial_number=f"{unit_type.type_code}-{n:04d}",
+                    material_type=unit_type.material_type,
+                    category=unit_type.category,
+                    brand=unit_type.brand,
+                    model_name=unit_type.model_name,
+                    supplier=unit_type.supplier,
+                    purchase_price=unit_type.unit_cost,
+                    notes="Opening stock — provisional serial, replace it with the real one.",
+                )
+        return unit_type
+
+    def update(self, instance, validated_data):
+        # Opening stock is a fact about the moment the product was opened; it
+        # is not something an edit can replay.
+        validated_data.pop("opening_quantity", None)
+        return super().update(instance, validated_data)
+
+    def validate_name(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Give the product a name.")
+        return value
+
+    def validate(self, attrs):
+        def current(name):
+            return attrs[name] if name in attrs else getattr(self.instance, name, None)
+
+        if current("default_has_warranty") and not current("default_warranty_months"):
+            raise serializers.ValidationError({
+                "default_warranty_months": "Set the warranty term in months, or clear the warranty default."
+            })
+        return attrs
+
+
+class InventoryUnitSerializer(serializers.ModelSerializer):
+    """Serialized ("unique") inventory items — one row per physical unit."""
+
+    material_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
+    category_name = serializers.CharField(source="category.name", read_only=True, default=None)
+    brand_name = serializers.CharField(source="brand.name", read_only=True, default=None)
+    supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
+    warranty_state = serializers.CharField(read_only=True)
+    is_under_warranty = serializers.BooleanField(read_only=True)
+    converted_device_code = serializers.CharField(
+        source="converted_device.asset_code", read_only=True, default=None
+    )
+    # Traceability: batch number plus the delivery and PO it arrived on.
+    # Not source="unit_type.__str__": with no product, DRF walks to a bound
+    # method-wrapper on None and renders it verbatim instead of falling back.
+    unit_type_name = serializers.SerializerMethodField()
+    unit_type_code = serializers.CharField(source="unit_type.type_code", read_only=True, default=None)
+    grn_number = serializers.CharField(
+        source="goods_receipt_line.receipt.grn_number", read_only=True, default=None
+    )
+    po_number = serializers.CharField(
+        source="goods_receipt_line.receipt.purchase_order.po_number", read_only=True, default=None
+    )
+    # Where the unit physically is: fitted into an asset, or still on the shelf.
+    installed_in_code = serializers.SerializerMethodField()
+    installed_in_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = InventoryUnit
+        fields = [
+            "id", "unit_code", "serial_number",
+            "unit_type", "unit_type_name", "unit_type_code",
+            "material_type", "material_name", "category", "category_name",
+            "brand", "brand_name", "model_name",
+            "status", "location", "installed_in_code", "installed_in_name",
+            "supplier", "supplier_name", "purchase_date", "purchase_price", "batch_number",
+            "goods_receipt_line", "grn_number", "po_number",
+            "has_warranty", "warranty_type", "warranty_start", "warranty_months", "warranty_end",
+            "warranty_state", "is_under_warranty",
+            "converted_device", "converted_device_code",
+            "notes", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "unit_code", "status", "converted_device", "goods_receipt_line",
+            "created_at", "updated_at",
+        ]
+
+    def get_unit_type_name(self, obj):
+        return str(obj.unit_type) if obj.unit_type_id else None
+
+    def _installed_device(self, obj):
+        """The asset this unit was fitted into, if it has been."""
+        component = getattr(obj, "asset_component", None)
+        return getattr(component, "device", None) if component else None
+
+    def get_installed_in_code(self, obj):
+        device = self._installed_device(obj)
+        return device.asset_code if device else None
+
+    def get_installed_in_name(self, obj):
+        device = self._installed_device(obj)
+        return (device.display_name or "") if device else None
+
+    def validate_serial_number(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Serial number is required for a unique item.")
+        return value
+
+    def validate(self, attrs):
+        # Reads fall back to the instance so PATCHes that touch only one
+        # warranty field are still validated against the full picture.
+        def current(name):
+            if name in attrs:
+                return attrs[name]
+            return getattr(self.instance, name, None)
+
+        # A unit is identified by a material type or by its make/model. Asked
+        # when the unit is registered, not on every edit afterwards: opening
+        # stock raises units from a product that may carry neither, and those
+        # units still need their provisional serials corrected.
+        identified = current("material_type") or (current("model_name") or "").strip()
+        if self.instance is None and not identified:
+            raise serializers.ValidationError(
+                {"material_type": "Give the unit a material type, or a model name."}
+            )
+
+        if current("has_warranty"):
+            if not current("warranty_type"):
+                raise serializers.ValidationError(
+                    {"warranty_type": "Select a warranty type, or clear 'has warranty'."}
+                )
+            if not current("warranty_start"):
+                raise serializers.ValidationError(
+                    {"warranty_start": "A warranty needs a start date."}
+                )
+            if not current("warranty_end") and not current("warranty_months"):
+                raise serializers.ValidationError(
+                    {"warranty_end": "Provide an end date or a term in months."}
+                )
+            start, end = current("warranty_start"), current("warranty_end")
+            if start and end and end < start:
+                raise serializers.ValidationError(
+                    {"warranty_end": "Warranty end date cannot be before the start date."}
+                )
+        return attrs
+
+
+class InventoryUnitTransitionSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=InventoryUnit.Status.choices)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+
+class InventoryUnitBulkSerializer(InventoryUnitSerializer):
+    """Register several identical unique items in one go.
+
+    Each physical unit still becomes its own row with its own serial number —
+    ``quantity`` is a data-entry convenience, not a field on the unit. Supply
+    ``serial_numbers`` (one per unit), or a single ``serial_number`` which is
+    suffixed ``-1 … -N``.
+    """
+
+    quantity = serializers.IntegerField(min_value=1, max_value=500, write_only=True)
+    serial_numbers = serializers.ListField(
+        child=serializers.CharField(max_length=200), write_only=True, required=False, allow_empty=True
+    )
+
+    class Meta(InventoryUnitSerializer.Meta):
+        fields = InventoryUnitSerializer.Meta.fields + ["quantity", "serial_numbers"]
+        extra_kwargs = {"serial_number": {"required": False}}
+
+    def validate(self, attrs):
+        quantity = attrs.get("quantity", 1)
+        serials = [s.strip() for s in (attrs.get("serial_numbers") or []) if s.strip()]
+        base = (attrs.get("serial_number") or "").strip()
+
+        if serials:
+            if len(serials) != quantity:
+                raise serializers.ValidationError(
+                    {"serial_numbers": f"Provide exactly {quantity} serial number(s); got {len(serials)}."}
+                )
+        elif base:
+            serials = [base] if quantity == 1 else [f"{base}-{i}" for i in range(1, quantity + 1)]
+        else:
+            raise serializers.ValidationError(
+                {"serial_number": "Provide a serial number, or one serial per unit in serial_numbers."}
+            )
+
+        if len(set(serials)) != len(serials):
+            raise serializers.ValidationError({"serial_numbers": "Serial numbers must be unique."})
+
+        clashes = list(
+            InventoryUnit.objects.filter(serial_number__in=serials).values_list("serial_number", flat=True)[:5]
+        )
+        if clashes:
+            raise serializers.ValidationError(
+                {"serial_numbers": f"Already registered: {', '.join(clashes)}"}
+            )
+
+        attrs["serial_number"] = serials[0]
+        # Run the parent's warranty checks against a single representative row.
+        attrs = super().validate(attrs)
+        attrs["_serials"] = serials
+        return attrs
+
+    def create(self, validated_data):
+        serials = validated_data.pop("_serials")
+        validated_data.pop("quantity", None)
+        validated_data.pop("serial_numbers", None)
+        validated_data.pop("serial_number", None)
+
+        units = []
+        for serial in serials:
+            # Saved one at a time (not bulk_create) so unit_code generation and
+            # the warranty-end derivation in save() run for every unit.
+            units.append(InventoryUnit.objects.create(serial_number=serial, **validated_data))
+        return units
+
 
 class StockMovementSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.material_type.name", read_only=True, default=None)
     performed_by_name = serializers.CharField(source="performed_by.get_full_name", read_only=True, default=None)
+    # Where this stock came from: the delivery, the order behind it, and who
+    # supplied it. Without these a movement says a number changed but not why.
+    grn_number = serializers.CharField(
+        source="goods_receipt_line.receipt.grn_number", read_only=True, default=None
+    )
+    po_number = serializers.CharField(
+        source="goods_receipt_line.receipt.purchase_order.po_number", read_only=True, default=None
+    )
+    supplier_name = serializers.CharField(
+        source="goods_receipt_line.receipt.purchase_order.supplier.name", read_only=True, default=None
+    )
 
     class Meta:
         model = StockMovement
         fields = [
             "id", "item", "item_name", "movement_type",
-            "quantity", "reference", "notes",
+            "quantity", "reference", "notes", "batch_number",
+            "goods_receipt_line", "grn_number", "po_number", "supplier_name",
             "performed_by", "performed_by_name", "created_at",
         ]
         read_only_fields = ["id", "created_at"]
@@ -58,14 +349,110 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
     inventory_item_name = serializers.CharField(
         source="inventory_item.material_type.name", read_only=True, default=None
     )
+    # Traceability: which delivery and which purchase order this came from.
+    grn_number = serializers.CharField(source="receipt.grn_number", read_only=True, default=None)
+    po_number = serializers.CharField(
+        source="receipt.purchase_order.po_number", read_only=True, default=None
+    )
+    supplier_name = serializers.CharField(
+        source="receipt.purchase_order.supplier.name", read_only=True, default=None
+    )
+    material_type = serializers.PrimaryKeyRelatedField(
+        source="po_item.material_type", read_only=True, default=None
+    )
+    material_name = serializers.CharField(
+        source="po_item.material_type.name", read_only=True, default=None
+    )
+    device_model_name = serializers.CharField(
+        source="po_item.device_model.name", read_only=True, default=None
+    )
+    inspected_by_name = serializers.CharField(
+        source="inspected_by.get_full_name", read_only=True, default=None
+    )
+    stocked_unit_count = serializers.SerializerMethodField()
 
     class Meta:
         model = GoodsReceiptLine
         fields = [
-            "id", "po_item", "po_item_description", "inventory_item", "inventory_item_name",
-            "quantity", "batch_number", "serial_numbers", "created_at",
+            "id", "receipt", "grn_number", "po_number", "supplier_name",
+            "po_item", "po_item_description", "material_type", "material_name", "device_model_name",
+            "inventory_item", "inventory_item_name",
+            "quantity", "batch_number", "serial_numbers",
+            "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
+            "inspected_by", "inspected_by_name", "inspected_at", "inspection_notes",
+            "stocked_unit_count", "created_at",
         ]
         read_only_fields = fields
+
+    def get_stocked_unit_count(self, obj):
+        return obj.units.count()
+
+
+class InventoryUnitIntakeSerializer(serializers.Serializer):
+    """One unique unit as entered by the inspecting technician.
+
+    When the product was already opened in inventory (``unit_type``), the
+    serial number is the only thing that needs typing — make, model, technical
+    details and warranty terms are inherited from that record.
+    """
+
+    serial_number = serializers.CharField(max_length=200)
+    unit_type = serializers.UUIDField(required=False, allow_null=True)
+    material_type = serializers.UUIDField(required=False, allow_null=True)
+    category = serializers.UUIDField(required=False, allow_null=True)
+    brand = serializers.UUIDField(required=False, allow_null=True)
+    model_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
+    supplier = serializers.UUIDField(required=False, allow_null=True)
+    purchase_price = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True
+    )
+    purchase_date = serializers.DateField(required=False, allow_null=True)
+    has_warranty = serializers.BooleanField(required=False, default=False)
+    warranty_type = serializers.ChoiceField(
+        choices=InventoryUnit.WarrantyType.choices, required=False, allow_blank=True
+    )
+    warranty_start = serializers.DateField(required=False, allow_null=True)
+    warranty_months = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    warranty_end = serializers.DateField(required=False, allow_null=True)
+
+
+class GoodsReceiptLineInspectSerializer(serializers.Serializer):
+    """A technician's inspection verdict on one received line."""
+
+    route = serializers.ChoiceField(choices=GoodsReceiptLine.Route.choices, required=False)
+    accepted_quantity = serializers.IntegerField(min_value=0)
+    rejected_quantity = serializers.IntegerField(min_value=0, required=False, default=0)
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    # Generic route: optional overrides for the stock record being topped up.
+    generic = serializers.DictField(required=False)
+    # Unique route: one entry per accepted unit.
+    units = InventoryUnitIntakeSerializer(many=True, required=False)
+
+    def validate(self, attrs):
+        line = self.context["line"]
+        if not line.is_pending_inspection:
+            raise serializers.ValidationError(
+                {"detail": f"This line was already inspected ({line.get_inspection_status_display()})."}
+            )
+
+        accepted = attrs["accepted_quantity"]
+        rejected = attrs.get("rejected_quantity", 0)
+        if accepted + rejected != line.quantity:
+            raise serializers.ValidationError({
+                "accepted_quantity": (
+                    f"Accepted plus rejected must equal the {line.quantity} received "
+                    f"(got {accepted} + {rejected})."
+                )
+            })
+        if accepted and not attrs.get("route"):
+            raise serializers.ValidationError(
+                {"route": "Choose where the accepted items go: generic stock or unique items."}
+            )
+        if accepted and attrs["route"] == GoodsReceiptLine.Route.UNIQUE and not attrs.get("units"):
+            raise serializers.ValidationError(
+                {"units": f"Enter details for the {accepted} unique item(s)."}
+            )
+        return attrs
 
 
 class GoodsReceiptSerializer(serializers.ModelSerializer):
@@ -98,17 +485,29 @@ class IssuanceSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.material_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="issued_to_site.name", read_only=True, default=None)
     project_name = serializers.CharField(source="issued_to_project.name", read_only=True, default=None)
-    issued_by_name = serializers.CharField(source="issued_by.get_full_name", read_only=True, default=None)
+    # Accounts without a full name still have to answer "who authorised this".
+    issued_by_name = serializers.SerializerMethodField()
+    # Stock goes out to a project or to a named person; the log has to say which.
+    issued_to_user_name = serializers.CharField(
+        source="issued_to_user.get_full_name", read_only=True, default=None
+    )
 
     class Meta:
         model = Issuance
         fields = [
             "id", "issue_number", "item", "item_name", "quantity",
-            "issued_to_site", "site_name", "issued_to_work_order", "issued_to_user",
+            "issued_to_site", "site_name", "issued_to_work_order",
+            "issued_to_user", "issued_to_user_name",
             "issued_to_project", "project_name", "bom_line",
             "issued_by", "issued_by_name", "reason", "notes", "created_at",
         ]
         read_only_fields = ["id", "issue_number", "issued_by", "created_at"]
+
+    def get_issued_by_name(self, obj):
+        user = obj.issued_by
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
 
     def validate(self, attrs):
         item = attrs.get("item")
@@ -118,3 +517,83 @@ class IssuanceSerializer(serializers.ModelSerializer):
                 {"quantity": f"Only {item.quantity} unit(s) of {item} in stock."}
             )
         return attrs
+
+
+class IssuanceRequestSerializer(serializers.ModelSerializer):
+    """Material asked of the store, and what has been handed over so far."""
+
+    what = serializers.CharField(read_only=True)
+    item_sku = serializers.CharField(source="item.sku", read_only=True, default=None)
+    item_name = serializers.CharField(
+        source="item.material_type.name", read_only=True, default=None
+    )
+    unit_type_name = serializers.StringRelatedField(source="unit_type", read_only=True)
+    project_name = serializers.CharField(source="project.name", read_only=True, default=None)
+    asset_code = serializers.CharField(
+        source="asset_component.device.asset_code", read_only=True, default=None
+    )
+    component_name = serializers.CharField(
+        source="asset_component.name", read_only=True, default=None
+    )
+    maintenance_title = serializers.CharField(
+        source="maintenance_schedule.title", read_only=True, default=None
+    )
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    source_display = serializers.CharField(source="get_source_display", read_only=True)
+    outstanding_quantity = serializers.IntegerField(read_only=True)
+    available_quantity = serializers.IntegerField(read_only=True)
+    requested_by_name = serializers.SerializerMethodField()
+    issued_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = IssuanceRequest
+        fields = [
+            "id", "request_number", "what",
+            "item", "item_sku", "item_name", "unit_type", "unit_type_name",
+            "quantity_requested", "quantity_issued", "outstanding_quantity", "available_quantity",
+            "source", "source_display", "purpose",
+            "project", "project_name", "asset_component", "asset_code", "component_name",
+            "maintenance_schedule", "maintenance_title",
+            "requested_by", "requested_by_name", "issued_by", "issued_by_name",
+            "received_by", "issued_serials",
+            "status", "status_display", "notes", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "request_number", "quantity_issued", "issued_by", "issued_serials",
+            "received_by", "status", "requested_by", "created_at", "updated_at",
+        ]
+
+    def _name(self, user):
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
+
+    def get_requested_by_name(self, obj):
+        return self._name(obj.requested_by)
+
+    def get_issued_by_name(self, obj):
+        return self._name(obj.issued_by)
+
+    def validate(self, attrs):
+        def current(name):
+            if name in attrs:
+                return attrs[name]
+            return getattr(self.instance, name, None)
+
+        item, unit_type = current("item"), current("unit_type")
+        if bool(item) == bool(unit_type):
+            raise serializers.ValidationError(
+                {"item": "Name either a stock item or a serialized product — one of the two."}
+            )
+        quantity = current("quantity_requested")
+        if quantity is not None and quantity < 1:
+            raise serializers.ValidationError({"quantity_requested": "Ask for at least one."})
+        return attrs
+
+
+class IssuanceRequestIssueSerializer(serializers.Serializer):
+    """One hand-over against a request; the balance stays on the queue."""
+
+    quantity = serializers.IntegerField(min_value=1)
+    received_by = serializers.CharField(required=False, allow_blank=True, default="")
+    notes = serializers.CharField(required=False, allow_blank=True, default="")

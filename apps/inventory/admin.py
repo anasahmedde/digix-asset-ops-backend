@@ -5,6 +5,8 @@ from .models import (
     GoodsReceiptLine,
     InventoryCategory,
     InventoryItem,
+    InventoryUnit,
+    InventoryUnitType,
     Issuance,
     StockMovement,
 )
@@ -24,6 +26,27 @@ class InventoryItemAdmin(admin.ModelAdmin):
     search_fields = ("sku", "material_type__name")
     raw_id_fields = ("material_type",)
     readonly_fields = ("sku",)
+
+
+@admin.register(InventoryUnitType)
+class InventoryUnitTypeAdmin(admin.ModelAdmin):
+    list_display = ("type_code", "name", "model_name", "brand", "material_type", "is_active")
+    list_filter = ("is_active", "category", "default_has_warranty")
+    search_fields = ("type_code", "name", "model_name", "brand__name")
+    raw_id_fields = ("material_type", "brand", "supplier")
+    readonly_fields = ("type_code",)
+
+
+@admin.register(InventoryUnit)
+class InventoryUnitAdmin(admin.ModelAdmin):
+    list_display = (
+        "unit_code", "serial_number", "material_type", "brand", "model_name",
+        "status", "location", "has_warranty", "warranty_end",
+    )
+    list_filter = ("status", "location", "has_warranty", "warranty_type", "category")
+    search_fields = ("unit_code", "serial_number", "model_name", "material_type__name", "brand__name")
+    raw_id_fields = ("material_type", "brand", "supplier", "goods_receipt_line", "converted_device")
+    readonly_fields = ("unit_code",)
 
 
 @admin.register(StockMovement)

@@ -170,9 +170,12 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
     ],
+    # One screen in this app costs several requests (the signed-in user, the
+    # notification and chat counters, then the page's own data), so a limit
+    # meant to stop abuse has to sit well above ordinary use.
     "DEFAULT_THROTTLE_RATES": {
         "anon": "100/hour",
-        "user": "1000/hour",
+        "user": "5000/hour",
     },
 }
 

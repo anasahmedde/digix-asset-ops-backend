@@ -5,6 +5,8 @@ import logging
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
+from apps.assets.models import Device
+
 from .models import DeviceInstallation, InstallationStep
 
 logger = logging.getLogger(__name__)
@@ -22,9 +24,37 @@ DEFAULT_STEP_TYPES = [
 
 
 def seed_steps(installation: DeviceInstallation) -> int:
-    """Create the default step checklist for an installation if it has none."""
+    """Create the step checklist for an installation if it has none.
+
+    An asset type with a saved checklist starts from that; anything else falls
+    back to the generic survey-to-handover list, so a job is never empty.
+    """
+    from .models import InstallationRouteTemplate
+
     if installation.steps.exists():
         return 0
+
+    asset_type_id = installation.device.asset_type_id
+    template = (
+        InstallationRouteTemplate.objects.filter(asset_type_id=asset_type_id).first()
+        if asset_type_id else None
+    )
+    if template is not None:
+        lines = list(template.steps.all())
+        if lines:
+            InstallationStep.objects.bulk_create([
+                InstallationStep(
+                    installation=installation,
+                    step_type=line.step_type,
+                    custom_label=line.custom_label,
+                    assigned_team=line.assigned_team,
+                    description=line.description,
+                    step_number=index + 1,
+                )
+                for index, line in enumerate(lines)
+            ])
+            return len(lines)
+
     InstallationStep.objects.bulk_create(
         [
             InstallationStep(
@@ -51,15 +81,36 @@ def create_default_installation_steps(sender, instance: DeviceInstallation, crea
 @receiver(post_save, sender=DeviceInstallation)
 def mark_device_on_installation_track(sender, instance: DeviceInstallation, created: bool, **kwargs):
     """Creating an installation puts a pre-install asset on the installation
-    track (WF-10) — the registry status flips without a manual edit. The
-    assets signals journal the change as a lifecycle event + audit entry."""
+    track (WF-10) — the registry status flips without a manual edit.
+
+    It moves to `assigned`, not `installed`: raising the job is not doing the
+    work. The asset becomes Installed when the checklist is finished, and
+    Active when the technician says so with a photo — otherwise every asset on
+    the tracker would claim to be installed the moment it got there, and the
+    progress the technician records would mean nothing.
+    """
     if not created:
         return
     device = instance.device
-    if device.status in ("procured", "in_transit", "in_stock", "assigned"):
-        device._transition_reason = f"Installation created at {instance.site.name}"
-        device.status = "installed"
+    if device.status in ("procured", "in_transit", "in_stock"):
+        device._transition_reason = f"Installation opened at {instance.site.name}"
+        device.status = "assigned"
         device.save(update_fields=["status", "updated_at"])
+
+
+@receiver(post_save, sender=Device)
+def open_installation_when_assigned(sender, instance: Device, created: bool, **kwargs):
+    """An assigned asset has an installation job, wherever it got assigned.
+
+    Hooked to the asset rather than to the transition endpoint so the edit
+    form counts too — an asset assigned before it had a site joins the tracker
+    as soon as one is set, instead of staying invisible.
+    """
+    if instance.status != "assigned" or instance.current_site_id is None:
+        return
+    from .services import open_installation_for
+
+    open_installation_for(instance)
 
 
 @receiver(post_save, sender=InstallationStep)

@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     ProjectBOMLineViewSet,
     ProjectBottleneckViewSet,
+    ProjectCostLineViewSet,
     ProjectMemberViewSet,
     ProjectMilestoneViewSet,
     ProjectScopeItemViewSet,
@@ -17,6 +18,7 @@ router.register("members", ProjectMemberViewSet)
 router.register("scope-items", ProjectScopeItemViewSet)
 router.register("milestones", ProjectMilestoneViewSet)
 router.register("bom-lines", ProjectBOMLineViewSet)
+router.register("cost-lines", ProjectCostLineViewSet)
 
 urlpatterns = [
     path("", include(router.urls)),

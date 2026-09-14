@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from .models import (
+    ProjectCostLine,
     BOMAllocation,
     Project,
     ProjectBOMLine,
@@ -156,3 +157,56 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
 
     def get_progress(self, obj):
         return obj.computed_progress()
+
+
+class ProjectCostLineSerializer(serializers.ModelSerializer):
+    """An overhead line on a project's cost plan."""
+
+    amount = serializers.SerializerMethodField()
+    actual_amount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProjectCostLine
+        fields = [
+            "id", "project", "cost_type", "description", "quantity", "unit_cost",
+            "amount", "actual_quantity", "actual_unit_cost", "actual_amount", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+        # A cost nobody planned for carries no planned rate, so the rate is
+        # required by validate() only while the budget is still being planned.
+        extra_kwargs = {"unit_cost": {"required": False}}
+
+    def get_amount(self, obj):
+        return str(obj.amount)
+
+    def get_actual_amount(self, obj):
+        return None if obj.actual_amount is None else str(obj.actual_amount)
+
+    def validate_cost_type(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Say what kind of cost this is.")
+        return value[:100]
+
+    def validate(self, attrs):
+        project = attrs.get("project") or getattr(self.instance, "project", None)
+        plan = getattr(project, "cost_plan", None) if project else None
+        locked = plan is not None and not plan.is_editable
+        if not locked:
+            if self.instance is None and attrs.get("unit_cost") is None:
+                raise serializers.ValidationError({"unit_cost": "Give the rate for this cost."})
+            return attrs
+
+        # The approved estimate does not move. What things actually cost does,
+        # so the actual columns stay open all through execution.
+        if self.instance is None:
+            # A cost nobody planned for belongs to the actuals, not to the
+            # figure that was signed off.
+            attrs["quantity"] = 0
+            attrs["unit_cost"] = 0
+        elif any(field in attrs for field in ("quantity", "unit_cost")):
+            raise serializers.ValidationError(
+                f"The budget is {plan.get_status_display().lower()} — revise it to change the "
+                f"planned figures. Recording what it actually cost is always allowed."
+            )
+        return attrs

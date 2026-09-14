@@ -1,9 +1,11 @@
 """Goods receipt against a purchase order (WF-04).
 
-One GRN records everything that arrived in a delivery: serialized lines
-spawn one Device per captured serial number, consumable lines top up
-warehouse stock. Everything runs in a single transaction — any validation
-failure rolls the whole receipt back.
+One GRN records everything that arrived in a delivery. Receipt does **not**
+put anything into the warehouse: every line is queued ``pending`` inspection.
+A technician then inspects it and routes the accepted quantity into generic
+stock or unique units (``inventory.services.stock_inspected_line``), which is
+the only step that moves stock. Everything runs in a single transaction — any
+validation failure rolls the whole receipt back.
 """
 
 from __future__ import annotations
@@ -15,8 +17,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from apps.assets.models import Device
-from apps.inventory.models import GoodsReceipt, GoodsReceiptLine, InventoryItem, StockMovement
-from apps.teams.models import BOMAllocation
+from apps.inventory.models import GoodsReceipt, GoodsReceiptLine
 
 from .models import PurchaseOrder
 
@@ -53,7 +54,9 @@ def _validate_lines(purchase_order, lines):
 
         serials = [str(s).strip() for s in line.get("serial_numbers") or []]
         line["serial_numbers"] = serials
-        if po_item.device_model_id:
+        # Serialized either because the line names a device model or because it
+        # names an opened unique product.
+        if po_item.device_model_id or po_item.inventory_unit_type_id:
             if len(serials) != line["quantity"]:
                 raise serializers.ValidationError({
                     label: (
@@ -65,7 +68,7 @@ def _validate_lines(purchase_order, lines):
                 raise serializers.ValidationError({label: "Serial numbers cannot be blank."})
         elif not po_item.material_type_id:
             raise serializers.ValidationError(
-                {label: "line has no device model or material type"}
+                {label: "line has no unique product, device model or material type"}
             )
         all_serials.extend(serials)
 
@@ -110,79 +113,24 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
             received_by=user,
         )
 
-        created_devices = []
         receipt_lines = []
-        today = timezone.localdate()
 
         for line in lines:
             po_item = line["_po_item"]
             qty = line["quantity"]
             batch_number = line.get("batch_number", "")
-            inventory_item = None
 
-            if po_item.device_model_id:
-                # Serialized: one Device per captured serial. DeviceModel has no
-                # asset_type of its own, so the type comes from the PO line.
-                bom_line = po_item.bom_line
-                for serial in line["serial_numbers"]:
-                    device = Device(
-                        device_model=po_item.device_model,
-                        asset_type=po_item.asset_type,
-                        serial_number=serial,
-                        batch_number=batch_number,
-                        supplier=purchase_order.supplier,
-                        purchase_price=po_item.unit_price,
-                        purchase_date=today,
-                        invoice_reference=receipt.grn_number,
-                        source=Device.Source.THIRD_PARTY,
-                        status=Device.Status.PROCURED,
-                        project=bom_line.project if bom_line else None,
-                    )
-                    # Journalled as a 'Registered' lifecycle event by the
-                    # Wave-1 signals; stash the actor so the journal names them.
-                    device._transition_user = user
-                    device.save()
-                    created_devices.append(device)
-                    if bom_line:
-                        BOMAllocation.objects.create(
-                            bom_line=bom_line,
-                            device=device,
-                            quantity=1,
-                            status=BOMAllocation.Status.ALLOCATED,
-                            allocated_by=user,
-                        )
-            else:
-                # Consumable: top up (or open) the stock record for the material.
-                inventory_item = (
-                    InventoryItem.objects.select_for_update()
-                    .filter(material_type=po_item.material_type)
-                    .order_by("created_at")
-                    .first()
-                )
-                if inventory_item is None:
-                    inventory_item = InventoryItem.objects.create(
-                        material_type=po_item.material_type,
-                        quantity=0,
-                        unit_cost=po_item.unit_price,
-                    )
-                inventory_item.quantity += qty
-                inventory_item.save(update_fields=["quantity", "updated_at"])
-                StockMovement.objects.create(
-                    item=inventory_item,
-                    movement_type=StockMovement.MovementType.IN,
-                    quantity=qty,
-                    reference=receipt.grn_number,
-                    performed_by=user,
-                    notes=f"Goods receipt {receipt.grn_number} against {purchase_order.po_number}",
-                )
-
+            # Goods stop at the door. Nothing is stocked and no asset is
+            # created here — the line waits for a technician's inspection,
+            # which routes the accepted quantity into generic stock or unique
+            # units (see inventory.services.stock_inspected_line).
             receipt_lines.append(GoodsReceiptLine.objects.create(
                 receipt=receipt,
                 po_item=po_item,
-                inventory_item=inventory_item,
                 quantity=qty,
                 batch_number=batch_number,
                 serial_numbers=line["serial_numbers"],
+                inspection_status=GoodsReceiptLine.Inspection.PENDING,
             ))
 
             po_item.received_quantity += qty
@@ -216,9 +164,8 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
         "id": str(receipt.pk),
         "grn_number": receipt.grn_number,
         "purchase_order": str(purchase_order.pk),
-        "created_devices": [
-            {"id": str(d.pk), "asset_code": d.asset_code, "serial_number": d.serial_number}
-            for d in created_devices
-        ],
+        # Received goods are held for inspection — nothing is in stock yet.
+        "pending_inspection": len(receipt_lines),
+        "created_devices": [],
         "lines": GoodsReceiptLineSerializer(receipt_lines, many=True).data,
     }

@@ -45,7 +45,10 @@ _FALLBACK_PREFIXES = {
     "ticket": "TKT",
     "goods_receipt": "GRN",
     "issuance": "ISS",
+    "material_request": "MR",
     "inventory_item": "ITM",
+    "inventory_unit": "IVU",
+    "inventory_unit_type": "IVT",
 }
 
 

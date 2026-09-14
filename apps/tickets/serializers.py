@@ -67,6 +67,18 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
     is_response_overdue = serializers.BooleanField(read_only=True)
     devices_info = serializers.SerializerMethodField()
     warranty_info = serializers.SerializerMethodField()
+    inventory_unit_serial = serializers.CharField(
+        source="inventory_unit.serial_number", read_only=True, default=None
+    )
+    inventory_unit_part = serializers.SerializerMethodField()
+
+    def get_inventory_unit_part(self, obj):
+        """What the claimed part is, however it was described when registered."""
+        unit = obj.inventory_unit
+        if unit is None:
+            return None
+        material = unit.material_type.name if unit.material_type_id else None
+        return material or (str(unit.unit_type) if unit.unit_type_id else None) or unit.model_name or None
 
     def get_devices_info(self, obj):
         return [
@@ -85,9 +97,9 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
-        # A ticket may only claim against a warranty of its own asset —
-        # otherwise any ticket-creator could flip unrelated warranties to
-        # "claim pending" (and skew their billability).
+        # A ticket may only claim against a warranty of its own asset, so a
+        # claim cannot be filed against an unrelated asset's cover (which would
+        # also skew that asset's billability).
         warranty = attrs.get("warranty")
         if warranty is not None:
             device = attrs.get("device") or (self.instance.device if self.instance else None)
@@ -108,7 +120,6 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
         return ticket
 
     def create(self, validated_data):
-        from apps.warranties.models import Warranty
         from apps.warranties.services import derive_billability
 
         devices = validated_data.get("devices") or []
@@ -131,13 +142,8 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
         ticket = super().create(validated_data)
         if ticket.device_id:
             ticket.devices.add(ticket.device)
-        if (
-            ticket.category == Ticket.Category.WARRANTY_CLAIM
-            and ticket.warranty
-            and ticket.warranty.status == Warranty.Status.ACTIVE
-        ):
-            ticket.warranty.status = Warranty.Status.CLAIMED
-            ticket.warranty.save(update_fields=["status", "updated_at"])
+        # Raising a claim deliberately leaves the warranty's own status alone:
+        # the claim is tracked on the claim, and the cover stays as it is.
         return ticket
 
     class Meta:
@@ -147,6 +153,7 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
             "issue_type", "issue_type_name",
             "device", "device_code", "devices", "devices_info", "site", "site_name",
             "warranty", "warranty_info", "is_billable", "charge_to", "repair_cost",
+            "inventory_unit", "inventory_unit_serial", "inventory_unit_part",
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
             "reported_by", "reported_by_name",
             "due_date", "response_due_at", "escalated", "escalated_at", "is_response_overdue",
@@ -180,6 +187,12 @@ class TicketListSerializer(serializers.ModelSerializer):
     attachment_count = serializers.IntegerField(source="attachments.count", read_only=True)
     comment_count = serializers.IntegerField(source="comments.count", read_only=True)
     is_response_overdue = serializers.BooleanField(read_only=True)
+    inventory_unit_serial = serializers.CharField(
+        source="inventory_unit.serial_number", read_only=True, default=None
+    )
+    supplier_name = serializers.CharField(
+        source="inventory_unit.supplier.name", read_only=True, default=None
+    )
 
     class Meta:
         model = Ticket
@@ -187,7 +200,8 @@ class TicketListSerializer(serializers.ModelSerializer):
             "id", "ticket_number", "occurrence", "complaint_by", "title", "description", "priority", "status", "category",
             "issue_type", "issue_type_name",
             "device", "device_code", "site", "site_name",
-            "is_billable", "charge_to",
+            "is_billable", "charge_to", "warranty", "repair_cost",
+            "inventory_unit", "inventory_unit_serial", "supplier_name",
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
             "reported_by", "reported_by_name",
             "due_date", "response_due_at", "escalated", "is_response_overdue",

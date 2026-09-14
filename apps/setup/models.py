@@ -69,6 +69,8 @@ class NumberingScheme(TimeStampedModel):
         GOODS_RECEIPT = "goods_receipt", "Goods Receipt"
         ISSUANCE = "issuance", "Inventory Issuance"
         INVENTORY_ITEM = "inventory_item", "Inventory Item (SKU)"
+        INVENTORY_UNIT = "inventory_unit", "Inventory Unit (Unique Item)"
+        INVENTORY_UNIT_TYPE = "inventory_unit_type", "Inventory Product (Unique Item Type)"
 
     entity = models.CharField(max_length=30, choices=Entity.choices, unique=True)
     prefix = models.CharField(max_length=12)

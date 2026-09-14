@@ -47,6 +47,30 @@ class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
         return Response(list(sites))
 
 
+    def perform_destroy(self, instance):
+        """A fault is closed, not deleted.
+
+        Deleting the open job for an asset that is still out of service leaves
+        it stranded: nothing tracks the repair, and nothing is left to complete
+        to bring it back into service. Complete it instead.
+        """
+        from rest_framework.exceptions import ValidationError
+
+        from apps.assets.models import Device
+
+        if (
+            instance.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE
+            and instance.status != MaintenanceSchedule.Status.COMPLETED
+            and instance.device_id
+            and instance.device.status == Device.Status.UNDER_MAINTENANCE
+        ):
+            raise ValidationError(
+                "This asset is out of service on this job — complete it instead, "
+                "which puts the asset back into service."
+            )
+        instance.delete()
+
+
 class MaintenanceRecordViewSet(viewsets.ModelViewSet):
     queryset = MaintenanceRecord.objects.select_related(
         "schedule", "performed_by"
@@ -61,6 +85,10 @@ class MaintenanceRecordViewSet(viewsets.ModelViewSet):
         # A completed visit rolls its schedule to the next cycle.
         if record.status == MaintenanceRecord.Status.COMPLETED:
             record.schedule.advance_after_completion(record.performed_at.date())
+            # Closing a corrective job is what returns the asset to Active.
+            from .services import return_to_service_if_done
+
+            return_to_service_if_done(record, self.request.user)
 
 
 class MaintenanceRecordPhotoViewSet(viewsets.ModelViewSet):

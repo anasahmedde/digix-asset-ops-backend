@@ -71,6 +71,18 @@ class WarehouseWriteElseRead(BasePermission):
         return _role(request.user) in WAREHOUSE_ROLES
 
 
+class InspectionWriteElseRead(BasePermission):
+    """Goods-receipt inspection: technicians and supervisors do the checking,
+    warehouse and management can too. Everyone authenticated may read."""
+
+    def has_permission(self, request, view):
+        if not (request.user and request.user.is_authenticated):
+            return False
+        if request.method in SAFE_METHODS:
+            return True
+        return _role(request.user) in set(FIELD_ROLES) | set(WAREHOUSE_ROLES)
+
+
 class TechnicianCanCreate(BasePermission):
     """
     Admin/Manager full access. Technicians can list, retrieve, create,
