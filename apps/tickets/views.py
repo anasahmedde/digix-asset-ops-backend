@@ -325,32 +325,12 @@ class TicketViewSet(viewsets.ModelViewSet):
             ticket.hold_reason = ""
 
         # Stamp closure time on close; clear it again when the ticket reopens.
+        # A claim's progress is tracked on the claim itself — the warranty's own
+        # status is left alone throughout.
         if new_status == Ticket.Status.CLOSED:
             ticket.closed_at = timezone.now()
-            # Closing a warranty claim releases the warranty from its
-            # "claim pending" state (WF-14).
-            if ticket.category == Ticket.Category.WARRANTY_CLAIM and ticket.warranty_id:
-                from apps.warranties.models import Warranty
-
-                warranty = ticket.warranty
-                if warranty.status == Warranty.Status.CLAIMED:
-                    warranty.status = (
-                        Warranty.Status.EXPIRED
-                        if warranty.end_date and warranty.end_date < timezone.localdate()
-                        else Warranty.Status.ACTIVE
-                    )
-                    warranty.save(update_fields=["status", "updated_at"])
         elif is_reopen:
             ticket.closed_at = None
-            # Reopening a warranty claim puts the warranty back into its
-            # "claim pending" state — mirror of the close branch above.
-            if ticket.category == Ticket.Category.WARRANTY_CLAIM and ticket.warranty_id:
-                from apps.warranties.models import Warranty
-
-                warranty = ticket.warranty
-                if warranty.status in (Warranty.Status.ACTIVE, Warranty.Status.EXPIRED):
-                    warranty.status = Warranty.Status.CLAIMED
-                    warranty.save(update_fields=["status", "updated_at"])
 
         ticket.status = new_status
         ticket.save(update_fields=[

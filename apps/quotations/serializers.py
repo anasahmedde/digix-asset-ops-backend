@@ -13,7 +13,7 @@ class QuotationItemSerializer(serializers.ModelSerializer):
 
     id = serializers.UUIDField(required=False)
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
-    device_model_name = serializers.CharField(source="device_model.__str__", read_only=True, default=None)
+    device_model_name = serializers.StringRelatedField(source="device_model", read_only=True)
     material_type_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
     line_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
 

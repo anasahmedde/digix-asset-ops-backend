@@ -16,15 +16,26 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
 
     id = serializers.UUIDField(required=False)
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
-    device_model_name = serializers.CharField(source="device_model.__str__", read_only=True, default=None)
+    device_model_name = serializers.StringRelatedField(source="device_model", read_only=True)
     material_type_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
+    # Which stock row the line lands in. Receiving needs to know a line is for
+    # serialized stock, so it can ask for the serial numbers at the door.
+    inventory_unit_type_name = serializers.SerializerMethodField()
+    inventory_item_sku = serializers.CharField(
+        source="inventory_item.sku", read_only=True, default=None
+    )
     line_total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    def get_inventory_unit_type_name(self, obj):
+        return str(obj.inventory_unit_type) if obj.inventory_unit_type_id else None
 
     class Meta:
         model = PurchaseOrderItem
         fields = [
             "id", "asset_type", "asset_type_name", "device_model", "device_model_name",
             "material_type", "material_type_name", "bom_line", "description",
+            "inventory_item", "inventory_item_sku",
+            "inventory_unit_type", "inventory_unit_type_name",
             "quantity", "unit_price", "received_quantity", "line_total",
         ]
         # received_quantity is owned by goods receiving — never writable via the API.
@@ -46,13 +57,21 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     ordered_by_name = serializers.CharField(source="ordered_by.get_full_name", read_only=True, default=None)
     approved_by_name = serializers.CharField(source="approved_by.get_full_name", read_only=True, default=None)
+    # What will actually print, so an older order with no terms of its own
+    # still shows the house standard for editing.
+    effective_terms = serializers.SerializerMethodField()
+
+    def get_effective_terms(self, obj):
+        from .documents import DEFAULT_TERMS
+
+        return obj.terms or DEFAULT_TERMS
 
     class Meta:
         model = PurchaseOrder
         fields = [
             "id", "po_number", "supplier", "supplier_name",
             "status", "status_display", "currency", "order_date", "expected_delivery",
-            "total_amount", "notes",
+            "total_amount", "notes", "terms", "effective_terms",
             "ordered_by", "ordered_by_name", "approved_by", "approved_by_name",
             "items", "created_at", "updated_at",
         ]
@@ -65,7 +84,12 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     ITEM_WRITE_STATUSES = (PurchaseOrder.Status.DRAFT, PurchaseOrder.Status.PENDING_APPROVAL)
 
     def create(self, validated_data):
+        from .documents import DEFAULT_TERMS
+
         items = validated_data.pop("items", [])
+        # A new order carries the house terms unless it was given its own.
+        if not (validated_data.get("terms") or "").strip():
+            validated_data["terms"] = DEFAULT_TERMS
         purchase_order = PurchaseOrder.objects.create(**validated_data)
         for item in items:
             item.pop("id", None)

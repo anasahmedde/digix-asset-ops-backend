@@ -116,13 +116,25 @@ class _InstallationCommonMixin(serializers.Serializer):
     """Shared derived fields for the installation tracker."""
 
     device_code = serializers.CharField(source="device.asset_code", read_only=True)
-    device_name = serializers.CharField(source="device.device_model.__str__", read_only=True)
+    # The asset's own name. It used to render the DeviceModel, which shows up
+    # as a bare model code now that assets no longer carry one.
+    device_name = serializers.SerializerMethodField()
     asset_name = serializers.CharField(source="device.display_name", read_only=True, default=None)
     asset_type_name = serializers.CharField(source="device.asset_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True)
     installed_by_name = serializers.CharField(source="installed_by.get_full_name", read_only=True, default=None)
     installed_by_phone = serializers.CharField(source="installed_by.phone", read_only=True, default=None)
+    # Technician identity comes straight from the manpower record — no retyping.
+    installed_by_employee_id = serializers.CharField(
+        source="installed_by.employee_id", read_only=True, default=None
+    )
+    installed_by_job_title = serializers.CharField(
+        source="installed_by.job_title", read_only=True, default=None
+    )
+    installed_by_role = serializers.CharField(source="installed_by.role", read_only=True, default=None)
     vendor_name = serializers.CharField(source="vendor.name", read_only=True, default=None)
+    # Whichever vendor was assigned — registered supplier or hand-entered.
+    vendor_display = serializers.SerializerMethodField()
     project_name = serializers.CharField(source="device.project.name", read_only=True, default=None)
     poc_name = serializers.CharField(source="device.assigned_client.contact_person", read_only=True, default=None)
     poc_phone = serializers.CharField(source="device.assigned_client.contact_phone", read_only=True, default=None)
@@ -131,9 +143,27 @@ class _InstallationCommonMixin(serializers.Serializer):
     client_delays = serializers.SerializerMethodField()
     on_hold_steps = serializers.SerializerMethodField()
     escalated = serializers.SerializerMethodField()
+    # One verdict on how the job is going, so the list, the header banner and
+    # the progress bar cannot disagree about it.
+    health = serializers.SerializerMethodField()
+    health_display = serializers.SerializerMethodField()
+    health_reason = serializers.SerializerMethodField()
+    step_template_available = serializers.SerializerMethodField()
 
     def get_escalated(self, obj):
         return bool(obj.escalation_state)
+
+    def get_device_name(self, obj):
+        return _asset_name(obj)
+
+    def get_vendor_display(self, obj):
+        """The assigned vendor, whether registered or hand-entered."""
+        if obj.vendor_id:
+            return obj.vendor.name
+        if obj.external_vendor_name:
+            label = obj.external_vendor_name
+            return f"{label} ({obj.external_vendor_contact})" if obj.external_vendor_contact else label
+        return None
 
     def get_client_names(self, obj):
         names = []
@@ -157,6 +187,84 @@ class _InstallationCommonMixin(serializers.Serializer):
     def get_on_hold_steps(self, obj):
         return sum(1 for s in obj.steps.all() if s.status == InstallationStep.StepStatus.ON_HOLD)
 
+    def get_health(self, obj):
+        return _health(obj)[0]
+
+    def get_health_display(self, obj):
+        return _health(obj)[1]
+
+    def get_health_reason(self, obj):
+        return _health(obj)[2]
+
+    def get_step_template_available(self, obj):
+        from .models import InstallationRouteTemplate
+
+        if not obj.device.asset_type_id:
+            return False
+        return InstallationRouteTemplate.objects.filter(
+            asset_type_id=obj.device.asset_type_id
+        ).exists()
+
+
+# Worst-first: a job that is both overdue and on hold is reported as on hold,
+# because that is the thing somebody has to act on.
+HEALTH_LABELS = {
+    "completed": "Completed",
+    "on_hold": "On Hold",
+    "delayed": "Delayed",
+    "overdue": "Overdue",
+    "at_risk": "Due Soon",
+    "on_time": "On Time",
+    "not_started": "Not Started",
+}
+
+
+def _health(installation):
+    """How the installation is going: (key, label, one-line reason).
+
+    A green progress bar on a job that has been sitting on hold for a week is
+    a lie, so the verdict is derived once here and everything reads it.
+    """
+    from django.utils import timezone
+
+    if installation.completed_at is not None:
+        return "completed", HEALTH_LABELS["completed"], ""
+
+    steps = list(installation.steps.all())
+    on_hold = [s for s in steps if s.status == InstallationStep.StepStatus.ON_HOLD]
+    if on_hold:
+        names = ", ".join(s.custom_label or s.get_step_type_display() for s in on_hold[:3])
+        return "on_hold", HEALTH_LABELS["on_hold"], f"On hold at {names}"
+
+    unresolved = [d for d in installation.delays.all() if d.resolved_at is None]
+    if unresolved:
+        causes = ", ".join(sorted({d.get_cause_display() for d in unresolved}))
+        word = "delay" if len(unresolved) == 1 else "delays"
+        return "delayed", HEALTH_LABELS["delayed"], f"{len(unresolved)} unresolved {word} ({causes})"
+
+    today = timezone.localdate()
+    if installation.due_date:
+        if installation.due_date < today:
+            overdue_by = (today - installation.due_date).days
+            return "overdue", HEALTH_LABELS["overdue"], f"{overdue_by} day(s) past the due date"
+        if (installation.due_date - today).days <= 3:
+            return "at_risk", HEALTH_LABELS["at_risk"], f"Due {installation.due_date:%d %b}"
+
+    if not any(s.status != InstallationStep.StepStatus.NOT_STARTED for s in steps):
+        return "not_started", HEALTH_LABELS["not_started"], ""
+    return "on_time", HEALTH_LABELS["on_time"], ""
+
+
+def _asset_name(installation):
+    """What to call the asset on screen: its own name, else its type, else
+    the code. Never the device model — that reads as a meaningless code."""
+    device = installation.device
+    return (
+        device.display_name
+        or (device.asset_type.name if device.asset_type_id else "")
+        or device.asset_code
+    )
+
 
 class DeviceInstallationListSerializer(_InstallationCommonMixin, serializers.ModelSerializer):
     class Meta:
@@ -165,10 +273,11 @@ class DeviceInstallationListSerializer(_InstallationCommonMixin, serializers.Mod
             "id", "device", "device_code", "device_name", "asset_name", "asset_type_name",
             "client_names", "project_name", "poc_name", "poc_phone",
             "site", "site_name", "installed_by", "installed_by_name", "installed_by_phone",
-            "vendor", "vendor_name",
+            "installed_by_employee_id", "installed_by_job_title", "installed_by_role",
+            "vendor", "vendor_name", "external_vendor_name", "external_vendor_contact", "vendor_display",
             "installed_at", "removed_at", "due_date", "completed_at",
             "escalated", "escalation_state",
-            "progress", "client_delays", "on_hold_steps", "created_at",
+            "progress", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
         ]
         read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
 
@@ -227,14 +336,33 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
             "device_image", "device_status",
             "client_names", "project_name", "poc_name", "poc_phone",
             "site", "site_name", "site_city", "zone",
-            "installed_by", "installed_by_name", "installed_by_phone", "installed_at", "removed_at",
-            "vendor", "vendor_name",
+            "installed_by", "installed_by_name", "installed_by_phone",
+            "installed_by_employee_id", "installed_by_job_title", "installed_by_role",
+            "installed_at", "removed_at",
+            "vendor", "vendor_name", "external_vendor_name", "external_vendor_contact", "vendor_display",
             "due_date", "completed_at",
             "escalated", "escalation_state",
             "position_label", "notes", "photos", "steps", "delays", "step_types",
-            "handover", "progress", "client_delays", "on_hold_steps", "created_at",
+            "handover", "progress", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
         ]
         read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
+
+    def validate(self, attrs):
+        """A vendor is either a registered supplier or a hand-entered one."""
+        def current(name):
+            return attrs[name] if name in attrs else getattr(self.instance, name, None)
+
+        vendor = current("vendor")
+        manual = (current("external_vendor_name") or "").strip()
+        if vendor and manual:
+            raise serializers.ValidationError({
+                "external_vendor_name": "Pick a registered vendor or enter one by hand, not both."
+            })
+        if not manual and (current("external_vendor_contact") or "").strip():
+            raise serializers.ValidationError({
+                "external_vendor_name": "Enter the vendor's name alongside their contact."
+            })
+        return attrs
 
     def create(self, validated_data):
         step_types = validated_data.pop("step_types", None)

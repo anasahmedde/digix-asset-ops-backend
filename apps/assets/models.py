@@ -90,16 +90,29 @@ class Device(TimeStampedModel):
         IN_TRANSIT = "in_transit", "In Transit"
 
     class Source(models.TextChoices):
+        """How the asset comes into existence and who installs it.
+
+        The route decides what the asset needs: an in-house build carries
+        components and production steps, while a vendor-built one does not.
+        """
+
+        # Built by us from inventory components, following production steps.
         INHOUSE = "inhouse", "In-house Production"
-        THIRD_PARTY = "third_party", "Third Party"
+        # Bought complete from a vendor, but installed by our own technician.
+        VENDOR_SUPPLIED = "vendor_supplied", "Vendor Supplied · Installed In-house"
+        # Vendor builds and installs it; our technician oversees the work.
+        VENDOR_TURNKEY = "vendor_turnkey", "Vendor Supplied & Installed"
 
     # Enforced status machine — status changes go through the /transition/
     # action (see views.DeviceViewSet.transition); every flip is journalled
     # as a DeviceLifecycleEvent + AuditLog entry by signals.py.
     VALID_TRANSITIONS = {
-        Status.PROCURED: (Status.IN_PRODUCTION, Status.IN_STOCK, Status.IN_TRANSIT, Status.RMA),
+        # Assets are built here from inventory components, so a procured asset
+        # goes to the production floor or straight to stock — never "in transit"
+        # (that is a movement state for assets that already exist).
+        Status.PROCURED: (Status.IN_PRODUCTION, Status.IN_STOCK, Status.RMA),
         Status.IN_PRODUCTION: (Status.IN_STOCK, Status.RMA),
-        Status.IN_TRANSIT: (Status.IN_STOCK, Status.PROCURED),
+        Status.IN_TRANSIT: (Status.IN_STOCK, Status.IN_PRODUCTION, Status.PROCURED),
         Status.IN_STOCK: (
             Status.ASSIGNED, Status.IN_PRODUCTION, Status.IN_TRANSIT,
             Status.DECOMMISSIONED, Status.LOST_STOLEN,
@@ -118,7 +131,10 @@ class Device(TimeStampedModel):
     }
 
     asset_code = models.CharField(max_length=50, unique=True, db_index=True)
-    serial_number = models.CharField(max_length=200, unique=True)
+    # Not entered by hand: every asset gets a generated asset_code with a
+    # QR/barcode label, and the serial defaults to it. Kept as its own
+    # field so a manufacturer serial can still be recorded when there is one.
+    serial_number = models.CharField(max_length=200, unique=True, blank=True)
     mobile_id = models.CharField(max_length=200, blank=True, help_text="Linked CMS device ID")
     mac_address = models.CharField(max_length=17, blank=True)
     imei = models.CharField(max_length=20, blank=True)
@@ -127,7 +143,13 @@ class Device(TimeStampedModel):
         AssetType, on_delete=models.PROTECT, null=True, blank=True, related_name="devices",
         help_text="Asset category (SMD Screen, Standee, Digital Display, …)",
     )
-    device_model = models.ForeignKey(DeviceModel, on_delete=models.PROTECT, related_name="devices")
+    # Deprecated on the asset itself: identity now comes from asset_type +
+    # display_name + its components. Kept (nullable) so historical assets
+    # keep their reference; DeviceModel is still used by BOM, quotation
+    # and purchase-order lines.
+    device_model = models.ForeignKey(
+        DeviceModel, on_delete=models.PROTECT, null=True, blank=True, related_name="devices"
+    )
     display_name = models.CharField(max_length=200, blank=True, help_text="Friendly asset name")
     firmware_version = models.CharField(max_length=100, blank=True)
     hardware_revision = models.CharField(max_length=100, blank=True)
@@ -142,7 +164,7 @@ class Device(TimeStampedModel):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROCURED)
     # Registration origin: built in-house or bought from a third party (WF-05).
     source = models.CharField(
-        max_length=20, choices=Source.choices, default=Source.THIRD_PARTY, db_index=True
+        max_length=20, choices=Source.choices, default=Source.INHOUSE, db_index=True
     )
 
     image = models.ImageField(upload_to=upload_to_path, blank=True, help_text="Primary device photo")
@@ -171,8 +193,28 @@ class Device(TimeStampedModel):
     clients = models.ManyToManyField(
         "clients.Client", blank=True, related_name="shared_devices"
     )
+    # Two different vendors can be involved and they are not the same thing:
+    # one sells us the finished asset, the other puts it up. On a turnkey job
+    # they are usually the same firm, but nothing says they have to be — and on
+    # a vendor-supplied asset our own technician installs it, so there is a
+    # supplying vendor and no installing one.
+    supply_vendor_name = models.CharField(
+        max_length=200, blank=True, help_text="Vendor the finished asset was bought from",
+    )
+    supply_vendor_contact = models.CharField(
+        max_length=100, blank=True, help_text="Phone or contact person for the supplying vendor",
+    )
+    # Who the asset is assigned to for installation. Captured when the status
+    # moves to `assigned`: an internal technician (from the manpower records)
+    # and/or an external vendor entered by hand.
     assigned_technician = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="assigned_devices"
+    )
+    assigned_vendor_name = models.CharField(
+        max_length=200, blank=True, help_text="External vendor installing this asset",
+    )
+    assigned_vendor_contact = models.CharField(
+        max_length=100, blank=True, help_text="Phone or contact person for the installing vendor",
     )
     installation_date = models.DateField(null=True, blank=True)
     installed_by = models.ForeignKey(
@@ -191,16 +233,202 @@ class Device(TimeStampedModel):
         ]
 
     def __str__(self):
-        return f"{self.asset_code} ({self.device_model})"
+        label = self.display_name or (
+            self.asset_type.name if self.asset_type_id
+            else (str(self.device_model) if self.device_model_id else "asset")
+        )
+        return f"{self.asset_code} ({label})"
 
     def save(self, *args, **kwargs):
         if not self.asset_code:
             self.asset_code = generate_code("asset", model=type(self), field="asset_code")
+        # Fall back to the generated code so the unique constraint never sees
+        # two blanks.
+        if not self.serial_number:
+            self.serial_number = self.asset_code
         super().save(*args, **kwargs)
 
     def can_transition_to(self, new_status: str) -> bool:
         allowed = self.VALID_TRANSITIONS.get(self.status, ())
         return new_status in allowed
+
+
+class ProductionRouteTemplate(TimeStampedModel):
+    """The standard build route for an asset type.
+
+    The first time an asset type is produced someone works out the sequence of
+    operations. Saving it here means the next asset of that type starts from
+    the known route instead of being reinvented — the classic ERP routing
+    master. One template per asset type; steps live on it.
+    """
+
+    asset_type = models.OneToOneField(
+        AssetType, on_delete=models.CASCADE, related_name="route_template"
+    )
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="route_templates",
+    )
+
+    class Meta:
+        ordering = ["asset_type__name"]
+
+    def __str__(self):
+        return f"Route for {self.asset_type.name}"
+
+
+class ProductionRouteTemplateStep(TimeStampedModel):
+    """One operation in a saved route, copied onto each new asset of that type."""
+
+    template = models.ForeignKey(
+        ProductionRouteTemplate, on_delete=models.CASCADE, related_name="steps"
+    )
+    step_number = models.PositiveSmallIntegerField()
+    name = models.CharField(max_length=200)
+    location = models.CharField(max_length=12, default="in_house")
+    workshop = models.ForeignKey(
+        "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="route_template_steps",
+    )
+    workshop_name = models.CharField(max_length=200, blank=True)
+    expected_days = models.PositiveSmallIntegerField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["step_number"]
+        unique_together = ["template", "step_number"]
+
+    def __str__(self):
+        return f"{self.template.asset_type.name} · {self.step_number}. {self.name}"
+
+
+class ComponentTemplate(TimeStampedModel):
+    """The standard bill of materials for an asset type.
+
+    The sibling of ProductionRouteTemplate: that one says how a type is built,
+    this one says what it is built from. Working the parts list out once means
+    the next asset of the same type starts from it instead of being itemised
+    again by hand. One template per asset type; lines live on it.
+    """
+
+    asset_type = models.OneToOneField(
+        AssetType, on_delete=models.CASCADE, related_name="component_template"
+    )
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="component_templates",
+    )
+
+    class Meta:
+        ordering = ["asset_type__name"]
+
+    def __str__(self):
+        return f"Components for {self.asset_type.name}"
+
+
+class ComponentTemplateLine(TimeStampedModel):
+    """One part in a saved bill of materials, copied onto each new asset."""
+
+    template = models.ForeignKey(
+        ComponentTemplate, on_delete=models.CASCADE, related_name="lines"
+    )
+    # Mirrors AssetComponent: exactly one of the two points at what is needed.
+    inventory_item = models.ForeignKey(
+        "inventory.InventoryItem", on_delete=models.CASCADE, null=True, blank=True,
+        related_name="component_template_lines",
+    )
+    inventory_unit_type = models.ForeignKey(
+        "inventory.InventoryUnitType", on_delete=models.CASCADE, null=True, blank=True,
+        related_name="component_template_lines",
+    )
+    quantity = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        source = self.inventory_unit_type or self.inventory_item
+        return f"{self.template.asset_type.name} · {source} ×{self.quantity}"
+
+
+class ProductionStep(TimeStampedModel):
+    """One operation in the route that turns components into a finished asset.
+
+    Only in-house builds have these. The initiator lays out the sequence up
+    front — some operations happen on our own floor, others go out to a
+    workshop (a standee leaving for painting or panaflex and coming back) —
+    so the asset shows where it physically is at any point in the build.
+    """
+
+    class Location(models.TextChoices):
+        IN_HOUSE = "in_house", "In-house"
+        EXTERNAL = "external", "Outside Workshop"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        IN_PROGRESS = "in_progress", "In Progress"
+        SENT_OUT = "sent_out", "Sent to Workshop"
+        RETURNED = "returned", "Returned from Workshop"
+        COMPLETED = "completed", "Completed"
+        SKIPPED = "skipped", "Skipped"
+
+    # An external operation is only meaningfully "sent"/"returned"; an in-house
+    # one just runs. Both converge on completed.
+    VALID_TRANSITIONS = {
+        Status.PENDING: (Status.IN_PROGRESS, Status.SENT_OUT, Status.SKIPPED),
+        Status.IN_PROGRESS: (Status.COMPLETED, Status.SENT_OUT, Status.SKIPPED),
+        Status.SENT_OUT: (Status.RETURNED, Status.SKIPPED),
+        Status.RETURNED: (Status.IN_PROGRESS, Status.COMPLETED),
+        Status.COMPLETED: (),
+        Status.SKIPPED: (),
+    }
+
+    device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name="production_steps")
+    step_number = models.PositiveSmallIntegerField()
+    name = models.CharField(max_length=200, help_text="e.g. Frame welding, Panaflex pasting")
+    location = models.CharField(max_length=12, choices=Location.choices, default=Location.IN_HOUSE)
+    # Where the work goes when it leaves the building.
+    workshop = models.ForeignKey(
+        "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="production_steps",
+    )
+    workshop_name = models.CharField(
+        max_length=200, blank=True, help_text="Workshop named by hand when it is not a registered supplier"
+    )
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING, db_index=True)
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="production_steps",
+    )
+    expected_days = models.PositiveSmallIntegerField(null=True, blank=True)
+    # What the planner expects this operation to cost. Unset until someone
+    # prices it — an unpriced step is not a free step.
+    planned_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    returned_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["step_number", "created_at"]
+        unique_together = ["device", "step_number"]
+        indexes = [models.Index(fields=["device", "status"])]
+
+    def __str__(self):
+        return f"{self.device.asset_code} · {self.step_number}. {self.name}"
+
+    def can_transition_to(self, new_status) -> bool:
+        return new_status in self.VALID_TRANSITIONS.get(self.status, ())
+
+    @property
+    def workshop_display(self):
+        if self.location != self.Location.EXTERNAL:
+            return None
+        if self.workshop_id:
+            return self.workshop.name
+        return self.workshop_name or "Unnamed workshop"
 
 
 class DeviceLifecycleEvent(TimeStampedModel):
@@ -244,6 +472,64 @@ class AssetComponent(TimeStampedModel):
     supplier = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True, related_name="supplied_components"
     )
+    # --- What this asset is built from -------------------------------------
+    # A component is a *requirement*: which inventory item, and how many of it
+    # this asset needs. It deliberately does NOT touch stock — you can specify
+    # a build before the parts exist. The project decides later whether to
+    # cover each requirement from stock or by procuring it, and that decision
+    # is what moves the warehouse.
+    #
+    # Generic requirement -> inventory_item; unique requirement -> the opened
+    # product (inventory_unit_type). Exactly one, enforced in the serializer.
+    inventory_item = models.ForeignKey(
+        "inventory.InventoryItem", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="asset_components",
+    )
+    inventory_unit_type = models.ForeignKey(
+        "inventory.InventoryUnitType", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="asset_components",
+    )
+    # Set once the requirement is fulfilled by a specific serialized unit.
+    inventory_unit = models.OneToOneField(
+        "inventory.InventoryUnit", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="asset_component",
+    )
+
+    # --- How the requirement gets covered ----------------------------------
+    # Decided in the Project section: draw it from existing stock, or procure
+    # it. Procurement stays available even when stock is on hand — that call
+    # belongs to the user, not the system.
+    class Fulfilment(models.TextChoices):
+        PENDING = "pending", "Not Decided"
+        FROM_STOCK = "from_stock", "From Inventory"
+        PROCUREMENT = "procurement", "To Be Procured"
+        FULFILLED = "fulfilled", "Fulfilled"
+
+    fulfilment = models.CharField(
+        max_length=12, choices=Fulfilment.choices, default=Fulfilment.PENDING, db_index=True
+    )
+    issued_quantity = models.PositiveIntegerField(
+        default=0, help_text="How much of the requirement has actually left the warehouse"
+    )
+    purchase_order_item = models.ForeignKey(
+        "procurement.PurchaseOrderItem", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="asset_components", help_text="PO line raised to cover this requirement",
+    )
+    # A price the planner sets by hand, when they know something the record
+    # does not — a fresh quote, a price rise. Overrides the derived price.
+    planned_unit_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    # --- Raising the requirement mid-project -------------------------------
+    # Wanting more than was planned costs money that was already signed off,
+    # so it is asked for and granted, never simply taken.
+    pending_increase = models.PositiveIntegerField(null=True, blank=True)
+    increase_reason = models.CharField(max_length=20, blank=True)
+    increase_notes = models.TextField(blank=True)
+    increase_requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="component_increase_requests",
+    )
+    increase_requested_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True)
 
     class Meta:
@@ -251,6 +537,20 @@ class AssetComponent(TimeStampedModel):
 
     def __str__(self):
         return f"{self.device.asset_code} · {self.name} ×{self.quantity}"
+
+    @property
+    def outstanding_quantity(self) -> int:
+        """How much of this requirement is still to be covered."""
+        return max(0, self.quantity - self.issued_quantity)
+
+    @property
+    def available_quantity(self) -> int:
+        """On-hand stock for whatever this requirement points at."""
+        if self.inventory_unit_type_id:
+            return self.inventory_unit_type.in_stock_count
+        if self.inventory_item_id:
+            return self.inventory_item.quantity
+        return 0
 
 
 class DeviceImage(TimeStampedModel):

@@ -239,13 +239,14 @@ def test_on_hold_steps_count_in_list(ops, installation):
 
 
 @pytest.mark.django_db
-def test_installation_creation_flips_device_to_installed(installation):
+def test_installation_creation_puts_the_device_on_the_track(installation):
     device = installation.device
     device.refresh_from_db()
-    # fixture device starts as procured; creating the installation puts it
-    # on the installation track and the flip is journalled
-    assert device.status == "installed"
-    event = device.lifecycle_events.get(event_type="status_change", to_value="installed")
+    # The fixture device starts as procured; opening the job puts it on the
+    # installation track and the flip is journalled. It is *assigned*, not
+    # installed — raising the job is not doing the work.
+    assert device.status == "assigned"
+    event = device.lifecycle_events.get(event_type="status_change", to_value="assigned")
     assert event.from_value == "procured"
     assert "Install Site" in event.description
 
@@ -798,3 +799,394 @@ def test_handover_client_falls_back_to_project_then_site(installation, ops):
     assert r.status_code == 201, r.content
     device.refresh_from_db()
     assert device.assigned_client_id == project_client.pk
+
+
+# ---------------------------------------------------------------------------
+# WF-09: assigning an installation to a technician / vendor
+# ---------------------------------------------------------------------------
+@pytest.mark.django_db
+def test_installation_exposes_technician_manpower_details(db):
+    """The technician's identity comes from their manpower record."""
+    from apps.accounts.models import User as _U
+    from apps.assets.models import Brand, Device, DeviceModel
+    from apps.sites.models import DeviceInstallation, Site
+    from django.utils import timezone
+    from rest_framework.test import APIClient
+
+    admin = _U.objects.create_user(username="wf09-admin", password="x", role="super_admin")
+    tech = _U.objects.create_user(
+        username="wf09-tech", password="x", role="technician", is_field_staff=True,
+        first_name="Bilal", last_name="Ahmed", employee_id="EMP-014",
+        job_title="Senior Technician", phone="0300-1234567",
+    )
+    brand = Brand.objects.create(name="WF09 Brand")
+    model = DeviceModel.objects.create(brand=brand, name="W-1")
+    device = Device.objects.create(device_model=model, serial_number="WF09-SN-1")
+    site = Site.objects.create(name="WF09 Site")
+    inst = DeviceInstallation.objects.create(
+        device=device, site=site, installed_by=tech, installed_at=timezone.now()
+    )
+
+    c = APIClient(); c.force_authenticate(admin)
+    r = c.get(f"/api/sites/installations/{inst.id}/")
+    assert r.status_code == 200, r.content
+    assert r.data["installed_by_name"] == "Bilal Ahmed"
+    assert r.data["installed_by_employee_id"] == "EMP-014"
+    assert r.data["installed_by_job_title"] == "Senior Technician"
+    assert r.data["installed_by_phone"] == "0300-1234567"
+
+
+@pytest.fixture
+def wf09_setup(db):
+    from apps.accounts.models import User as _U
+    from apps.assets.models import Brand, Device, DeviceModel
+    from apps.sites.models import DeviceInstallation, Site
+    from django.utils import timezone
+    from rest_framework.test import APIClient
+
+    admin = _U.objects.create_user(username="wf09b-admin", password="x", role="super_admin")
+    brand = Brand.objects.create(name="WF09B Brand")
+    model = DeviceModel.objects.create(brand=brand, name="W-2")
+    device = Device.objects.create(device_model=model, serial_number="WF09B-SN-1")
+    site = Site.objects.create(name="WF09B Site")
+    inst = DeviceInstallation.objects.create(device=device, site=site, installed_at=timezone.now())
+    c = APIClient(); c.force_authenticate(admin)
+    return {"client": c, "inst": inst}
+
+
+@pytest.mark.django_db
+def test_vendor_can_be_entered_manually(wf09_setup):
+    c, inst = wf09_setup["client"], wf09_setup["inst"]
+    r = c.patch(
+        f"/api/sites/installations/{inst.id}/",
+        {"external_vendor_name": "Rapid Signage Crew", "external_vendor_contact": "0321-9876543"},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["vendor"] is None
+    assert r.data["vendor_display"] == "Rapid Signage Crew (0321-9876543)"
+
+
+@pytest.mark.django_db
+def test_registered_vendor_still_wins_the_display(wf09_setup, db):
+    from apps.suppliers.models import Supplier
+
+    c, inst = wf09_setup["client"], wf09_setup["inst"]
+    supplier = Supplier.objects.create(name="Registered Vendor Ltd")
+    r = c.patch(f"/api/sites/installations/{inst.id}/", {"vendor": str(supplier.id)}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["vendor_display"] == "Registered Vendor Ltd"
+
+
+@pytest.mark.django_db
+def test_cannot_set_both_registered_and_manual_vendor(wf09_setup, db):
+    from apps.suppliers.models import Supplier
+
+    c, inst = wf09_setup["client"], wf09_setup["inst"]
+    supplier = Supplier.objects.create(name="Both Vendor Ltd")
+    r = c.patch(
+        f"/api/sites/installations/{inst.id}/",
+        {"vendor": str(supplier.id), "external_vendor_name": "Hand Typed Crew"},
+        format="json",
+    )
+    assert r.status_code == 400, r.content
+    assert "external_vendor_name" in r.data
+
+
+@pytest.mark.django_db
+def test_manual_vendor_contact_needs_a_name(wf09_setup):
+    c, inst = wf09_setup["client"], wf09_setup["inst"]
+    r = c.patch(
+        f"/api/sites/installations/{inst.id}/",
+        {"external_vendor_contact": "0300-0000000"}, format="json",
+    )
+    assert r.status_code == 400, r.content
+    assert "external_vendor_name" in r.data
+
+
+# ---------------------------------------------------------------------------
+# The tracker drives Installed -> Active, with the technician's photo
+# ---------------------------------------------------------------------------
+def _png():
+    import base64
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    data = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+    return SimpleUploadedFile("live.png", data, content_type="image/png")
+
+
+@pytest.fixture
+def live_install(db):
+    tech = User.objects.create_user(
+        username="live-tech", password="x", role="technician", is_field_staff=True
+    )
+    site = Site.objects.create(name="Live Site")
+    device = Device.objects.create(
+        asset_code="AST-LIVE-1", serial_number="LIVE-1", status="assigned",
+        assigned_technician=tech,
+    )
+    installation = DeviceInstallation.objects.create(
+        device=device, site=site, installed_by=tech, installed_at=timezone.now()
+    )
+    # Work the checklist the way the technician would; finishing it is what
+    # makes the asset Installed and so eligible to be marked Active.
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+    device.refresh_from_db()
+    return {"tech": tech, "device": device, "installation": installation}
+
+
+@pytest.mark.django_db
+def test_creating_the_installation_puts_the_asset_on_the_track(db):
+    """The registry follows the tracker without anyone editing it — onto the
+    track when the job opens, Installed only once the checklist is done."""
+    site = Site.objects.create(name="Track Site")
+    device = Device.objects.create(
+        asset_code="AST-TRACK-1", serial_number="TRACK-1", status="in_stock",
+    )
+    installation = DeviceInstallation.objects.create(
+        device=device, site=site, installed_at=timezone.now()
+    )
+    device.refresh_from_db()
+    assert device.status == "assigned"
+
+    # Working the checklist through is what makes it Installed.
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+    device.refresh_from_db()
+    assert device.status == "installed"
+
+
+@pytest.mark.django_db
+def test_technician_activates_from_the_tracker_with_a_photo(live_install):
+    c = APIClient()
+    c.force_authenticate(live_install["tech"])
+    installation, device = live_install["installation"], live_install["device"]
+
+    # The photo is the evidence, so it is not optional.
+    r = c.post(f"/api/sites/installations/{installation.id}/activate/", {}, format="multipart")
+    assert r.status_code == 400, r.content
+    assert "Upload a photo" in str(r.data["photos"])
+
+    r = c.post(
+        f"/api/sites/installations/{installation.id}/activate/",
+        {"photos": _png(), "notes": "Powered on and running"},
+        format="multipart",
+    )
+    assert r.status_code == 200, r.content
+
+    device.refresh_from_db()
+    assert device.status == "active"
+    # It lands in the asset's own gallery as well as the installation record.
+    assert device.images.count() == 1
+    assert device.images.first().is_primary is True
+    assert installation.photos.count() == 1
+    # And the change is journalled against the technician who made it.
+    event = device.lifecycle_events.order_by("-created_at").first()
+    assert event.performed_by_id == live_install["tech"].id
+
+    # Twice is a no-op, not a second journal entry.
+    r = c.post(
+        f"/api/sites/installations/{installation.id}/activate/",
+        {"photos": _png()}, format="multipart",
+    )
+    assert r.status_code == 400
+    assert "already active" in r.data["detail"]
+
+
+@pytest.mark.django_db
+def test_unrelated_technician_cannot_activate(live_install):
+    other = User.objects.create_user(
+        username="other-live-tech", password="x", role="technician", is_field_staff=True
+    )
+    c = APIClient()
+    c.force_authenticate(other)
+    r = c.post(
+        f"/api/sites/installations/{live_install['installation'].id}/activate/",
+        {"photos": _png()}, format="multipart",
+    )
+    assert r.status_code == 403, r.content
+
+
+@pytest.mark.django_db
+def test_assigning_an_asset_opens_its_installation_job(db):
+    """The reported gap: an asset assigned in the registry never reached the
+    tracker, because the job had to be raised there by hand."""
+    from rest_framework.test import APIClient as _Client
+
+    ops = User.objects.create_user(username="track-ops", password="x", role="ops_manager")
+    tech = User.objects.create_user(
+        username="track-tech", password="x", role="technician", is_field_staff=True,
+    )
+    site = Site.objects.create(name="Assign-Opens Site")
+    device = Device.objects.create(
+        asset_code="AST-OPEN-1", serial_number="OPEN-1", status="in_stock", current_site=site,
+    )
+    assert device.installations.count() == 0
+
+    c = _Client()
+    c.force_authenticate(ops)
+    r = c.post(
+        f"/api/assets/devices/{device.id}/transition/",
+        {"status": "assigned", "reason": "Ready to install", "assigned_technician": str(tech.id)},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+
+    installation = device.installations.get()
+    assert installation.site_id == site.id
+    assert installation.installed_by_id == tech.id
+    # It comes with the standard checklist, so the tracker has something to run.
+    assert installation.steps.count() == 6
+
+    # It shows up in the tracker listing.
+    listed = c.get("/api/sites/installations/", {"device": str(device.id)}).json()
+    assert (listed.get("results") or listed)[0]["id"] == str(installation.id)
+
+    # Reassigning mid-flight keeps the job and its progress.
+    other = User.objects.create_user(
+        username="track-tech-2", password="x", role="technician", is_field_staff=True,
+    )
+    r = c.post(
+        f"/api/assets/devices/{device.id}/reassign/",
+        {"assigned_technician": str(other.id), "reason": "swap"}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert device.installations.count() == 1
+
+
+@pytest.mark.django_db
+def test_an_asset_assigned_before_it_had_a_site_joins_the_tracker_later(db):
+    """Assets assigned without a site were invisible on the tracker; setting
+    the site puts them on it rather than leaving them stranded."""
+    from rest_framework.test import APIClient as _Client
+
+    ops = User.objects.create_user(username="late-ops", password="x", role="ops_manager")
+    tech = User.objects.create_user(
+        username="late-tech", password="x", role="technician", is_field_staff=True,
+    )
+    device = Device.objects.create(
+        asset_code="AST-LATE-1", serial_number="LATE-1", status="assigned",
+        assigned_technician=tech,
+    )
+    assert device.installations.count() == 0
+
+    site = Site.objects.create(name="Late Site")
+    c = _Client()
+    c.force_authenticate(ops)
+    r = c.patch(f"/api/assets/devices/{device.id}/", {"current_site": str(site.id)}, format="json")
+    assert r.status_code == 200, r.content
+
+    installation = device.installations.get()
+    assert installation.site_id == site.id
+    assert installation.installed_by_id == tech.id
+    assert installation.steps.count() == 6
+
+
+# ---------------------------------------------------------------------------
+# Installation checklists: defined once per asset type, reused after that
+# ---------------------------------------------------------------------------
+@pytest.mark.django_db
+def test_installation_checklist_is_saved_and_reused_per_asset_type(db):
+    from rest_framework.test import APIClient as _Client
+
+    from apps.assets.models import AssetType
+    from apps.sites.models import InstallationRouteTemplate, InstallationStep as _Step
+
+    ops = User.objects.create_user(username="chk-ops", password="x", role="ops_manager")
+    c = _Client()
+    c.force_authenticate(ops)
+
+    asset_type = AssetType.objects.create(name="Checklist Standee")
+    site = Site.objects.create(name="Checklist Site")
+    first = Device.objects.create(
+        asset_code="AST-CHK-1", serial_number="CHK-1", asset_type=asset_type, current_site=site,
+    )
+    job = DeviceInstallation.objects.create(device=first, site=site, installed_at=timezone.now())
+    # Falls back to the generic list until a standard exists.
+    assert job.steps.count() == 6
+
+    # Trim it to what this type actually needs, then save it as the standard.
+    job.steps.filter(step_type__in=["wiring", "programming"]).delete()
+    r = c.post(f"/api/sites/installations/{job.id}/save-step-template/", {}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["saved_steps"] == 4
+    assert InstallationRouteTemplate.objects.filter(asset_type=asset_type).exists()
+
+    # The next asset of the same type opens with that checklist, not the generic one.
+    second = Device.objects.create(
+        asset_code="AST-CHK-2", serial_number="CHK-2", asset_type=asset_type, current_site=site,
+    )
+    job2 = DeviceInstallation.objects.create(device=second, site=site, installed_at=timezone.now())
+    assert job2.steps.count() == 4
+    assert list(job2.steps.values_list("step_number", flat=True)) == [1, 2, 3, 4]
+
+    detail = c.get(f"/api/sites/installations/{job2.id}/").json()
+    assert detail["step_template_available"] is True
+
+    # A job already under way is not silently rebuilt.
+    step = job2.steps.first()
+    step.status = _Step.StepStatus.IN_PROGRESS
+    step.save()
+    r = c.post(f"/api/sites/installations/{job2.id}/apply-step-template/", {}, format="json")
+    assert r.status_code == 400
+    assert "already started" in r.data["detail"]
+
+
+@pytest.mark.django_db
+def test_installation_health_reports_the_thing_to_act_on(db):
+    from datetime import timedelta
+
+    from rest_framework.test import APIClient as _Client
+
+    from apps.sites.models import InstallationDelay, InstallationStep as _Step
+
+    ops = User.objects.create_user(username="health-ops", password="x", role="ops_manager")
+    c = _Client()
+    c.force_authenticate(ops)
+
+    site = Site.objects.create(name="Health Site")
+    device = Device.objects.create(asset_code="AST-HLT-1", serial_number="HLT-1")
+    job = DeviceInstallation.objects.create(
+        device=device, site=site, installed_at=timezone.now(),
+        due_date=timezone.localdate() + timedelta(days=30),
+    )
+
+    def health():
+        return c.get(f"/api/sites/installations/{job.id}/").json()
+
+    assert health()["health"] == "not_started"
+
+    step = job.steps.first()
+    step.status = _Step.StepStatus.IN_PROGRESS
+    step.save()
+    assert health()["health"] == "on_time"
+
+    InstallationDelay.objects.create(
+        installation=job, cause=InstallationDelay.Cause.CLIENT, description="Client not ready",
+    )
+    body = health()
+    assert body["health"] == "delayed"
+    assert "unresolved delay" in body["health_reason"]
+
+    # On hold outranks a delay: it is what somebody has to act on.
+    step.status = _Step.StepStatus.ON_HOLD
+    step.save()
+    body = health()
+    assert body["health"] == "on_hold"
+    assert "On hold at" in body["health_reason"]
+
+    # Overdue when nothing is blocking but the date has passed.
+    step.status = _Step.StepStatus.IN_PROGRESS
+    step.save()
+    job.delays.update(resolved_at=timezone.now())
+    job.due_date = timezone.localdate() - timedelta(days=2)
+    job.save(update_fields=["due_date"])
+    body = health()
+    assert body["health"] == "overdue"
+    assert "past the due date" in body["health_reason"]

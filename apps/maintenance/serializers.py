@@ -6,6 +6,7 @@ from .models import MaintenanceRecord, MaintenanceRecordPhoto, MaintenanceSchedu
 class MaintenanceScheduleSerializer(serializers.ModelSerializer):
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
     device_name = serializers.CharField(source="device.display_name", read_only=True, default=None)
+    device_status = serializers.CharField(source="device.status", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     assigned_to_name = serializers.CharField(source="assigned_to.get_full_name", read_only=True, default=None)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
@@ -16,7 +17,7 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
         model = MaintenanceSchedule
         fields = [
             "id", "title", "maintenance_type", "frequency", "priority",
-            "device", "device_code", "device_name", "site", "site_name",
+            "device", "device_code", "device_name", "device_status", "site", "site_name",
             "assigned_to", "assigned_to_name", "vendors", "vendor_names",
             "next_due", "instructions", "required_components",
             "status", "status_display",
@@ -28,18 +29,73 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
     def get_vendor_names(self, obj):
         return [v.name for v in obj.vendors.all()]
 
+    def validate(self, attrs):
+        # A finished one-off job stays finished: its completion record is the
+        # history, and a new fault raises a new job. Without this, a stale copy
+        # of the schedule on someone's screen, saved from the edit form,
+        # silently reopened jobs that had already been closed out.
+        instance = self.instance
+        if (
+            instance is not None
+            and instance.status == MaintenanceSchedule.Status.COMPLETED
+            and not instance.is_active
+            and "status" in attrs
+            and attrs["status"] != MaintenanceSchedule.Status.COMPLETED
+        ):
+            raise serializers.ValidationError({
+                "status": "This job was completed and closed out — raise a new one for a new fault."
+            })
+        return attrs
+
     def validate_required_components(self, value):
+        """What the visit takes along, picked from inventory where possible.
+
+        Each row is a stock item, an opened unique product, or (for older
+        schedules) a name typed by hand. The name is filled in from inventory,
+        so the list reads the same however it was built.
+        """
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        from apps.inventory.models import InventoryItem, InventoryUnitType
+
         if not isinstance(value, list):
             raise serializers.ValidationError("Must be a list of components.")
         cleaned = []
         for row in value:
-            if not isinstance(row, dict) or not str(row.get("name", "")).strip():
-                raise serializers.ValidationError("Each component needs a name.")
+            if not isinstance(row, dict):
+                raise serializers.ValidationError("Each component must be an object.")
             try:
-                quantity = int(row.get("quantity", 1))
+                quantity = max(1, int(row.get("quantity", 1)))
             except (TypeError, ValueError):
                 quantity = 1
-            cleaned.append({"name": str(row["name"]).strip()[:200], "quantity": max(1, quantity)})
+            name = str(row.get("name", "")).strip()
+            entry = {"quantity": quantity}
+            try:
+                if row.get("inventory_item"):
+                    item = (
+                        InventoryItem.objects.select_related("material_type")
+                        .filter(pk=row["inventory_item"]).first()
+                    )
+                    if item is None:
+                        raise serializers.ValidationError("That stock item no longer exists.")
+                    entry["inventory_item"] = str(item.pk)
+                    entry["name"] = name or (item.material_type.name if item.material_type_id else item.sku)
+                elif row.get("inventory_unit_type"):
+                    product = InventoryUnitType.objects.filter(pk=row["inventory_unit_type"]).first()
+                    if product is None:
+                        raise serializers.ValidationError("That product no longer exists.")
+                    entry["inventory_unit_type"] = str(product.pk)
+                    entry["name"] = name or str(product)
+                elif name:
+                    entry["name"] = name
+                else:
+                    raise serializers.ValidationError(
+                        "Each component needs an inventory item — or at least a name."
+                    )
+            except (DjangoValidationError, ValueError):
+                raise serializers.ValidationError("That inventory reference is not valid.")
+            entry["name"] = entry["name"][:200]
+            cleaned.append(entry)
         return cleaned
 
 

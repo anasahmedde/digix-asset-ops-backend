@@ -121,6 +121,12 @@ class Ticket(TimeStampedModel):
     warranty = models.ForeignKey(
         "warranties.Warranty", on_delete=models.SET_NULL, null=True, blank=True, related_name="claims"
     )
+    # A claim can also be raised on a serialized part's own cover, whether the
+    # part is still on the shelf or already fitted into an asset.
+    inventory_unit = models.ForeignKey(
+        "inventory.InventoryUnit", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="claims",
+    )
     # Cost liability (WF-15): out-of-warranty work defaults to billable-to-client.
     is_billable = models.BooleanField(default=False)
     charge_to = models.CharField(max_length=10, choices=ChargeTo.choices, blank=True, default="")

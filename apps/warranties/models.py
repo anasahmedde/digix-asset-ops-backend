@@ -7,7 +7,9 @@ class Warranty(TimeStampedModel):
     class WarrantyType(models.TextChoices):
         MANUFACTURER = "manufacturer", "Manufacturer"
         EXTENDED = "extended", "Extended"
-        SUPPLIER = "supplier", "Supplier"
+        # The vendor who supplied the asset. Called "supplier" in the data for
+        # historical reasons; everywhere a person reads it, it is Vendor.
+        SUPPLIER = "supplier", "Vendor"
         CLIENT = "client", "Client Warranty"
 
     class Status(models.TextChoices):

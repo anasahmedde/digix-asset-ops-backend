@@ -324,3 +324,108 @@ def test_side_filter_applies_to_export(all_sides):
 
     log = _AuditLog.objects.filter(action="export", resource_type="warranty").latest("created_at")
     assert log.detail == {"count": 3, "params": {"side": "supplier"}}
+
+
+
+# ---------------------------------------------------------------------------
+# Vendor warranties: fixed type, extensions recorded
+# ---------------------------------------------------------------------------
+@pytest.mark.django_db
+def test_vendor_warranty_can_be_extended_and_keeps_its_history():
+    from datetime import timedelta
+
+    from dateutil.relativedelta import relativedelta
+    from django.utils import timezone as _tz
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.assets.models import Device as _D
+    from apps.warranties.models import Warranty as _W
+
+    ops = _U.objects.create_user(username="ext-ops", password="x", role="super_admin")
+    c = _C()
+    c.force_authenticate(ops)
+    device = _D.objects.create(asset_code="AST-EXT-1", serial_number="EXT-1")
+    today = _tz.localdate()
+    w = _W.objects.create(device=device, warranty_type="supplier", start_date=today - timedelta(days=300),
+                          end_date=today + timedelta(days=65), months=12)
+
+    r = c.post(f"/api/warranties/{w.id}/extend/", {"months": 12, "reference_number": "EXT-99"}, format="json")
+    assert r.status_code == 200, r.content
+    w.refresh_from_db()
+    assert w.end_date == today + timedelta(days=65) + relativedelta(months=12)
+    assert "Extended" in w.notes and "EXT-99" in w.notes
+    assert device.lifecycle_events.filter(description__icontains="warranty extended").exists()
+
+    # An "extension" that shortens cover is refused.
+    r = c.post(f"/api/warranties/{w.id}/extend/", {"end_date": today.isoformat()}, format="json")
+    assert r.status_code == 400
+
+    # A lapsed vendor warranty comes back to life when extended past today.
+    w.status = _W.Status.EXPIRED
+    w.end_date = today - timedelta(days=1)
+    w.save()
+    r = c.post(f"/api/warranties/{w.id}/extend/", {"months": 6}, format="json")
+    assert r.status_code == 200, r.content
+    w.refresh_from_db()
+    assert w.status == _W.Status.ACTIVE
+
+    # Client cover is reissued, not extended.
+    client_w = _W.objects.create(device=device, warranty_type="client", start_date=today,
+                                 end_date=today + timedelta(days=90), months=3)
+    r = c.post(f"/api/warranties/{client_w.id}/extend/", {"months": 3}, format="json")
+    assert r.status_code == 400
+
+
+@pytest.mark.django_db
+def test_vendor_warranty_type_cannot_be_changed():
+    from datetime import timedelta
+
+    from django.utils import timezone as _tz
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.assets.models import Device as _D
+    from apps.warranties.models import Warranty as _W
+
+    ops = _U.objects.create_user(username="lock-ops", password="x", role="ops_manager")
+    c = _C()
+    c.force_authenticate(ops)
+    device = _D.objects.create(asset_code="AST-LOCK-1", serial_number="LOCK-1")
+    today = _tz.localdate()
+    w = _W.objects.create(device=device, warranty_type="supplier", start_date=today,
+                          end_date=today + timedelta(days=365), months=12)
+    r = c.patch(f"/api/warranties/{w.id}/", {"warranty_type": "manufacturer"}, format="json")
+    assert r.status_code == 400, r.content
+    assert "vendor warranty" in str(r.data["warranty_type"]).lower()
+
+
+
+@pytest.mark.django_db
+def test_asset_level_outside_cover_is_always_a_vendor_warranty():
+    from datetime import timedelta
+
+    from django.utils import timezone as _tz
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.assets.models import AssetComponent, Device as _D
+
+    admin = _U.objects.create_user(username="unify-admin", password="x", role="super_admin")
+    c = _C()
+    c.force_authenticate(admin)
+    device = _D.objects.create(asset_code="AST-UNI-1", serial_number="UNI-1")
+    today = _tz.localdate()
+    dates = {"start_date": today.isoformat(), "end_date": (today + timedelta(days=365)).isoformat()}
+
+    r = c.post("/api/warranties/", {"device": str(device.id), "warranty_type": "manufacturer", **dates}, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["warranty_type"] == "supplier"
+
+    # A part's own manufacturer cover keeps its type.
+    component = AssetComponent.objects.create(device=device, name="Uni Module", quantity=1)
+    r = c.post("/api/warranties/", {
+        "device": str(device.id), "component": str(component.id), "warranty_type": "manufacturer", **dates,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["warranty_type"] == "manufacturer"

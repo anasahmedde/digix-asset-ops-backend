@@ -285,3 +285,281 @@ def test_due_alert_site_only_schedule_dedupes_by_message(db):
     assert alert.device_id is None
     assert alert.site_id == site.id
     assert "Site sweep" in alert.message
+
+
+# ---------------------------------------------------------------------------
+# Corrective loop: out of service raises a job, back in service closes it
+# ---------------------------------------------------------------------------
+import pytest as _pytest
+from rest_framework.test import APIClient as _APIClient
+
+from apps.accounts.models import User as _User
+from apps.assets.models import Device as _Device
+from apps.maintenance.models import (
+    MaintenanceRecord as _Record,
+    MaintenanceSchedule as _Schedule,
+)
+
+
+@_pytest.fixture
+def corrective_client(db):
+    ops = _User.objects.create_user(username="corr-ops", password="x", role="ops_manager")
+    c = _APIClient()
+    c.force_authenticate(ops)
+    return c, ops
+
+
+@_pytest.mark.django_db
+def test_taking_an_asset_out_of_service_raises_a_corrective_job(corrective_client):
+    c, ops = corrective_client
+    asset = _Device.objects.create(
+        asset_code="AST-CM-1", serial_number="CM-SN-1", status=_Device.Status.ACTIVE,
+    )
+    assert _Schedule.objects.filter(device=asset).count() == 0
+
+    r = c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "under_maintenance", "reason": "Screen flickering intermittently", **_down()},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+
+    job = _Schedule.objects.get(device=asset)
+    assert job.maintenance_type == _Schedule.MaintenanceType.CORRECTIVE
+    assert job.frequency == _Schedule.Frequency.ONE_TIME
+    assert job.status == _Schedule.Status.IN_PROCESS
+    assert job.title == "Screen flickering intermittently"
+    assert job.priority == _Schedule.Priority.HIGH
+
+    # It shows up where the maintenance section and the asset's service
+    # history both look for it.
+    listed = c.get("/api/maintenance/schedules/", {"device": str(asset.id)}).json()
+    assert (listed.get("results") or listed)[0]["id"] == str(job.id)
+
+
+@_pytest.mark.django_db
+def test_returning_to_service_closes_the_job_with_a_record(corrective_client):
+    c, ops = corrective_client
+    asset = _Device.objects.create(
+        asset_code="AST-CM-2", serial_number="CM-SN-2", status=_Device.Status.ACTIVE,
+    )
+    c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "under_maintenance", "reason": "Power supply replaced", **_down()}, format="json",
+    )
+    job = _Schedule.objects.get(device=asset)
+
+    r = c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "active", "reason": "PSU swapped, tested, back in service"}, format="json",
+    )
+    assert r.status_code == 200, r.content
+
+    job.refresh_from_db()
+    assert job.status == _Schedule.Status.COMPLETED
+    assert job.is_active is False
+
+    record = _Record.objects.get(schedule=job)
+    assert record.status == _Record.Status.COMPLETED
+    assert record.performed_by_id == ops.id
+    assert record.notes == "PSU swapped, tested, back in service"
+    # No warranty on file, so the visit is billable to the client.
+    assert record.is_billable is True
+    assert record.charge_to == "client"
+
+
+@_pytest.mark.django_db
+def test_one_outage_raises_one_job(corrective_client):
+    c, _ = corrective_client
+    asset = _Device.objects.create(
+        asset_code="AST-CM-3", serial_number="CM-SN-3", status=_Device.Status.ACTIVE,
+    )
+    c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "under_maintenance", "reason": "Dead pixels", **_down()}, format="json",
+    )
+    # Out to installed and straight back out again — the first job is still
+    # open on the way in, so it must not be duplicated.
+    asset.refresh_from_db()
+    asset.status = _Device.Status.UNDER_MAINTENANCE
+    asset._previous_status = _Device.Status.ACTIVE
+    asset.save(update_fields=["status"])
+    assert _Schedule.objects.filter(device=asset).count() == 1
+
+
+@_pytest.mark.django_db
+def test_leaving_maintenance_for_rma_also_closes_the_job(corrective_client):
+    c, _ = corrective_client
+    asset = _Device.objects.create(
+        asset_code="AST-CM-4", serial_number="CM-SN-4", status=_Device.Status.ACTIVE,
+    )
+    c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "under_maintenance", "reason": "Controller fault", **_down()}, format="json",
+    )
+    r = c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "rma", "reason": "Beyond on-site repair"}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    job = _Schedule.objects.get(device=asset)
+    assert job.status == _Schedule.Status.COMPLETED
+    assert _Record.objects.filter(schedule=job).count() == 1
+
+
+
+def _down():
+    """What taking an asset out of service now has to say about the job."""
+    from datetime import timedelta
+
+    from django.utils import timezone as _tz
+
+    tech, _ = _User.objects.get_or_create(
+        username="down-tech", defaults={"role": "technician", "first_name": "Down", "last_name": "Tech"}
+    )
+    return {
+        "maintenance_due": (_tz.localdate() + timedelta(days=5)).isoformat(),
+        "maintenance_assigned_to": str(tech.id),
+    }
+
+
+@_pytest.mark.django_db
+def test_going_down_requires_the_corrective_job_details(corrective_client):
+    c, _ = corrective_client
+    asset = _Device.objects.create(asset_code="AST-CM-D1", serial_number="CM-D1", status=_Device.Status.ACTIVE)
+    r = c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "under_maintenance", "reason": "No picture"}, format="json",
+    )
+    assert r.status_code == 400, r.content
+    assert "maintenance_due" in r.data and "maintenance_assigned_to" in r.data
+
+
+@_pytest.mark.django_db
+def test_the_job_carries_what_the_asset_dialog_asked_for(corrective_client):
+    from datetime import timedelta
+
+    from django.utils import timezone as _tz
+
+    c, _ = corrective_client
+    tech = _User.objects.create_user(username="cm-fixer", password="x", role="technician")
+    asset = _Device.objects.create(asset_code="AST-CM-D2", serial_number="CM-D2", status=_Device.Status.ACTIVE)
+    due = _tz.localdate() + timedelta(days=3)
+    r = c.post(f"/api/assets/devices/{asset.id}/transition/", {
+        "status": "under_maintenance", "reason": "Half the panel is dark",
+        "maintenance_due": due.isoformat(), "maintenance_assigned_to": str(tech.id),
+        "maintenance_priority": "medium", "maintenance_instructions": "Bring two spare receiving cards",
+    }, format="json")
+    assert r.status_code == 200, r.content
+
+    job = _Schedule.objects.get(device=asset)
+    assert job.title == "Half the panel is dark"
+    assert job.next_due == due
+    assert job.assigned_to_id == tech.id
+    assert job.priority == "medium"
+    assert job.instructions == "Bring two spare receiving cards"
+
+
+@_pytest.mark.django_db
+def test_completing_the_job_puts_the_asset_back_in_service(corrective_client):
+    from django.utils import timezone as _tz
+
+    c, _ = corrective_client
+    asset = _Device.objects.create(asset_code="AST-CM-D3", serial_number="CM-D3", status=_Device.Status.ACTIVE)
+    c.post(f"/api/assets/devices/{asset.id}/transition/",
+           {"status": "under_maintenance", "reason": "Flicker", **_down()}, format="json")
+    job = _Schedule.objects.get(device=asset)
+
+    # The technician closes it from the maintenance register.
+    tech = job.assigned_to
+    t = _APIClient()
+    t.force_authenticate(tech)
+    r = t.post("/api/maintenance/records/", {
+        "schedule": str(job.id), "performed_at": _tz.now().isoformat(),
+        "status": "completed", "notes": "Replaced the receiving card",
+    }, format="json")
+    assert r.status_code == 201, r.content
+
+    asset.refresh_from_db()
+    assert asset.status == _Device.Status.ACTIVE
+    job.refresh_from_db()
+    assert job.status == _Schedule.Status.COMPLETED
+    # One completion record — the return to service does not file a second.
+    assert _Record.objects.filter(schedule=job).count() == 1
+    event = asset.lifecycle_events.order_by("-created_at").first()
+    assert event.to_value == "active"
+    assert "Back in service" in event.description
+
+
+@_pytest.mark.django_db
+def test_schedule_materials_are_picked_from_inventory(corrective_client):
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem
+
+    c, _ = corrective_client
+    item = InventoryItem.objects.create(material_type=MaterialType.objects.create(name="PM Sealant"), quantity=9)
+    r = c.post("/api/maintenance/schedules/", {
+        "title": "Quarterly visit", "maintenance_type": "preventive", "frequency": "quarterly",
+        "next_due": "2030-01-01",
+        "required_components": [{"inventory_item": str(item.id), "quantity": 2}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    row = r.data["required_components"][0]
+    assert row["inventory_item"] == str(item.id)
+    assert row["name"] == "PM Sealant"
+    assert row["quantity"] == 2
+
+
+
+@_pytest.mark.django_db
+def test_a_closed_job_cannot_be_reopened_from_a_stale_edit(corrective_client):
+    c, _ = corrective_client
+    asset = _Device.objects.create(asset_code="AST-CM-R1", serial_number="CM-R1", status=_Device.Status.ACTIVE)
+    c.post(f"/api/assets/devices/{asset.id}/transition/",
+           {"status": "under_maintenance", "reason": "Stuck pixels", **_down()}, format="json")
+    c.post(f"/api/assets/devices/{asset.id}/transition/",
+           {"status": "active", "reason": "Pixels reseated"}, format="json")
+    job = _Schedule.objects.get(device=asset)
+    assert job.status == _Schedule.Status.COMPLETED
+
+    # A copy of the form opened before the job closed still says "in process".
+    r = c.patch(f"/api/maintenance/schedules/{job.id}/", {"status": "in_process"}, format="json")
+    assert r.status_code == 400, r.content
+    job.refresh_from_db()
+    assert job.status == _Schedule.Status.COMPLETED
+
+    # Editing other details without touching the status is still allowed.
+    r = c.patch(f"/api/maintenance/schedules/{job.id}/", {"instructions": "Filed"}, format="json")
+    assert r.status_code == 200, r.content
+
+
+
+@_pytest.mark.django_db
+def test_an_open_job_cannot_be_deleted_while_the_asset_is_out_of_service(corrective_client):
+    """Deleting it would strand the asset: out of service, nothing tracking it."""
+    from django.utils import timezone as _tz
+
+    c, _ = corrective_client
+    asset = _Device.objects.create(asset_code="AST-CM-D9", serial_number="CM-D9", status=_Device.Status.ACTIVE)
+    c.post(f"/api/assets/devices/{asset.id}/transition/",
+           {"status": "under_maintenance", "reason": "Blank screen", **_down()}, format="json")
+    job = _Schedule.objects.get(device=asset)
+
+    r = c.delete(f"/api/maintenance/schedules/{job.id}/")
+    assert r.status_code == 400, r.content
+    assert "complete it instead" in str(r.data)
+    assert _Schedule.objects.filter(pk=job.pk).exists()
+
+    # Completing it returns the asset to service, and then it can be removed.
+    tech = job.assigned_to
+    t = _APIClient()
+    t.force_authenticate(tech)
+    t.post("/api/maintenance/records/", {
+        "schedule": str(job.id), "performed_at": _tz.now().isoformat(),
+        "status": "completed", "notes": "Board swapped",
+    }, format="json")
+    asset.refresh_from_db()
+    assert asset.status == _Device.Status.ACTIVE
+
+    r = c.delete(f"/api/maintenance/schedules/{job.id}/")
+    assert r.status_code == 204, r.content

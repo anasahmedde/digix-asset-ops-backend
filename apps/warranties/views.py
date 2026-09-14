@@ -110,3 +110,78 @@ class WarrantyViewSet(viewsets.ModelViewSet):
         original.status = Warranty.Status.REISSUED
         original.save(update_fields=["status", "updated_at"])
         return Response(WarrantySerializer(replacement).data, status=http_status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def extend(self, request, pk=None):
+        """Push a warranty's expiry later — an extension the vendor granted.
+
+        The warranty keeps its identity and its start date; only the end moves.
+        The change is written onto the warranty and journalled on the asset, so
+        the history of extensions is never lost behind the current date.
+        """
+        from django.utils.dateparse import parse_date
+
+        from apps.assets.models import DeviceLifecycleEvent
+
+        warranty = self.get_object()
+        if warranty.warranty_type == Warranty.WarrantyType.CLIENT:
+            return Response(
+                {"detail": "Client warranties are reissued, not extended — use Reissue."},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        if warranty.status in (Warranty.Status.VOID, Warranty.Status.REISSUED):
+            return Response(
+                {"detail": f"A {warranty.get_status_display().lower()} warranty cannot be extended."},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_end, raw_months = request.data.get("end_date"), request.data.get("months")
+        if raw_end:
+            new_end = parse_date(str(raw_end))
+            if new_end is None:
+                return Response({"end_date": ["Use a real date."]}, status=http_status.HTTP_400_BAD_REQUEST)
+        elif raw_months not in (None, ""):
+            try:
+                months = int(raw_months)
+            except (TypeError, ValueError):
+                return Response({"months": ["Must be a whole number."]}, status=http_status.HTTP_400_BAD_REQUEST)
+            if months < 1:
+                return Response({"months": ["Add at least one month."]}, status=http_status.HTTP_400_BAD_REQUEST)
+            new_end = warranty.end_date + relativedelta(months=months)
+        else:
+            return Response(
+                {"detail": "Give the new expiry date, or how many months to add."},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        if new_end <= warranty.end_date:
+            return Response(
+                {"end_date": [f"An extension has to move the expiry later than {warranty.end_date:%d %b %Y}."]},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        old_end = warranty.end_date
+        reference = (request.data.get("reference_number") or "").strip()
+        notes = (request.data.get("notes") or "").strip()
+        who = request.user.get_full_name() or request.user.username
+
+        warranty.end_date = new_end
+        delta = relativedelta(new_end, warranty.start_date)
+        warranty.months = max(1, delta.years * 12 + delta.months + (1 if delta.days else 0))
+        if warranty.status == Warranty.Status.EXPIRED and new_end > timezone.now().date():
+            warranty.status = Warranty.Status.ACTIVE
+        entry = f"Extended {old_end:%d %b %Y} → {new_end:%d %b %Y} by {who}"
+        if reference:
+            entry += f" — ref {reference}"
+        if notes:
+            entry += f" — {notes}"
+        warranty.notes = f"{warranty.notes}\n{entry}" if warranty.notes else entry
+        warranty.save(update_fields=["end_date", "months", "status", "notes", "updated_at"])
+
+        DeviceLifecycleEvent.objects.create(
+            device=warranty.device,
+            event_type=DeviceLifecycleEvent.EventType.NOTE,
+            description=f"{warranty.get_warranty_type_display()} warranty extended to {new_end:%d %b %Y}",
+            performed_by=request.user,
+            metadata={"warranty": str(warranty.pk), "from": str(old_end), "to": str(new_end)},
+        )
+        return Response(WarrantySerializer(warranty).data)

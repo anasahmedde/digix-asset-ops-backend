@@ -36,6 +36,14 @@ class WarrantySerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"component": "Component does not belong to this device."})
 
         if self.instance is None:
+            # Cover from outside on the asset itself is the vendor's warranty,
+            # whatever the paperwork calls it. Manufacturer and extended cover
+            # belong to a component; only the client warranty is ours.
+            if not component and attrs.get("warranty_type", Warranty.WarrantyType.MANUFACTURER) in (
+                Warranty.WarrantyType.MANUFACTURER, Warranty.WarrantyType.EXTENDED,
+            ):
+                attrs["warranty_type"] = Warranty.WarrantyType.SUPPLIER
+
             # Anchoring defaults: supplier-side warranties start at the
             # procurement/delivery date, client warranties at handover (today
             # until the installation handover re-anchors them).
@@ -59,4 +67,15 @@ class WarrantySerializer(serializers.ModelSerializer):
         # A warranty is bound to its device/component for life; ignore reassignment.
         validated_data.pop("device", None)
         validated_data.pop("component", None)
+        # The vendor's cover on a finished asset is the vendor's, full stop:
+        # its type does not change. Longer cover is recorded as an extension.
+        new_type = validated_data.get("warranty_type")
+        if (
+            instance.warranty_type == Warranty.WarrantyType.SUPPLIER
+            and new_type
+            and new_type != Warranty.WarrantyType.SUPPLIER
+        ):
+            raise serializers.ValidationError({
+                "warranty_type": "A vendor warranty stays a vendor warranty — extend it instead."
+            })
         return super().update(instance, validated_data)

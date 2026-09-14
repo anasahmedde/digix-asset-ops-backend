@@ -5,7 +5,7 @@ from .models import WorkOrder, WorkOrderItem
 
 class WorkOrderItemSerializer(serializers.ModelSerializer):
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
-    device_model_name = serializers.CharField(source="device_model.__str__", read_only=True, default=None)
+    device_model_name = serializers.StringRelatedField(source="device_model", read_only=True)
     line_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
 
     class Meta:
