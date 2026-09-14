@@ -1,6 +1,9 @@
 from django.contrib import admin
 
 from .models import (
+    ProductionRouteTemplate,
+    ProductionRouteTemplateStep,
+    ProductionStep,
     AssetCode,
     AssetType,
     Brand,
@@ -69,3 +72,24 @@ class DeviceLifecycleEventAdmin(admin.ModelAdmin):
 class AssetCodeAdmin(admin.ModelAdmin):
     list_display = ["device", "format", "is_current", "printed_at"]
     list_filter = ["format", "is_current"]
+
+
+@admin.register(ProductionStep)
+class ProductionStepAdmin(admin.ModelAdmin):
+    list_display = ("device", "step_number", "name", "location", "status", "workshop")
+    list_filter = ("status", "location")
+    search_fields = ("name", "workshop_name", "device__asset_code")
+    raw_id_fields = ("device", "workshop", "assigned_to")
+
+
+class RouteTemplateStepInline(admin.TabularInline):
+    model = ProductionRouteTemplateStep
+    extra = 0
+    raw_id_fields = ("workshop",)
+
+
+@admin.register(ProductionRouteTemplate)
+class ProductionRouteTemplateAdmin(admin.ModelAdmin):
+    list_display = ("asset_type", "created_by", "created_at")
+    search_fields = ("asset_type__name",)
+    inlines = [RouteTemplateStepInline]

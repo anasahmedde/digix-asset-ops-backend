@@ -19,6 +19,25 @@ def render_label(device, fmt: str = "qr") -> ContentFile:
     return ContentFile(payload, name=f"{code}-{fmt}.png")
 
 
+def render_labels_pdf(devices, fmt: str = "qr") -> bytes:
+    """Render one PDF with a label per page for a batch of devices.
+
+    Reuses the exact same PNG rendering as :func:`render_label` so bulk
+    prints look identical to single prints, then stitches the pages into
+    a multi-page PDF via Pillow.
+    """
+    from PIL import Image
+
+    render = _render_code128 if fmt == "code128" else _render_qr
+    pages = [Image.open(io.BytesIO(render(d.asset_code))).convert("RGB") for d in devices]
+    if not pages:
+        raise ValueError("render_labels_pdf needs at least one device")
+
+    buf = io.BytesIO()
+    pages[0].save(buf, format="PDF", save_all=True, append_images=pages[1:], resolution=203)
+    return buf.getvalue()
+
+
 def _render_qr(code: str) -> bytes:
     import qrcode
     from PIL import Image, ImageDraw, ImageFont

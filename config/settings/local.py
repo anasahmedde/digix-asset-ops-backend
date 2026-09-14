@@ -20,3 +20,11 @@ CHANNEL_LAYERS = {
         "BACKEND": "channels.layers.InMemoryChannelLayer",
     },
 }
+
+# Development drives the API hard — every page view costs several calls, and
+# automated checks run through whole flows in seconds. Rate limiting here only
+# blocks the person testing; production keeps the limits from base.py.
+REST_FRAMEWORK = {  # noqa: F405
+    **REST_FRAMEWORK,  # noqa: F405
+    "DEFAULT_THROTTLE_RATES": {"anon": None, "user": None},
+}

@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
-from .models import Notification, WebhookEndpoint
+from .models import Notification, PushToken, WebhookEndpoint
+
+
+class PushTokenSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PushToken
+        fields = ["id", "token", "platform", "created_at"]
+        read_only_fields = ["id", "created_at"]
 
 
 class NotificationSerializer(serializers.ModelSerializer):
@@ -18,6 +25,7 @@ class NotificationSerializer(serializers.ModelSerializer):
             "message",
             "alert",
             "ticket",
+            "installation",
             "data",
             "is_read",
             "read_at",

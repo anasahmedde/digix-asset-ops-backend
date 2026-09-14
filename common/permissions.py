@@ -1,16 +1,23 @@
 from rest_framework.permissions import SAFE_METHODS, BasePermission
 
 ADMIN_ROLES = ("super_admin",)
-MANAGER_ROLES = ("super_admin", "ops_manager")
+# Group Head is the escalation apex (oversees operations AND marketing) and
+# carries full manager powers.
+MANAGER_ROLES = ("super_admin", "group_head", "ops_manager")
 # Supervisors sit between managers and technicians: they run field crews,
 # can act on tickets and review/approve their team's work.
-SUPERVISOR_ROLES = ("super_admin", "ops_manager", "supervisor")
-FIELD_ROLES = ("super_admin", "ops_manager", "supervisor", "technician")
+SUPERVISOR_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
+FIELD_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor", "technician")
 FINANCE_ROLES = ("super_admin", "finance")
-WAREHOUSE_ROLES = ("super_admin", "ops_manager", "warehouse")
+WAREHOUSE_ROLES = ("super_admin", "group_head", "ops_manager", "warehouse")
 ALL_INTERNAL_ROLES = (
-    "super_admin", "ops_manager", "supervisor", "technician", "finance", "warehouse",
+    "super_admin", "group_head", "ops_manager", "marketing_head", "supervisor",
+    "technician", "finance", "warehouse",
 )
+# External vendor-portal logins (XC-04). Deliberately absent from every
+# write-role group above: vendors are read-only everywhere except the
+# explicit ticket/installation actions scoped to their own supplier.
+VENDOR_ROLES = ("vendor",)
 
 
 def _role(user):
@@ -64,6 +71,18 @@ class WarehouseWriteElseRead(BasePermission):
         return _role(request.user) in WAREHOUSE_ROLES
 
 
+class InspectionWriteElseRead(BasePermission):
+    """Goods-receipt inspection: technicians and supervisors do the checking,
+    warehouse and management can too. Everyone authenticated may read."""
+
+    def has_permission(self, request, view):
+        if not (request.user and request.user.is_authenticated):
+            return False
+        if request.method in SAFE_METHODS:
+            return True
+        return _role(request.user) in set(FIELD_ROLES) | set(WAREHOUSE_ROLES)
+
+
 class TechnicianCanCreate(BasePermission):
     """
     Admin/Manager full access. Technicians can list, retrieve, create,
@@ -77,6 +96,11 @@ class TechnicianCanCreate(BasePermission):
         "transition", "submit_completion",
         "ticket_comments", "ticket_attachments",
     )
+    # Vendors work tickets assigned to their supplier but never create or
+    # edit them; the view's object gates enforce the supplier match.
+    VENDOR_ALLOWED_ACTIONS = (
+        "transition", "submit_completion", "ticket_comments",
+    )
 
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
@@ -86,7 +110,9 @@ class TechnicianCanCreate(BasePermission):
         role = _role(request.user)
         if role in MANAGER_ROLES:
             return True
-        if role in ("technician", "supervisor") and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
+        if role in ("technician", "supervisor", "marketing", "marketing_head") and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
+            return True
+        if role in VENDOR_ROLES and view.action in self.VENDOR_ALLOWED_ACTIONS:
             return True
         return False
 

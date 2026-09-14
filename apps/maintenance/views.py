@@ -5,21 +5,25 @@ from rest_framework.response import Response
 
 from common.permissions import TechnicianCanCreate
 
-from .models import MaintenanceRecord, MaintenanceSchedule
-from .serializers import MaintenanceRecordSerializer, MaintenanceScheduleSerializer
+from .models import MaintenanceRecord, MaintenanceRecordPhoto, MaintenanceSchedule
+from .serializers import (
+    MaintenanceRecordPhotoSerializer,
+    MaintenanceRecordSerializer,
+    MaintenanceScheduleSerializer,
+)
 
 
 class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
     queryset = MaintenanceSchedule.objects.select_related(
         "device", "site", "assigned_to"
-    ).all()
+    ).prefetch_related("vendors").all()
     serializer_class = MaintenanceScheduleSerializer
     permission_classes = [IsAuthenticated, TechnicianCanCreate]
     filterset_fields = [
-        "maintenance_type", "frequency", "status", "is_active", "assigned_to", "device",
+        "maintenance_type", "frequency", "status", "is_active", "assigned_to", "device", "priority",
     ]
-    search_fields = ["title"]
-    ordering_fields = ["next_due", "created_at"]
+    search_fields = ["title", "device__asset_code", "device__display_name"]
+    ordering_fields = ["next_due", "created_at", "priority"]
 
     @action(detail=False, methods=["get"])
     def map_data(self, request):
@@ -34,7 +38,7 @@ class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
             .select_related("site")
             .values(
                 "id", "title", "maintenance_type", "frequency", "next_due",
-                "site__id", "site__name", "site__city",
+                "device", "site__id", "site__name", "site__city",
                 "site__state_province", "site__country",
                 "site__latitude", "site__longitude",
             )
@@ -43,11 +47,55 @@ class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
         return Response(list(sites))
 
 
+    def perform_destroy(self, instance):
+        """A fault is closed, not deleted.
+
+        Deleting the open job for an asset that is still out of service leaves
+        it stranded: nothing tracks the repair, and nothing is left to complete
+        to bring it back into service. Complete it instead.
+        """
+        from rest_framework.exceptions import ValidationError
+
+        from apps.assets.models import Device
+
+        if (
+            instance.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE
+            and instance.status != MaintenanceSchedule.Status.COMPLETED
+            and instance.device_id
+            and instance.device.status == Device.Status.UNDER_MAINTENANCE
+        ):
+            raise ValidationError(
+                "This asset is out of service on this job — complete it instead, "
+                "which puts the asset back into service."
+            )
+        instance.delete()
+
+
 class MaintenanceRecordViewSet(viewsets.ModelViewSet):
     queryset = MaintenanceRecord.objects.select_related(
         "schedule", "performed_by"
-    ).all()
+    ).prefetch_related("components_used", "photos").all()
     serializer_class = MaintenanceRecordSerializer
     permission_classes = [IsAuthenticated, TechnicianCanCreate]
     filterset_fields = ["schedule", "status", "performed_by"]
     ordering_fields = ["performed_at"]
+
+    def perform_create(self, serializer):
+        record = serializer.save(performed_by=self.request.user)
+        # A completed visit rolls its schedule to the next cycle.
+        if record.status == MaintenanceRecord.Status.COMPLETED:
+            record.schedule.advance_after_completion(record.performed_at.date())
+            # Closing a corrective job is what returns the asset to Active.
+            from .services import return_to_service_if_done
+
+            return_to_service_if_done(record, self.request.user)
+
+
+class MaintenanceRecordPhotoViewSet(viewsets.ModelViewSet):
+    queryset = MaintenanceRecordPhoto.objects.select_related("record").all()
+    serializer_class = MaintenanceRecordPhotoSerializer
+    permission_classes = [IsAuthenticated, TechnicianCanCreate]
+    filterset_fields = ["record"]
+
+    def perform_create(self, serializer):
+        serializer.save(taken_by=self.request.user)

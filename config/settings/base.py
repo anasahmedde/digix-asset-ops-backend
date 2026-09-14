@@ -21,6 +21,10 @@ SECRET_KEY = env("DJANGO_SECRET_KEY")
 DEBUG = env("DJANGO_DEBUG")
 ALLOWED_HOSTS = env("DJANGO_ALLOWED_HOSTS")
 
+# Behind nginx/TLS: trust the forwarded scheme so absolute URLs (media files)
+# are generated as https — Android blocks cleartext image URLs.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
 # ---------------------------------------------------------------------------
 # Application definition
 # ---------------------------------------------------------------------------
@@ -59,12 +63,14 @@ LOCAL_APPS = [
     "apps.suppliers",
     "apps.clients",
     "apps.procurement",
+    "apps.quotations",
     "apps.finance",
     "apps.analytics",
     "apps.notifications",
     "apps.chat",
     "apps.workorders",
     "apps.reports",
+    "apps.attendance",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -164,9 +170,12 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
     ],
+    # One screen in this app costs several requests (the signed-in user, the
+    # notification and chat counters, then the page's own data), so a limit
+    # meant to stop abuse has to sit well above ordinary use.
     "DEFAULT_THROTTLE_RATES": {
         "anon": "100/hour",
-        "user": "1000/hour",
+        "user": "5000/hour",
     },
 }
 
@@ -207,6 +216,36 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
+# Fail fast when the broker is unreachable — request paths queue emails
+# fire-and-forget and must never sit in kombu's reconnect loops.
+CELERY_TASK_PUBLISH_RETRY = False
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    "socket_connect_timeout": 2,
+    "socket_timeout": 2,
+    "max_retries": 0,
+}
+CELERY_RESULT_BACKEND_TRANSPORT_OPTIONS = {
+    "socket_connect_timeout": 2,
+    "socket_timeout": 2,
+    "retry_policy": {"max_retries": 0},
+}
+
+# ---------------------------------------------------------------------------
+# Email (XC-02) — SMTP when EMAIL_HOST is configured, console echo otherwise.
+# Everything reads from env with safe defaults so an unset environment keeps
+# working (local.py pins the console backend for dev regardless).
+# ---------------------------------------------------------------------------
+EMAIL_HOST = env("EMAIL_HOST", default="")
+EMAIL_BACKEND = (
+    "django.core.mail.backends.smtp.EmailBackend"
+    if EMAIL_HOST
+    else "django.core.mail.backends.console.EmailBackend"
+)
+EMAIL_PORT = env.int("EMAIL_PORT", default=587)
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
+EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=True)
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="alerts@localhost")
 
 # ---------------------------------------------------------------------------
 # AWS / S3

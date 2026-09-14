@@ -2,6 +2,7 @@ from django.contrib import admin
 
 from .models import (
     DeviceInstallation,
+    InstallationDelay,
     InstallationPhoto,
     InstallationStep,
     Site,
@@ -43,9 +44,15 @@ class InstallationStepInline(admin.TabularInline):
 
 @admin.register(DeviceInstallation)
 class DeviceInstallationAdmin(admin.ModelAdmin):
-    list_display = ["device", "site", "installed_by", "installed_at"]
+    list_display = ["device", "site", "installed_by", "installed_at", "due_date", "completed_at"]
     list_filter = ["site"]
     inlines = [InstallationStepInline]
+
+
+@admin.register(InstallationDelay)
+class InstallationDelayAdmin(admin.ModelAdmin):
+    list_display = ["installation", "step", "cause", "reported_by", "created_at", "resolved_at"]
+    list_filter = ["cause"]
 
 
 @admin.register(InstallationStep)

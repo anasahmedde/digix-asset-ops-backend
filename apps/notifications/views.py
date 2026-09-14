@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from django.db.models import Q
 from django.utils import timezone
-from rest_framework import viewsets
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -10,9 +10,41 @@ from rest_framework.response import Response
 from apps.tickets.models import Ticket
 from common.permissions import IsSuperAdmin
 
-from .models import Notification, WebhookEndpoint
-from .serializers import NotificationSerializer, WebhookEndpointSerializer
+from .models import Notification, PushToken, WebhookEndpoint
+from .serializers import (
+    NotificationSerializer,
+    PushTokenSerializer,
+    WebhookEndpointSerializer,
+)
 from .tasks import send_webhook_delivery
+
+
+class PushTokenViewSet(
+    mixins.CreateModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Register / de-register a device's Expo push token for the current user."""
+
+    serializer_class = PushTokenSerializer
+    permission_classes = [IsAuthenticated]
+    lookup_field = "token"
+
+    def get_queryset(self):
+        return PushToken.objects.filter(user=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        token = serializer.validated_data["token"]
+        obj, _ = PushToken.objects.update_or_create(
+            token=token,
+            defaults={
+                "user": request.user,
+                "platform": serializer.validated_data.get("platform", ""),
+            },
+        )
+        return Response(PushTokenSerializer(obj).data, status=status.HTTP_201_CREATED)
 
 
 class NotificationViewSet(viewsets.ModelViewSet):

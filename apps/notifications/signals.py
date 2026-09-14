@@ -10,9 +10,14 @@ from django.utils import timezone
 
 from apps.accounts.models import User
 from apps.analytics.models import Alert
+from apps.chat.models import ChatMessage
+from apps.maintenance.models import MaintenanceSchedule
+from apps.sites.models import DeviceInstallation
 from apps.tickets.models import Ticket
 
+from . import tasks as notification_tasks
 from .models import Notification
+from .push import send_push_to_user
 from .serializers import NotificationSerializer
 
 logger = logging.getLogger(__name__)
@@ -22,19 +27,53 @@ RESOLVED_STATUSES = (Ticket.Status.APPROVED, Ticket.Status.CLOSED)
 
 def _push_ws(notification: Notification):
     channel_layer = get_channel_layer()
-    if channel_layer is None:
-        return
-    group_name = f"notifications_{notification.recipient_id}"
+    if channel_layer is not None:
+        group_name = f"notifications_{notification.recipient_id}"
+        try:
+            async_to_sync(channel_layer.group_send)(
+                group_name,
+                {
+                    "type": "send_notification",
+                    "notification": NotificationSerializer(notification).data,
+                },
+            )
+        except Exception:
+            logger.exception("Failed to send WS notification to %s", group_name)
+
+    # Also deliver an OS-level push to the recipient's registered devices.
     try:
-        async_to_sync(channel_layer.group_send)(
-            group_name,
-            {
-                "type": "send_notification",
-                "notification": NotificationSerializer(notification).data,
-            },
+        send_push_to_user(
+            notification.recipient_id,
+            notification.title,
+            notification.message,
+            {**(notification.data or {}), "notification_type": notification.notification_type},
         )
     except Exception:
-        logger.exception("Failed to send WS notification to %s", group_name)
+        logger.exception("Failed push to %s", notification.recipient_id)
+
+
+# ── Chat message → push to the other participants ────────────────────
+
+@receiver(post_save, sender=ChatMessage)
+def push_chat_message(sender, instance: ChatMessage, created: bool, **kwargs):
+    if not created or instance.message_type == ChatMessage.MessageType.SYSTEM:
+        return
+    try:
+        sender_name = instance.sender.get_full_name().strip() or instance.sender.username
+        recipient_ids = (
+            instance.room.participants.exclude(id=instance.sender_id)
+            .values_list("id", flat=True)
+        )
+        preview = instance.content if instance.message_type == ChatMessage.MessageType.TEXT else "📎 Attachment"
+        for uid in recipient_ids:
+            send_push_to_user(
+                uid,
+                sender_name,
+                preview[:140],
+                {"notification_type": "chat_message", "room_id": str(instance.room_id)},
+            )
+    except Exception:
+        logger.exception("Failed chat push for message %s", instance.pk)
 
 
 # ── Alert → Notification ─────────────────────────────────────────────
@@ -46,7 +85,7 @@ def create_notifications_for_alert(sender, instance: Alert, created: bool, **kwa
 
     recipients = User.objects.filter(
         is_active=True,
-        role__in=("super_admin", "ops_manager"),
+        role__in=("super_admin", "group_head", "ops_manager"),
     )
 
     alert_data = {
@@ -77,6 +116,92 @@ def create_notifications_for_alert(sender, instance: Alert, created: bool, **kwa
         _push_ws(notif)
 
 
+# ── Installation assignment → notify the installer ──────────────────
+
+@receiver(pre_save, sender=DeviceInstallation)
+def capture_installation_previous_state(sender, instance: DeviceInstallation, **kwargs):
+    if instance.pk:
+        try:
+            old = DeviceInstallation.objects.get(pk=instance.pk)
+            instance._prev_installed_by_id = old.installed_by_id
+        except DeviceInstallation.DoesNotExist:
+            instance._prev_installed_by_id = None
+    else:
+        instance._prev_installed_by_id = None
+
+
+@receiver(post_save, sender=DeviceInstallation)
+def notify_installer_on_assignment(sender, instance: DeviceInstallation, created: bool, **kwargs):
+    prev = getattr(instance, "_prev_installed_by_id", None)
+    if not instance.installed_by_id or (not created and prev == instance.installed_by_id):
+        return
+    try:
+        data = {
+            "installation_id": str(instance.id),
+            "device_id": str(instance.device_id),
+            "site_id": str(instance.site_id),
+        }
+        if instance.due_date:
+            data["due_date"] = str(instance.due_date)
+        notification = Notification.objects.create(
+            recipient=instance.installed_by,
+            notification_type=Notification.Type.INSTALLATION_ASSIGNED,
+            title="Installation assigned to you",
+            message=(
+                f"{instance.device.asset_code} at {instance.site.name}"
+                + (f" — due {instance.due_date}" if instance.due_date else "")
+            ),
+            data=data,
+            is_actionable=True,
+        )
+        _push_ws(notification)
+        notification_tasks.queue_notification_email(notification)
+    except Exception:  # pragma: no cover - notification failure must not block saves
+        logger.exception("Failed installer notification for installation %s", instance.pk)
+
+
+# ── Maintenance assignment → notify the assignee ────────────────────
+
+@receiver(pre_save, sender=MaintenanceSchedule)
+def capture_schedule_previous_state(sender, instance: MaintenanceSchedule, **kwargs):
+    if instance.pk:
+        try:
+            old = MaintenanceSchedule.objects.get(pk=instance.pk)
+            instance._prev_assigned_to_id = old.assigned_to_id
+        except MaintenanceSchedule.DoesNotExist:
+            instance._prev_assigned_to_id = None
+    else:
+        instance._prev_assigned_to_id = None
+
+
+@receiver(post_save, sender=MaintenanceSchedule)
+def notify_maintenance_assignee(sender, instance: MaintenanceSchedule, created: bool, **kwargs):
+    prev = getattr(instance, "_prev_assigned_to_id", None)
+    if not instance.assigned_to_id or (not created and prev == instance.assigned_to_id):
+        return
+    try:
+        data = {"schedule_id": str(instance.id), "priority": instance.priority}
+        if instance.device_id:
+            data["device_id"] = str(instance.device_id)
+        if instance.site_id:
+            data["site_id"] = str(instance.site_id)
+        notification = Notification.objects.create(
+            recipient=instance.assigned_to,
+            notification_type=Notification.Type.MAINTENANCE_REMINDER,
+            title="Maintenance assigned to you",
+            message=(
+                f"{instance.title}"
+                + (f" — {instance.device.asset_code}" if instance.device_id else "")
+                + (f" · due {instance.next_due}" if instance.next_due else "")
+            ),
+            data=data,
+            is_actionable=True,
+        )
+        _push_ws(notification)
+    except Exception:  # pragma: no cover - notification failure must not block saves
+        logger.exception("Failed maintenance notification for schedule %s", instance.pk)
+
+
 # ── Ticket → Notification ────────────────────────────────────────────
 
 @receiver(pre_save, sender=Ticket)
@@ -101,6 +226,19 @@ def handle_ticket_notifications(sender, instance: Ticket, created: bool, **kwarg
 
     if instance.assigned_to_id and (created or prev_assigned != instance.assigned_to_id):
         _create_ticket_assignment_notification(instance)
+
+    # New unassigned ticket: park centrally and route to Operations for assignment.
+    if created and not instance.assigned_to_id:
+        for ops in User.objects.filter(role__in=("super_admin", "group_head", "ops_manager"), is_active=True):
+            notification = Notification.objects.create(
+                recipient=ops,
+                notification_type=Notification.Type.TICKET_UPDATE,
+                title=f"New ticket awaiting assignment: {instance.ticket_number}",
+                message=instance.title,
+                ticket=instance,
+                is_actionable=True,
+            )
+            _push_ws(notification)
 
     if not created and prev_status != instance.status:
         if instance.status == Ticket.Status.PENDING_REVIEW:
@@ -147,6 +285,7 @@ def _create_ticket_assignment_notification(ticket: Ticket):
         data=_build_ticket_data(ticket),
     )
     _push_ws(notif)
+    notification_tasks.queue_notification_email(notif)
 
 
 def _create_ticket_status_notification(ticket: Ticket):
@@ -172,7 +311,7 @@ def _create_review_request_notification(ticket: Ticket):
 
     admins = User.objects.filter(
         is_active=True,
-        role__in=("super_admin", "ops_manager"),
+        role__in=("super_admin", "group_head", "ops_manager"),
     ).exclude(id__in=recipients).values_list("id", flat=True)
     recipients.extend(admins)
 

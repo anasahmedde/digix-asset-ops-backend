@@ -4,4 +4,6 @@ from rest_framework.pagination import PageNumberPagination
 class StandardResultsSetPagination(PageNumberPagination):
     page_size = 25
     page_size_query_param = "page_size"
-    max_page_size = 100
+    # Table pages fetch their full dataset (page_size=1000) so the analytics
+    # strips above them count every record, not just the first page.
+    max_page_size = 1000

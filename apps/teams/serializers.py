@@ -1,6 +1,57 @@
 from rest_framework import serializers
 
-from .models import Project, ProjectBottleneck, ProjectMember
+from .models import (
+    ProjectCostLine,
+    BOMAllocation,
+    Project,
+    ProjectBOMLine,
+    ProjectBottleneck,
+    ProjectMember,
+    ProjectMilestone,
+    ProjectScopeItem,
+)
+
+
+class BOMAllocationSerializer(serializers.ModelSerializer):
+    device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
+    device_serial = serializers.CharField(source="device.serial_number", read_only=True, default=None)
+    item_name = serializers.CharField(source="inventory_item.material_type.name", read_only=True, default=None)
+    allocated_by_name = serializers.CharField(source="allocated_by.get_full_name", read_only=True, default=None)
+
+    class Meta:
+        model = BOMAllocation
+        fields = [
+            "id", "bom_line", "device", "device_code", "device_serial",
+            "inventory_item", "item_name", "quantity", "status",
+            "allocated_by", "allocated_by_name", "created_at",
+        ]
+        read_only_fields = ["id", "status", "allocated_by", "created_at"]
+
+
+class ProjectBOMLineSerializer(serializers.ModelSerializer):
+    asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
+    device_model_name = serializers.CharField(source="device_model.name", read_only=True, default=None)
+    material_type_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
+    allocated_quantity = serializers.IntegerField(read_only=True)
+    issued_quantity = serializers.IntegerField(read_only=True)
+    shortage = serializers.IntegerField(read_only=True)
+    allocations = BOMAllocationSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ProjectBOMLine
+        fields = [
+            "id", "project", "asset_type", "asset_type_name",
+            "device_model", "device_model_name", "material_type", "material_type_name",
+            "description", "quantity", "unit_price",
+            "allocated_quantity", "issued_quantity", "shortage",
+            "allocations", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate_quantity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Quantity must be a positive integer.")
+        return value
 
 
 class ProjectBottleneckSerializer(serializers.ModelSerializer):
@@ -21,21 +72,60 @@ class ProjectMemberSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
+class ProjectScopeItemSerializer(serializers.ModelSerializer):
+    device_code = serializers.CharField(source="device.asset_code", read_only=True)
+    device_name = serializers.CharField(source="device.display_name", read_only=True, default=None)
+    component_name = serializers.CharField(source="component.name", read_only=True, default=None)
+    site_name = serializers.CharField(source="site.name", read_only=True, default=None)
+
+    class Meta:
+        model = ProjectScopeItem
+        fields = [
+            "id", "project", "device", "device_code", "device_name",
+            "component", "component_name", "quantity",
+            "site", "site_name", "start_date", "notes", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
+    def validate(self, attrs):
+        component = attrs.get("component")
+        device = attrs.get("device") or getattr(self.instance, "device", None)
+        if component and device and component.device_id != device.id:
+            raise serializers.ValidationError({"component": "Component does not belong to this asset."})
+        return attrs
+
+
+class ProjectMilestoneSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectMilestone
+        fields = ["id", "project", "title", "due_date", "completed_at", "order", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
 class ProjectListSerializer(serializers.ModelSerializer):
+    assets_count = serializers.IntegerField(source="devices.count", read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     manager_name = serializers.CharField(source="manager.get_full_name", read_only=True, default=None)
     bottleneck_count = serializers.IntegerField(read_only=True, default=0)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
+    phase_display = serializers.CharField(source="get_phase_display", read_only=True)
+    contract_type_display = serializers.CharField(source="get_contract_type_display", read_only=True)
+    progress = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
         fields = [
             "id", "name", "location", "image", "client", "client_name",
-            "site", "site_name", "status", "status_display", "progress",
+            "site", "site_name", "status", "status_display",
+            "phase", "phase_display", "progress",
+            "contract_type", "contract_type_display", "rental_end_date",
             "start_date", "target_date", "completed_date",
             "manager", "manager_name", "bottleneck_count", "created_at",
-        ]
+         "assets_count",]
+
+    def get_progress(self, obj):
+        return obj.computed_progress()
 
 
 class ProjectDetailSerializer(serializers.ModelSerializer):
@@ -44,14 +134,79 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
     manager_name = serializers.CharField(source="manager.get_full_name", read_only=True, default=None)
     bottlenecks = ProjectBottleneckSerializer(many=True, read_only=True)
     members = ProjectMemberSerializer(many=True, read_only=True)
+    scope_items = ProjectScopeItemSerializer(many=True, read_only=True)
+    milestones = ProjectMilestoneSerializer(many=True, read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    phase_display = serializers.CharField(source="get_phase_display", read_only=True)
+    contract_type_display = serializers.CharField(source="get_contract_type_display", read_only=True)
+    progress = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
         fields = [
             "id", "name", "description", "location", "image",
             "client", "client_name", "site", "site_name",
-            "status", "progress", "start_date", "target_date", "completed_date",
+            "status", "status_display", "phase", "phase_display",
+            "contract_type", "contract_type_display", "rental_end_date",
+            "progress", "start_date", "target_date", "completed_date",
             "manager", "manager_name", "budget", "notes",
-            "bottlenecks", "members", "created_at", "updated_at",
+            "bottlenecks", "members", "scope_items", "milestones",
+            "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+    def get_progress(self, obj):
+        return obj.computed_progress()
+
+
+class ProjectCostLineSerializer(serializers.ModelSerializer):
+    """An overhead line on a project's cost plan."""
+
+    amount = serializers.SerializerMethodField()
+    actual_amount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProjectCostLine
+        fields = [
+            "id", "project", "cost_type", "description", "quantity", "unit_cost",
+            "amount", "actual_quantity", "actual_unit_cost", "actual_amount", "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+        # A cost nobody planned for carries no planned rate, so the rate is
+        # required by validate() only while the budget is still being planned.
+        extra_kwargs = {"unit_cost": {"required": False}}
+
+    def get_amount(self, obj):
+        return str(obj.amount)
+
+    def get_actual_amount(self, obj):
+        return None if obj.actual_amount is None else str(obj.actual_amount)
+
+    def validate_cost_type(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Say what kind of cost this is.")
+        return value[:100]
+
+    def validate(self, attrs):
+        project = attrs.get("project") or getattr(self.instance, "project", None)
+        plan = getattr(project, "cost_plan", None) if project else None
+        locked = plan is not None and not plan.is_editable
+        if not locked:
+            if self.instance is None and attrs.get("unit_cost") is None:
+                raise serializers.ValidationError({"unit_cost": "Give the rate for this cost."})
+            return attrs
+
+        # The approved estimate does not move. What things actually cost does,
+        # so the actual columns stay open all through execution.
+        if self.instance is None:
+            # A cost nobody planned for belongs to the actuals, not to the
+            # figure that was signed off.
+            attrs["quantity"] = 0
+            attrs["unit_cost"] = 0
+        elif any(field in attrs for field in ("quantity", "unit_cost")):
+            raise serializers.ValidationError(
+                f"The budget is {plan.get_status_display().lower()} — revise it to change the "
+                f"planned figures. Recording what it actually cost is always allowed."
+            )
+        return attrs

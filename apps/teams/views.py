@@ -1,23 +1,44 @@
-from django.db.models import Count, Q
+from decimal import Decimal, InvalidOperation
+
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.utils import timezone
+from django.db.models import Count, Q, Sum
+from rest_framework import status as drf_status
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import AdminManagerWriteElseRead
+from common.permissions import AdminManagerWriteElseRead, WarehouseWriteElseRead
 
-from .models import Project, ProjectBottleneck, ProjectMember
+from .costing import project_devices
+from .models import (
+    ProjectBudget,
+    ProjectCostLine,
+    BOMAllocation,
+    Project,
+    ProjectBOMLine,
+    ProjectBottleneck,
+    ProjectMember,
+    ProjectMilestone,
+    ProjectScopeItem,
+)
 from .serializers import (
+    ProjectCostLineSerializer,
+    ProjectBOMLineSerializer,
     ProjectBottleneckSerializer,
     ProjectDetailSerializer,
     ProjectListSerializer,
     ProjectMemberSerializer,
+    ProjectMilestoneSerializer,
+    ProjectScopeItemSerializer,
 )
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
-    filterset_fields = ["status", "client", "site", "manager"]
+    filterset_fields = ["status", "phase", "contract_type", "client", "site", "manager"]
     search_fields = ["name", "location", "description"]
     ordering_fields = ["created_at", "start_date", "target_date", "progress"]
 
@@ -26,6 +47,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             Project.objects
             .select_related("client", "site", "manager")
             .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
+            .prefetch_related("scope_items", "milestones")
             .all()
         )
 
@@ -34,16 +56,225 @@ class ProjectViewSet(viewsets.ModelViewSet):
             return ProjectListSerializer
         return ProjectDetailSerializer
 
+    @action(detail=True, methods=["get"], url_path="bom-summary")
+    def bom_summary(self, request, pk=None):
+        """Per-line fulfilment figures + project-level totals for the BOM tab."""
+        project = self.get_object()
+        lines = []
+        totals = {"required": 0, "allocated": 0, "issued": 0, "shortage": 0}
+        for line in project.bom_lines.prefetch_related("allocations").all():
+            allocated = line.allocated_quantity
+            issued = line.issued_quantity
+            shortage = line.shortage
+            lines.append({
+                "id": str(line.id),
+                "description": line.description,
+                "quantity": line.quantity,
+                "allocated_quantity": allocated,
+                "issued_quantity": issued,
+                "shortage": shortage,
+                "unit_price": line.unit_price,
+            })
+            totals["required"] += line.quantity
+            totals["allocated"] += allocated
+            totals["issued"] += issued
+            totals["shortage"] += shortage
+        return Response({"lines": lines, "totals": totals})
+
+    @action(detail=True, methods=["get"])
+    def requirements(self, request, pk=None):
+        """Every asset in this project and what it is built from.
+
+        A project can hold many assets; each asset's components are its bill of
+        materials, gathered here automatically. Per line we report what is
+        required, what the warehouse actually holds, and how the requirement is
+        being covered — which is the decision the user makes on this screen.
+        Availability is informational: procuring is allowed even when stock
+        would cover it.
+        """
+        from apps.assets.models import AssetComponent, Device
+        from apps.assets.serializers import AssetComponentSerializer
+
+        project = self.get_object()
+        # An asset reaches a project two ways: its own `project` field, or a
+        # Scope row. Both count, or assets added through the Scope screen would
+        # silently go missing from the build plan.
+        devices = (
+            project_devices(project)
+            .prefetch_related(
+                "components__inventory_item__material_type",
+                "components__inventory_unit_type",
+                "components__purchase_order_item__purchase_order",
+            )
+        )
+
+        assets = []
+        totals = {"required": 0, "issued": 0, "outstanding": 0,
+                  "awaiting_decision": 0, "to_procure": 0}
+
+        for device in devices:
+            components = list(device.components.all())
+            rows = AssetComponentSerializer(components, many=True).data
+            for component, row in zip(components, rows):
+                totals["required"] += component.quantity
+                totals["issued"] += component.issued_quantity
+                totals["outstanding"] += component.outstanding_quantity
+                if component.fulfilment == AssetComponent.Fulfilment.PENDING:
+                    totals["awaiting_decision"] += 1
+                elif component.fulfilment == AssetComponent.Fulfilment.PROCUREMENT:
+                    totals["to_procure"] += 1
+                # Can this line be covered from stock right now?
+                row["can_use_stock"] = (
+                    component.outstanding_quantity > 0
+                    and component.available_quantity >= component.outstanding_quantity
+                )
+            assets.append({
+                "id": str(device.pk),
+                "asset_code": device.asset_code,
+                "display_name": device.display_name or str(device.device_model),
+                "status": device.status,
+                "components": rows,
+            })
+
+        return Response({"project": str(project.pk), "assets": assets, "totals": totals})
+
+    # Who signs a budget off. Kept apart from who writes it: an estimate should
+    # not be approved by the person who produced it (super admins excepted).
+    BUDGET_APPROVER_ROLES = ("super_admin", "group_head", "finance")
+
+    @action(detail=True, methods=["get", "patch"], url_path="plan")
+    def plan(self, request, pk=None):
+        """The project's cost plan; PATCH sets the contingency percentage."""
+        from .costing import build_plan, get_or_create_plan
+
+        project = self.get_object()
+        if request.method == "PATCH":
+            plan = get_or_create_plan(project)
+            if not plan.is_editable:
+                return Response(
+                    {"detail": f"The budget is {plan.get_status_display().lower()} — revise it to change it."},
+                    status=drf_status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                pct = Decimal(str(request.data.get("contingency_percent", plan.contingency_percent)))
+            except (InvalidOperation, TypeError):
+                return Response({"contingency_percent": ["Must be a number."]}, status=400)
+            if pct < 0 or pct > 100:
+                return Response({"contingency_percent": ["Must be between 0 and 100."]}, status=400)
+            plan.contingency_percent = pct
+            plan.save(update_fields=["contingency_percent", "updated_at"])
+        return Response(build_plan(project))
+
+    @action(detail=True, methods=["get"], url_path="actuals")
+    def actuals(self, request, pk=None):
+        """What the project is actually costing, against what was approved."""
+        from .costing import build_actuals
+
+        return Response(build_actuals(self.get_object()))
+
+    @action(detail=True, methods=["post"], url_path="submit-budget")
+    def submit_budget(self, request, pk=None):
+        """Send the estimate up for approval."""
+        from .costing import build_plan, get_or_create_plan
+
+        project = self.get_object()
+        plan = get_or_create_plan(project)
+        if not plan.is_editable:
+            return Response(
+                {"detail": f"The budget is already {plan.get_status_display().lower()}."}, status=400
+            )
+        summary = build_plan(project)
+        if summary["total"] <= 0:
+            return Response(
+                {"detail": "There is nothing to approve yet — the estimate comes to zero."}, status=400
+            )
+        plan.status = ProjectBudget.Status.SUBMITTED
+        plan.submitted_by = request.user
+        plan.submitted_at = timezone.now()
+        plan.decision_notes = ""
+        plan.save(update_fields=["status", "submitted_by", "submitted_at", "decision_notes", "updated_at"])
+        return Response(build_plan(project))
+
+    @action(detail=True, methods=["post"], url_path="approve-budget")
+    def approve_budget(self, request, pk=None):
+        return self._decide_budget(request, approve=True)
+
+    @action(detail=True, methods=["post"], url_path="reject-budget")
+    def reject_budget(self, request, pk=None):
+        return self._decide_budget(request, approve=False)
+
+    def _decide_budget(self, request, *, approve):
+        from .costing import build_plan, get_or_create_plan
+
+        project = self.get_object()
+        plan = get_or_create_plan(project)
+        role = getattr(request.user, "role", "")
+        if role not in self.BUDGET_APPROVER_ROLES:
+            return Response(
+                {"detail": "Budgets are approved by the group head, finance or a super admin."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+        if plan.status != ProjectBudget.Status.SUBMITTED:
+            return Response({"detail": "Only a budget awaiting approval can be decided."}, status=400)
+        if plan.submitted_by_id == request.user.id and role != "super_admin":
+            return Response(
+                {"detail": "You submitted this budget — someone else has to approve it."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+        notes = (request.data.get("notes") or "").strip()
+        if not approve and not notes:
+            return Response({"notes": ["Say why the budget is being sent back."]}, status=400)
+
+        summary = build_plan(project)
+        plan.status = ProjectBudget.Status.APPROVED if approve else ProjectBudget.Status.REJECTED
+        plan.decided_by = request.user
+        plan.decided_at = timezone.now()
+        plan.decision_notes = notes
+        update = ["status", "decided_by", "decided_at", "decision_notes", "updated_at"]
+        if approve:
+            # Freeze the figure that was signed off; the project carries it.
+            plan.approved_total = summary["total"]
+            update.append("approved_total")
+            project.budget = summary["total"]
+            project.save(update_fields=["budget", "updated_at"])
+        plan.save(update_fields=update)
+        return Response(build_plan(project))
+
+    @action(detail=True, methods=["post"], url_path="revise-budget")
+    def revise_budget(self, request, pk=None):
+        """Reopen an approved or pending budget for changes.
+
+        Execution locks again until the revised figure is approved.
+        """
+        from .costing import build_plan, get_or_create_plan
+
+        project = self.get_object()
+        plan = get_or_create_plan(project)
+        if plan.is_editable:
+            return Response({"detail": "The budget is already open for changes."}, status=400)
+        plan.status = ProjectBudget.Status.DRAFT
+        plan.save(update_fields=["status", "updated_at"])
+        return Response(build_plan(project))
+
     @action(detail=False, methods=["get"])
     def dashboard_stats(self, request):
         qs = Project.objects.all()
         total = qs.count()
         by_status = dict(qs.values_list("status").annotate(c=Count("id")).values_list("status", "c"))
-        flagged = list(
-            qs.filter(status__in=["at_risk", "delayed"])
-            .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
-            .values("id", "name", "progress", "status", "bottleneck_count")[:8]
-        )
+        flagged = [
+            {
+                "id": str(p.id),
+                "name": p.name,
+                "progress": p.computed_progress(),
+                "status": p.status,
+                "bottleneck_count": p.bottleneck_count,
+            }
+            for p in (
+                qs.filter(status__in=["at_risk", "delayed"])
+                .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
+                .prefetch_related("milestones")[:8]
+            )
+        ]
         top_bottlenecks = list(
             ProjectBottleneck.objects
             .filter(is_resolved=False)
@@ -74,3 +305,210 @@ class ProjectMemberViewSet(viewsets.ModelViewSet):
     serializer_class = ProjectMemberSerializer
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["project", "user", "role"]
+
+
+class ProjectScopeItemViewSet(viewsets.ModelViewSet):
+    queryset = ProjectScopeItem.objects.select_related(
+        "project", "device", "component", "site"
+    ).all()
+    serializer_class = ProjectScopeItemSerializer
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    filterset_fields = ["project", "device", "site"]
+
+
+class ProjectMilestoneViewSet(viewsets.ModelViewSet):
+    queryset = ProjectMilestone.objects.select_related("project").all()
+    serializer_class = ProjectMilestoneSerializer
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    filterset_fields = ["project"]
+    ordering_fields = ["order", "due_date"]
+
+
+class ProjectBOMLineViewSet(viewsets.ModelViewSet):
+    """BOM lines + their fulfilment actions (allocate / issue).
+
+    Allocation and issuance are warehouse work, so the warehouse role can
+    write here even though the rest of the teams app is manager-only.
+    """
+
+    queryset = (
+        ProjectBOMLine.objects
+        .select_related("project", "asset_type", "device_model", "material_type")
+        .prefetch_related("allocations")
+        .all()
+    )
+    serializer_class = ProjectBOMLineSerializer
+    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    filterset_fields = ["project"]
+    search_fields = ["description"]
+    ordering_fields = ["created_at"]
+
+    def _line_response(self, line_pk):
+        line = self.get_queryset().get(pk=line_pk)
+        return Response(self.get_serializer(line).data)
+
+    @action(detail=True, methods=["post"])
+    def allocate(self, request, pk=None):
+        """Reserve a unique device or a slice of warehouse stock for this line.
+
+        Exactly one of ``device`` / ``inventory_item`` must be given. Devices
+        must be in stock and are moved through the status machine
+        (in_stock → assigned); stock allocations are guarded against
+        over-allocation across every line reserving the same item.
+        """
+        from apps.assets.models import Device
+        from apps.inventory.models import InventoryItem
+
+        line = self.get_object()
+        device_id = request.data.get("device")
+        item_id = request.data.get("inventory_item")
+        if bool(device_id) == bool(item_id):
+            return Response(
+                {"detail": "Provide exactly one of device or inventory_item."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            if device_id:
+                try:
+                    device = Device.objects.select_for_update().get(pk=device_id)
+                except (Device.DoesNotExist, ValueError, ValidationError):
+                    return Response({"device": "Device not found."}, status=drf_status.HTTP_400_BAD_REQUEST)
+                if device.status != Device.Status.IN_STOCK:
+                    return Response(
+                        {"device": f"Device must be in stock to allocate (currently {device.status})."},
+                        status=drf_status.HTTP_400_BAD_REQUEST,
+                    )
+                # Flip through the Wave-1 status machine so the lifecycle
+                # journal + audit trail record who allocated it and why.
+                device.status = Device.Status.ASSIGNED
+                device.project = line.project
+                device._transition_user = request.user
+                device._transition_reason = f"Allocated to project {line.project.name}"
+                device.save(update_fields=["status", "project", "updated_at"])
+                BOMAllocation.objects.create(
+                    bom_line=line, device=device, quantity=1, allocated_by=request.user
+                )
+            else:
+                try:
+                    item = InventoryItem.objects.select_for_update().get(pk=item_id)
+                except (InventoryItem.DoesNotExist, ValueError, ValidationError):
+                    return Response(
+                        {"inventory_item": "Inventory item not found."},
+                        status=drf_status.HTTP_400_BAD_REQUEST,
+                    )
+                try:
+                    quantity = int(request.data.get("quantity"))
+                except (TypeError, ValueError):
+                    return Response(
+                        {"quantity": "Quantity is required for stock allocations."},
+                        status=drf_status.HTTP_400_BAD_REQUEST,
+                    )
+                if quantity <= 0:
+                    return Response(
+                        {"quantity": "Quantity must be a positive integer."},
+                        status=drf_status.HTTP_400_BAD_REQUEST,
+                    )
+                # Un-issued allocations across ALL lines still reserve stock;
+                # issued ones already decremented the physical quantity.
+                reserved = (
+                    BOMAllocation.objects
+                    .filter(inventory_item=item, status=BOMAllocation.Status.ALLOCATED)
+                    .aggregate(total=Sum("quantity"))["total"] or 0
+                )
+                available = item.quantity - reserved
+                if quantity > available:
+                    return Response(
+                        {"quantity": f"Only {max(0, available)} unit(s) available (in stock minus reservations)."},
+                        status=drf_status.HTTP_400_BAD_REQUEST,
+                    )
+                BOMAllocation.objects.create(
+                    bom_line=line, inventory_item=item, quantity=quantity, allocated_by=request.user
+                )
+
+        return self._line_response(line.pk)
+
+    @action(detail=True, methods=["post"])
+    def issue(self, request, pk=None):
+        """Issue a stock allocation out of the warehouse to the project.
+
+        Creates an Issuance through the shared atomic decrement +
+        StockMovement OUT path and flips the allocation to ``issued``.
+        Device allocations are rejected — devices are issued through
+        installation.
+        """
+        from apps.inventory.models import InventoryItem, Issuance
+        from apps.inventory.services import apply_issuance_stock_out
+
+        line = self.get_object()
+        alloc_id = request.data.get("allocation")
+        if not alloc_id:
+            return Response({"allocation": "This field is required."}, status=drf_status.HTTP_400_BAD_REQUEST)
+        try:
+            allocation = line.allocations.get(pk=alloc_id)
+        except (BOMAllocation.DoesNotExist, ValueError, ValidationError):
+            return Response(
+                {"allocation": "Allocation not found on this BOM line."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        if allocation.device_id:
+            return Response(
+                {"detail": "devices are issued through installation"},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        if allocation.status != BOMAllocation.Status.ALLOCATED:
+            return Response(
+                {"allocation": f"Allocation is already {allocation.status}."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        if not allocation.inventory_item_id:
+            return Response(
+                {"allocation": "Allocation has no inventory item."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            item = InventoryItem.objects.select_for_update().get(pk=allocation.inventory_item_id)
+            if allocation.quantity > item.quantity:
+                return Response(
+                    {"quantity": f"Only {item.quantity} unit(s) of {item} in stock."},
+                    status=drf_status.HTTP_400_BAD_REQUEST,
+                )
+            issuance = Issuance.objects.create(
+                item=item,
+                quantity=allocation.quantity,
+                issued_to_project=line.project,
+                bom_line=line,
+                issued_to_site=line.project.site,
+                issued_by=request.user,
+                reason=f"BOM issue for project {line.project.name}",
+            )
+            apply_issuance_stock_out(issuance, request.user)
+            allocation.status = BOMAllocation.Status.ISSUED
+            allocation.save(update_fields=["status", "updated_at"])
+
+        return self._line_response(line.pk)
+
+
+class ProjectCostLineViewSet(viewsets.ModelViewSet):
+    """Overheads on a project cost plan (travel, labour, transport, ...)."""
+
+    queryset = ProjectCostLine.objects.select_related("project").all()
+    serializer_class = ProjectCostLineSerializer
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    filterset_fields = ["project"]
+
+    def perform_create(self, serializer):
+        from .costing import get_or_create_plan
+
+        line = serializer.save()
+        get_or_create_plan(line.project)
+
+    def perform_destroy(self, instance):
+        plan = getattr(instance.project, "cost_plan", None)
+        planned = (instance.quantity or 0) * (instance.unit_cost or 0)
+        if plan is not None and not plan.is_editable and planned:
+            from rest_framework.exceptions import ValidationError as _VE
+
+            raise _VE(f"The budget is {plan.get_status_display().lower()} — revise it before changing costs.")
+        instance.delete()

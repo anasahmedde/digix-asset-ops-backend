@@ -61,6 +61,7 @@ class NumberingScheme(TimeStampedModel):
         SUPPLIER = "supplier", "Supplier"
         CLIENT = "client", "Client"
         PURCHASE_ORDER = "purchase_order", "Purchase Order"
+        QUOTATION = "quotation", "Quotation"
         INVOICE = "invoice", "Invoice"
         WORK_ORDER = "work_order", "Work Order"
         PROJECT = "project", "Project"
@@ -68,6 +69,8 @@ class NumberingScheme(TimeStampedModel):
         GOODS_RECEIPT = "goods_receipt", "Goods Receipt"
         ISSUANCE = "issuance", "Inventory Issuance"
         INVENTORY_ITEM = "inventory_item", "Inventory Item (SKU)"
+        INVENTORY_UNIT = "inventory_unit", "Inventory Unit (Unique Item)"
+        INVENTORY_UNIT_TYPE = "inventory_unit_type", "Inventory Product (Unique Item Type)"
 
     entity = models.CharField(max_length=30, choices=Entity.choices, unique=True)
     prefix = models.CharField(max_length=12)
@@ -144,3 +147,55 @@ class WarrantyPeriodPreset(TimeStampedModel):
 
     def __str__(self):
         return self.label
+
+
+class EscalationPolicy(TimeStampedModel):
+    """Data-driven escalation ladder (client hierarchy:
+    Group Head > Operations/Marketing Head > Supervisors > Technician).
+
+    One row per (scope, trigger, stage). The beat tasks walk active policies
+    grouped by trigger and fire each stage once per record, notifying
+    ``escalate_to_role`` users (and optionally ``also_notify_role`` — e.g.
+    operations always hears about assignment breaches).
+
+    ``hours`` is the offset in hours FROM THE TRIGGER ANCHOR for that stage —
+    stage 2 hours are absolute from the anchor, not relative to stage 1.
+    """
+
+    class Scope(models.TextChoices):
+        TICKET = "ticket", "Ticket"
+        INSTALLATION = "installation", "Installation"
+
+    class Trigger(models.TextChoices):
+        ASSIGNMENT_SLA = "assignment_sla", "Unassigned beyond window"
+        RESPONSE_SLA = "response_sla", "No response within SLA"
+        DUE_DATE = "due_date", "Past due date"
+
+    scope = models.CharField(max_length=20, choices=Scope.choices, default=Scope.TICKET)
+    trigger = models.CharField(max_length=20, choices=Trigger.choices)
+    stage = models.PositiveSmallIntegerField(default=1)
+    hours = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text=(
+            "Offset in hours from the trigger anchor for this stage "
+            "(stage hours are absolute from the anchor). Blank = 0 "
+            "(assignment trigger falls back to 24)."
+        ),
+    )
+    escalate_to_role = models.CharField(
+        max_length=20, default="group_head",
+        help_text="Role that receives the escalation (accounts.User.Role value)",
+    )
+    also_notify_role = models.CharField(
+        max_length=20, blank=True, default="ops_manager",
+        help_text="Additional role notified alongside (blank = none)",
+    )
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["scope", "trigger", "stage"]
+        unique_together = [("scope", "trigger", "stage")]
+        verbose_name_plural = "escalation policies"
+
+    def __str__(self):
+        return f"[{self.scope}] {self.get_trigger_display()} (stage {self.stage}) -> {self.escalate_to_role}"

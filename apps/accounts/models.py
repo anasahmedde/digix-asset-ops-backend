@@ -1,6 +1,7 @@
 import uuid
 
 from django.contrib.auth.models import AbstractUser
+from django.core.validators import RegexValidator
 from django.db import models
 
 from common.models import TimeStampedModel
@@ -9,18 +10,43 @@ from common.models import TimeStampedModel
 class User(AbstractUser):
     class Role(models.TextChoices):
         SUPER_ADMIN = "super_admin", "Super Admin"
-        OPS_MANAGER = "ops_manager", "Operations Manager"
+        GROUP_HEAD = "group_head", "Group Head"
+        OPS_MANAGER = "ops_manager", "Operations Head"
+        MARKETING_HEAD = "marketing_head", "Marketing Head"
         SUPERVISOR = "supervisor", "Supervisor"
         TECHNICIAN = "technician", "Technician"
+        MARKETING = "marketing", "Marketing"
         FINANCE = "finance", "Finance"
         WAREHOUSE = "warehouse", "Warehouse Staff"
         CLIENT_VIEWER = "client_viewer", "Client Viewer"
+        VENDOR = "vendor", "Vendor"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.TECHNICIAN)
+    # Display title within a role tier, e.g. "Production Supervisor" vs
+    # "Execution Supervisor" — permissions stay on `role`.
+    job_title = models.CharField(max_length=100, blank=True)
     phone = models.CharField(max_length=20, blank=True)
     avatar = models.ImageField(upload_to="avatars/", blank=True)
     is_field_staff = models.BooleanField(default=False)
+    # HR fields (EM-01): company employee number, national ID, employment dates.
+    employee_id = models.CharField(max_length=50, blank=True, db_index=True)
+    cnic = models.CharField(
+        max_length=15,
+        blank=True,
+        validators=[RegexValidator(r"^\d{5}-\d{7}-\d$", "CNIC must be in #####-#######-# format")],
+    )
+    join_date = models.DateField(null=True, blank=True)
+    leaving_date = models.DateField(null=True, blank=True)
+    # Vendor-portal accounts (XC-04): which supplier this login belongs to.
+    # Everything a role=vendor user can see/do is scoped to this supplier.
+    supplier = models.ForeignKey(
+        "suppliers.Supplier",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="portal_users",
+    )
 
     class Meta:
         ordering = ["-date_joined"]

@@ -73,8 +73,30 @@ class DeviceInstallation(TimeStampedModel):
     installed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="installations_done"
     )
+    vendor = models.ForeignKey(
+        "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installations", help_text="External vendor doing the installation work",
+    )
+    # Not every third party is on the supplier register — a one-off crew can be
+    # named by hand instead. Exactly one of `vendor` / `external_vendor_name`
+    # is used (enforced in the serializer); `vendor_display` resolves whichever.
+    external_vendor_name = models.CharField(
+        max_length=200, blank=True,
+        help_text="Vendor named by hand when they are not a registered supplier",
+    )
+    external_vendor_contact = models.CharField(
+        max_length=100, blank=True, help_text="Phone or contact person for the manual vendor",
+    )
     installed_at = models.DateTimeField()
     removed_at = models.DateTimeField(null=True, blank=True)
+    due_date = models.DateField(null=True, blank=True, help_text="Agreed completion date for the installation")
+    completed_at = models.DateTimeField(
+        null=True, blank=True, help_text="Auto-stamped when every step is completed or skipped"
+    )
+    escalation_state = models.JSONField(
+        default=dict, blank=True,
+        help_text='Escalation ledger: "<trigger>:<stage>" -> ISO timestamp when that stage fired.',
+    )
     position_label = models.CharField(max_length=200, blank=True)
     notes = models.TextField(blank=True)
 
@@ -95,10 +117,12 @@ class InstallationStep(TimeStampedModel):
         PROGRAMMING = "programming", "Programming"
         TESTING = "testing", "Testing & Commissioning"
         HANDOVER = "handover", "Handover"
+        OTHER = "other", "Other"
 
     class StepStatus(models.TextChoices):
         NOT_STARTED = "not_started", "Not Started Yet"
         IN_PROGRESS = "in_progress", "In Progress"
+        ON_HOLD = "on_hold", "On Hold (Client)"
         COMPLETED = "completed", "Completed"
         SKIPPED = "skipped", "Skipped"
 
@@ -106,6 +130,9 @@ class InstallationStep(TimeStampedModel):
         DeviceInstallation, on_delete=models.CASCADE, related_name="steps"
     )
     step_type = models.CharField(max_length=20, choices=StepType.choices)
+    custom_label = models.CharField(
+        max_length=200, blank=True, help_text="Display name for custom ('other') steps"
+    )
     step_number = models.PositiveSmallIntegerField()
     status = models.CharField(max_length=20, choices=StepStatus.choices, default=StepStatus.NOT_STARTED)
     assigned_team = models.CharField(max_length=200, blank=True)
@@ -117,8 +144,50 @@ class InstallationStep(TimeStampedModel):
         ordering = ["step_number"]
         unique_together = ["installation", "step_number"]
 
+    def save(self, *args, **kwargs):
+        from django.utils import timezone
+
+        # Stamp the timeline automatically as the step advances.
+        if self.status == self.StepStatus.IN_PROGRESS and not self.started_at:
+            self.started_at = timezone.now()
+        if self.status == self.StepStatus.COMPLETED:
+            if not self.started_at:
+                self.started_at = timezone.now()
+            if not self.completed_at:
+                self.completed_at = timezone.now()
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.installation} - Step {self.step_number}: {self.get_step_type_display()}"
+
+
+class InstallationDelay(TimeStampedModel):
+    """A logged delay during an installation, attributable to a cause (esp. the client)."""
+
+    class Cause(models.TextChoices):
+        CLIENT = "client", "Client"
+        INTERNAL = "internal", "Internal"
+        VENDOR = "vendor", "Vendor"
+        OTHER = "other", "Other"
+
+    installation = models.ForeignKey(
+        DeviceInstallation, on_delete=models.CASCADE, related_name="delays"
+    )
+    step = models.ForeignKey(
+        InstallationStep, on_delete=models.CASCADE, null=True, blank=True, related_name="delays"
+    )
+    cause = models.CharField(max_length=15, choices=Cause.choices)
+    description = models.TextField(blank=True)
+    reported_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="installation_delays_reported"
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.get_cause_display()} delay on {self.installation}"
 
 
 class InstallationPhoto(TimeStampedModel):
@@ -126,6 +195,7 @@ class InstallationPhoto(TimeStampedModel):
         PRE_INSTALL = "pre_install", "Pre-Installation"
         POST_INSTALL = "post_install", "Post-Installation"
         VERIFICATION = "verification", "Verification"
+        HANDOVER = "handover", "Handover"
 
     installation = models.ForeignKey(
         DeviceInstallation, on_delete=models.CASCADE, related_name="photos"
@@ -141,3 +211,78 @@ class InstallationPhoto(TimeStampedModel):
 
     def __str__(self):
         return f"{self.photo_type} - {self.installation}"
+
+
+class HandoverRecord(TimeStampedModel):
+    """Formal client acceptance of an installation (WF-12).
+
+    One handover per installation: captures who accepted, when, the signature
+    and notes. Creating it (via the installation's handover action) assigns
+    the client + site to the asset and moves it to Active.
+    """
+
+    installation = models.OneToOneField(
+        DeviceInstallation, on_delete=models.CASCADE, related_name="handover"
+    )
+    device = models.ForeignKey("assets.Device", on_delete=models.CASCADE, related_name="handovers")
+    client = models.ForeignKey("clients.Client", on_delete=models.PROTECT, related_name="handovers")
+    site = models.ForeignKey(Site, on_delete=models.PROTECT, related_name="handovers")
+    handover_date = models.DateField()
+    accepted_by_name = models.CharField(max_length=200)
+    acceptance_notes = models.TextField(blank=True)
+    signature = models.ImageField(upload_to=upload_to_path, blank=True)
+    performed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="handovers_performed"
+    )
+
+    class Meta:
+        ordering = ["-handover_date"]
+
+    def __str__(self):
+        return f"Handover of {self.device.asset_code} to {self.client.name} on {self.handover_date}"
+
+
+class InstallationRouteTemplate(TimeStampedModel):
+    """The standard installation checklist for an asset type.
+
+    The sibling of the production routing master: that one says how an asset
+    is built, this one says how it gets put up. Installing the first asset of
+    a type means working the sequence out; saving it means the next one starts
+    from it instead of falling back to the generic survey-to-handover list.
+    """
+
+    asset_type = models.OneToOneField(
+        "assets.AssetType", on_delete=models.CASCADE, related_name="installation_template"
+    )
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installation_templates",
+    )
+
+    class Meta:
+        ordering = ["asset_type__name"]
+
+    def __str__(self):
+        return f"Installation steps for {self.asset_type.name}"
+
+
+class InstallationRouteTemplateStep(TimeStampedModel):
+    """One step in a saved installation checklist."""
+
+    template = models.ForeignKey(
+        InstallationRouteTemplate, on_delete=models.CASCADE, related_name="steps"
+    )
+    step_number = models.PositiveSmallIntegerField()
+    step_type = models.CharField(max_length=20, choices=InstallationStep.StepType.choices)
+    custom_label = models.CharField(max_length=200, blank=True)
+    assigned_team = models.CharField(max_length=200, blank=True)
+    description = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["step_number"]
+        unique_together = ["template", "step_number"]
+
+    def __str__(self):
+        label = self.custom_label or self.get_step_type_display()
+        return f"{self.template.asset_type.name} · {self.step_number}. {label}"

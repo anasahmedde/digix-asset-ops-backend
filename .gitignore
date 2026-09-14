@@ -17,3 +17,6 @@ staticfiles/
 htmlcov/
 coverage/
 .DS_Store
+# Front-end build output that lands here when a dev server is started from
+# the wrong directory — never part of the backend.
+.next/
