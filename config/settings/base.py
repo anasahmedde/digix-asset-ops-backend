@@ -134,7 +134,11 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # ---------------------------------------------------------------------------
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "UTC"
+# The company and every site it serves are in Pakistan. Timestamps are still
+# stored in UTC (USE_TZ); this is the clock every date is read against, so an
+# installation finished at 9pm in Karachi is dated that day and not the one
+# before — which is what UTC was doing for the last five hours of every day.
+TIME_ZONE = "Asia/Karachi"
 USE_I18N = True
 USE_TZ = True
 

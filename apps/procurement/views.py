@@ -1,14 +1,16 @@
+from decimal import Decimal, InvalidOperation
+
 from django.db import transaction
 from django.db.models import Q
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status as drf_status
-from rest_framework import viewsets
+from rest_framework import serializers, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import FinanceWriteElseRead
+from common.permissions import FinanceWriteElseRead, PurchaseOrderActionElseRead
 
 from .models import PurchaseOrder, PurchaseOrderItem
 from .serializers import (
@@ -83,7 +85,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             purchase_order.recalc_total()
 
         return Response(
-            PurchaseOrderSerializer(purchase_order).data,
+            PurchaseOrderSerializer(purchase_order, context={"request": request}).data,
             status=drf_status.HTTP_201_CREATED,
         )
 
@@ -154,11 +156,53 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             return (str(scoped[0]), scoped[1]) if scoped else (None, None)
 
         rows = []
+        # Vendor-built assets: the whole asset is what gets bought.
+        from apps.assets.models import Device
+
+        devices = (
+            Device.objects.filter(
+                source__in=(Device.Source.VENDOR_SUPPLIED, Device.Source.VENDOR_TURNKEY),
+                status=Device.Status.PROCURED,
+            )
+            .select_related("project", "asset_type", "procurement_item__purchase_order")
+            .order_by("asset_code")
+        )
+        if project_id:
+            devices = devices.filter(Q(project_id=project_id) | Q(pk__in=scoped_ids))
+        if request.query_params.get("unordered") in ("1", "true", "True"):
+            devices = devices.filter(procurement_item__isnull=True)
+        for d in devices:
+            project_pk, project_name = project_of(d)
+            label = d.display_name or (d.asset_type.name if d.asset_type_id else d.asset_code)
+            rows.append({
+                "kind": "asset",
+                "component": None,
+                "device": str(d.pk),
+                "name": f"{label} (complete asset)",
+                "asset": str(d.pk),
+                "asset_code": d.asset_code,
+                "project": project_pk,
+                "project_name": project_name,
+                "required_quantity": 1,
+                "outstanding_quantity": 0 if d.procurement_item_id else 1,
+                "available_quantity": None,
+                "unit_price": d.purchase_price,
+                "supply_vendor_name": d.supply_vendor_name,
+                "inventory_item": None,
+                "inventory_unit_type": None,
+                "purchase_order_item": str(d.procurement_item_id) if d.procurement_item_id else None,
+                "po_number": (
+                    d.procurement_item.purchase_order.po_number if d.procurement_item_id else None
+                ),
+            })
+
         for c in components:
             if c.outstanding_quantity <= 0:
                 continue
             project_pk, project_name = project_of(c.device)
             rows.append({
+                "kind": "component",
+                "device": None,
                 "component": str(c.pk),
                 "name": c.name,
                 "asset": str(c.device_id),
@@ -186,18 +230,25 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     def raise_po(self, request):
         """Create one purchase order covering the given requirements.
 
-        Body: ``{"supplier": uuid, "components": [uuid, ...], "currency"?: str}``.
+        Body: supplier, components [ids], devices [ids], prices {id: amount},
+        and optionally currency, expected_delivery, terms, notes.
         Each requirement becomes a PO line for its outstanding quantity and is
-        linked back, so receiving the goods closes the loop.
+        linked back, so receiving the goods closes the loop. A vendor-built
+        asset is bought as one line. Prices default to the last known figure;
+        the buyer changes them before the order is placed.
         """
-        from apps.assets.models import AssetComponent
+        from apps.assets.models import AssetComponent, Device
         from apps.suppliers.models import Supplier
 
         supplier_id = request.data.get("supplier")
         component_ids = request.data.get("components") or []
+        device_ids = request.data.get("devices") or []
+        prices = request.data.get("prices") or {}
         if not supplier_id:
             return Response({"supplier": ["Choose the supplier to buy from."]}, status=400)
-        if not isinstance(component_ids, list) or not component_ids:
+        if not isinstance(component_ids, list) or not isinstance(device_ids, list):
+            return Response({"components": ["Send lists of requirement and asset ids."]}, status=400)
+        if not component_ids and not device_ids:
             return Response({"components": ["Pick at least one requirement."]}, status=400)
         if not Supplier.objects.filter(pk=supplier_id).exists():
             return Response({"supplier": ["Unknown supplier."]}, status=400)
@@ -219,12 +270,44 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 status=400,
             )
 
+        devices = list(Device.objects.filter(pk__in=device_ids)) if device_ids else []
+        bought = [d.asset_code for d in devices if d.procurement_item_id]
+        if bought:
+            return Response(
+                {"devices": [f"Already on a purchase order: {', '.join(bought)}"]}, status=400
+            )
+
+        def price_for(key, fallback):
+            raw = prices.get(str(key))
+            if raw in (None, ""):
+                return fallback or 0
+            try:
+                return Decimal(str(raw))
+            except (InvalidOperation, ValueError):
+                return fallback or 0
+
+        from .documents import DEFAULT_TERMS
+
         with transaction.atomic():
             purchase_order = PurchaseOrder.objects.create(
                 supplier_id=supplier_id,
                 currency=request.data.get("currency", PurchaseOrder.Currency.PKR),
+                expected_delivery=request.data.get("expected_delivery") or None,
+                terms=(request.data.get("terms") or "").strip() or DEFAULT_TERMS,
+                notes=(request.data.get("notes") or "").strip(),
                 ordered_by=request.user,
             )
+            for device in devices:
+                item = PurchaseOrderItem.objects.create(
+                    purchase_order=purchase_order,
+                    description=f"{device.display_name or device.asset_code} — complete asset",
+                    quantity=1,
+                    unit_price=price_for(device.pk, device.purchase_price),
+                    device_model=device.device_model,
+                    asset_type=device.asset_type,
+                )
+                device.procurement_item = item
+                device.save(update_fields=["procurement_item", "updated_at"])
             for component in components:
                 quantity = component.outstanding_quantity
                 if quantity < 1:
@@ -233,11 +316,11 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                     purchase_order=purchase_order,
                     description=component.name,
                     quantity=quantity,
-                    unit_price=(
+                    unit_price=price_for(component.pk, (
                         component.inventory_unit_type.unit_cost
                         if component.inventory_unit_type_id
                         else (component.inventory_item.unit_cost if component.inventory_item_id else None)
-                    ) or 0,
+                    )),
                     material_type=(
                         component.inventory_item.material_type
                         if component.inventory_item_id else None
@@ -251,18 +334,38 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             purchase_order.recalc_total()
 
         return Response(
-            PurchaseOrderSerializer(purchase_order).data, status=drf_status.HTTP_201_CREATED
+            PurchaseOrderSerializer(purchase_order, context={"request": request}).data, status=drf_status.HTTP_201_CREATED
         )
+
+    def get_permissions(self):
+        if getattr(self, "action", None) == "transition":
+            return [IsAuthenticated(), PurchaseOrderActionElseRead()]
+        return super().get_permissions()
 
     @action(detail=True, methods=["post"])
     def transition(self, request, pk=None):
         purchase_order = self.get_object()
+        if getattr(request.user, "role", "") == "group_head" and request.data.get("status") != "approved":
+            return Response(
+                {"detail": "The Group Head signs purchase orders off; Operations move them otherwise."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
         ser = PurchaseOrderTransitionSerializer(
             data=request.data, context={"purchase_order": purchase_order}
         )
         ser.is_valid(raise_exception=True)
         new_status = ser.validated_data["status"]
         notes = ser.validated_data.get("notes", "").strip()
+
+        # Placing an order commits money: Operations raise it, the Group Head
+        # signs it off (or the Super Admin).
+        if new_status == PurchaseOrder.Status.APPROVED and getattr(
+            request.user, "role", ""
+        ) not in ("super_admin", "group_head"):
+            return Response(
+                {"detail": "Purchase orders are approved by the Group Head."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
 
         update_fields = ["status", "updated_at"]
         old_status_display = purchase_order.get_status_display()
@@ -271,6 +374,24 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         if new_status == PurchaseOrder.Status.APPROVED:
             purchase_order.approved_by = request.user
             update_fields += ["approved_by"]
+
+        # The order date is the day it was placed — stamped, never typed.
+        if new_status == PurchaseOrder.Status.ORDERED and not purchase_order.order_date:
+            purchase_order.order_date = timezone.localdate()
+            update_fields += ["order_date"]
+
+        # A cancelled order bought nothing: every requirement it was covering
+        # goes back to "to procure" so it can be raised again, and any asset it
+        # was buying is unlinked.
+        if new_status == PurchaseOrder.Status.CANCELLED:
+            from apps.assets.models import AssetComponent, Device
+
+            AssetComponent.objects.filter(
+                purchase_order_item__purchase_order=purchase_order
+            ).update(purchase_order_item=None, fulfilment=AssetComponent.Fulfilment.PROCUREMENT)
+            Device.objects.filter(
+                procurement_item__purchase_order=purchase_order
+            ).update(procurement_item=None)
 
         if notes:
             stamp = timezone.localtime().strftime("%Y-%m-%d %H:%M")
@@ -284,7 +405,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
 
         purchase_order.save(update_fields=update_fields)
 
-        return Response(PurchaseOrderSerializer(purchase_order).data)
+        return Response(PurchaseOrderSerializer(purchase_order, context={"request": request}).data)
 
 
 class PurchaseOrderItemViewSet(viewsets.ModelViewSet):
@@ -295,12 +416,24 @@ class PurchaseOrderItemViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, FinanceWriteElseRead]
     filterset_fields = ["purchase_order"]
 
+    EDITABLE = ("draft", "pending_approval")
+
+    def _refuse_if_fixed(self, purchase_order):
+        """Item 30: prices and lines can change up to approval, not after."""
+        if purchase_order.status not in self.EDITABLE:
+            raise serializers.ValidationError(
+                {"detail": f"{purchase_order.po_number} is {purchase_order.get_status_display()}: "
+                           "its lines and prices are fixed once approved."}
+            )
+
     def perform_create(self, serializer):
+        self._refuse_if_fixed(serializer.validated_data["purchase_order"])
         item = serializer.save()
         item.purchase_order.recalc_total()
 
     def perform_update(self, serializer):
         old_parent = serializer.instance.purchase_order
+        self._refuse_if_fixed(old_parent)
         item = serializer.save()
         item.purchase_order.recalc_total()
         if item.purchase_order.pk != old_parent.pk:
@@ -308,5 +441,6 @@ class PurchaseOrderItemViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         purchase_order = instance.purchase_order
+        self._refuse_if_fixed(purchase_order)
         instance.delete()
         purchase_order.recalc_total()

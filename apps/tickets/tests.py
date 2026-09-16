@@ -368,8 +368,10 @@ def test_legacy_escalated_ticket_not_refired(heads):
 
 @pytest.mark.django_db
 def test_due_date_multi_stage(heads):
-    t_old = _mk_ticket(heads["mkt"], due_date=timezone.now().date() - timedelta(days=3))
-    t_new = _mk_ticket(heads["mkt"], due_date=timezone.now().date() - timedelta(days=1))
+    # localdate: due dates are local calendar days, and the escalation ladder
+    # anchors on local midnight.
+    t_old = _mk_ticket(heads["mkt"], due_date=timezone.localdate() - timedelta(days=3))
+    t_new = _mk_ticket(heads["mkt"], due_date=timezone.localdate() - timedelta(days=1))
     Ticket.objects.filter(pk__in=[t_old.pk, t_new.pk]).update(
         response_due_at=timezone.now() + timedelta(hours=24)
     )

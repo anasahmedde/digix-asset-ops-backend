@@ -272,7 +272,9 @@ def test_components_and_project_link():
 
 
 @pytest.mark.django_db
-def test_component_with_supplier_and_warranty(db):
+def test_component_takes_a_supplier_but_no_typed_warranty(db):
+    """A part's warranty is recorded when it is received, not typed on the
+    component row — those fields are ignored here."""
     from datetime import date
 
     from apps.suppliers.models import Supplier
@@ -306,11 +308,7 @@ def test_component_with_supplier_and_warranty(db):
     }, format="json")
     assert r.status_code == 201, r.content
     assert r.data["supplier_name"] == "Comp Supplier"
-    w = Warranty.objects.get(component_id=r.data["id"])
-    assert w.device == device and w.supplier == supplier
-    assert w.warranty_type == "supplier" and w.months == 12
-    # anchored at the device purchase (delivery) date
-    assert str(w.start_date) == "2026-08-01" and str(w.end_date) == "2027-08-01"
+    assert not Warranty.objects.filter(component_id=r.data["id"]).exists()
 
     # component from another device is rejected on warranty create
     other = Device.objects.create(device_model=dm, asset_code="AST-COMP-2", serial_number="COMP-2")
@@ -1438,15 +1436,18 @@ def test_in_transit_can_reach_production(admin_client, procured_device):
 
 
 @pytest.mark.django_db
-def test_in_stock_to_production_also_needs_components(admin_client, procured_device):
+def test_a_stocked_asset_does_not_go_back_into_production(admin_client, procured_device):
+    """Production ends when the asset reaches stock; a rebuild is maintenance,
+    not a second trip through the build route."""
     procured_device.status = Device.Status.IN_STOCK
     procured_device.save(update_fields=["status"])
+    detail = admin_client.get(f"/api/assets/devices/{procured_device.id}/").json()
+    assert "in_production" not in detail["allowed_transitions"]
     r = admin_client.post(
         f"/api/assets/devices/{procured_device.id}/transition/",
         {"status": "in_production", "reason": "rebuild"}, format="json",
     )
     assert r.status_code == 400, r.content
-    assert "Components section is empty" in str(r.data["status"])
 
 
 # ---------------------------------------------------------------------------
@@ -2349,7 +2350,9 @@ def test_asset_returns_to_active_from_maintenance_in_the_registry(admin_client, 
     )
     detail = admin_client.get(f"/api/assets/devices/{asset.id}/").json()
     assert "active" in detail["allowed_transitions"]
-    assert "installed" in detail["allowed_transitions"]
+    # It was installed before it broke; the only ways out are back into
+    # service, to the vendor, or out of the fleet.
+    assert "installed" not in detail["allowed_transitions"]
 
     r = admin_client.post(
         f"/api/assets/devices/{asset.id}/transition/",

@@ -102,6 +102,39 @@ def _asset_warranty_summary(device, kind):
     }
 
 
+def copy_build_definition(source, target):
+    """Give `target` the same parts list and production route as `source`.
+
+    Only the definition is copied — what the asset is built from and how —
+    never what has happened to the source (issued stock, PO links, progress).
+    """
+    if target.source != Device.Source.INHOUSE:
+        return
+    for component in source.components.all():
+        AssetComponent.objects.create(
+            device=target,
+            name=component.name,
+            component_type=component.component_type,
+            quantity=component.quantity,
+            supplier=component.supplier,
+            inventory_item=component.inventory_item,
+            inventory_unit_type=component.inventory_unit_type,
+            unit=component.unit,
+            planned_unit_price=component.planned_unit_price,
+        )
+    for step in source.production_steps.all().order_by("step_number"):
+        ProductionStep.objects.create(
+            device=target,
+            step_number=step.step_number,
+            name=step.name,
+            location=step.location,
+            workshop=step.workshop,
+            workshop_name=step.workshop_name,
+            expected_days=step.expected_days,
+            planned_cost=step.planned_cost,
+        )
+
+
 def _upsert_asset_warranty(device, kind, *, end=None, months=None):
     """Record (or move) one of the asset's own warranties.
 
@@ -188,9 +221,13 @@ class DeviceModelSerializer(serializers.ModelSerializer):
 
 
 class MaterialTypeSerializer(serializers.ModelSerializer):
+    """A component definition — name, category and unit of measure."""
+
+    category_name = serializers.CharField(source="category.name", read_only=True, default=None)
+
     class Meta:
         model = MaterialType
-        fields = ["id", "name", "category", "unit", "description", "created_at"]
+        fields = ["id", "name", "category", "category_name", "unit", "description", "created_at"]
         read_only_fields = ["id", "created_at"]
 
 
@@ -203,14 +240,8 @@ class DeviceImageSerializer(serializers.ModelSerializer):
 
 class AssetComponentSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
-    # Optional warranty registered together with the component; creates a
-    # component-scoped Warranty row anchored at the device's purchase date.
-    warranty_type = serializers.ChoiceField(
-        choices=["manufacturer", "extended", "supplier", "client"], write_only=True, required=False, allow_null=True
-    )
-    warranty_months = serializers.ChoiceField(
-        choices=[3, 6, 12, 24, 36], write_only=True, required=False, allow_null=True
-    )
+    # Read-only here: cover is recorded in the Warranties section, and for a
+    # part it is created automatically when the part is received.
     active_warranty = serializers.SerializerMethodField()
     # Where the parts came from. Components are drawn from the warehouse:
     # either generic stock (inventory_item + quantity) or one serialized unit.
@@ -248,7 +279,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "pending_increase", "increase_reason", "increase_notes",
             "increase_requested_by_name", "increase_requested_at",
             "inventory_unit", "inventory_unit_code", "source_label",
-            "warranty_type", "warranty_months", "active_warranty",
+            "active_warranty", "unit",
             "notes", "created_at",
         ]
         read_only_fields = [
@@ -320,8 +351,26 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             if (attrs.get("quantity") or 1) < 1:
                 raise serializers.ValidationError({"quantity": "Quantity must be at least 1."})
 
+            # The same component is one line with a quantity, not two lines.
+            if device is not None:
+                clash = device.components.filter(
+                    inventory_item=item, inventory_unit_type=product
+                ).first() if (item or product) else None
+                if clash is not None:
+                    raise serializers.ValidationError({
+                        "inventory_item": (
+                            f"'{clash.name}' is already on this asset (×{clash.quantity}) — "
+                            "increase its quantity instead of adding it again."
+                        )
+                    })
+
             # Describe the requirement from whichever record it points at.
             source = product or item
+            if not attrs.get("unit"):
+                attrs["unit"] = (
+                    product.unit if product
+                    else (source.material_type.unit if source.material_type_id else "")
+                ) or "piece"
             if not attrs.get("name"):
                 if product:
                     attrs["name"] = str(product)
@@ -336,35 +385,9 @@ class AssetComponentSerializer(serializers.ModelSerializer):
                 attrs["supplier"] = getattr(source, "supplier", None)
         return attrs
 
-    def create(self, validated_data):
-        months = validated_data.pop("warranty_months", None)
-        warranty_type = validated_data.pop("warranty_type", None)
-        component = super().create(validated_data)
-
-        # Requirements do not move stock, so nothing is consumed here. An
-        # explicit warranty term still registers a component-scoped warranty.
-        if months:
-            from dateutil.relativedelta import relativedelta
-
-            from apps.warranties.models import Warranty
-
-            device = component.device
-            start = device.purchase_date or timezone.now().date()
-            Warranty.objects.create(
-                device=device,
-                component=component,
-                supplier=component.supplier or device.supplier,
-                warranty_type=warranty_type or Warranty.WarrantyType.SUPPLIER,
-                start_date=start,
-                end_date=start + relativedelta(months=months),
-                months=months,
-            )
-        return component
-
-    def update(self, instance, validated_data):
-        validated_data.pop("warranty_months", None)
-        validated_data.pop("warranty_type", None)
-        return super().update(instance, validated_data)
+    # Requirements do not move stock, so nothing is consumed on create; and
+    # they carry no warranty of their own — the part's cover is registered
+    # when the part is received.
 
 
 def _client_names(device):
@@ -398,13 +421,14 @@ class DeviceListSerializer(serializers.ModelSerializer):
     project_name = serializers.SerializerMethodField()
     warranty_status = serializers.SerializerMethodField()
 
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
     class Meta:
         model = Device
         fields = [
             "id", "asset_code", "serial_number", "display_name", "project", "project_name",
             "asset_type", "asset_type_name",
             "device_model", "device_model_name",
-            "status", "source", "image", "current_site", "site_name",
+            "status", "status_display", "source", "image", "current_site", "site_name",
             "assigned_client", "client_name", "client_names",
             "installation_date", "warranty_status", "created_at",
         ]
@@ -489,7 +513,18 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     route_template_available = serializers.SerializerMethodField()
     component_template_available = serializers.SerializerMethodField()
     allowed_transitions = serializers.SerializerMethodField()
+    # Frozen once the project is executing: components and route are read-only.
+    is_locked = serializers.BooleanField(read_only=True)
+    # Register by copying an existing asset: its details are the form's
+    # defaults, and its components and production route come across too.
+    copy_from = serializers.PrimaryKeyRelatedField(
+        queryset=Device.objects.all(), write_only=True, required=False, allow_null=True
+    )
+    procurement_po_number = serializers.CharField(
+        source="procurement_item.purchase_order.po_number", read_only=True, default=None
+    )
 
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
     class Meta:
         model = Device
         fields = [
@@ -500,7 +535,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "device_model", "device_model_name", "brand_name",
             "length_in", "width_in", "depth_in", "diagonal_inches",
             "hardware_revision",
-            "status", "source", "source_display", "allowed_transitions", "image", "images",
+            "status", "status_display", "source", "source_display", "allowed_transitions", "image", "images",
             "purchase_date", "purchase_price", "supplier", "supplier_name",
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
@@ -511,6 +546,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "technician_job_title", "technician_phone",
             "assigned_vendor_name", "assigned_vendor_contact", "assigned_to_display",
             "supply_vendor_name", "supply_vendor_contact",
+            "is_locked", "procurement_item", "procurement_po_number", "copy_from",
             "installation_date", "installed_by", "installed_by_name",
             "warranty_status", "active_warranty",
             "tickets_total", "tickets_open",
@@ -526,9 +562,12 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
         months = validated_data.pop("client_warranty_months", None)
         client_end = validated_data.pop("client_warranty_end", None)
         vendor_end = validated_data.pop("vendor_warranty_end", None)
+        source = validated_data.pop("copy_from", None)
         device = super().create(validated_data)
         _upsert_asset_warranty(device, "client", end=client_end, months=months)
         _upsert_asset_warranty(device, "vendor", end=vendor_end)
+        if source is not None:
+            copy_build_definition(source, device)
         return device
 
     def get_client_warranty(self, obj):
@@ -873,7 +912,7 @@ class ProductionStepSerializer(serializers.ModelSerializer):
             "id", "device", "step_number", "name",
             "location", "location_display", "workshop", "workshop_name", "workshop_display",
             "status", "status_display", "allowed_transitions",
-            "assigned_to", "assigned_to_name", "expected_days", "planned_cost",
+            "assigned_to", "assigned_to_name", "expected_days", "planned_cost", "actual_cost",
             "started_at", "sent_at", "returned_at", "completed_at",
             "notes", "created_at",
         ]

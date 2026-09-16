@@ -35,12 +35,26 @@ class DeviceModel(TimeStampedModel):
 
 
 class MaterialType(TimeStampedModel):
-    """Type of material/component used across the platform (cables, mounts, etc.)."""
+    """A component: something an asset is built from (cables, mounts, players…).
+
+    Shown to users as "Component". Its category is one of the inventory
+    categories — the old free-text category duplicated that list, which is
+    exactly what the client flagged.
+    """
 
     name = models.CharField(max_length=200, unique=True)
-    category = models.CharField(max_length=100, blank=True)
+    legacy_category = models.CharField(max_length=100, blank=True, editable=False)
+    category = models.ForeignKey(
+        "inventory.InventoryCategory", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="components",
+    )
+    # Unit of measure: piece, meter, box, kg …
     unit = models.CharField(max_length=50, default="piece")
     description = models.TextField(blank=True)
+
+    class Meta:
+        verbose_name = "component"
+        ordering = ["name"]
 
     def __str__(self):
         return self.name
@@ -76,7 +90,7 @@ class AssetType(TimeStampedModel):
 
 class Device(TimeStampedModel):
     class Status(models.TextChoices):
-        PROCURED = "procured", "Procured"
+        PROCURED = "procured", "In Procurement"
         IN_PRODUCTION = "in_production", "In Production"
         IN_STOCK = "in_stock", "In Stock"
         ASSIGNED = "assigned", "Assigned to Client"
@@ -112,18 +126,18 @@ class Device(TimeStampedModel):
         # (that is a movement state for assets that already exist).
         Status.PROCURED: (Status.IN_PRODUCTION, Status.IN_STOCK, Status.RMA),
         Status.IN_PRODUCTION: (Status.IN_STOCK, Status.RMA),
-        Status.IN_TRANSIT: (Status.IN_STOCK, Status.IN_PRODUCTION, Status.PROCURED),
+        Status.IN_TRANSIT: (Status.IN_STOCK, Status.IN_PRODUCTION),
         Status.IN_STOCK: (
-            Status.ASSIGNED, Status.IN_PRODUCTION, Status.IN_TRANSIT,
+            Status.ASSIGNED, Status.IN_TRANSIT,
             Status.DECOMMISSIONED, Status.LOST_STOLEN,
         ),
         Status.ASSIGNED: (Status.INSTALLED, Status.IN_STOCK, Status.IN_TRANSIT),
-        Status.INSTALLED: (Status.ACTIVE, Status.UNDER_MAINTENANCE, Status.ASSIGNED, Status.RMA),
+        Status.INSTALLED: (Status.ACTIVE, Status.UNDER_MAINTENANCE, Status.RMA),
         Status.ACTIVE: (
             Status.UNDER_MAINTENANCE, Status.RMA, Status.CLIENT_PROPERTY,
             Status.IN_TRANSIT, Status.DECOMMISSIONED, Status.LOST_STOLEN,
         ),
-        Status.UNDER_MAINTENANCE: (Status.ACTIVE, Status.INSTALLED, Status.RMA, Status.DECOMMISSIONED),
+        Status.UNDER_MAINTENANCE: (Status.ACTIVE, Status.RMA, Status.DECOMMISSIONED),
         Status.RMA: (Status.IN_STOCK, Status.DECOMMISSIONED),
         Status.CLIENT_PROPERTY: (Status.DECOMMISSIONED,),
         Status.LOST_STOLEN: (Status.IN_STOCK,),
@@ -171,6 +185,12 @@ class Device(TimeStampedModel):
 
     purchase_date = models.DateField(null=True, blank=True)
     purchase_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # For an asset bought complete from a vendor: the purchase-order line that
+    # buys it. Receiving that line is what brings the asset into stock.
+    procurement_item = models.ForeignKey(
+        "procurement.PurchaseOrderItem", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="procured_devices",
+    )
     supplier = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True, related_name="devices"
     )
@@ -251,6 +271,26 @@ class Device(TimeStampedModel):
     def can_transition_to(self, new_status: str) -> bool:
         allowed = self.VALID_TRANSITIONS.get(self.status, ())
         return new_status in allowed
+
+    @property
+    def is_locked(self) -> bool:
+        """Once the project is executing, the build definition is fixed.
+
+        The budget that was approved priced *this* parts list and *this* route;
+        changing either afterwards would make the approval meaningless. Status
+        still moves — the build progresses — but what it is built from does not.
+        """
+        plan = getattr(self.project, "cost_plan", None) if self.project_id else None
+        if plan is not None and plan.status == "approved":
+            return True
+        # An asset in a project's scope is bound by that project's budget too.
+        from apps.teams.models import ProjectScopeItem
+
+        if ProjectScopeItem.objects.filter(device=self, project__cost_plan__status="approved").exists():
+            return True
+        return self.components.filter(
+            models.Q(issued_quantity__gt=0) | models.Q(purchase_order_item__isnull=False)
+        ).exists()
 
 
 class ProductionRouteTemplate(TimeStampedModel):
@@ -405,6 +445,7 @@ class ProductionStep(TimeStampedModel):
     # What the planner expects this operation to cost. Unset until someone
     # prices it — an unpriced step is not a free step.
     planned_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    actual_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     sent_at = models.DateTimeField(null=True, blank=True)
     returned_at = models.DateTimeField(null=True, blank=True)
@@ -515,6 +556,9 @@ class AssetComponent(TimeStampedModel):
         "procurement.PurchaseOrderItem", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="asset_components", help_text="PO line raised to cover this requirement",
     )
+    # Unit of measure carried from the component definition, kept here so a
+    # requirement still reads correctly if the definition changes later.
+    unit = models.CharField(max_length=50, blank=True)
     # A price the planner sets by hand, when they know something the record
     # does not — a fresh quote, a price rise. Overrides the derived price.
     planned_unit_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
@@ -534,6 +578,19 @@ class AssetComponent(TimeStampedModel):
 
     class Meta:
         ordering = ["name"]
+        constraints = [
+            # One line per component per asset; more of it is a bigger quantity.
+            models.UniqueConstraint(
+                fields=["device", "inventory_item"],
+                condition=models.Q(inventory_item__isnull=False),
+                name="uniq_component_generic_per_device",
+            ),
+            models.UniqueConstraint(
+                fields=["device", "inventory_unit_type"],
+                condition=models.Q(inventory_unit_type__isnull=False),
+                name="uniq_component_unique_per_device",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.device.asset_code} · {self.name} ×{self.quantity}"

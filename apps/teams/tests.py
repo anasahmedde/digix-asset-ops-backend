@@ -430,7 +430,9 @@ def test_requirements_do_not_duplicate_an_asset_linked_both_ways(db):
     brand = Brand.objects.create(name="Both Brand")
     model = DeviceModel.objects.create(brand=brand, name="BW-1")
     device = Device.objects.create(device_model=model, serial_number="BW-1", project=project)
-    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    # Each asset appears once per project: the link above already made its
+    # scope row, so a second add is a no-op rather than a duplicate.
+    ProjectScopeItem.objects.get_or_create(project=project, device=device, defaults={"quantity": 1})
 
     c = APIClient(); c.force_authenticate(admin)
     r = c.get(f"/api/teams/projects/{project.id}/requirements/")

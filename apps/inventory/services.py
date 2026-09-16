@@ -213,7 +213,12 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
     if accepted_quantity:
         if route == GoodsReceiptLine.Route.GENERIC:
             generic = generic or {}
-            material_type_id = generic.get("material_type") or (po_item.material_type_id if po_item else None)
+            material_type_id = (
+                generic.get("material_type")
+                or (po_item.material_type_id if po_item else None)
+                # a return names the stock row it came from
+                or (line.inventory_item.material_type_id if line.inventory_item_id else None)
+            )
             if not material_type_id:
                 raise serializers.ValidationError(
                     {"generic": "This line has no material type — pick one to stock it as generic."}
@@ -221,8 +226,10 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
             # Prefer the row the purchase was raised against; only fall back to
             # matching on material when the line does not name one, otherwise
             # goods land on a different row than the requirement is watching.
-            named_item_id = (generic or {}).get("inventory_item") or (
-                po_item.inventory_item_id if po_item else None
+            named_item_id = (
+                (generic or {}).get("inventory_item")
+                or (po_item.inventory_item_id if po_item else None)
+                or line.inventory_item_id
             )
             inventory_item = (
                 InventoryItem.objects.select_for_update().filter(pk=named_item_id).first()
@@ -287,9 +294,12 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
             po_model = po_item.device_model if po_item and po_item.device_model_id else None
             # The PO line may already name the opened product; otherwise the
             # inspector can supply it once for the whole line.
+            stashed = (line.inspection_notes or "")
             line_unit_type_id = (
                 (po_item.inventory_unit_type_id if po_item else None)
                 or (generic or {}).get("unit_type")
+                # a return of a unique component names its product on the line
+                or (stashed.split("unit_type:", 1)[1].split()[0] if "unit_type:" in stashed else None)
             )
             for payload in units:
                 material = payload.get("material_type") or material_type_id
@@ -317,9 +327,17 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
                     # Batch + receipt link: this is the trace back to the PO.
                     batch_number=batch,
                     goods_receipt_line=line,
-                    has_warranty=bool(payload.get("has_warranty")),
-                    warranty_type=payload.get("warranty_type", "") or "",
-                    warranty_start=payload.get("warranty_start"),
+                    # Item 23: the storekeeper types the term; the start is the
+                    # day the part arrived and the vendor gave the cover.
+                    has_warranty=bool(payload.get("warranty_months")) or bool(payload.get("has_warranty")),
+                    warranty_type=(
+                        payload.get("warranty_type") or "supplier"
+                        if (payload.get("warranty_months") or payload.get("has_warranty")) else ""
+                    ),
+                    warranty_start=(
+                        (payload.get("warranty_start") or timezone.localdate())
+                        if (payload.get("warranty_months") or payload.get("has_warranty")) else None
+                    ),
                     warranty_months=payload.get("warranty_months"),
                     warranty_end=payload.get("warranty_end"),
                     notes=f"Received on {trace}",

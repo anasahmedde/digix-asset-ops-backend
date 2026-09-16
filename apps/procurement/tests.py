@@ -21,6 +21,9 @@ def people(db):
         "finance": User.objects.create_user(username="po-fin", password="x", role="finance"),
         "ops": User.objects.create_user(username="po-ops", password="x", role="ops_manager"),
         "tech": User.objects.create_user(username="po-tech", password="x", role="technician"),
+        # Deliveries are checked by a supervisor; the Group Head signs orders off.
+        "inspector": User.objects.create_user(username="po-insp", password="x", role="supervisor"),
+        "group_head": User.objects.create_user(username="po-gh", password="x", role="group_head"),
     }
 
 
@@ -195,7 +198,7 @@ def test_item_writes_rejected_after_approval(people, supplier):
     )
     assert r.status_code == 200, r.content
 
-    assert _client(people["ops"]).post(f"/api/procurement/orders/{pid}/transition/", {"status": "approved"}, format="json").status_code == 200
+    assert _client(people["group_head"]).post(f"/api/procurement/orders/{pid}/transition/", {"status": "approved"}, format="json").status_code == 200
 
     # approved — nested item writes rejected with a clear error
     r = c.patch(
@@ -243,11 +246,11 @@ def test_full_transition_flow_and_approved_by_stamp(people, supplier):
     assert r.status_code == 200, r.content
 
     c_ops = _client(people["ops"])
-    r = c_ops.post(f"/api/procurement/orders/{pid}/transition/", {"status": "approved", "notes": "ok"}, format="json")
+    r = _client(people["group_head"]).post(f"/api/procurement/orders/{pid}/transition/", {"status": "approved", "notes": "ok"}, format="json")
     assert r.status_code == 200, r.content
     po = PurchaseOrder.objects.get(pk=pid)
     assert po.status == "approved"
-    assert po.approved_by == people["ops"]
+    assert po.approved_by == people["group_head"]  # the signature is the Group Head's
 
     assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "ordered"}, format="json").status_code == 200
     assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "partially_received"}, format="json").status_code == 200
@@ -259,7 +262,7 @@ def test_full_transition_flow_and_approved_by_stamp(people, supplier):
 @pytest.mark.django_db
 def test_transition_role_gated(people, supplier):
     body = _create_po(_client(people["finance"]), supplier)
-    c_tech = _client(people["tech"])
+    c_tech = _client(people["inspector"])
     r = c_tech.post(f"/api/procurement/orders/{body['id']}/transition/", {"status": "pending_approval"}, format="json")
     assert r.status_code == 403
     # read stays open
@@ -505,7 +508,7 @@ def test_from_shortage_rejects_foreign_line_ids(people, supplier, bom_project):
 
 @pytest.mark.django_db
 def test_from_shortage_role_gated(people, supplier, bom_project):
-    r = _client(people["tech"]).post(
+    r = _client(people["inspector"]).post(
         "/api/procurement/purchase-orders/from-shortage/",
         {"project": str(bom_project["project"].id), "supplier": str(supplier.id)},
         format="json",
@@ -606,7 +609,7 @@ def test_receive_serialized_line_creates_devices(people, supplier, receivable_po
     # A technician inspects and routes them into unique inventory.
     line_id = body["lines"][0]["id"]
     ins = _inspect(
-        _client(people["tech"]), line_id, route="unique", accepted_quantity=3,
+        _client(people["inspector"]), line_id, route="unique", accepted_quantity=3,
         units=[{"serial_number": sn} for sn in ["GRN-SN-A", "GRN-SN-B", "GRN-SN-C"]],
     )
     assert ins.status_code == 200, ins.content
@@ -735,7 +738,7 @@ def test_receive_consumable_updates_stock_and_movement(people, receivable_po):
     assert stock.quantity == 5
 
     ins = _inspect(
-        _client(people["tech"]), body["lines"][0]["id"],
+        _client(people["inspector"]), body["lines"][0]["id"],
         route="generic", accepted_quantity=10,
     )
     assert ins.status_code == 200, ins.content
@@ -774,7 +777,7 @@ def test_receive_consumable_creates_inventory_item_when_missing(people, receivab
     assert not InventoryItem.objects.filter(material_type=material).exists()
 
     ins = _inspect(
-        _client(people["tech"]), r.json()["lines"][0]["id"],
+        _client(people["inspector"]), r.json()["lines"][0]["id"],
         route="generic", accepted_quantity=7,
     )
     assert ins.status_code == 200, ins.content
@@ -804,7 +807,7 @@ def test_receive_mixed_po_single_call(people, receivable_po):
     assert len(body["lines"]) == 2
     assert body["pending_inspection"] == 2
 
-    tech = _client(people["tech"])
+    tech = _client(people["inspector"])
     by_item = _lines(body)
     ok = _inspect(tech, by_item[str(serialized.pk)], route="unique", accepted_quantity=3,
                   units=[{"serial_number": sn} for sn in ["MX-A", "MX-B", "MX-C"]])
@@ -906,7 +909,7 @@ def test_receive_bom_line_sets_project_and_allocation(people, receivable_po):
     # Allocation happens once the goods pass inspection, not at the door.
     assert not BOMAllocation.objects.filter(bom_line=bom_line).exists()
 
-    tech_user = people["tech"]
+    tech_user = people["inspector"]
     ins = _inspect(
         _client(tech_user), r.json()["lines"][0]["id"], route="unique", accepted_quantity=2,
         units=[{"serial_number": sn} for sn in ["BOM-1", "BOM-2"]],
@@ -928,7 +931,7 @@ def test_receive_bom_line_sets_project_and_allocation(people, receivable_po):
 
 @pytest.mark.django_db
 def test_receive_role_gated(people, receivable_po):
-    r = _receive(_client(people["tech"]), receivable_po["po"].pk, [{
+    r = _receive(_client(people["inspector"]), receivable_po["po"].pk, [{
         "po_item": str(receivable_po["consumable"].pk), "quantity": 1,
     }])
     assert r.status_code == 403
@@ -1050,7 +1053,10 @@ def test_receiving_a_product_line_only_needs_serials(people, requisitions, suppl
     item_id = po_resp.data["items"][0]["id"]
 
     for st in ("pending_approval", "approved", "ordered"):
-        c.post(f"/api/procurement/purchase-orders/{po_id}/transition/", {"status": st}, format="json")
+        # Approval is the Group Head's step; the rest is Operations/Finance.
+        mover = _client(people["group_head"]) if st == "approved" else c
+        r_st = mover.post(f"/api/procurement/purchase-orders/{po_id}/transition/", {"status": st}, format="json")
+        assert r_st.status_code == 200, r_st.content
 
     received = _receive(c, po_id, [{
         "po_item": item_id, "quantity": 3, "batch_number": "REQ-B1",
@@ -1061,7 +1067,7 @@ def test_receiving_a_product_line_only_needs_serials(people, requisitions, suppl
     line_id = received.json()["lines"][0]["id"]
     # Serial only — the opened product on the PO line supplies the rest.
     ins = _inspect(
-        _client(people["tech"]), line_id, route="unique", accepted_quantity=3,
+        _client(people["inspector"]), line_id, route="unique", accepted_quantity=3,
         units=[{"serial_number": s} for s in ["RQ-1", "RQ-2", "RQ-3"]],
     )
     assert ins.status_code == 200, ins.content
