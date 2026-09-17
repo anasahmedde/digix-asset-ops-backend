@@ -228,10 +228,8 @@ class InventoryUnitSerializer(serializers.ModelSerializer):
             )
 
         if current("has_warranty"):
-            if not current("warranty_type"):
-                raise serializers.ValidationError(
-                    {"warranty_type": "Select a warranty type, or clear 'has warranty'."}
-                )
+            # A part's cover comes from the supplier it was received from.
+            attrs["warranty_type"] = "supplier"
             if not current("warranty_start"):
                 raise serializers.ValidationError(
                     {"warranty_start": "A warranty needs a start date."}
@@ -371,6 +369,20 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
         source="inspected_by.get_full_name", read_only=True, default=None
     )
     stocked_unit_count = serializers.SerializerMethodField()
+    # The unit the delivered quantity is counted in.
+    unit = serializers.SerializerMethodField()
+
+    def get_unit(self, obj):
+        po = obj.po_item
+        if po is not None and po.inventory_unit_type_id:
+            return po.inventory_unit_type.unit or "piece"
+        if obj.inventory_item_id and obj.inventory_item.material_type_id:
+            return obj.inventory_item.material_type.unit or "piece"
+        if po is not None and po.material_type_id:
+            return po.material_type.unit or "piece"
+        if po is not None and po.procured_devices.exists():
+            return "asset"
+        return "piece"
 
     class Meta:
         model = GoodsReceiptLine
@@ -378,7 +390,7 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             "id", "receipt", "grn_number", "po_number", "supplier_name",
             "po_item", "po_item_description", "material_type", "material_name", "device_model_name",
             "inventory_item", "inventory_item_name",
-            "quantity", "batch_number", "serial_numbers",
+            "quantity", "unit", "batch_number", "serial_numbers",
             "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
             "inspected_by", "inspected_by_name", "inspected_at", "inspection_notes",
             "stocked_unit_count", "created_at",

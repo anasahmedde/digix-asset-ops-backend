@@ -330,8 +330,9 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
                     # Item 23: the storekeeper types the term; the start is the
                     # day the part arrived and the vendor gave the cover.
                     has_warranty=bool(payload.get("warranty_months")) or bool(payload.get("has_warranty")),
+                    # A part is received from its supplier: that is whose cover it carries.
                     warranty_type=(
-                        payload.get("warranty_type") or "supplier"
+                        "supplier"
                         if (payload.get("warranty_months") or payload.get("has_warranty")) else ""
                     ),
                     warranty_start=(

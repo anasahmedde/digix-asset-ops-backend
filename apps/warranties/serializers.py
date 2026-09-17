@@ -35,6 +35,10 @@ class WarrantySerializer(serializers.ModelSerializer):
         if component and device and component.device_id != device.id:
             raise serializers.ValidationError({"component": "Component does not belong to this device."})
 
+        # A part's cover is its supplier's: the one kind there is on a component.
+        if component or (self.instance is not None and self.instance.component_id):
+            attrs["warranty_type"] = Warranty.WarrantyType.SUPPLIER
+
         if self.instance is None:
             # Cover from outside on the asset itself is the vendor's warranty,
             # whatever the paperwork calls it. Manufacturer and extended cover

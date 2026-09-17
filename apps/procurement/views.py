@@ -193,6 +193,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 "project": project_pk,
                 "project_name": project_name,
                 "required_quantity": 1,
+                "unit": "asset",
                 "outstanding_quantity": 0 if d.procurement_item_id else 1,
                 "available_quantity": None,
                 "unit_price": d.purchase_price,
@@ -225,6 +226,11 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 "project": project_pk,
                 "project_name": project_name,
                 "required_quantity": c.quantity,
+                "unit": c.unit or (
+                    (c.inventory_unit_type.unit or "piece") if c.inventory_unit_type_id
+                    else (c.inventory_item.material_type.unit or "piece")
+                    if c.inventory_item_id and c.inventory_item.material_type_id else "piece"
+                ),
                 "outstanding_quantity": _to_buy(c),
                 "available_quantity": c.available_quantity,
                 "inventory_item": str(c.inventory_item_id) if c.inventory_item_id else None,

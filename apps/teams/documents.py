@@ -126,7 +126,7 @@ def render_cost_plan_pdf(project, plan: dict) -> bytes:
     story.append(Paragraph("<b>Asset Development Cost</b>", s["section"]))
     story.append(Spacer(1, 2 * mm))
     rows = [[
-        Paragraph("ITEM", s["head"]), Paragraph("QTY", s["headr"]), Paragraph("UNIT", s["head"]),
+        Paragraph("ITEM", s["head"]), Paragraph("QTY", s["headr"]),
         Paragraph("UNIT PRICE", s["headr"]), Paragraph("AMOUNT", s["headr"]),
     ]]
     bands = []
@@ -135,31 +135,41 @@ def render_cost_plan_pdf(project, plan: dict) -> bytes:
         bands.append(len(rows))
         rows.append([
             Paragraph(f"<b>{asset['asset_code']}</b>  {asset.get('asset_name', '')}", s["cell"]),
-            "", "", "",
+            "", "",
             Paragraph(f"<b>{_money(asset['asset_total'])}</b>", s["num"]),
         ])
+        if asset.get("vendor_asset"):
+            # Bought complete: one line, priced as the vendor quoted it.
+            price = asset.get("asset_price")
+            rows.append([
+                Paragraph("&nbsp;&nbsp;&nbsp;Complete asset from the vendor"
+                          + (f"  <font color='#6b7280'>{asset['supply_vendor_name']}</font>" if asset.get("supply_vendor_name") else ""), s["cell"]),
+                Paragraph("1 asset", s["num"]),
+                Paragraph(_money(price) if price is not None else "No price on record", s["num"]),
+                Paragraph(_money(price) if price is not None else "—", s["num"]),
+            ])
+            continue
         lines = [m for m in materials if m["asset_code"] == asset["asset_code"]]
-        rows.append([Paragraph("Components", s["head"]), "", "", "",
+        rows.append([Paragraph("Components", s["head"]), "", "",
                      Paragraph(_money(asset["materials_total"]), s["num"])])
         for m in lines:
             rows.append([
                 Paragraph(f"&nbsp;&nbsp;&nbsp;{m['name']}", s["cell"]),
-                Paragraph(str(m["quantity"]), s["num"]),
-                Paragraph(m.get("unit") or "", s["cell"]),
+                Paragraph(f"{m['quantity']} {m.get('unit') or 'piece'}", s["num"]),
                 Paragraph(_money(m["unit_price"]), s["num"]),
                 Paragraph(_money(m["line_total"]), s["num"]),
             ])
-        rows.append([Paragraph("Production", s["head"]), "", "", "",
+        rows.append([Paragraph("Production", s["head"]), "", "",
                      Paragraph(_money(asset["production_total"]), s["num"])])
         for step in asset.get("steps", []):
             rows.append([
                 Paragraph(f"&nbsp;&nbsp;&nbsp;{step['step_number']}. {step['name']}", s["cell"]),
-                "", "", "",
+                "", "",
                 Paragraph(_money(step["planned_cost"]), s["num"]),
             ])
     if len(rows) == 1:
-        rows.append([Paragraph("No assets on this project yet.", s["cell"]), "", "", "", ""])
-    story.append(_grid(rows, [86, 14, 18, 28, 28], s, bands))
+        rows.append([Paragraph("No assets on this project yet.", s["cell"]), "", "", ""])
+    story.append(_grid(rows, [86, 32, 28, 28], s, bands))
     story.append(Spacer(1, 5 * mm))
 
     # ── Overheads ──
@@ -213,22 +223,21 @@ def render_boq_pdf(project, boq: dict) -> bytes:
 
     rows = [[
         Paragraph("#", s["head"]), Paragraph("COMPONENT", s["head"]), Paragraph("QTY", s["headr"]),
-        Paragraph("UNIT", s["head"]), Paragraph("UNIT PRICE", s["headr"]), Paragraph("AMOUNT", s["headr"]),
+        Paragraph("UNIT PRICE", s["headr"]), Paragraph("AMOUNT", s["headr"]),
         Paragraph("USED ON", s["head"]),
     ]]
     for n, line in enumerate(boq.get("lines", []), start=1):
         rows.append([
             Paragraph(str(n), s["cell"]),
             Paragraph(line["name"], s["cell"]),
-            Paragraph(str(line["quantity"]), s["num"]),
-            Paragraph(line.get("unit") or "", s["cell"]),
+            Paragraph(f"{line['quantity']} {line.get('unit') or 'piece'}", s["num"]),
             Paragraph(_money(line["unit_price"]), s["num"]),
             Paragraph(_money(line["amount"]), s["num"]),
             Paragraph(", ".join(line.get("assets", [])), s["head"]),
         ])
     if len(rows) == 1:
-        rows.append([Paragraph("No components on this project yet.", s["cell"]), "", "", "", "", "", ""])
-    story.append(_grid(rows, [8, 52, 14, 14, 26, 26, 34], s))
+        rows.append([Paragraph("No components on this project yet.", s["cell"]), "", "", "", "", ""])
+    story.append(_grid(rows, [8, 52, 28, 26, 26, 34], s))
     story.append(Spacer(1, 4 * mm))
 
     total = Table(
@@ -309,8 +318,8 @@ def render_actuals_pdf(project, actuals: dict) -> bytes:
             for m in asset.get("lines", []):
                 rows.append([
                     Paragraph(f"&nbsp;&nbsp;&nbsp;{m['name']}", s["cell"]),
-                    Paragraph(str(m["required"]), s["num"]),
-                    Paragraph(str(m["issued"]), s["num"]),
+                    Paragraph(f"{m['required']} {m.get('unit') or 'piece'}", s["num"]),
+                    Paragraph(f"{m['issued']} {m.get('unit') or 'piece'}", s["num"]),
                     Paragraph(_money(m["unit_price"]), s["num"]),
                     Paragraph(m.get("price_source") or "", s["cell"]),
                     Paragraph(_money(m["line_total"]), s["num"]),
