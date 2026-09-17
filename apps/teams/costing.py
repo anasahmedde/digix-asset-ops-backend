@@ -249,10 +249,13 @@ def build_actuals(project):
 
     assets = []
     materials_actual = Decimal("0")
+    production_actual = Decimal("0")
+    work_orders_actual = Decimal("0")
     devices = project_devices(project).prefetch_related(
         "components__inventory_item__material_type",
         "components__inventory_unit_type",
         "components__purchase_order_item__purchase_order",
+        "production_steps", "work_orders",
     )
     for device in devices:
         lines = []
@@ -275,12 +278,54 @@ def build_actuals(project):
                 "line_total": line_total,
             })
         materials_actual += asset_total
+
+        # The build itself: each operation as it actually cost. A step with
+        # no actual yet is not free — it is simply not known.
+        steps = []
+        asset_production = Decimal("0")
+        for step in sorted(device.production_steps.all(), key=lambda x: x.step_number):
+            actual = None if step.actual_cost is None else money(step.actual_cost)
+            if actual is not None:
+                asset_production += actual
+            steps.append({
+                "id": str(step.pk),
+                "step_number": step.step_number,
+                "name": step.name,
+                "status": step.status,
+                "planned_cost": None if step.planned_cost is None else money(step.planned_cost),
+                "actual_cost": actual,
+            })
+        production_actual += asset_production
+
+        # A vendor-built asset costs what its work orders come to.
+        work_orders = []
+        asset_work_orders = Decimal("0")
+        for order in device.work_orders.all():
+            if order.status == "cancelled":
+                continue
+            amount = money(order.total_amount)
+            asset_work_orders += amount
+            work_orders.append({
+                "id": str(order.pk),
+                "wo_number": order.wo_number,
+                "status": order.status,
+                "supplier": order.supplier.name if order.supplier_id else "",
+                "amount": amount,
+            })
+        work_orders_actual += asset_work_orders
+
         assets.append({
             "id": str(device.pk),
             "asset_code": device.asset_code,
             "asset_name": device.display_name or "",
+            "source": device.source,
             "lines": lines,
-            "actual_total": money(asset_total),
+            "steps": steps,
+            "work_orders": work_orders,
+            "materials_actual": money(asset_total),
+            "production_actual": money(asset_production),
+            "work_orders_actual": money(asset_work_orders),
+            "actual_total": money(asset_total + asset_production + asset_work_orders),
             "outstanding": outstanding,
         })
 
@@ -304,7 +349,7 @@ def build_actuals(project):
             "unplanned": planned == 0,
         })
 
-    total = money(materials_actual + actual_total)
+    total = money(materials_actual + production_actual + work_orders_actual + actual_total)
     approved = plan.approved_total if plan else None
     return {
         "project": str(project.pk),
@@ -313,6 +358,8 @@ def build_actuals(project):
         "estimate_total": estimate["total"],
         "assets": assets,
         "materials_actual": money(materials_actual),
+        "production_actual": money(production_actual),
+        "work_orders_actual": money(work_orders_actual),
         "overheads": overheads,
         "overheads_planned_total": money(planned_total),
         "overheads_actual_total": money(actual_total),
@@ -321,3 +368,49 @@ def build_actuals(project):
         "variance_vs_approved": None if approved is None else money(total - approved),
         "cost_types": estimate["cost_types"],
     }
+
+
+def build_boq(project):
+    """Bill of quantities: the same component on several assets is one line.
+
+    A BOM is per asset; the BOQ is what the buyer works from — one row per
+    component with the total quantity across every asset on the project.
+    """
+    devices = project_devices(project).prefetch_related(
+        "components__inventory_item__material_type", "components__inventory_unit_type",
+    )
+    rows = {}
+    for device in devices:
+        for component in device.components.all():
+            key = (
+                ("item", component.inventory_item_id) if component.inventory_item_id
+                else ("unit", component.inventory_unit_type_id) if component.inventory_unit_type_id
+                else ("name", component.name.strip().lower())
+            )
+            row = rows.get(key)
+            if row is None:
+                price, source = component_unit_price(component)
+                row = rows[key] = {
+                    "name": component.name,
+                    "unit": component.unit or (
+                        component.inventory_item.material_type.unit if component.inventory_item_id
+                        else component.inventory_unit_type.unit if component.inventory_unit_type_id
+                        else ""
+                    ),
+                    "quantity": 0,
+                    "unit_price": price,
+                    "price_source": source,
+                    "assets": [],
+                }
+            row["quantity"] += component.quantity
+            row["assets"].append(f"{device.asset_code} ×{component.quantity}")
+
+    lines = []
+    total = Decimal("0")
+    for row in sorted(rows.values(), key=lambda r: r["name"].lower()):
+        amount = money(row["unit_price"] * row["quantity"]) if row["unit_price"] is not None else None
+        if amount is not None:
+            total += amount
+        lines.append({**row, "amount": amount})
+    return {"project": str(project.pk), "lines": lines, "total": money(total),
+            "unpriced_lines": sum(1 for l in lines if l["amount"] is None)}

@@ -205,7 +205,9 @@ def escalate_overdue_tickets():
         breached = Ticket.objects.filter(
             status__in=ACTIVE_STATUSES,
             due_date__isnull=False,
-            due_date__lt=now.date(),
+            # localdate, to match the local-midnight anchor below. now.date()
+            # is the UTC date, which runs a day behind for part of every day.
+            due_date__lt=timezone.localdate(),
         ).select_related("device")
         for ticket in breached:
             anchor = _due_date_anchor(ticket.due_date)

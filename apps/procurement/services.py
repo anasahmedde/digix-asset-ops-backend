@@ -66,6 +66,20 @@ def _validate_lines(purchase_order, lines):
                 })
             if any(not s for s in serials):
                 raise serializers.ValidationError({label: "Serial numbers cannot be blank."})
+        elif po_item.procured_devices.exists():
+            # A complete asset bought from a vendor. It is already in the
+            # registry, so serials are optional here — given, they are stamped
+            # on the arriving assets (one per unit) and may repeat what was
+            # typed at registration.
+            if serials and len(serials) != line["quantity"]:
+                raise serializers.ValidationError({
+                    label: (
+                        f"'{po_item.description}' arrives as {line['quantity']} asset(s): give one "
+                        f"serial number each, or none."
+                    )
+                })
+            own = set(po_item.procured_devices.values_list("serial_number", flat=True))
+            serials = [x for x in serials if x not in own]
         elif not po_item.material_type_id:
             raise serializers.ValidationError(
                 {label: "line has no unique product, device model or material type"}
@@ -135,6 +149,49 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
 
             po_item.received_quantity += qty
             po_item.save(update_fields=["received_quantity", "updated_at"])
+
+            # A line that buys complete assets is not stock to inspect: the
+            # assets already exist in the registry and now physically arrive.
+            # They come into stock, priced at what the order paid, with the
+            # vendor's warranty running from today if a term was given.
+            arriving = list(po_item.procured_devices.filter(status="procured")[:qty])
+            if arriving:
+                from dateutil.relativedelta import relativedelta
+
+                from apps.warranties.models import Warranty
+
+                today = timezone.localdate()
+                months = line.get("warranty_months")
+                typed = line.get("serial_numbers") or []
+                for idx, device in enumerate(arriving):
+                    device._transition_user = user
+                    device._transition_reason = f"Received against {purchase_order.po_number}"
+                    device.status = "in_stock"
+                    device.purchase_date = today
+                    device.purchase_price = po_item.unit_price
+                    device.supplier = purchase_order.supplier
+                    fields = ["status", "purchase_date", "purchase_price", "supplier", "updated_at"]
+                    if idx < len(typed) and typed[idx] and typed[idx] != device.serial_number:
+                        device.serial_number = typed[idx]
+                        fields.append("serial_number")
+                    device.save(update_fields=fields)
+                    if months:
+                        Warranty.objects.create(
+                            device=device,
+                            supplier=purchase_order.supplier,
+                            warranty_type="supplier",
+                            status="active",
+                            start_date=today,
+                            end_date=today + relativedelta(months=int(months)),
+                            months=int(months),
+                        )
+                receipt_lines[-1].inspection_status = GoodsReceiptLine.Inspection.PASSED
+                receipt_lines[-1].inspection_notes = "Complete asset — entered the registry directly."
+                receipt_lines[-1].inspected_by = user
+                receipt_lines[-1].inspected_at = timezone.now()
+                receipt_lines[-1].save(update_fields=[
+                    "inspection_status", "inspection_notes", "inspected_by", "inspected_at", "updated_at",
+                ])
 
         # Auto-advance the PO — a system transition, not a user one: set the
         # status directly (bypassing the role-gated endpoint) and journal it

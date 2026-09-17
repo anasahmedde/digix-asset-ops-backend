@@ -6,7 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import AdminManagerWriteElseRead
+from common.permissions import CommercialWriteElseRead
 
 from .models import Quotation
 from .pdf import build_quotation_pdf
@@ -52,7 +52,7 @@ class QuotationViewSet(viewsets.ModelViewSet):
         .all()
     )
     serializer_class = QuotationSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
     filterset_fields = ["status", "client", "site", "currency"]
     search_fields = ["quote_number", "title", "description"]
     ordering_fields = ["created_at", "valid_until", "total_amount"]

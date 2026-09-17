@@ -165,6 +165,103 @@ class ProjectViewSet(viewsets.ModelViewSet):
             plan.save(update_fields=["contingency_percent", "updated_at"])
         return Response(build_plan(project))
 
+    @action(detail=True, methods=["get"], url_path="plan/document")
+    def plan_document(self, request, pk=None):
+        """The cost plan as a PDF, for approval or the file."""
+        from django.http import HttpResponse
+
+        from .costing import build_plan
+        from .documents import render_cost_plan_pdf
+
+        project = self.get_object()
+        pdf = render_cost_plan_pdf(project, build_plan(project))
+        response = HttpResponse(pdf, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="cost-plan-{project.name}.pdf"'
+        return response
+
+    @action(detail=True, methods=["get"], url_path="boq")
+    def boq(self, request, pk=None):
+        """Bill of quantities: every component the whole project needs."""
+        from .costing import build_boq
+
+        return Response(build_boq(self.get_object()))
+
+    @action(detail=True, methods=["get"], url_path="boq/document")
+    def boq_document(self, request, pk=None):
+        from django.http import HttpResponse
+
+        from .costing import build_boq
+        from .documents import render_boq_pdf
+
+        project = self.get_object()
+        pdf = render_boq_pdf(project, build_boq(project))
+        response = HttpResponse(pdf, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="boq-{project.name}.pdf"'
+        return response
+
+    @action(detail=True, methods=["post"], url_path="raise-work-order")
+    def raise_work_order(self, request, pk=None):
+        """A work order for a vendor-built asset, the way a PO covers a part.
+
+        Body: device, supplier, optional amount, expected_delivery, notes.
+        The order type follows the asset's route: supplied-only, or supplied
+        and installed. It lands in Work Orders as a draft.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        from apps.assets.models import Device
+        from apps.suppliers.models import Supplier
+        from apps.workorders.models import WorkOrder, WorkOrderItem
+
+        project = self.get_object()
+        blocked = self._execution_blocked(project)
+        if blocked is not None:
+            return blocked
+        device = Device.objects.filter(pk=request.data.get("device")).first()
+        if device is None:
+            return Response({"device": ["Choose the asset the vendor is building."]}, status=400)
+        if device.source == Device.Source.INHOUSE:
+            return Response({"device": ["An in-house build is not given to a vendor."]}, status=400)
+        supplier = Supplier.objects.filter(pk=request.data.get("supplier")).first()
+        if supplier is None:
+            return Response({"supplier": ["Choose the vendor."]}, status=400)
+        if device.work_orders.exclude(status="cancelled").exists():
+            return Response({"device": [f"{device.asset_code} already has a work order."]}, status=400)
+        try:
+            amount = Decimal(str(request.data.get("amount") or device.purchase_price or 0))
+        except (InvalidOperation, ValueError):
+            amount = Decimal("0")
+
+        order_type = (
+            WorkOrder.OrderType.SUPPLY_INSTALL
+            if device.source == Device.Source.VENDOR_TURNKEY else WorkOrder.OrderType.SUPPLY
+        )
+        with transaction.atomic():
+            order = WorkOrder.objects.create(
+                title=f"{device.display_name or device.asset_code} — {project.name}",
+                description=(request.data.get("notes") or "").strip(),
+                order_type=order_type,
+                supplier=supplier,
+                client=project.client,
+                site=device.current_site or project.site,
+                project=project,
+                device=device,
+                expected_delivery=request.data.get("expected_delivery") or None,
+                created_by=request.user,
+            )
+            WorkOrderItem.objects.create(
+                work_order=order,
+                asset_type=device.asset_type,
+                device_model=device.device_model,
+                description=f"{device.display_name or device.asset_code} ({device.get_source_display()})",
+                quantity=1,
+                unit_price=amount,
+            )
+            order.recalc_total()
+        from apps.workorders.serializers import WorkOrderSerializer
+
+        return Response(WorkOrderSerializer(order).data, status=201)
+
     @action(detail=True, methods=["get"], url_path="actuals")
     def actuals(self, request, pk=None):
         """What the project is actually costing, against what was approved."""

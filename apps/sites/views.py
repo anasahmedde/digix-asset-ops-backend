@@ -9,19 +9,19 @@ from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
-from common.permissions import AdminManagerWriteElseRead
+from common.permissions import ADMIN_ROLES, AdminManagerWriteElseRead, CommercialWriteElseRead
 
 
 class IsSuperAdminOrAssignedInstaller(BasePermission):
     """Step/delay actions: the assigned installer (mobile), the installation's
-    vendor (portal login, XC-04) or a super admin (desktop)."""
+    vendor (portal login, XC-04) or a platform admin (desktop)."""
 
-    message = "Only the assigned installer or a super admin can do this."
+    message = "Only the assigned installer or a platform admin can do this."
 
     def has_object_permission(self, request, view, obj):
         installation = obj.installation if hasattr(obj, "installation") else obj
         user = request.user
-        if getattr(user, "role", None) == "super_admin":
+        if getattr(user, "role", None) in ADMIN_ROLES:
             return True
         if installation.installed_by_id == user.id:
             return True
@@ -59,7 +59,7 @@ from .serializers import (
 
 
 class SiteViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
     filterset_fields = ["client", "city", "state_province", "country", "is_active"]
     search_fields = ["name", "address", "city", "state_province"]
     ordering_fields = ["name", "created_at"]
@@ -81,7 +81,7 @@ class SiteViewSet(viewsets.ModelViewSet):
 class SiteContactViewSet(viewsets.ModelViewSet):
     queryset = SiteContact.objects.select_related("site").all()
     serializer_class = SiteContactSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
     filterset_fields = ["site", "is_primary"]
     search_fields = ["name", "email", "phone"]
 
@@ -89,7 +89,7 @@ class SiteContactViewSet(viewsets.ModelViewSet):
 class SiteZoneViewSet(viewsets.ModelViewSet):
     queryset = SiteZone.objects.select_related("site").all()
     serializer_class = SiteZoneSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
     filterset_fields = ["site"]
     search_fields = ["name"]
 
@@ -377,6 +377,36 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             device.status = "active"
             device.save(update_fields=["status", "updated_at"])
 
+            # 23: the client's warranty on our asset runs from the day it goes
+            # live. Only the term is typed; the dates follow from today.
+            raw_months = request.data.get("client_warranty_months")
+            if raw_months not in (None, ""):
+                try:
+                    months = int(raw_months)
+                except (TypeError, ValueError):
+                    months = 0
+                if months > 0:
+                    from dateutil.relativedelta import relativedelta
+
+                    from apps.warranties.models import Warranty
+
+                    start = timezone.localdate()
+                    existing = device.warranties.filter(
+                        warranty_type="client", component__isnull=True
+                    ).exclude(status__in=("void", "reissued")).order_by("-end_date").first()
+                    if existing is not None:
+                        existing.start_date = start
+                        existing.end_date = start + relativedelta(months=months)
+                        existing.months = months
+                        existing.status = "active"
+                        existing.save(update_fields=["start_date", "end_date", "months", "status", "updated_at"])
+                    else:
+                        Warranty.objects.create(
+                            device=device, warranty_type="client", status="active",
+                            start_date=start, end_date=start + relativedelta(months=months),
+                            months=months,
+                        )
+
         installation.refresh_from_db()
         installation._prefetched_objects_cache = {}
         return Response(
@@ -533,10 +563,10 @@ class InstallationDelayViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         installation = serializer.validated_data["installation"]
         user = self.request.user
-        if getattr(user, "role", None) != "super_admin" and installation.installed_by_id != user.id:
+        if getattr(user, "role", None) not in ADMIN_ROLES and installation.installed_by_id != user.id:
             from rest_framework.exceptions import PermissionDenied
 
-            raise PermissionDenied("Only the assigned installer or a super admin can flag a delay.")
+            raise PermissionDenied("Only the assigned installer or a platform admin can flag a delay.")
         serializer.save(reported_by=user)
 
 

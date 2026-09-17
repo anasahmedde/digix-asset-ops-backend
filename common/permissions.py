@@ -1,5 +1,7 @@
 from rest_framework.permissions import SAFE_METHODS, BasePermission
 
+# Platform administration: user accounts, roles, teams, audit log. Per the
+# client's signed authority matrix this is the Super Admin alone.
 ADMIN_ROLES = ("super_admin",)
 # Group Head is the escalation apex (oversees operations AND marketing) and
 # carries full manager powers.
@@ -7,9 +9,15 @@ MANAGER_ROLES = ("super_admin", "group_head", "ops_manager")
 # Supervisors sit between managers and technicians: they run field crews,
 # can act on tickets and review/approve their team's work.
 SUPERVISOR_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
+# The client-facing lead runs the commercial side alongside management.
+COMMERCIAL_ROLES = ("super_admin", "group_head", "ops_manager", "marketing_head")
 FIELD_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor", "technician")
-FINANCE_ROLES = ("super_admin", "finance")
+# No Finance position exists on the org chart, so the Group Head carries the
+# finance authority (signed off with the organogram).
+FINANCE_ROLES = ("super_admin", "group_head", "finance")
 WAREHOUSE_ROLES = ("super_admin", "group_head", "ops_manager", "warehouse")
+# Who physically hands material over against a request (approval gate 3).
+ISSUING_ROLES = ("super_admin", "ops_manager", "warehouse")
 ALL_INTERNAL_ROLES = (
     "super_admin", "group_head", "ops_manager", "marketing_head", "supervisor",
     "technician", "finance", "warehouse",
@@ -25,6 +33,8 @@ def _role(user):
 
 
 class IsSuperAdmin(BasePermission):
+    """Platform administration — the Super Admin (see ADMIN_ROLES)."""
+
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
             return False
@@ -50,13 +60,16 @@ class AdminManagerWriteElseRead(BasePermission):
 
 
 class FinanceWriteElseRead(BasePermission):
-    """Finance + Admin can write; everyone else is read-only."""
+    """Finance, Operations and Admin can write; everyone else is read-only."""
 
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
             return False
         if request.method in SAFE_METHODS:
             return True
+        # Procurement rights sit with Operations (client decision 2); the Group
+        # Head's lever is approving the budget that unlocks it, and signing
+        # off the order itself — see PurchaseOrderViewSet.transition.
         return _role(request.user) in ("super_admin", "ops_manager", "finance")
 
 
@@ -71,16 +84,40 @@ class WarehouseWriteElseRead(BasePermission):
         return _role(request.user) in WAREHOUSE_ROLES
 
 
+class PurchaseOrderActionElseRead(BasePermission):
+    """Moving a purchase order along: Operations/Finance/Admin raise and place
+    orders, and the Group Head signs them (the view limits the Group Head to
+    that step). Everyone authenticated may read."""
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.method in SAFE_METHODS:
+            return True
+        return _role(request.user) in ("super_admin", "ops_manager", "finance", "group_head")
+
+
 class InspectionWriteElseRead(BasePermission):
-    """Goods-receipt inspection: technicians and supervisors do the checking,
-    warehouse and management can too. Everyone authenticated may read."""
+    """Goods-receipt inspection: supervisors check deliveries, the store
+    receives them, management can do either. Everyone authenticated may read."""
 
     def has_permission(self, request, view):
         if not (request.user and request.user.is_authenticated):
             return False
         if request.method in SAFE_METHODS:
             return True
-        return _role(request.user) in set(FIELD_ROLES) | set(WAREHOUSE_ROLES)
+        return _role(request.user) in set(SUPERVISOR_ROLES) | set(WAREHOUSE_ROLES)
+
+
+class CommercialWriteElseRead(BasePermission):
+    """Management and the Marketing Head can write; everyone else is read-only."""
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.method in SAFE_METHODS:
+            return True
+        return _role(request.user) in COMMERCIAL_ROLES
 
 
 class TechnicianCanCreate(BasePermission):
@@ -108,9 +145,9 @@ class TechnicianCanCreate(BasePermission):
         if request.method in SAFE_METHODS:
             return True
         role = _role(request.user)
-        if role in MANAGER_ROLES:
+        if role in MANAGER_ROLES or role == "marketing_head":
             return True
-        if role in ("technician", "supervisor", "marketing", "marketing_head") and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
+        if role in ("technician", "supervisor", "marketing") and view.action in self.TECHNICIAN_ALLOWED_ACTIONS:
             return True
         if role in VENDOR_ROLES and view.action in self.VENDOR_ALLOWED_ACTIONS:
             return True

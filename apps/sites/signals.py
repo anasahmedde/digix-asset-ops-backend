@@ -139,13 +139,42 @@ def stamp_installation_completion(sender, instance: InstallationStep, **kwargs):
         installation.save(update_fields=["completed_at", "updated_at"])
 
 
+def installation_date_for(installation: DeviceInstallation):
+    """The date an installation actually went in.
+
+    A formal handover date wins when one exists — that is the date both sides
+    agreed on. Otherwise the checklist being finished is what happened, and
+    failing that the date the job was booked in for.
+    """
+    from django.utils import timezone
+
+    record = getattr(installation, "handover", None)
+    if record is not None and record.handover_date:
+        return record.handover_date
+    stamp = installation.completed_at or installation.installed_at
+    # localdate, not .date(): a job finished at 9pm in Karachi is still that
+    # day's work, and calling .date() on the UTC stamp would book it yesterday.
+    return timezone.localdate(stamp) if stamp else None
+
+
 def _mark_device_installed(installation: DeviceInstallation) -> None:
-    """Handover flips a pre-install asset to Installed — the registry status
-    stays honest without anyone editing it by hand."""
+    """Finishing the checklist flips a pre-install asset to Installed and
+    records when it went in — the registry stays honest without anyone
+    editing it by hand."""
     device = installation.device
+    fields = []
     if device.status in ("procured", "in_transit", "in_stock", "assigned"):
         device.status = "installed"
-        device.save(update_fields=["status", "updated_at"])
+        fields.append("status")
+    # Set even when the status was already moved by hand: the date belongs to
+    # the installation, so it should never have to be typed in.
+    if device.installation_date is None:
+        installed_on = installation_date_for(installation)
+        if installed_on is not None:
+            device.installation_date = installed_on
+            fields.append("installation_date")
+    if fields:
+        device.save(update_fields=[*fields, "updated_at"])
 
 
 def _anchor_client_warranties(installation: DeviceInstallation) -> None:

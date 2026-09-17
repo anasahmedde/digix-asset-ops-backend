@@ -61,6 +61,14 @@ class WorkOrder(TimeStampedModel):
         "sites.Site", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_orders"
     )
 
+    # Raised from a project's execution for a vendor-built asset, the way a PO
+    # is raised for a component. Its cost is that asset's actual cost.
+    project = models.ForeignKey(
+        "teams.Project", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_orders"
+    )
+    device = models.ForeignKey(
+        "assets.Device", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_orders"
+    )
     payment_terms = models.ForeignKey(
         "setup.PaymentTerms", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_orders"
     )

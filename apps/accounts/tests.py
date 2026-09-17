@@ -255,3 +255,98 @@ def test_supplier_field_admin_only_write(admin):
     assert r.status_code == 200, r.content
     vendor.refresh_from_db()
     assert vendor.supplier_id == other.id
+
+
+# ---------------------------------------------------------------------------
+# Authority matrix, as signed off with the client organogram: the Group Head
+# is the apex of the organisation and holds complete rights. There is no
+# Finance position on the org chart, so finance authority sits with them too.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def group_head(db):
+    return User.objects.create_user(username="acc-gh", password="x", role="group_head")
+
+
+@pytest.mark.django_db
+def test_user_administration_is_the_super_admins_alone(group_head):
+    """Client's signed matrix, gate 9: logins and roles are Super Admin only."""
+    c = _client(group_head)
+    r = c.post("/api/accounts/users/", {
+        "username": "gh-created", "password": "Str0ng-Pass!23", "role": "technician",
+    }, format="json")
+    assert r.status_code == 403, r.content
+    assert not User.objects.filter(username="gh-created").exists()
+
+    admin = User.objects.create_user(username="acc-sa", password="x", role="super_admin")
+    r = _client(admin).post("/api/accounts/users/", {
+        "username": "sa-created", "password": "Str0ng-Pass!23", "role": "technician",
+    }, format="json")
+    assert r.status_code == 201, r.content
+
+
+@pytest.mark.django_db
+def test_operations_raise_purchase_orders_and_the_group_head_signs_them(group_head):
+    """Client decision 2: procurement rights sit with Operations; the Group
+    Head's part is the sign-off. Neither can do the other's half."""
+    from apps.suppliers.models import Supplier
+
+    supplier = Supplier.objects.create(name="GH Authority Supplier")
+    payload = {
+        "supplier": str(supplier.id),
+        "items": [{"description": "Cable", "quantity": 2, "unit_price": "100.00"}],
+    }
+    # The Group Head does not raise orders…
+    r = _client(group_head).post("/api/procurement/purchase-orders/", payload, format="json")
+    assert r.status_code == 403, r.content
+
+    ops = User.objects.create_user(username="acc-ops-po", password="x", role="ops_manager")
+    r = _client(ops).post("/api/procurement/purchase-orders/", payload, format="json")
+    assert r.status_code == 201, r.content
+    po_id = r.data["id"]
+    r = _client(ops).post(f"/api/procurement/purchase-orders/{po_id}/transition/",
+                          {"status": "pending_approval"}, format="json")
+    assert r.status_code == 200, r.content
+
+    # …and Operations do not approve them.
+    r = _client(ops).post(f"/api/procurement/purchase-orders/{po_id}/transition/",
+                          {"status": "approved"}, format="json")
+    assert r.status_code == 403, r.content
+    r = _client(group_head).post(f"/api/procurement/purchase-orders/{po_id}/transition/",
+                                 {"status": "approved"}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["status"] == "approved"
+
+
+@pytest.mark.django_db
+def test_group_head_approves_a_budget_someone_else_submitted(group_head):
+    """With no Finance position, budget sign-off rests with the Group Head."""
+    from apps.teams.models import Project, ProjectBudget, ProjectCostLine
+
+    ops = User.objects.create_user(username="acc-ops", password="x", role="ops_manager")
+    project = Project.objects.create(name="Authority Matrix Project")
+    # An estimate of zero has nothing to approve.
+    ProjectCostLine.objects.create(project=project, cost_type="Travelling", quantity=1, unit_cost=1000)
+
+    r = _client(ops).post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json")
+    assert r.status_code == 200, r.content
+
+    r = _client(group_head).post(
+        f"/api/teams/projects/{project.id}/approve-budget/", {"notes": "ok"}, format="json"
+    )
+    assert r.status_code == 200, r.content
+    assert ProjectBudget.objects.get(project=project).status == "approved"
+
+
+@pytest.mark.django_db
+def test_four_eyes_rule_still_applies_to_the_group_head(group_head):
+    """Complete rights are not a licence to approve your own submission."""
+    from apps.teams.models import Project, ProjectCostLine
+
+    project = Project.objects.create(name="Self Approval Project")
+    ProjectCostLine.objects.create(project=project, cost_type="Travelling", quantity=1, unit_cost=1000)
+    c = _client(group_head)
+    assert c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json").status_code == 200
+
+    r = c.post(f"/api/teams/projects/{project.id}/approve-budget/", {"notes": "mine"}, format="json")
+    assert r.status_code == 403
+    assert "someone else has to approve" in str(r.data)

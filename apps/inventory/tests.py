@@ -537,8 +537,9 @@ def received_line(db):
 
 
 @pytest.fixture
-def tech(db):
-    return User.objects.create_user(username="insp-tech", password="x", role="technician")
+def inspector(db):
+    """Deliveries are checked by a supervisor (or the store); technicians read."""
+    return User.objects.create_user(username="insp-supervisor", password="x", role="supervisor")
 
 
 @pytest.mark.django_db
@@ -557,11 +558,11 @@ def test_received_line_starts_pending_and_stocks_nothing(ops, received_line):
 
 
 @pytest.mark.django_db
-def test_technician_inspects_into_generic_stock_with_batch(tech, received_line):
+def test_supervisor_inspects_into_generic_stock_with_batch(inspector, received_line):
     from apps.inventory.models import InventoryItem, StockMovement
 
     line = received_line["line"]
-    r = _client(tech).post(
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{line.id}/inspect/",
         {"route": "generic", "accepted_quantity": 10, "notes": "All good"},
         format="json",
@@ -578,15 +579,15 @@ def test_technician_inspects_into_generic_stock_with_batch(tech, received_line):
     assert movement.goods_receipt_line_id == line.id
 
     line.refresh_from_db()
-    assert line.inspected_by == tech
+    assert line.inspected_by == inspector
     assert line.inspected_at is not None
     assert line.inspection_notes == "All good"
 
 
 @pytest.mark.django_db
-def test_technician_inspects_into_unique_units_carrying_batch(tech, received_line):
+def test_supervisor_inspects_into_unique_units_carrying_batch(inspector, received_line):
     line = received_line["line"]
-    r = _client(tech).post(
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{line.id}/inspect/",
         {
             "route": "unique", "accepted_quantity": 2, "rejected_quantity": 8,
@@ -616,8 +617,8 @@ def test_technician_inspects_into_unique_units_carrying_batch(tech, received_lin
 
 
 @pytest.mark.django_db
-def test_accepted_plus_rejected_must_equal_received(tech, received_line):
-    r = _client(tech).post(
+def test_accepted_plus_rejected_must_equal_received(inspector, received_line):
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{received_line['line'].id}/inspect/",
         {"route": "generic", "accepted_quantity": 3, "rejected_quantity": 3},
         format="json",
@@ -627,11 +628,11 @@ def test_accepted_plus_rejected_must_equal_received(tech, received_line):
 
 
 @pytest.mark.django_db
-def test_full_rejection_stocks_nothing(tech, received_line):
+def test_full_rejection_stocks_nothing(inspector, received_line):
     from apps.inventory.models import InventoryItem
 
     line = received_line["line"]
-    r = _client(tech).post(
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{line.id}/inspect/",
         {"accepted_quantity": 0, "rejected_quantity": 10, "notes": "Damaged in transit"},
         format="json",
@@ -642,8 +643,8 @@ def test_full_rejection_stocks_nothing(tech, received_line):
 
 
 @pytest.mark.django_db
-def test_unique_route_needs_one_entry_per_accepted_unit(tech, received_line):
-    r = _client(tech).post(
+def test_unique_route_needs_one_entry_per_accepted_unit(inspector, received_line):
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{received_line['line'].id}/inspect/",
         {"route": "unique", "accepted_quantity": 3, "rejected_quantity": 7,
          "units": [{"serial_number": "ONLY-1"}]},
@@ -654,9 +655,9 @@ def test_unique_route_needs_one_entry_per_accepted_unit(tech, received_line):
 
 
 @pytest.mark.django_db
-def test_a_line_cannot_be_inspected_twice(tech, received_line):
+def test_a_line_cannot_be_inspected_twice(inspector, received_line):
     line = received_line["line"]
-    c = _client(tech)
+    c = _client(inspector)
     first = c.post(
         f"/api/inventory/receipt-lines/{line.id}/inspect/",
         {"route": "generic", "accepted_quantity": 10}, format="json",
@@ -670,8 +671,8 @@ def test_a_line_cannot_be_inspected_twice(tech, received_line):
 
 
 @pytest.mark.django_db
-def test_accepted_quantity_requires_a_route(tech, received_line):
-    r = _client(tech).post(
+def test_accepted_quantity_requires_a_route(inspector, received_line):
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{received_line['line'].id}/inspect/",
         {"accepted_quantity": 10}, format="json",
     )
@@ -778,7 +779,7 @@ def test_in_stock_count_tracks_registered_units(ops, product_refs):
 
 
 @pytest.mark.django_db
-def test_inspection_only_needs_serials_for_an_opened_product(tech, received_line, product_refs):
+def test_inspection_only_needs_serials_for_an_opened_product(inspector, received_line, product_refs):
     from apps.inventory.models import InventoryUnitType
 
     product = InventoryUnitType.objects.create(
@@ -786,7 +787,7 @@ def test_inspection_only_needs_serials_for_an_opened_product(tech, received_line
         default_has_warranty=True, default_warranty_type="supplier", default_warranty_months=12,
     )
     line = received_line["line"]
-    r = _client(tech).post(
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{line.id}/inspect/",
         {
             "route": "unique", "accepted_quantity": 2, "rejected_quantity": 8,
@@ -839,7 +840,7 @@ def test_editing_the_existing_stock_row_is_still_allowed(ops, db):
 
 
 @pytest.mark.django_db
-def test_receipt_stocks_the_row_the_po_line_named(tech, db):
+def test_receipt_stocks_the_row_the_po_line_named(inspector, db):
     """Goods must land on the row the requirement is watching."""
     from apps.inventory.models import GoodsReceipt, GoodsReceiptLine, InventoryItem
     from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
@@ -859,7 +860,7 @@ def test_receipt_stocks_the_row_the_po_line_named(tech, db):
     receipt = GoodsReceipt.objects.create(purchase_order=po)
     line = GoodsReceiptLine.objects.create(receipt=receipt, po_item=po_item, quantity=7)
 
-    r = _client(tech).post(
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{line.id}/inspect/",
         {"route": "generic", "accepted_quantity": 7}, format="json",
     )
@@ -909,11 +910,11 @@ def ordered_requirement(db):
 
 
 @pytest.mark.django_db
-def test_inspection_closes_the_requirement_it_was_bought_for(tech, ordered_requirement):
+def test_inspection_closes_the_requirement_it_was_bought_for(inspector, ordered_requirement):
     component = ordered_requirement["component"]
     item = ordered_requirement["item"]
 
-    r = _client(tech).post(
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{ordered_requirement['line'].id}/inspect/",
         {"route": "generic", "accepted_quantity": 7}, format="json",
     )
@@ -930,13 +931,13 @@ def test_inspection_closes_the_requirement_it_was_bought_for(tech, ordered_requi
 
 
 @pytest.mark.django_db
-def test_the_asset_starts_building_once_its_parts_arrive(tech, ordered_requirement):
+def test_the_asset_starts_building_once_its_parts_arrive(inspector, ordered_requirement):
     from apps.assets.models import Device
 
     device = ordered_requirement["device"]
     assert device.status == Device.Status.PROCURED
 
-    r = _client(tech).post(
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{ordered_requirement['line'].id}/inspect/",
         {"route": "generic", "accepted_quantity": 7}, format="json",
     )
@@ -947,9 +948,9 @@ def test_the_asset_starts_building_once_its_parts_arrive(tech, ordered_requireme
 
 
 @pytest.mark.django_db
-def test_a_short_delivery_only_covers_what_arrived(tech, ordered_requirement):
+def test_a_short_delivery_only_covers_what_arrived(inspector, ordered_requirement):
     component = ordered_requirement["component"]
-    r = _client(tech).post(
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{ordered_requirement['line'].id}/inspect/",
         {"route": "generic", "accepted_quantity": 4, "rejected_quantity": 3}, format="json",
     )
@@ -962,11 +963,11 @@ def test_a_short_delivery_only_covers_what_arrived(tech, ordered_requirement):
 
 
 @pytest.mark.django_db
-def test_stock_bought_without_a_requirement_stays_in_the_warehouse(tech, received_line):
+def test_stock_bought_without_a_requirement_stays_in_the_warehouse(inspector, received_line):
     """Ordinary replenishment is not claimed by anything."""
     from apps.inventory.models import InventoryItem
 
-    r = _client(tech).post(
+    r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{received_line['line'].id}/inspect/",
         {"route": "generic", "accepted_quantity": 10}, format="json",
     )
@@ -1075,7 +1076,7 @@ def test_a_request_can_be_issued_in_part_and_the_balance_stays_owed(ops, items):
 
     store = _client(ops)
     r = store.post(f"/api/inventory/issuance-requests/{request_id}/issue/",
-                   {"quantity": 4, "received_by": "Bilal (site tech)"}, format="json")
+                   {"quantity": 4, "received_by": "Bilal (site inspector)"}, format="json")
     assert r.status_code == 200, r.content
     assert r.data["issued"] == 4
     assert r.data["request"]["status"] == "partial"
@@ -1098,7 +1099,7 @@ def test_a_request_can_be_issued_in_part_and_the_balance_stays_owed(ops, items):
     assert "outstanding" in str(over.data)
 
     row = IssuanceRequest.objects.get(pk=request_id)
-    assert row.received_by == "Bilal (site tech)"
+    assert row.received_by == "Bilal (site inspector)"
 
 
 @pytest.mark.django_db

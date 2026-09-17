@@ -90,8 +90,26 @@ class ProjectScopeItemSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         component = attrs.get("component")
         device = attrs.get("device") or getattr(self.instance, "device", None)
+        project = attrs.get("project") or getattr(self.instance, "project", None)
         if component and device and component.device_id != device.id:
             raise serializers.ValidationError({"component": "Component does not belong to this asset."})
+        if self.instance is None and device is not None and project is not None:
+            # Every asset has its own ID: it sits on one project, once.
+            if ProjectScopeItem.objects.filter(project=project, device=device).exists():
+                raise serializers.ValidationError(
+                    {"device": f"{device.asset_code} is already in this project's scope."}
+                )
+            elsewhere = (
+                ProjectScopeItem.objects.filter(device=device).exclude(project=project)
+                .select_related("project").first()
+            )
+            other = elsewhere.project if elsewhere else (
+                device.project if device.project_id and device.project_id != project.id else None
+            )
+            if other is not None:
+                raise serializers.ValidationError(
+                    {"device": f"{device.asset_code} already belongs to project '{other.name}'."}
+                )
         return attrs
 
 
@@ -113,6 +131,12 @@ class ProjectListSerializer(serializers.ModelSerializer):
     contract_type_display = serializers.CharField(source="get_contract_type_display", read_only=True)
     progress = serializers.SerializerMethodField()
 
+    # Item 4: a project covers several sites; the list names them.
+    site_names = serializers.SerializerMethodField()
+
+    def get_site_names(self, obj):
+        return [site.name for site in obj.sites.all()]
+
     class Meta:
         model = Project
         fields = [
@@ -122,7 +146,8 @@ class ProjectListSerializer(serializers.ModelSerializer):
             "contract_type", "contract_type_display", "rental_end_date",
             "start_date", "target_date", "completed_date",
             "manager", "manager_name", "bottleneck_count", "created_at",
-         "assets_count",]
+            "assets_count", "sites", "site_names",
+        ]
 
     def get_progress(self, obj):
         return obj.computed_progress()
@@ -136,6 +161,10 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
     members = ProjectMemberSerializer(many=True, read_only=True)
     scope_items = ProjectScopeItemSerializer(many=True, read_only=True)
     milestones = ProjectMilestoneSerializer(many=True, read_only=True)
+    site_names = serializers.SerializerMethodField()
+
+    def get_site_names(self, obj):
+        return [site.name for site in obj.sites.all()]
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     phase_display = serializers.CharField(source="get_phase_display", read_only=True)
     contract_type_display = serializers.CharField(source="get_contract_type_display", read_only=True)
@@ -149,11 +178,13 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
             "status", "status_display", "phase", "phase_display",
             "contract_type", "contract_type_display", "rental_end_date",
             "progress", "start_date", "target_date", "completed_date",
-            "manager", "manager_name", "budget", "notes",
+            "manager", "manager_name", "budget", "notes", "sites", "site_names",
             "bottlenecks", "members", "scope_items", "milestones",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        # The budget is what planning arrives at and approval freezes — not a
+        # number typed when the project is opened.
+        read_only_fields = ["id", "budget", "created_at", "updated_at"]
 
     def get_progress(self, obj):
         return obj.computed_progress()
@@ -174,7 +205,7 @@ class ProjectCostLineSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
         # A cost nobody planned for carries no planned rate, so the rate is
         # required by validate() only while the budget is still being planned.
-        extra_kwargs = {"unit_cost": {"required": False}}
+        extra_kwargs = {"unit_cost": {"required": False}, "cost_type": {"required": False}}
 
     def get_amount(self, obj):
         return str(obj.amount)
@@ -189,6 +220,9 @@ class ProjectCostLineSerializer(serializers.ModelSerializer):
         return value[:100]
 
     def validate(self, attrs):
+        # An overhead is known by what it is for; the type is that same wording.
+        if self.instance is None and not (attrs.get("cost_type") or "").strip():
+            attrs["cost_type"] = (attrs.get("description") or "Overhead").strip()[:100]
         project = attrs.get("project") or getattr(self.instance, "project", None)
         plan = getattr(project, "cost_plan", None) if project else None
         locked = plan is not None and not plan.is_editable

@@ -45,12 +45,16 @@ class WorkOrderSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source="created_by.get_full_name", read_only=True, default=None)
     approved_by_name = serializers.CharField(source="approved_by.get_full_name", read_only=True, default=None)
 
+    project_name = serializers.CharField(source="project.name", read_only=True, default=None)
+    device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
+
     class Meta:
         model = WorkOrder
         fields = [
             "id", "wo_number", "title", "description", "order_type", "order_type_display",
             "status", "status_display",
             "supplier", "supplier_name", "client", "client_name", "site", "site_name",
+            "project", "project_name", "device", "device_code",
             "payment_terms", "payment_terms_name", "terms_template", "terms_conditions",
             "safety_instructions", "warranty_months",
             "currency", "order_date", "expected_delivery", "total_amount", "notes",
