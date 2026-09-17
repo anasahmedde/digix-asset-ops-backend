@@ -191,6 +191,10 @@ class Device(TimeStampedModel):
         "procurement.PurchaseOrderItem", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="procured_devices",
     )
+    # A vendor-supplied asset on a project is sent to Procurement from the
+    # project's Execution tab once the budget is approved; standalone assets
+    # go straight to the to-buy list.
+    procurement_requested_at = models.DateTimeField(null=True, blank=True)
     supplier = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True, related_name="devices"
     )
@@ -270,6 +274,9 @@ class Device(TimeStampedModel):
 
     def can_transition_to(self, new_status: str) -> bool:
         allowed = self.VALID_TRANSITIONS.get(self.status, ())
+        # A vendor-supplied asset arrives complete: it is never built here.
+        if new_status == self.Status.IN_PRODUCTION and self.source != self.Source.INHOUSE:
+            return False
         return new_status in allowed
 
     @property
@@ -291,6 +298,12 @@ class Device(TimeStampedModel):
         return self.components.filter(
             models.Q(issued_quantity__gt=0) | models.Q(purchase_order_item__isnull=False)
         ).exists()
+
+    @property
+    def route_complete(self) -> bool:
+        """Every operation on the route is done (or skipped) — the build is finished."""
+        steps = list(self.production_steps.all())
+        return bool(steps) and all(s.status in ("completed", "skipped") for s in steps)
 
 
 class ProductionRouteTemplate(TimeStampedModel):

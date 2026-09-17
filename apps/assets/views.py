@@ -6,7 +6,7 @@ from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -595,6 +595,33 @@ class DeviceViewSet(viewsets.ModelViewSet):
         log_export(request.user, "device", len(rows), export_params(request))
         return xlsx_response("assets", "Assets", columns, rows)
 
+    @action(detail=True, methods=["post"], url_path="ready-for-installation")
+    def ready_for_installation(self, request, pk=None):
+        """The build is finished: a finished route takes the asset to In Stock so
+        it can be assigned to a site. Already stocked assets pass straight through."""
+        device = self.get_object()
+        if device.status == Device.Status.IN_STOCK:
+            return Response(DeviceDetailSerializer(device, context={"request": request}).data)
+        if device.status != Device.Status.IN_PRODUCTION:
+            return Response(
+                {"detail": f"{device.asset_code} is {device.get_status_display()} — only an asset in production is finished into stock."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # A vendor-supplied asset has no route of its own to finish.
+        if device.source == Device.Source.INHOUSE and not device.route_complete:
+            return Response(
+                {"detail": "The production route is not finished yet — complete or skip every operation first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        device._transition_user = request.user
+        device._transition_reason = (
+            "Production route complete — ready to assign for installation"
+            if device.source == Device.Source.INHOUSE else "Vendor-supplied asset in hand — ready to assign for installation"
+        )
+        device.status = Device.Status.IN_STOCK
+        device.save(update_fields=["status", "updated_at"])
+        return Response(DeviceDetailSerializer(device, context={"request": request}).data)
+
     @action(detail=True, methods=["post"], url_path="label")
     def label(self, request, pk=None):
         """Generate (or refresh) the printable QR/barcode label for this device.
@@ -700,6 +727,16 @@ def _budget_block_response(component):
     )
 
 
+def _refuse_if_vendor_asset(device, what: str):
+    """A vendor-supplied asset arrives complete: it is bought, not built, so
+    it carries no components or production route of its own."""
+    if device is not None and device.source != Device.Source.INHOUSE:
+        raise ValidationError({
+            "device": f"{device.asset_code} is {device.get_source_display()} — it arrives complete "
+                      f"from the vendor and has no {what} of its own."
+        })
+
+
 class AssetComponentViewSet(viewsets.ModelViewSet):
     queryset = (
         AssetComponent.objects.select_related(
@@ -736,6 +773,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         self._refuse_if_locked(serializer.validated_data.get("device"))
+        _refuse_if_vendor_asset(serializer.validated_data.get("device"), "components" if isinstance(self, AssetComponentViewSet) else "production route")
         super().perform_create(serializer)
 
     def perform_update(self, serializer):
@@ -1057,6 +1095,7 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         self._refuse_if_locked(serializer.validated_data.get("device"))
+        _refuse_if_vendor_asset(serializer.validated_data.get("device"), "components" if isinstance(self, AssetComponentViewSet) else "production route")
         super().perform_create(serializer)
 
     def perform_update(self, serializer):
@@ -1125,6 +1164,22 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
             "workshop", "assigned_to"
         )
         return Response(ProductionStepSerializer(steps, many=True).data)
+
+    @action(detail=True, methods=["post"], url_path="decide")
+    def decide(self, request, pk=None):
+        """Execution decision for one operation: done in-house. (Giving it to a
+        workshop is a work order, raised from the project.)"""
+        step = self.get_object()
+        if step.work_orders.exclude(status="cancelled").exists():
+            return Response(
+                {"detail": f"'{step.name}' is on a work order — cancel that first to bring it in-house."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        step.location = ProductionStep.Location.IN_HOUSE
+        step.workshop = None
+        step.workshop_name = ""
+        step.save(update_fields=["location", "workshop", "workshop_name", "updated_at"])
+        return Response(ProductionStepSerializer(step).data)
 
     @action(detail=True, methods=["post"])
     def transition(self, request, pk=None):

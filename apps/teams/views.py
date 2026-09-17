@@ -81,6 +81,18 @@ class ProjectViewSet(viewsets.ModelViewSet):
             totals["shortage"] += shortage
         return Response({"lines": lines, "totals": totals})
 
+    def _execution_blocked(self, project):
+        """Execution decisions follow budget approval: a plan that exists but is
+        not approved blocks them; a project with no plan at all is left alone."""
+        plan = ProjectBudget.objects.filter(project=project).first()
+        if plan is not None and plan.status != ProjectBudget.Status.APPROVED:
+            return Response(
+                {"detail": f"The budget for {project.name} is {plan.get_status_display().lower()} — "
+                           "execution starts once it is approved."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        return None
+
     @action(detail=True, methods=["get"])
     def requirements(self, request, pk=None):
         """Every asset in this project and what it is built from.
@@ -93,7 +105,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         would cover it.
         """
         from apps.assets.models import AssetComponent, Device
-        from apps.assets.serializers import AssetComponentSerializer
+        from apps.assets.serializers import AssetComponentSerializer, ProductionStepSerializer
 
         project = self.get_object()
         # An asset reaches a project two ways: its own `project` field, or a
@@ -101,10 +113,12 @@ class ProjectViewSet(viewsets.ModelViewSet):
         # silently go missing from the build plan.
         devices = (
             project_devices(project)
+            .select_related("procurement_item__purchase_order", "asset_type")
             .prefetch_related(
                 "components__inventory_item__material_type",
                 "components__inventory_unit_type",
                 "components__purchase_order_item__purchase_order",
+                "production_steps__work_orders", "production_steps__workshop",
             )
         )
 
@@ -113,6 +127,36 @@ class ProjectViewSet(viewsets.ModelViewSet):
                   "awaiting_decision": 0, "to_procure": 0}
 
         for device in devices:
+            if device.source != Device.Source.INHOUSE:
+                # Bought complete: the one decision is to send it to Procurement.
+                on_order = device.procurement_item_id is not None
+                arrived = device.status != Device.Status.PROCURED
+                totals["required"] += 1
+                if not arrived:
+                    totals["outstanding"] += 1
+                    if on_order or device.procurement_requested_at:
+                        totals["to_procure"] += 1
+                    else:
+                        totals["awaiting_decision"] += 1
+                assets.append({
+                    "id": str(device.pk),
+                    "asset_code": device.asset_code,
+                    "display_name": device.display_name or (device.asset_type.name if device.asset_type_id else ""),
+                    "status": device.status,
+                    "status_display": device.get_status_display(),
+                    "vendor_asset": True,
+                    "source": device.source,
+                    "source_display": device.get_source_display(),
+                    "purchase_price": device.purchase_price,
+                    "supply_vendor_name": device.supply_vendor_name,
+                    "procurement_requested_at": device.procurement_requested_at,
+                    "po_number": device.procurement_item.purchase_order.po_number if on_order else None,
+                    "po_status": device.procurement_item.purchase_order.status if on_order else None,
+                    "components": [],
+                    "steps": [],
+                    "route_complete": False,
+                })
+                continue
             components = list(device.components.all())
             rows = AssetComponentSerializer(components, many=True).data
             for component, row in zip(components, rows):
@@ -128,15 +172,55 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     component.outstanding_quantity > 0
                     and component.available_quantity >= component.outstanding_quantity
                 )
+            steps = sorted(device.production_steps.all(), key=lambda x: x.step_number)
             assets.append({
                 "id": str(device.pk),
                 "asset_code": device.asset_code,
                 "display_name": device.display_name or str(device.device_model),
                 "status": device.status,
+                "status_display": device.get_status_display(),
+                "vendor_asset": False,
+                "source": device.source,
+                "source_display": device.get_source_display(),
                 "components": rows,
+                # The route's own decisions: each operation in-house or on a work order.
+                "steps": ProductionStepSerializer(steps, many=True).data,
+                "route_complete": bool(steps) and all(x.status in ("completed", "skipped") for x in steps),
             })
 
         return Response({"project": str(project.pk), "assets": assets, "totals": totals})
+
+    @action(detail=True, methods=["post"], url_path="procure-asset")
+    def procure_asset(self, request, pk=None):
+        """Execution decision for a vendor-supplied asset: buy it complete.
+
+        Sends the asset to Procurement's to-buy list, where the purchase order
+        is raised and follows the usual approval and receipt. `undo` pulls it
+        back while no order has been raised.
+        """
+        from apps.assets.models import Device
+
+        project = self.get_object()
+        blocked = self._execution_blocked(project)
+        if blocked is not None:
+            return blocked
+        device = project_devices(project).filter(pk=request.data.get("device")).first()
+        if device is None:
+            return Response({"device": ["Choose an asset on this project."]}, status=400)
+        if device.source == Device.Source.INHOUSE:
+            return Response({"device": ["An in-house build is not bought complete — decide its components instead."]}, status=400)
+        if device.procurement_item_id:
+            return Response({"device": [f"{device.asset_code} is already on {device.procurement_item.purchase_order.po_number}."]}, status=400)
+        if device.status != Device.Status.PROCURED:
+            return Response({"device": [f"{device.asset_code} has already been received."]}, status=400)
+        if request.data.get("undo"):
+            device.procurement_requested_at = None
+            detail = f"{device.asset_code} taken back from Procurement."
+        else:
+            device.procurement_requested_at = timezone.now()
+            detail = f"{device.asset_code} sent to Procurement — raise the purchase order from To Procure."
+        device.save(update_fields=["procurement_requested_at", "updated_at"])
+        return Response({"detail": detail, "procurement_requested_at": device.procurement_requested_at})
 
     # Who signs a budget off. Kept apart from who writes it: an estimate should
     # not be approved by the person who produced it (super admins excepted).
@@ -209,7 +293,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         """
         from decimal import Decimal, InvalidOperation
 
-        from apps.assets.models import Device
+        from apps.assets.models import Device, ProductionStep
         from apps.suppliers.models import Supplier
         from apps.workorders.models import WorkOrder, WorkOrderItem
 
@@ -220,27 +304,47 @@ class ProjectViewSet(viewsets.ModelViewSet):
         device = Device.objects.filter(pk=request.data.get("device")).first()
         if device is None:
             return Response({"device": ["Choose the asset the vendor is building."]}, status=400)
-        if device.source == Device.Source.INHOUSE:
-            return Response({"device": ["An in-house build is not given to a vendor."]}, status=400)
         supplier = Supplier.objects.filter(pk=request.data.get("supplier")).first()
         if supplier is None:
             return Response({"supplier": ["Choose the vendor."]}, status=400)
-        if device.work_orders.exclude(status="cancelled").exists():
-            return Response({"device": [f"{device.asset_code} already has a work order."]}, status=400)
+        # One operation of an in-house route, given to an outside workshop.
+        step = None
+        if request.data.get("production_step"):
+            step = ProductionStep.objects.filter(pk=request.data.get("production_step"), device=device).first()
+            if step is None:
+                return Response({"production_step": ["That operation is not on this asset's route."]}, status=400)
+            if step.work_orders.exclude(status="cancelled").exists():
+                return Response({"production_step": [f"'{step.name}' already has a work order."]}, status=400)
+            if step.status in ("completed", "skipped"):
+                return Response({"production_step": [f"'{step.name}' is already finished."]}, status=400)
+        else:
+            if device.source == Device.Source.INHOUSE:
+                return Response({"device": ["An in-house build is not given to a vendor whole — raise a work order per operation."]}, status=400)
+            if device.work_orders.exclude(status="cancelled").exists():
+                return Response({"device": [f"{device.asset_code} already has a work order."]}, status=400)
+        fallback = (step.planned_cost if step is not None else device.purchase_price) or 0
         try:
-            amount = Decimal(str(request.data.get("amount") or device.purchase_price or 0))
+            amount = Decimal(str(request.data.get("amount") or fallback))
         except (InvalidOperation, ValueError):
             amount = Decimal("0")
 
-        order_type = (
-            WorkOrder.OrderType.SUPPLY_INSTALL
-            if device.source == Device.Source.VENDOR_TURNKEY else WorkOrder.OrderType.SUPPLY
+        if step is not None:
+            order_type = WorkOrder.OrderType.PRODUCTION
+        else:
+            order_type = (
+                WorkOrder.OrderType.SUPPLY_INSTALL
+                if device.source == Device.Source.VENDOR_TURNKEY else WorkOrder.OrderType.SUPPLY
+            )
+        title = (
+            f"{step.name} — {device.asset_code} — {project.name}" if step is not None
+            else f"{device.display_name or device.asset_code} — {project.name}"
         )
         with transaction.atomic():
             order = WorkOrder.objects.create(
-                title=f"{device.display_name or device.asset_code} — {project.name}",
+                title=title,
                 description=(request.data.get("notes") or "").strip(),
                 order_type=order_type,
+                production_step=step,
                 supplier=supplier,
                 client=project.client,
                 site=device.current_site or project.site,
@@ -253,11 +357,20 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 work_order=order,
                 asset_type=device.asset_type,
                 device_model=device.device_model,
-                description=f"{device.display_name or device.asset_code} ({device.get_source_display()})",
+                description=(
+                    f"{step.name} on {device.display_name or device.asset_code}" if step is not None
+                    else f"{device.display_name or device.asset_code} ({device.get_source_display()})"
+                ),
                 quantity=1,
                 unit_price=amount,
             )
             order.recalc_total()
+            if step is not None:
+                # The route now says this operation happens at that workshop.
+                step.location = ProductionStep.Location.EXTERNAL
+                step.workshop = supplier
+                step.workshop_name = ""
+                step.save(update_fields=["location", "workshop", "workshop_name", "updated_at"])
         from apps.workorders.serializers import WorkOrderSerializer
 
         return Response(WorkOrderSerializer(order).data, status=201)

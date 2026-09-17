@@ -164,7 +164,15 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 source__in=(Device.Source.VENDOR_SUPPLIED, Device.Source.VENDOR_TURNKEY),
                 status=Device.Status.PROCURED,
             )
+            # On a project the buy is decided in Execution; a standalone asset
+            # is simply bought.
+            .filter(
+                Q(procurement_requested_at__isnull=False)
+                | Q(procurement_item__isnull=False)
+                | Q(project__isnull=True, project_scope_items__isnull=True)
+            )
             .select_related("project", "asset_type", "procurement_item__purchase_order")
+            .distinct()
             .order_by("asset_code")
         )
         if project_id:

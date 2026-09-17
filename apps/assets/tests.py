@@ -2316,17 +2316,20 @@ def test_component_set_is_saved_and_reused_per_asset_type():
 
 
 @_pytest.mark.django_db
-def test_vendor_supplied_asset_enters_production_without_components(admin_client, db):
-    """The vendor builds it, so there is no parts list of ours to demand."""
+def test_vendor_supplied_asset_never_enters_production(admin_client, db):
+    """A vendor-supplied asset arrives complete: it is bought, not built, so
+    production is neither offered nor allowed for it."""
     from apps.assets.models import Device
 
     asset = Device.objects.create(asset_code="AST-VP-1", source=Device.Source.VENDOR_SUPPLIED)
+    detail = admin_client.get(f"/api/assets/devices/{asset.id}/").json()
+    assert "in_production" not in detail["allowed_transitions"]
+    assert "in_stock" in detail["allowed_transitions"]
     r = admin_client.post(
         f"/api/assets/devices/{asset.id}/transition/",
         {"status": "in_production", "reason": "vendor building it"}, format="json",
     )
-    assert r.status_code == 200, r.content
-    assert r.data["status"] == "in_production"
+    assert r.status_code == 400, r.content
 
     # An in-house build with nothing on it still has to be itemised first.
     inhouse = Device.objects.create(asset_code="AST-VP-2", source=Device.Source.INHOUSE)
