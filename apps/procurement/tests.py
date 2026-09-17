@@ -997,7 +997,10 @@ def test_raise_a_po_from_requisitions(people, requisitions, supplier):
     assert r.data["po_number"].startswith("PO")
     assert len(r.data["items"]) == 2
 
-    by_desc = {i["description"]: i for i in r.data["items"]}
+    # The stored description now carries the category, unit and asset in brackets;
+    # the title is the bare component name.
+    by_desc = {i["line_title"]: i for i in r.data["items"]}
+    assert "Req Cable" in by_desc, [(i["line_title"], i["line_detail"], i["description"]) for i in r.data["items"]]
     assert by_desc["Req Cable"]["quantity"] == 20
     assert by_desc["Req Player"]["quantity"] == 3
     # Prices default from the inventory records.
@@ -1155,3 +1158,30 @@ def test_purchase_order_prints_as_a_document_with_its_own_terms(people, supplier
 
     r = c.get(f"/api/procurement/purchase-orders/{body['id']}/document/")
     assert r.status_code == 200 and r.content[:5] == b"%PDF-"
+
+
+@pytest.mark.django_db
+def test_approval_stamps_the_order_date_and_lines_say_what_they_buy(people, supplier):
+    """The order date is the day the Group Head approved; a whole-asset line
+    names the asset, its kind and its code, not just a code."""
+    from django.utils import timezone
+
+    from apps.assets.models import AssetType, Device
+
+    kind = AssetType.objects.create(name="PO Line Display")
+    device = Device.objects.create(asset_type=kind, display_name="Lobby Wall", source=Device.Source.VENDOR_SUPPLIED,
+                                   serial_number="PO-LINE-1", diagonal_inches="55.0")
+    c = _client(people["ops"])
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {"supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)], "prices": {}}, format="json")
+    assert r.status_code == 201, r.content
+    line = r.data["items"][0]
+    assert line["description"].startswith("Lobby Wall (PO Line Display")
+    assert device.asset_code in line["description"] and "complete asset" in line["description"]
+    assert line["line_title"] == "Lobby Wall" and "55" in line["line_detail"]
+
+    pid = r.data["id"]
+    assert r.data["order_date"] is None
+    assert c.post(f"/api/procurement/purchase-orders/{pid}/transition/", {"status": "pending_approval"}, format="json").status_code == 200
+    r = _client(people["group_head"]).post(f"/api/procurement/purchase-orders/{pid}/transition/", {"status": "approved"}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["order_date"] == timezone.localdate().isoformat()

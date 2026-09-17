@@ -12,6 +12,7 @@ from rest_framework.response import Response
 
 from common.permissions import FinanceWriteElseRead, PurchaseOrderActionElseRead
 
+from .lines import describe_asset, describe_component, line_text
 from .models import PurchaseOrder, PurchaseOrderItem
 from .serializers import (
     PurchaseOrderFromShortageSerializer,
@@ -314,7 +315,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             for device in devices:
                 item = PurchaseOrderItem.objects.create(
                     purchase_order=purchase_order,
-                    description=f"{device.display_name or device.asset_code} — complete asset",
+                    description=line_text(*describe_asset(device)),
                     quantity=1,
                     unit_price=price_for(device.pk, device.purchase_price),
                     device_model=device.device_model,
@@ -329,7 +330,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                     continue
                 item = PurchaseOrderItem.objects.create(
                     purchase_order=purchase_order,
-                    description=component.name,
+                    description=line_text(*describe_component(component)),
                     quantity=quantity,
                     unit_price=price_for(component.pk, (
                         component.inventory_unit_type.unit_cost
@@ -389,8 +390,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         if new_status == PurchaseOrder.Status.APPROVED:
             purchase_order.approved_by = request.user
             update_fields += ["approved_by"]
+            # The order date is the day the Group Head approved it — stamped,
+            # never typed. That approval is what commits the company.
+            if not purchase_order.order_date:
+                purchase_order.order_date = timezone.localdate()
+                update_fields += ["order_date"]
 
-        # The order date is the day it was placed — stamped, never typed.
+        # An order that somehow reached placement without approval on record
+        # still gets a date the day it is placed.
         if new_status == PurchaseOrder.Status.ORDERED and not purchase_order.order_date:
             purchase_order.order_date = timezone.localdate()
             update_fields += ["order_date"]

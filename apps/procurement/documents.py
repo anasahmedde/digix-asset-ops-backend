@@ -181,10 +181,14 @@ def render_purchase_order_pdf(purchase_order) -> bytes:
         Paragraph("QTY", s["head"]), Paragraph("UNIT PRICE", s["head"]),
         Paragraph("AMOUNT", s["head"]),
     ]]
+    from .lines import describe_item
+
     for n, item in enumerate(purchase_order.items.all(), start=1):
+        title, detail = describe_item(item)
+        text = f"<b>{title}</b>" + (f"<br/><font size='7.5' color='#6b7280'>{detail}</font>" if detail else "")
         rows.append([
             Paragraph(str(n), s["cell"]),
-            Paragraph(item.description or "—", s["cell"]),
+            Paragraph(text, s["cell"]),
             Paragraph(str(item.quantity), s["num"]),
             Paragraph(_money(item.unit_price, currency), s["num"]),
             Paragraph(_money(item.line_total, currency), s["num"]),
