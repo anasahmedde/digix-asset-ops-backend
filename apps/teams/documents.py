@@ -251,3 +251,151 @@ def render_boq_pdf(project, boq: dict) -> bytes:
 
     doc.build(story)
     return buf.getvalue()
+
+
+def render_actuals_pdf(project, actuals: dict) -> bytes:
+    """Execution actuals: what each asset has really cost so far, the
+    overheads planned against actual, and the position against the budget."""
+    s = _styles()
+    buf = io.BytesIO()
+    doc = _doc(buf, f"Actual Cost — {project.name}")
+    story = _masthead("EXECUTION — ACTUAL COST", project, s)
+
+    budget = (actuals.get("budget_status") or "no plan").replace("_", " ").title()
+    approved = actuals.get("approved_total")
+    variance = actuals.get("variance_vs_approved")
+    line = f"<b>Budget:</b> {budget}"
+    if approved is not None:
+        line += f" · <b>Approved at:</b> {_money(approved)}"
+    line += f" · <b>Actual to date:</b> {_money(actuals['actual_total'])}"
+    if variance is not None:
+        sign = "over" if float(variance) > 0 else "under"
+        line += f" · <b>{_money(abs(float(variance)))} {sign}</b>"
+    story.append(Paragraph(line, s["body"]))
+    story.append(Spacer(1, 4 * mm))
+
+    # ── Assets: materials, production, vendor work ──
+    story.append(Paragraph("<b>Assets — materials, production and vendor work</b>", s["section"]))
+    story.append(Spacer(1, 2 * mm))
+    rows = [[
+        Paragraph("ITEM", s["head"]), Paragraph("REQUIRED", s["headr"]), Paragraph("USED", s["headr"]),
+        Paragraph("UNIT PRICE", s["headr"]), Paragraph("VALUED AT", s["head"]), Paragraph("ACTUAL", s["headr"]),
+    ]]
+    bands = []
+    for asset in actuals.get("assets", []):
+        bands.append(len(rows))
+        outstanding = asset.get("outstanding") or 0
+        rows.append([
+            Paragraph(
+                f"<b>{asset['asset_code']}</b>  {asset.get('asset_name', '')}"
+                + (f"  <font color='#b45309'>· {outstanding} still to come</font>" if outstanding else ""),
+                s["cell"],
+            ),
+            "", "", "", "",
+            Paragraph(f"<b>{_money(asset['actual_total'])}</b>", s["num"]),
+        ])
+        if asset.get("vendor_asset"):
+            paid = float(asset.get("materials_actual") or 0)
+            rows.append([
+                Paragraph("&nbsp;&nbsp;&nbsp;Complete asset from the vendor", s["cell"]),
+                Paragraph("1", s["num"]), Paragraph("1" if paid else "0", s["num"]),
+                Paragraph(_money(asset.get("asset_price")), s["num"]),
+                Paragraph("Vendor price" if paid else "Not yet received", s["cell"]),
+                Paragraph(_money(asset["materials_actual"]) if paid else "—", s["num"]),
+            ])
+        else:
+            rows.append([Paragraph("Components", s["head"]), "", "", "", "",
+                         Paragraph(_money(asset["materials_actual"]), s["num"])])
+            for m in asset.get("lines", []):
+                rows.append([
+                    Paragraph(f"&nbsp;&nbsp;&nbsp;{m['name']}", s["cell"]),
+                    Paragraph(str(m["required"]), s["num"]),
+                    Paragraph(str(m["issued"]), s["num"]),
+                    Paragraph(_money(m["unit_price"]), s["num"]),
+                    Paragraph(m.get("price_source") or "", s["cell"]),
+                    Paragraph(_money(m["line_total"]), s["num"]),
+                ])
+            if asset.get("steps"):
+                rows.append([Paragraph("Production", s["head"]), "", "", "", "",
+                             Paragraph(_money(asset["production_actual"]), s["num"])])
+                for st in asset["steps"]:
+                    status = (st.get("status") or "").replace("_", " ")
+                    rows.append([
+                        Paragraph(f"&nbsp;&nbsp;&nbsp;{st['step_number']}. {st['name']}  <font color='#6b7280'>{status}</font>", s["cell"]),
+                        "", "",
+                        Paragraph(_money(st.get("planned_cost")), s["num"]),
+                        Paragraph("Planned" if st.get("planned_cost") is not None else "", s["cell"]),
+                        Paragraph(_money(st.get("actual_cost")), s["num"]),
+                    ])
+        if asset.get("work_orders"):
+            rows.append([Paragraph("Work orders", s["head"]), "", "", "", "",
+                         Paragraph(_money(asset["work_orders_actual"]), s["num"])])
+            for w in asset["work_orders"]:
+                rows.append([
+                    Paragraph(f"&nbsp;&nbsp;&nbsp;{w['wo_number']}  {w.get('supplier') or ''}", s["cell"]),
+                    "", "", "",
+                    Paragraph((w.get("status") or "").replace("_", " "), s["cell"]),
+                    Paragraph(_money(w["amount"]), s["num"]),
+                ])
+    if len(rows) == 1:
+        rows.append([Paragraph("No assets on this project yet.", s["cell"]), "", "", "", "", ""])
+    story.append(_grid(rows, [66, 16, 14, 26, 28, 24], s, bands))
+    story.append(Spacer(1, 5 * mm))
+
+    # ── Overheads: planned against actual ──
+    overheads = actuals.get("overheads", [])
+    if overheads:
+        story.append(Paragraph("<b>Overheads — planned against actual</b>", s["section"]))
+        story.append(Spacer(1, 2 * mm))
+        rows = [[Paragraph("DESCRIPTION", s["head"]), Paragraph("PLANNED", s["headr"]),
+                 Paragraph("ACTUAL QTY", s["headr"]), Paragraph("ACTUAL RATE", s["headr"]),
+                 Paragraph("ACTUAL", s["headr"])]]
+        for o in overheads:
+            label = o.get("description") or o.get("cost_type") or "—"
+            if o.get("unplanned"):
+                label += "  <font color='#b45309'>unplanned</font>"
+            rows.append([
+                Paragraph(label, s["cell"]),
+                Paragraph(_money(o["planned_amount"]), s["num"]),
+                Paragraph("" if o.get("actual_quantity") is None else f"{float(o['actual_quantity']):g}", s["num"]),
+                Paragraph(_money(o.get("actual_unit_cost")), s["num"]),
+                Paragraph(_money(o.get("actual_amount")), s["num"]),
+            ])
+        rows.append([
+            Paragraph("<b>Overheads</b>", s["cell"]),
+            Paragraph(f"<b>{_money(actuals['overheads_planned_total'])}</b>", s["num"]), "", "",
+            Paragraph(f"<b>{_money(actuals['overheads_actual_total'])}</b>", s["num"]),
+        ])
+        story.append(_grid(rows, [80, 26, 22, 22, 24], s))
+        story.append(Spacer(1, 5 * mm))
+
+    # ── Position ──
+    totals = [
+        ("Materials used", actuals["materials_actual"]),
+        ("Production", actuals.get("production_actual")),
+        ("Vendor work orders", actuals.get("work_orders_actual")),
+        ("Overheads (actual)", actuals["overheads_actual_total"]),
+    ]
+    rows = [[Paragraph(label, s["cell"]), Paragraph(_money(value), s["num"])] for label, value in totals]
+    rows.append([Paragraph("<b>ACTUAL TO DATE</b>", s["cell"]),
+                 Paragraph(f"<b>{_money(actuals['actual_total'])}</b>", s["num"])])
+    if approved is not None:
+        rows.append([Paragraph("Approved budget", s["cell"]), Paragraph(_money(approved), s["num"])])
+        rows.append([Paragraph("Estimate as it stands", s["cell"]), Paragraph(_money(actuals.get("estimate_total")), s["num"])])
+        if variance is not None:
+            sign = "over" if float(variance) > 0 else "under"
+            rows.append([Paragraph(f"<b>Variance ({sign} the approved budget)</b>", s["cell"]),
+                         Paragraph(f"<b>{_money(abs(float(variance)))}</b>", s["num"])])
+    total = Table(rows, colWidths=[124 * mm, 50 * mm])
+    total.setStyle(TableStyle([
+        ("LINEBELOW", (0, 0), (-1, -2), 0.25, RULE),
+        ("LINEABOVE", (0, 4), (-1, 4), 1, INK),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(total)
+
+    doc.build(story)
+    return buf.getvalue()

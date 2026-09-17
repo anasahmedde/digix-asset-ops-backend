@@ -820,11 +820,15 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         )
         if already_open + quantity > component.outstanding_quantity:
             return Response({"quantity": [
-                f"{already_open} already waiting with the store on this line."
+                f"Only {component.undecided_quantity} of this line is still to be decided "
+                f"({already_open} already asked for)."
             ]}, status=400)
 
         with transaction.atomic():
-            component.fulfilment = AssetComponent.Fulfilment.FROM_STOCK
+            component.fulfilment = (
+                AssetComponent.Fulfilment.PROCUREMENT if component.procure_quantity
+                else AssetComponent.Fulfilment.FROM_STOCK
+            )
             component.save(update_fields=["fulfilment", "updated_at"])
             issuance_request = IssuanceRequest.objects.create(
                 item=component.inventory_item,
@@ -859,25 +863,36 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             return Response(
                 {"detail": "This requirement is already fully covered."}, status=400
             )
-        component.fulfilment = AssetComponent.Fulfilment.PROCUREMENT
-        component.save(update_fields=["fulfilment", "updated_at"])
-        # The goods still come through the store: queue the issue now, marked
-        # as waiting on procurement, so it is issued from stock once received.
+        undecided = component.undecided_quantity
+        if undecided == 0:
+            return Response({"quantity": ["Every unit of this line already has a decision."]}, status=400)
+        try:
+            quantity = int(request.data.get("quantity", undecided))
+        except (TypeError, ValueError):
+            return Response({"quantity": ["Must be a whole number."]}, status=400)
+        if quantity < 1:
+            return Response({"quantity": ["Buy at least one."]}, status=400)
+        if quantity > undecided:
+            return Response({"quantity": [
+                f"Only {undecided} of this line is still to be decided."
+            ]}, status=400)
         from apps.inventory.models import IssuanceRequest
 
-        already_open = component.issuance_requests.exclude(
-            status=IssuanceRequest.Status.CANCELLED
-        ).exclude(status=IssuanceRequest.Status.FULFILLED).exists()
-        if not already_open and component.outstanding_quantity > 0:
+        with transaction.atomic():
+            component.fulfilment = AssetComponent.Fulfilment.PROCUREMENT
+            component.save(update_fields=["fulfilment", "updated_at"])
+            # The goods still come through the store: queue the issue now,
+            # marked as waiting on procurement, for exactly what is being bought.
             IssuanceRequest.objects.create(
                 item=component.inventory_item,
                 unit_type=component.inventory_unit_type,
-                quantity_requested=component.outstanding_quantity,
+                quantity_requested=quantity,
                 source=IssuanceRequest.Source.PROJECT,
                 purpose=f"{component.device.asset_code} · {component.name} — procurement in progress",
                 project=component.device.project,
                 asset_component=component,
                 requested_by=request.user,
+                awaiting_procurement=True,
             )
         # Journalled on the asset so the decision is visible there, but the
         # build has not started, so the status is left alone.
@@ -885,7 +900,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             device=component.device,
             event_type=DeviceLifecycleEvent.EventType.NOTE,
             description=(
-                f"{component.name} × {component.outstanding_quantity} flagged for procurement"
+                f"{component.name} × {quantity} flagged for procurement"
             ),
             performed_by=request.user,
             metadata={"component": str(component.pk)},

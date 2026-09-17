@@ -515,6 +515,9 @@ class IssuanceRequest(TimeStampedModel):
         "assets.AssetComponent", on_delete=models.CASCADE, null=True, blank=True,
         related_name="issuance_requests",
     )
+    # Raised by a project's "Procure" decision: the goods are being bought and
+    # will be issued from stock once the delivery has been received.
+    awaiting_procurement = models.BooleanField(default=False)
     maintenance_schedule = models.ForeignKey(
         "maintenance.MaintenanceSchedule", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="issuance_requests",

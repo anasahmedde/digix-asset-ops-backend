@@ -613,6 +613,27 @@ class AssetComponent(TimeStampedModel):
         """How much of this requirement is still to be covered."""
         return max(0, self.quantity - self.issued_quantity)
 
+    def _open_requests(self):
+        return [
+            r for r in self.issuance_requests.all()
+            if r.status not in ("cancelled", "fulfilled")
+        ]
+
+    @property
+    def stock_requested_quantity(self) -> int:
+        """How much the store has been asked to issue from inventory."""
+        return sum(r.outstanding_quantity for r in self._open_requests() if not r.awaiting_procurement)
+
+    @property
+    def procure_quantity(self) -> int:
+        """How much has been decided to buy (each Procure decision is a request)."""
+        return sum(r.outstanding_quantity for r in self._open_requests() if r.awaiting_procurement)
+
+    @property
+    def undecided_quantity(self) -> int:
+        """What is still to be covered and has no decision on it yet."""
+        return max(0, self.outstanding_quantity - self.stock_requested_quantity - self.procure_quantity)
+
     @property
     def available_quantity(self) -> int:
         """On-hand stock for whatever this requirement points at."""

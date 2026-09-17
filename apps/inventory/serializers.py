@@ -551,14 +551,12 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
     po_number = serializers.SerializerMethodField()
 
     def get_awaiting_procurement(self, obj):
-        component = obj.asset_component
-        if component is None:
+        if not obj.awaiting_procurement:
             return False
-        line = component.purchase_order_item
-        if line is not None:
-            return line.received_quantity < line.quantity
-        # Flagged for procurement but not yet on an order: still being bought.
-        return getattr(component, "fulfilment", "") == "procurement"
+        component = obj.asset_component
+        line = component.purchase_order_item if component is not None else None
+        # Still being bought until the order line has been received.
+        return line is None or line.received_quantity < line.quantity
 
     def get_po_number(self, obj):
         component = obj.asset_component

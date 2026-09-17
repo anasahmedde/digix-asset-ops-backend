@@ -249,6 +249,20 @@ class ProjectViewSet(viewsets.ModelViewSet):
             plan.save(update_fields=["contingency_percent", "updated_at"])
         return Response(build_plan(project))
 
+    @action(detail=True, methods=["get"], url_path="actuals/document")
+    def actuals_document(self, request, pk=None):
+        """The execution actuals as a PDF — the complete table, for the file."""
+        from django.http import HttpResponse
+
+        from .costing import build_actuals
+        from .documents import render_actuals_pdf
+
+        project = self.get_object()
+        pdf = render_actuals_pdf(project, build_actuals(project))
+        response = HttpResponse(pdf, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="actual-cost-{project.name}.pdf"'
+        return response
+
     @action(detail=True, methods=["get"], url_path="plan/document")
     def plan_document(self, request, pk=None):
         """The cost plan as a PDF, for approval or the file."""

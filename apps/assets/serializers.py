@@ -258,6 +258,9 @@ class AssetComponentSerializer(serializers.ModelSerializer):
     # What the warehouse holds right now — shown for information only; it never
     # limits what you can require.
     available_quantity = serializers.SerializerMethodField()
+    stock_requested_quantity = serializers.IntegerField(read_only=True)
+    procure_quantity = serializers.IntegerField(read_only=True)
+    undecided_quantity = serializers.IntegerField(read_only=True)
     outstanding_quantity = serializers.IntegerField(read_only=True)
     po_number = serializers.CharField(
         source="purchase_order_item.purchase_order.po_number", read_only=True, default=None
@@ -274,7 +277,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "quantity", "supplier", "supplier_name",
             "inventory_item", "inventory_item_name", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name", "available_quantity",
-            "fulfilment", "issued_quantity", "outstanding_quantity",
+            "fulfilment", "issued_quantity", "outstanding_quantity", "stock_requested_quantity", "procure_quantity", "undecided_quantity",
             "purchase_order_item", "po_number", "planned_unit_price",
             "pending_increase", "increase_reason", "increase_notes",
             "increase_requested_by_name", "increase_requested_at",

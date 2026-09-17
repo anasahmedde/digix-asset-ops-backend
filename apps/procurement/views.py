@@ -204,8 +204,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 ),
             })
 
+        def _to_buy(c):
+            # Each Procure decision is an awaiting request; a line flagged before
+            # quantities were recorded falls back to everything outstanding.
+            decided = c.procure_quantity
+            return decided if decided else (c.outstanding_quantity if not c._open_requests() else 0)
+
         for c in components:
-            if c.outstanding_quantity <= 0:
+            if c.outstanding_quantity <= 0 or (_to_buy(c) <= 0 and not c.purchase_order_item_id):
                 continue
             project_pk, project_name = project_of(c.device)
             rows.append({
@@ -218,7 +224,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 "project": project_pk,
                 "project_name": project_name,
                 "required_quantity": c.quantity,
-                "outstanding_quantity": c.outstanding_quantity,
+                "outstanding_quantity": _to_buy(c),
                 "available_quantity": c.available_quantity,
                 "inventory_item": str(c.inventory_item_id) if c.inventory_item_id else None,
                 "inventory_unit_type": (
@@ -317,7 +323,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 device.procurement_item = item
                 device.save(update_fields=["procurement_item", "updated_at"])
             for component in components:
-                quantity = component.outstanding_quantity
+                decided = component.procure_quantity
+                quantity = decided if decided else component.outstanding_quantity
                 if quantity < 1:
                     continue
                 item = PurchaseOrderItem.objects.create(
