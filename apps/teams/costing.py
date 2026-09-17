@@ -34,6 +34,17 @@ def project_devices(project):
     )
 
 
+def component_unit(component) -> str:
+    """The unit of measure a component is counted in."""
+    if component.unit:
+        return component.unit
+    if component.inventory_unit_type_id:
+        return component.inventory_unit_type.unit or "piece"
+    if component.inventory_item_id and component.inventory_item.material_type_id:
+        return component.inventory_item.material_type.unit or "piece"
+    return "piece"
+
+
 def component_unit_price(component):
     """(unit price, where it came from) for one component line.
 
@@ -142,6 +153,7 @@ def build_plan(project):
                 "asset_name": device.display_name or "",
                 "name": component.name,
                 "quantity": component.quantity,
+                "unit": component_unit(component),
                 "unit_price": price,
                 "price_source": source,
                 "line_total": line_total,
@@ -305,6 +317,7 @@ def build_actuals(project):
                 "component": str(component.pk),
                 "name": component.name,
                 "required": component.quantity,
+                "unit": component_unit(component),
                 "issued": issued,
                 "unit_price": price,
                 "price_source": source,

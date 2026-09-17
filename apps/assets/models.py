@@ -415,23 +415,28 @@ class ProductionStep(TimeStampedModel):
     """
 
     class Location(models.TextChoices):
+        # Where an operation happens is the project's call, made in Execution.
+        UNDECIDED = "undecided", "Not decided"
         IN_HOUSE = "in_house", "In-house"
         EXTERNAL = "external", "Outside Workshop"
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         IN_PROGRESS = "in_progress", "In Progress"
-        SENT_OUT = "sent_out", "Sent to Workshop"
+        SENT_OUT = "sent_out", "Work Order Raised"
         RETURNED = "returned", "Returned from Workshop"
         COMPLETED = "completed", "Completed"
         SKIPPED = "skipped", "Skipped"
 
     # An external operation is only meaningfully "sent"/"returned"; an in-house
     # one just runs. Both converge on completed.
+    # The moves a person makes on an in-house operation. A step on a work
+    # order is not moved by hand: Work Order Raised and Completed follow the
+    # work order itself (see workorders.signals).
     VALID_TRANSITIONS = {
-        Status.PENDING: (Status.IN_PROGRESS, Status.SENT_OUT, Status.SKIPPED),
-        Status.IN_PROGRESS: (Status.COMPLETED, Status.SENT_OUT, Status.SKIPPED),
-        Status.SENT_OUT: (Status.RETURNED, Status.SKIPPED),
+        Status.PENDING: (Status.IN_PROGRESS, Status.COMPLETED),
+        Status.IN_PROGRESS: (Status.COMPLETED,),
+        Status.SENT_OUT: (),
         Status.RETURNED: (Status.IN_PROGRESS, Status.COMPLETED),
         Status.COMPLETED: (),
         Status.SKIPPED: (),
@@ -440,7 +445,7 @@ class ProductionStep(TimeStampedModel):
     device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name="production_steps")
     step_number = models.PositiveSmallIntegerField()
     name = models.CharField(max_length=200, help_text="e.g. Frame welding, Panaflex pasting")
-    location = models.CharField(max_length=12, choices=Location.choices, default=Location.IN_HOUSE)
+    location = models.CharField(max_length=12, choices=Location.choices, default=Location.UNDECIDED)
     # Where the work goes when it leaves the building.
     workshop = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
@@ -475,6 +480,30 @@ class ProductionStep(TimeStampedModel):
 
     def can_transition_to(self, new_status) -> bool:
         return new_status in self.VALID_TRANSITIONS.get(self.status, ())
+
+    @property
+    def on_project(self) -> bool:
+        device = self.device
+        return bool(device.project_id) or device.project_scope_items.exists()
+
+    @property
+    def manual_moves(self) -> tuple:
+        """What a person may move this step to right now."""
+        if self.location == self.Location.EXTERNAL:
+            return ()  # follows its work order
+        if self.location == self.Location.UNDECIDED and self.on_project:
+            return ()  # the project decides first
+        return self.VALID_TRANSITIONS.get(self.status, ())
+
+    @property
+    def hold_reason(self) -> str:
+        if self.status in (self.Status.COMPLETED, self.Status.SKIPPED):
+            return ""
+        if self.location == self.Location.EXTERNAL:
+            return "On a work order — its status follows the work order."
+        if self.location == self.Location.UNDECIDED and self.on_project:
+            return "Decide in the project's Execution tab whether this is done in-house or on a work order."
+        return ""
 
     @property
     def workshop_display(self):

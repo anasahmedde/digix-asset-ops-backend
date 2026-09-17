@@ -929,7 +929,7 @@ class ProductionStepSerializer(serializers.ModelSerializer):
         fields = [
             "id", "device", "step_number", "name",
             "location", "location_display", "workshop", "workshop_name", "workshop_display",
-            "status", "status_display", "allowed_transitions", "work_order",
+            "status", "status_display", "allowed_transitions", "hold_reason", "work_order",
             "assigned_to", "assigned_to_name", "expected_days", "planned_cost", "actual_cost",
             "started_at", "sent_at", "returned_at", "completed_at",
             "notes", "created_at",
@@ -942,7 +942,9 @@ class ProductionStepSerializer(serializers.ModelSerializer):
         validators = []
 
     def get_allowed_transitions(self, obj):
-        return list(ProductionStep.VALID_TRANSITIONS.get(obj.status, ()))
+        return list(obj.manual_moves)
+
+    hold_reason = serializers.CharField(read_only=True)
 
     def validate(self, attrs):
         def current(name):

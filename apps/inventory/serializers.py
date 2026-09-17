@@ -529,6 +529,15 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         source="item.material_type.name", read_only=True, default=None
     )
     unit_type_name = serializers.StringRelatedField(source="unit_type", read_only=True)
+    # Quantities read with their unit of measure (piece, meter, box…).
+    unit = serializers.SerializerMethodField()
+
+    def get_unit(self, obj):
+        if obj.unit_type_id:
+            return obj.unit_type.unit or "piece"
+        if obj.item_id and obj.item.material_type_id:
+            return obj.item.material_type.unit or "piece"
+        return "piece"
     project_name = serializers.CharField(source="project.name", read_only=True, default=None)
     asset_code = serializers.CharField(
         source="asset_component.device.asset_code", read_only=True, default=None
@@ -568,7 +577,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         model = IssuanceRequest
         fields = [
             "id", "request_number", "what",
-            "item", "item_sku", "item_name", "unit_type", "unit_type_name",
+            "item", "item_sku", "item_name", "unit_type", "unit_type_name", "unit",
             "quantity_requested", "quantity_issued", "outstanding_quantity", "available_quantity",
             "source", "source_display", "purpose",
             "project", "project_name", "asset_component", "asset_code", "component_name",

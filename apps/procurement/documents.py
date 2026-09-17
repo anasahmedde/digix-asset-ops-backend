@@ -182,6 +182,10 @@ def render_purchase_order_pdf(purchase_order) -> bytes:
         Paragraph("AMOUNT", s["head"]),
     ]]
     from .lines import describe_item
+    from .serializers import PurchaseOrderItemSerializer
+
+    def unit_of(item):
+        return PurchaseOrderItemSerializer().get_unit(item)
 
     for n, item in enumerate(purchase_order.items.all(), start=1):
         title, detail = describe_item(item)
@@ -189,7 +193,7 @@ def render_purchase_order_pdf(purchase_order) -> bytes:
         rows.append([
             Paragraph(str(n), s["cell"]),
             Paragraph(text, s["cell"]),
-            Paragraph(str(item.quantity), s["num"]),
+            Paragraph(f"{item.quantity} {unit_of(item)}", s["num"]),
             Paragraph(_money(item.unit_price, currency), s["num"]),
             Paragraph(_money(item.line_total, currency), s["num"]),
         ])

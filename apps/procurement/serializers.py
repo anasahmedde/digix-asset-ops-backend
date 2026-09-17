@@ -31,6 +31,28 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
     def get_procured_asset_codes(self, obj):
         return list(obj.procured_devices.values_list("asset_code", flat=True))
 
+    unit = serializers.SerializerMethodField()
+
+    def get_unit(self, obj):
+        comps = list(obj.asset_components.all()) if hasattr(obj, "asset_components") else []
+        if comps:
+            c = comps[0]
+            if c.unit:
+                return c.unit
+            if c.inventory_unit_type_id:
+                return c.inventory_unit_type.unit or "piece"
+            if c.inventory_item_id and c.inventory_item.material_type_id:
+                return c.inventory_item.material_type.unit or "piece"
+        if obj.procured_devices.exists():
+            return "asset"
+        if obj.inventory_unit_type_id:
+            return obj.inventory_unit_type.unit or "piece"
+        if obj.inventory_item_id and obj.inventory_item.material_type_id:
+            return obj.inventory_item.material_type.unit or "piece"
+        if obj.material_type_id:
+            return obj.material_type.unit or "piece"
+        return "piece"
+
     def get_line_title(self, obj):
         from .lines import describe_item
         return describe_item(obj)[0]
@@ -53,7 +75,7 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
             "material_type", "material_type_name", "bom_line", "description", "line_title", "line_detail", "procured_asset_codes",
             "inventory_item", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name",
-            "quantity", "unit_price", "received_quantity", "line_total",
+            "quantity", "unit", "unit_price", "received_quantity", "line_total",
         ]
         # received_quantity is owned by goods receiving — never writable via the API.
         read_only_fields = ["line_total", "received_quantity"]

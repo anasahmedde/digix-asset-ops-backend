@@ -1214,8 +1214,10 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
 
         if new_status == step.status:
             return Response({"detail": "The step is already in that status."}, status=400)
-        if not step.can_transition_to(new_status):
-            allowed = ", ".join(ProductionStep.VALID_TRANSITIONS.get(step.status, ())) or "none"
+        if new_status not in step.manual_moves:
+            if step.hold_reason:
+                return Response({"detail": step.hold_reason}, status=400)
+            allowed = ", ".join(step.manual_moves) or "none"
             return Response(
                 {"detail": f"Cannot move from '{step.status}' to '{new_status}'. Allowed: {allowed}."},
                 status=400,
