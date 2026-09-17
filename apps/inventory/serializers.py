@@ -32,7 +32,8 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         fields = [
             "id", "material_type", "material_name", "category", "category_name",
             "sku", "quantity", "min_stock_level", "unit", "location", "storage_location",
-            "unit_cost", "total_value", "notes", "is_low_stock", "created_at", "updated_at",
+            "unit_cost", "total_value", "watch_on_dashboard", "notes", "is_low_stock",
+            "created_at", "updated_at",
         ]
         read_only_fields = ["id", "sku", "created_at", "updated_at"]
 
@@ -82,7 +83,7 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
         fields = [
             "id", "type_code", "name",
             "material_type", "material_name", "category", "category_name",
-            "brand", "brand_name", "model_name", "specifications",
+            "brand", "brand_name", "model_name", "unit", "specifications",
             "unit_cost", "min_stock_level", "is_high_value",
             "default_has_warranty", "default_warranty_type", "default_warranty_months",
             "supplier", "supplier_name",
@@ -465,7 +466,7 @@ class GoodsReceiptSerializer(serializers.ModelSerializer):
     class Meta:
         model = GoodsReceipt
         fields = [
-            "id", "grn_number", "work_order", "wo_number",
+            "id", "grn_number", "source", "work_order", "wo_number",
             "purchase_order", "po_number", "item", "item_name",
             "quantity", "reference", "received_by", "received_by_name",
             "notes", "lines", "created_at",
@@ -544,6 +545,26 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
     available_quantity = serializers.IntegerField(read_only=True)
     requested_by_name = serializers.SerializerMethodField()
     issued_by_name = serializers.SerializerMethodField()
+    # True while the goods are still being bought: the store cannot issue
+    # until the PO is received and inspected into stock.
+    awaiting_procurement = serializers.SerializerMethodField()
+    po_number = serializers.SerializerMethodField()
+
+    def get_awaiting_procurement(self, obj):
+        component = obj.asset_component
+        if component is None:
+            return False
+        line = component.purchase_order_item
+        if line is not None:
+            return line.received_quantity < line.quantity
+        # Flagged for procurement but not yet on an order: still being bought.
+        return getattr(component, "fulfilment", "") == "procurement"
+
+    def get_po_number(self, obj):
+        component = obj.asset_component
+        if component is None or component.purchase_order_item_id is None:
+            return None
+        return component.purchase_order_item.purchase_order.po_number
 
     class Meta:
         model = IssuanceRequest
@@ -555,7 +576,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "project", "project_name", "asset_component", "asset_code", "component_name",
             "maintenance_schedule", "maintenance_title",
             "requested_by", "requested_by_name", "issued_by", "issued_by_name",
-            "received_by", "issued_serials",
+            "received_by", "issued_serials", "awaiting_procurement", "po_number",
             "status", "status_display", "notes", "created_at", "updated_at",
         ]
         read_only_fields = [

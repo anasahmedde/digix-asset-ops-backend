@@ -1,7 +1,7 @@
 from rest_framework import viewsets
 from rest_framework.permissions import IsAuthenticated
 
-from common.permissions import AdminManagerWriteElseRead, IsAdminOrManager
+from common.permissions import CommercialWriteElseRead, IsAdminOrManager
 
 from .models import (
     EscalationPolicy,
@@ -24,7 +24,7 @@ from .serializers import (
 class CompanyViewSet(viewsets.ModelViewSet):
     queryset = Company.objects.all()
     serializer_class = CompanySerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
     search_fields = ["name", "legal_name"]
 
 
@@ -40,7 +40,7 @@ class NumberingSchemeViewSet(viewsets.ModelViewSet):
 class PaymentTermsViewSet(viewsets.ModelViewSet):
     queryset = PaymentTerms.objects.all()
     serializer_class = PaymentTermsSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
     filterset_fields = ["is_active"]
     search_fields = ["name", "code"]
     ordering_fields = ["days", "name", "created_at"]
@@ -49,7 +49,7 @@ class PaymentTermsViewSet(viewsets.ModelViewSet):
 class TermsTemplateViewSet(viewsets.ModelViewSet):
     queryset = TermsTemplate.objects.all()
     serializer_class = TermsTemplateSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
     filterset_fields = ["category", "is_active", "is_default"]
     search_fields = ["name", "body"]
 
@@ -57,7 +57,7 @@ class TermsTemplateViewSet(viewsets.ModelViewSet):
 class WarrantyPeriodPresetViewSet(viewsets.ModelViewSet):
     queryset = WarrantyPeriodPreset.objects.all()
     serializer_class = WarrantyPeriodPresetSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
     filterset_fields = ["is_active"]
     ordering_fields = ["months", "label"]
 
@@ -65,5 +65,5 @@ class WarrantyPeriodPresetViewSet(viewsets.ModelViewSet):
 class EscalationPolicyViewSet(viewsets.ModelViewSet):
     queryset = EscalationPolicy.objects.all()
     serializer_class = EscalationPolicySerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
     filterset_fields = ["is_active", "trigger", "scope", "stage"]

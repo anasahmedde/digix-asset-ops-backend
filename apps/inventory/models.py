@@ -44,6 +44,8 @@ class InventoryItem(TimeStampedModel):
         max_length=200, blank=True, help_text="Where it is placed, e.g. Rack A3"
     )
     unit_cost = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    # Picked from the dashboard's in-hand stock panel to be watched there.
+    watch_on_dashboard = models.BooleanField(default=False)
     notes = models.TextField(blank=True)
 
     class Meta:
@@ -89,6 +91,7 @@ class InventoryUnitType(TimeStampedModel):
         related_name="inventory_unit_types",
     )
     model_name = models.CharField(max_length=200, blank=True)
+    unit = models.CharField(max_length=50, default="piece")
     specifications = models.JSONField(
         default=dict, blank=True, help_text="Free-form technical details captured when the item is opened"
     )
@@ -328,7 +331,13 @@ class GoodsReceipt(TimeStampedModel):
     """Receiving stock into the warehouse — optionally against a Work Order
     (legacy single-item flow) or a Purchase Order (line-level GRN, WF-04)."""
 
+    class Source(models.TextChoices):
+        PURCHASE = "purchase", "Purchase Order"
+        PROJECT_RETURN = "project_return", "Returned from Project"
+        MAINTENANCE_RETURN = "maintenance_return", "Returned from Maintenance"
+
     grn_number = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
+    source = models.CharField(max_length=20, choices=Source.choices, default=Source.PURCHASE)
     work_order = models.ForeignKey(
         "workorders.WorkOrder", on_delete=models.SET_NULL, null=True, blank=True, related_name="goods_receipts"
     )

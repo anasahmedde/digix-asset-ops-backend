@@ -10,7 +10,8 @@ from rest_framework.response import Response
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from common.permissions import (
-    WAREHOUSE_ROLES,
+    ISSUING_ROLES,
+    MANAGER_ROLES,
     InspectionWriteElseRead,
     WarehouseWriteElseRead,
 )
@@ -70,7 +71,7 @@ class InventoryItemViewSet(viewsets.ModelViewSet):
     )
     serializer_class = InventoryItemSerializer
     permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
-    filterset_fields = ["location", "category", "material_type"]
+    filterset_fields = ["location", "category", "material_type", "watch_on_dashboard"]
     search_fields = ["sku", "material_type__name", "category__name"]
     ordering_fields = ["quantity", "total_value", "material_type__name", "created_at"]
 
@@ -368,8 +369,59 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
     )
     serializer_class = GoodsReceiptSerializer
     permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
-    filterset_fields = ["item", "work_order", "purchase_order"]
+    filterset_fields = ["item", "work_order", "purchase_order", "source"]
     ordering_fields = ["created_at"]
+
+    @action(detail=False, methods=["post"], url_path="return")
+    def record_return(self, request):
+        """Material coming back from a project or a maintenance job.
+
+        It is received the same way a delivery is — a receipt with a line that
+        waits for inspection — so nothing re-enters stock unchecked. Body:
+        source (project_return | maintenance_return), inventory_item or
+        unit_type, quantity, optional serial_numbers, reference, notes.
+        """
+        source = request.data.get("source")
+        if source not in (GoodsReceipt.Source.PROJECT_RETURN, GoodsReceipt.Source.MAINTENANCE_RETURN):
+            return Response({"source": ["Say whether this is a project or a maintenance return."]}, status=400)
+        try:
+            quantity = int(request.data.get("quantity") or 0)
+        except (TypeError, ValueError):
+            quantity = 0
+        if quantity < 1:
+            return Response({"quantity": ["Return at least one."]}, status=400)
+
+        item_id = request.data.get("inventory_item") or None
+        unit_type_id = request.data.get("unit_type") or None
+        if not item_id and not unit_type_id:
+            return Response({"inventory_item": ["Name the component coming back."]}, status=400)
+        serials = request.data.get("serial_numbers") or []
+        if unit_type_id and len(serials) != quantity:
+            return Response(
+                {"serial_numbers": [f"Give {quantity} serial number(s) for the units coming back."]},
+                status=400,
+            )
+
+        with transaction.atomic():
+            receipt = GoodsReceipt.objects.create(
+                source=source,
+                reference=(request.data.get("reference") or "").strip(),
+                notes=(request.data.get("notes") or "").strip(),
+                received_by=request.user,
+            )
+            line = GoodsReceiptLine.objects.create(
+                receipt=receipt,
+                inventory_item_id=item_id,
+                quantity=quantity,
+                serial_numbers=serials,
+                inspection_status=GoodsReceiptLine.Inspection.PENDING,
+            )
+            # A unique product is remembered on the line's notes for the
+            # inspector, who files the serials against it.
+            if unit_type_id:
+                line.inspection_notes = f"unit_type:{unit_type_id}"
+                line.save(update_fields=["inspection_notes", "updated_at"])
+        return Response(GoodsReceiptSerializer(receipt).data, status=201)
 
     def perform_create(self, serializer):
         with transaction.atomic():
@@ -428,9 +480,20 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         serializer.save(requested_by=self.request.user)
 
     def _store_only(self, request):
-        if getattr(request.user, "role", "") not in WAREHOUSE_ROLES:
+        # Approval gate 3: the store hands material over; management may too.
+        if getattr(request.user, "role", "") not in ISSUING_ROLES:
             return Response(
                 {"detail": "Only the warehouse can issue material."}, status=403
+            )
+        return None
+
+    def _management_only(self, request):
+        # Client decision 8: withdrawing a request needs the Operations Head or
+        # the Group Head, after written approval.
+        if getattr(request.user, "role", "") not in MANAGER_ROLES:
+            return Response(
+                {"detail": "Only the Operations Head or Group Head can cancel a request."},
+                status=403,
             )
         return None
 
@@ -464,7 +527,7 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
         """Close a request that is no longer needed; issued stock is untouched."""
-        denied = self._store_only(request)
+        denied = self._management_only(request)
         if denied is not None:
             return denied
 

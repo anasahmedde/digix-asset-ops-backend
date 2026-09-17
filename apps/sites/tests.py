@@ -263,6 +263,42 @@ def test_completion_marks_device_installed(installation):
     assert device.status == "installed"
 
 
+@pytest.mark.django_db
+def test_completion_records_when_the_asset_went_in(installation):
+    """The installation date comes off the installation — never typed by hand."""
+    device = installation.device
+    device.status = "assigned"
+    device.installation_date = None
+    device.save()
+    assert device.installation_date is None
+
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+
+    installation.refresh_from_db()
+    device.refresh_from_db()
+    assert installation.completed_at is not None
+    assert device.installation_date == timezone.localdate(installation.completed_at)
+
+
+@pytest.mark.django_db
+def test_installation_date_is_filled_even_when_the_status_was_set_by_hand(installation):
+    """An asset already marked Installed still gets its date from the tracker."""
+    device = installation.device
+    device.status = "installed"
+    device.installation_date = None
+    device.save()
+
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+
+    installation.refresh_from_db()
+    device.refresh_from_db()
+    assert device.installation_date == timezone.localdate(installation.completed_at)
+
+
 def _complete_non_handover_steps(installation):
     for step in installation.steps.exclude(step_type=InstallationStep.StepType.HANDOVER):
         step.status = InstallationStep.StepStatus.COMPLETED

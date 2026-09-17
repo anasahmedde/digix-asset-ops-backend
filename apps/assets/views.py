@@ -113,7 +113,7 @@ class MaterialTypeViewSet(viewsets.ModelViewSet):
     serializer_class = MaterialTypeSerializer
     permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
     filterset_fields = ["category"]
-    search_fields = ["name", "category"]
+    search_fields = ["name", "category__name"]
 
 
 class DeviceViewSet(viewsets.ModelViewSet):
@@ -725,6 +725,28 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             return [IsAuthenticated()]
         return super().get_permissions()
 
+    # 10: once the project is executing, the build definition is frozen. The
+    # budget approved this parts list and this route; only status moves now.
+    def _refuse_if_locked(self, device):
+        if device is not None and device.is_locked:
+            raise PermissionDenied(
+                f"{device.asset_code} is in execution — its components and production "
+                "route are fixed. Only the asset's status can change now."
+            )
+
+    def perform_create(self, serializer):
+        self._refuse_if_locked(serializer.validated_data.get("device"))
+        super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        self._refuse_if_locked(serializer.instance.device)
+        super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        self._refuse_if_locked(instance.device)
+        super().perform_destroy(instance)
+
+
     @action(detail=True, methods=["post"], url_path="fulfil-from-stock")
     def fulfil_from_stock(self, request, pk=None):
         """Ask the store to cover this requirement (or part of it) from stock.
@@ -801,6 +823,24 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             )
         component.fulfilment = AssetComponent.Fulfilment.PROCUREMENT
         component.save(update_fields=["fulfilment", "updated_at"])
+        # The goods still come through the store: queue the issue now, marked
+        # as waiting on procurement, so it is issued from stock once received.
+        from apps.inventory.models import IssuanceRequest
+
+        already_open = component.issuance_requests.exclude(
+            status=IssuanceRequest.Status.CANCELLED
+        ).exclude(status=IssuanceRequest.Status.FULFILLED).exists()
+        if not already_open and component.outstanding_quantity > 0:
+            IssuanceRequest.objects.create(
+                item=component.inventory_item,
+                unit_type=component.inventory_unit_type,
+                quantity_requested=component.outstanding_quantity,
+                source=IssuanceRequest.Source.PROJECT,
+                purpose=f"{component.device.asset_code} · {component.name} — procurement in progress",
+                project=component.device.project,
+                asset_component=component,
+                requested_by=request.user,
+            )
         # Journalled on the asset so the decision is visible there, but the
         # build has not started, so the status is left alone.
         DeviceLifecycleEvent.objects.create(
@@ -1005,6 +1045,28 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
     ).all()
     serializer_class = ProductionStepSerializer
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+
+    # 10: once the project is executing, the build definition is frozen. The
+    # budget approved this parts list and this route; only status moves now.
+    def _refuse_if_locked(self, device):
+        if device is not None and device.is_locked:
+            raise PermissionDenied(
+                f"{device.asset_code} is in execution — its components and production "
+                "route are fixed. Only the asset's status can change now."
+            )
+
+    def perform_create(self, serializer):
+        self._refuse_if_locked(serializer.validated_data.get("device"))
+        super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        self._refuse_if_locked(serializer.instance.device)
+        super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        self._refuse_if_locked(instance.device)
+        super().perform_destroy(instance)
+
     filterset_fields = ["device", "status", "location"]
     search_fields = ["name", "workshop_name", "device__asset_code"]
     ordering_fields = ["step_number", "created_at"]
@@ -1024,6 +1086,7 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
         neighbour rather than renumbered, so nothing else in the route shifts.
         """
         step = self.get_object()
+        self._refuse_if_locked(step.device)
         direction = str(request.data.get("direction", "")).lower()
         if direction not in ("up", "down"):
             return Response({"direction": "Send 'up' or 'down'."}, status=400)
@@ -1049,6 +1112,14 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
             ProductionStep.objects.filter(pk=step.pk).update(step_number=parking)
             ProductionStep.objects.filter(pk=neighbour.pk).update(step_number=mine)
             ProductionStep.objects.filter(pk=step.pk).update(step_number=theirs)
+            # Renumber so the sequence reads 1..n with no gaps left by deletes;
+            # park everything high first so no two rows collide on the way.
+            ordered = list(siblings.order_by("step_number", "created_at").values_list("pk", flat=True))
+            offset = len(ordered) + parking
+            for n, pk in enumerate(ordered, start=1):
+                ProductionStep.objects.filter(pk=pk).update(step_number=offset + n)
+            for n, pk in enumerate(ordered, start=1):
+                ProductionStep.objects.filter(pk=pk).update(step_number=n)
 
         steps = ProductionStep.objects.filter(device_id=step.device_id).select_related(
             "workshop", "assigned_to"

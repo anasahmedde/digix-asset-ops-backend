@@ -26,14 +26,11 @@ class Project(TimeStampedModel):
         QUOTATION = "quotation", "Quotation"
         NEGOTIATION = "negotiation", "Negotiation"
         ORDER_CONFIRMATION = "order_confirmation", "Order Confirmation"
-        LOST = "lost", "Lost"
+        LOST = "lost", "Order Lost"
         PRODUCTION = "production", "Production"
         DELIVERY = "delivery", "Delivery"
         INSTALLATION = "installation", "Installation"
         HANDOVER = "handover", "Handing Over"
-        UNDER_WARRANTY = "under_warranty", "Under Warranty"
-        EXTENDED_WARRANTY = "extended_warranty", "Extended Warranty"
-        DECOMMISSIONED = "decommissioned", "De-Commissioned"
 
     name = models.CharField(max_length=300)
     phase = models.CharField(max_length=25, choices=Phase.choices, default=Phase.QUERY)
@@ -46,6 +43,9 @@ class Project(TimeStampedModel):
     site = models.ForeignKey(
         "sites.Site", on_delete=models.SET_NULL, null=True, blank=True, related_name="projects"
     )
+    # One order can put assets up at several sites. `site` stays as the
+    # primary for older screens; this is the full list.
+    sites = models.ManyToManyField("sites.Site", blank=True, related_name="scoped_projects")
     contract_type = models.CharField(
         max_length=10, choices=ContractType.choices, blank=True, default="",
         help_text="Whether the project is sold outright or rented",
@@ -121,9 +121,13 @@ class ProjectScopeItem(TimeStampedModel):
 
     class Meta:
         ordering = ["created_at"]
+        constraints = [
+            # Every asset has its own ID; it is on a project once, not counted.
+            models.UniqueConstraint(fields=["project", "device"], name="uniq_asset_per_project"),
+        ]
 
     def __str__(self):
-        return f"{self.project.name}: {self.device.asset_code} ×{self.quantity}"
+        return f"{self.project.name}: {self.device.asset_code}"
 
 
 class ProjectMilestone(TimeStampedModel):
@@ -320,7 +324,7 @@ class ProjectCostLine(TimeStampedModel):
     """
 
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="cost_lines")
-    cost_type = models.CharField(max_length=100)
+    cost_type = models.CharField(max_length=100, blank=True)
     description = models.CharField(max_length=300, blank=True)
     quantity = models.DecimalField(max_digits=10, decimal_places=2, default=1)
     unit_cost = models.DecimalField(max_digits=12, decimal_places=2)

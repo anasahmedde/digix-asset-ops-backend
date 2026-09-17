@@ -21,6 +21,12 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
     # Which stock row the line lands in. Receiving needs to know a line is for
     # serialized stock, so it can ask for the serial numbers at the door.
     inventory_unit_type_name = serializers.SerializerMethodField()
+    # A line that buys complete assets names them, so the receiving form
+    # knows the line is serialised and which registry entries are arriving.
+    procured_asset_codes = serializers.SerializerMethodField()
+
+    def get_procured_asset_codes(self, obj):
+        return list(obj.procured_devices.values_list("asset_code", flat=True))
     inventory_item_sku = serializers.CharField(
         source="inventory_item.sku", read_only=True, default=None
     )
@@ -33,7 +39,7 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
         model = PurchaseOrderItem
         fields = [
             "id", "asset_type", "asset_type_name", "device_model", "device_model_name",
-            "material_type", "material_type_name", "bom_line", "description",
+            "material_type", "material_type_name", "bom_line", "description", "procured_asset_codes",
             "inventory_item", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name",
             "quantity", "unit_price", "received_quantity", "line_total",
@@ -51,8 +57,33 @@ class PurchaseOrderItemDetailSerializer(PurchaseOrderItemSerializer):
         fields = PurchaseOrderItemSerializer.Meta.fields + ["purchase_order"]
 
 
+# Who may see prices on a purchase order. The store receives against the
+# order and needs quantities, not what was paid.
+PRICE_VIEW_ROLES = ("super_admin", "group_head", "ops_manager", "finance", "marketing_head")
+
+
+def _can_see_prices(context) -> bool:
+    request = context.get("request")
+    user = getattr(request, "user", None)
+    if user is None or not user.is_authenticated:
+        return False
+    return getattr(user, "role", "") in PRICE_VIEW_ROLES
+
+
 class PurchaseOrderSerializer(serializers.ModelSerializer):
     items = PurchaseOrderItemSerializer(many=True, required=False)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not _can_see_prices(self.context):
+            data["total_amount"] = None
+            data["prices_hidden"] = True
+            for line in data.get("items") or []:
+                line["unit_price"] = None
+                line["line_total"] = None
+        else:
+            data["prices_hidden"] = False
+        return data
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     ordered_by_name = serializers.CharField(source="ordered_by.get_full_name", read_only=True, default=None)
@@ -184,6 +215,8 @@ class PurchaseOrderReceiveLineSerializer(serializers.Serializer):
     serial_numbers = serializers.ListField(
         child=serializers.CharField(max_length=200), required=False, default=list
     )
+    # Vendor warranty on a complete asset, in months from the day it arrives.
+    warranty_months = serializers.IntegerField(required=False, allow_null=True, min_value=1)
 
 
 class PurchaseOrderReceiveSerializer(serializers.Serializer):
