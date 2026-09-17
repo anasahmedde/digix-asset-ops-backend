@@ -1905,6 +1905,27 @@ def test_a_step_on_a_work_order_follows_it(admin_client, inhouse_asset, db):
 
 
 @pytest.mark.django_db
+def test_a_step_work_order_spawns_no_installation_project(admin_client, inhouse_asset, db):
+    """One operation given to a workshop is production, not an installation:
+    approving its work order must not open a delivery project."""
+    from apps.assets.models import ProductionStep
+    from apps.suppliers.models import Supplier
+    from apps.teams.models import Project
+    from apps.workorders.models import WorkOrder
+
+    painter = Supplier.objects.create(name="Ali Paint Works")
+    step = ProductionStep.objects.get(pk=_step(admin_client, inhouse_asset, 1, "Painting").data["id"])
+    order = WorkOrder.objects.create(
+        title="Painting", supplier=painter, production_step=step, device=inhouse_asset,
+        order_type=WorkOrder.OrderType.PRODUCTION,
+    )
+    for status in ("pending_approval", "approved"):
+        r = admin_client.post(f"/api/work-orders/{order.id}/transition/", {"status": status}, format="json")
+        assert r.status_code == 200, r.content
+    assert not Project.objects.filter(source_work_order=order).exists()
+
+
+@pytest.mark.django_db
 def test_the_step_flow_is_guarded(admin_client, inhouse_asset):
     step_id = _step(admin_client, inhouse_asset, 1, "Welding").data["id"]
     # pending to returned makes no sense, it was never sent anywhere
@@ -2125,9 +2146,10 @@ def test_save_a_route_then_reuse_it_on_the_next_asset(admin_client, standee_type
     assert applied.data["applied"] == 3
     names = [s["name"] for s in applied.data["steps"]]
     assert names == ["Frame welding", "Painting", "Panaflex pasting"]
-    shops = {s["name"]: s["workshop_display"] for s in applied.data["steps"]}
-    assert shops["Painting"] == "Ali Paint Works"
-    assert shops["Panaflex pasting"] == "Corner Signage Shop"
+    # The route brings the operations, not the first asset's decisions: where
+    # each one happens is decided again, per project, in Execution.
+    assert {s["location"] for s in applied.data["steps"]} == {"undecided"}
+    assert all(s["workshop_display"] is None for s in applied.data["steps"])
     # Copied steps start fresh, not carrying the first asset's progress.
     assert all(s["status"] == "pending" for s in applied.data["steps"])
 
@@ -2541,3 +2563,29 @@ def test_raising_a_quantity_waits_for_a_manager(admin_client, db):
     r = tech_client.post(f"/api/assets/components/{component.id}/increase-quantity/",
                          {"additional": 1, "reason": "gremlins"}, format="json")
     assert r.status_code == 400
+
+
+@pytest.mark.django_db
+def test_a_copied_route_leaves_the_decision_to_the_project(admin_client, inhouse_asset, db):
+    """Copying an asset brings its operations, not its decisions: where each
+    one happens is decided again, per project."""
+    from apps.suppliers.models import Supplier
+    from apps.assets.models import ProductionStep
+
+    painter = Supplier.objects.create(name="Copy Paint Works")
+    first = _step(admin_client, inhouse_asset, 1, "Cutting").data["id"]
+    second = _step(admin_client, inhouse_asset, 2, "Painting").data["id"]
+    for step_id, location in ((first, "in_house"), (second, "external")):
+        step = ProductionStep.objects.get(pk=step_id)
+        step.location = location
+        step.workshop = painter if location == "external" else None
+        step.save(update_fields=["location", "workshop"])
+
+    r = admin_client.post("/api/assets/devices/", {
+        "source": "inhouse", "serial_number": "COPY-ROUTE-1", "copy_from": str(inhouse_asset.id),
+    }, format="json")
+    assert r.status_code == 201, r.content
+    copied = ProductionStep.objects.filter(device_id=r.data["id"]).order_by("step_number")
+    assert [s.name for s in copied] == ["Cutting", "Painting"]
+    assert {s.location for s in copied} == {"undecided"}
+    assert all(s.workshop_id is None for s in copied)

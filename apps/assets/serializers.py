@@ -127,9 +127,8 @@ def copy_build_definition(source, target):
             device=target,
             step_number=step.step_number,
             name=step.name,
-            location=step.location,
-            workshop=step.workshop,
-            workshop_name=step.workshop_name,
+            # The operations carry over; where each happens does not. That is
+            # the project's decision for this asset, made in Execution.
             expected_days=step.expected_days,
             planned_cost=step.planned_cost,
         )
@@ -929,7 +928,7 @@ class ProductionStepSerializer(serializers.ModelSerializer):
         fields = [
             "id", "device", "step_number", "name",
             "location", "location_display", "workshop", "workshop_name", "workshop_display",
-            "status", "status_display", "allowed_transitions", "hold_reason", "work_order",
+            "status", "status_display", "allowed_transitions", "hold_reason", "decision_pending", "work_order",
             "assigned_to", "assigned_to_name", "expected_days", "planned_cost", "actual_cost",
             "started_at", "sent_at", "returned_at", "completed_at",
             "notes", "created_at",
@@ -945,6 +944,11 @@ class ProductionStepSerializer(serializers.ModelSerializer):
         return list(obj.manual_moves)
 
     hold_reason = serializers.CharField(read_only=True)
+    # True while the project still has to say where this operation happens.
+    decision_pending = serializers.SerializerMethodField()
+
+    def get_decision_pending(self, obj):
+        return obj.location == obj.Location.UNDECIDED and obj.on_project
 
     def validate(self, attrs):
         def current(name):
