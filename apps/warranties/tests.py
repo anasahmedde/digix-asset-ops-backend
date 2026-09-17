@@ -428,4 +428,5 @@ def test_asset_level_outside_cover_is_always_a_vendor_warranty():
         "device": str(device.id), "component": str(component.id), "warranty_type": "manufacturer", **dates,
     }, format="json")
     assert r.status_code == 201, r.content
-    assert r.data["warranty_type"] == "manufacturer"
+    # A part's cover is its supplier's — the one kind there is on a component.
+    assert r.data["warranty_type"] == "supplier"

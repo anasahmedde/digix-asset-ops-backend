@@ -324,12 +324,13 @@ def test_warranty_end_derived_from_months(ops, unit_refs):
 
 
 @pytest.mark.django_db
-def test_warranty_requires_type_and_start_when_flagged(ops, unit_refs):
+def test_warranty_requires_start_when_flagged(ops, unit_refs):
+    """A unit's cover is always its supplier's, so only the start date is asked for."""
     r = _client(ops).post(
         "/api/inventory/units/", _unit_payload(unit_refs, has_warranty=True), format="json"
     )
     assert r.status_code == 400, r.content
-    assert "warranty_type" in r.data
+    assert "warranty_start" in r.data and "warranty_type" not in r.data
 
 
 @pytest.mark.django_db

@@ -258,6 +258,9 @@ class AssetComponentSerializer(serializers.ModelSerializer):
     # What the warehouse holds right now — shown for information only; it never
     # limits what you can require.
     available_quantity = serializers.SerializerMethodField()
+    stock_requested_quantity = serializers.IntegerField(read_only=True)
+    procure_quantity = serializers.IntegerField(read_only=True)
+    undecided_quantity = serializers.IntegerField(read_only=True)
     outstanding_quantity = serializers.IntegerField(read_only=True)
     po_number = serializers.CharField(
         source="purchase_order_item.purchase_order.po_number", read_only=True, default=None
@@ -274,7 +277,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "quantity", "supplier", "supplier_name",
             "inventory_item", "inventory_item_name", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name", "available_quantity",
-            "fulfilment", "issued_quantity", "outstanding_quantity",
+            "fulfilment", "issued_quantity", "outstanding_quantity", "stock_requested_quantity", "procure_quantity", "undecided_quantity",
             "purchase_order_item", "po_number", "planned_unit_price",
             "pending_increase", "increase_reason", "increase_notes",
             "increase_requested_by_name", "increase_requested_at",
@@ -515,6 +518,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     allowed_transitions = serializers.SerializerMethodField()
     # Frozen once the project is executing: components and route are read-only.
     is_locked = serializers.BooleanField(read_only=True)
+    route_complete = serializers.BooleanField(read_only=True)
     # Register by copying an existing asset: its details are the form's
     # defaults, and its components and production route come across too.
     copy_from = serializers.PrimaryKeyRelatedField(
@@ -546,7 +550,8 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "technician_job_title", "technician_phone",
             "assigned_vendor_name", "assigned_vendor_contact", "assigned_to_display",
             "supply_vendor_name", "supply_vendor_contact",
-            "is_locked", "procurement_item", "procurement_po_number", "copy_from",
+            "is_locked", "route_complete", "procurement_item", "procurement_po_number",
+            "procurement_requested_at", "copy_from",
             "installation_date", "installed_by", "installed_by_name",
             "warranty_status", "active_warranty",
             "tickets_total", "tickets_open",
@@ -686,6 +691,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
         return [
             status for status in Device.VALID_TRANSITIONS.get(obj.status, ())
             if (obj.status, status) not in DeviceTransitionSerializer.TRACKER_DRIVEN
+            and obj.can_transition_to(status)
         ]
 
     def get_stage_dates(self, obj):
@@ -905,13 +911,25 @@ class ProductionStepSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     location_display = serializers.CharField(source="get_location_display", read_only=True)
     allowed_transitions = serializers.SerializerMethodField()
+    # The open work order for this operation, when it was given to a workshop.
+    work_order = serializers.SerializerMethodField()
+
+    def get_work_order(self, obj):
+        orders = getattr(obj, "_prefetched_objects_cache", {}).get("work_orders")
+        orders = list(orders) if orders is not None else list(obj.work_orders.all())
+        live = [o for o in orders if o.status != "cancelled"]
+        if not live:
+            return None
+        o = sorted(live, key=lambda x: x.created_at)[-1]
+        return {"id": str(o.pk), "wo_number": o.wo_number, "status": o.status,
+                "status_display": o.get_status_display(), "amount": o.total_amount}
 
     class Meta:
         model = ProductionStep
         fields = [
             "id", "device", "step_number", "name",
             "location", "location_display", "workshop", "workshop_name", "workshop_display",
-            "status", "status_display", "allowed_transitions",
+            "status", "status_display", "allowed_transitions", "hold_reason", "work_order",
             "assigned_to", "assigned_to_name", "expected_days", "planned_cost", "actual_cost",
             "started_at", "sent_at", "returned_at", "completed_at",
             "notes", "created_at",
@@ -924,7 +942,9 @@ class ProductionStepSerializer(serializers.ModelSerializer):
         validators = []
 
     def get_allowed_transitions(self, obj):
-        return list(ProductionStep.VALID_TRANSITIONS.get(obj.status, ()))
+        return list(obj.manual_moves)
+
+    hold_reason = serializers.CharField(read_only=True)
 
     def validate(self, attrs):
         def current(name):

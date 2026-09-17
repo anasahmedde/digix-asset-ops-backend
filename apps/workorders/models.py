@@ -24,6 +24,7 @@ class WorkOrder(TimeStampedModel):
         SUPPLY = "supply", "Supply / Purchase"
         INSTALLATION = "installation", "Installation"
         SUPPLY_INSTALL = "supply_install", "Supply & Installation"
+        PRODUCTION = "production", "Production Step"
 
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
@@ -68,6 +69,11 @@ class WorkOrder(TimeStampedModel):
     )
     device = models.ForeignKey(
         "assets.Device", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_orders"
+    )
+    # One operation of an in-house build given to an outside workshop.
+    production_step = models.ForeignKey(
+        "assets.ProductionStep", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="work_orders",
     )
     payment_terms = models.ForeignKey(
         "setup.PaymentTerms", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_orders"

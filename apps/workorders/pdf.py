@@ -76,7 +76,7 @@ def build_work_order_pdf(work_order) -> bytes:
         f"<b>Type:</b> {work_order.get_order_type_display()}",
         f"<b>Status:</b> {work_order.get_status_display()}",
         f"<b>Order date:</b> {work_order.order_date or '—'}",
-        f"<b>Expected delivery:</b> {work_order.expected_delivery or '—'}",
+        f"<b>Required delivery:</b> {work_order.expected_delivery or '—'}",
         f"<b>Payment terms:</b> {work_order.payment_terms.name if work_order.payment_terms else '—'}",
         f"<b>Warranty:</b> {str(work_order.warranty_months) + ' months' if work_order.warranty_months else '—'}",
     ]

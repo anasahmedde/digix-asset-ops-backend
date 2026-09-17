@@ -780,3 +780,43 @@ def test_actual_costs_are_recorded_against_the_approved_budget():
     r = c.patch(f"/api/teams/cost-lines/{line.id}/", {"unit_cost": "9999"}, format="json")
     assert r.status_code == 400
     assert "revise it to change the planned figures" in str(r.data)
+
+
+@pytest.mark.django_db
+def test_actuals_document_prints_the_complete_table(db):
+    """Execution's actual-cost table prints as a PDF naming every asset, the
+    vendor line, the production steps and the overheads."""
+    from apps.accounts.models import User as _U
+    from apps.assets.models import AssetComponent, Brand, Device, DeviceModel, ProductionStep
+    from apps.teams.models import Project, ProjectCostLine, ProjectScopeItem
+    from rest_framework.test import APIClient
+
+    admin = _U.objects.create_user(username="act-doc", password="x", role="super_admin")
+    project = Project.objects.create(name="Actuals Doc Project")
+    brand = Brand.objects.create(name="Doc Brand")
+    model = DeviceModel.objects.create(brand=brand, name="DOC-1")
+    built = Device.objects.create(device_model=model, serial_number="DOC-IH", source=Device.Source.INHOUSE)
+    bought = Device.objects.create(device_model=model, serial_number="DOC-VS", source=Device.Source.VENDOR_SUPPLIED,
+                                   purchase_price="120000", status=Device.Status.IN_STOCK)
+    for d in (built, bought):
+        ProjectScopeItem.objects.create(project=project, device=d, quantity=1)
+    AssetComponent.objects.create(device=built, name="Doc Cable", quantity=3)
+    ProductionStep.objects.create(device=built, step_number=1, name="Doc cutting", location="in_house",
+                                  planned_cost="500", actual_cost="650")
+    ProjectCostLine.objects.create(project=project, cost_type="Travelling", description="Travelling",
+                                   quantity="2", unit_cost="1500", actual_quantity="2", actual_unit_cost="1700")
+
+    c = APIClient(); c.force_authenticate(admin)
+    r = c.get(f"/api/teams/projects/{project.id}/actuals/document/")
+    assert r.status_code == 200, r.content[:200]
+    assert r["Content-Type"] == "application/pdf"
+    assert r.content[:4] == b"%PDF"
+    try:
+        from pypdf import PdfReader
+    except ImportError:  # pragma: no cover - the text check needs pypdf
+        return
+    import io as _io
+    text = " ".join(p.extract_text() for p in PdfReader(_io.BytesIO(r.content)).pages)
+    for needle in ("ACTUAL COST", built.asset_code, bought.asset_code, "Complete asset from the vendor",
+                   "Doc cutting", "Travelling", "ACTUAL TO DATE", "120,000.00", "650.00"):
+        assert needle in text, needle

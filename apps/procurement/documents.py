@@ -29,7 +29,7 @@ COMPANY_NAME = "DIGIX Asset Ops"
 # The house standard, seeded onto a new order and editable per order.
 DEFAULT_TERMS = """1. This purchase order number must be quoted on all invoices, packing notes and correspondence.
 2. Goods are received subject to inspection. Anything rejected on inspection is returned at the supplier's cost.
-3. Delivery is to be completed by the expected delivery date stated above.
+3. Delivery is to be completed by the required delivery date stated above.
 4. Payment terms are 30 days from receipt of a correct invoice and acceptance of the goods.
 5. Prices are fixed for the duration of this order and include all applicable taxes and duties unless stated otherwise.
 6. The supplier warrants the goods against defects in material and workmanship for the agreed warranty period.
@@ -39,6 +39,24 @@ INK = colors.HexColor("#111827")
 MUTED = colors.HexColor("#6b7280")
 RULE = colors.HexColor("#d1d5db")
 BAND = colors.HexColor("#f3f4f6")
+WATERMARK = colors.Color(0.55, 0.55, 0.6, alpha=0.16)
+
+# Until the Group Head has approved it, the printout is a draft and says so.
+UNAPPROVED = ("draft", "pending_approval")
+
+
+def _watermark(text):
+    """A page callback that stamps a large rotated word across the sheet."""
+    def draw(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica-Bold", 96)
+        canvas.setFillColor(WATERMARK)
+        width, height = doc.pagesize
+        canvas.translate(width / 2, height / 2)
+        canvas.rotate(38)
+        canvas.drawCentredString(0, -30, text)
+        canvas.restoreState()
+    return draw
 
 
 def _styles():
@@ -117,24 +135,27 @@ def render_purchase_order_pdf(purchase_order) -> bytes:
     def field(label, value):
         return [Paragraph(label.upper(), s["label"]), Paragraph(value or "—", s["body"])]
 
+    # Four facts in two columns of label + value; each pair gets room enough
+    # for a date or a status word, so nothing runs under the supplier box.
     facts = Table(
         [
             field("PO Number", purchase_order.po_number) + field("Status", purchase_order.get_status_display()),
             field("Order Date", purchase_order.order_date.isoformat() if purchase_order.order_date else "—")
-            + field("Expected Delivery",
+            + field("Required Delivery",
                     purchase_order.expected_delivery.isoformat() if purchase_order.expected_delivery else "—"),
         ],
-        colWidths=[22 * mm, 43 * mm, 30 * mm, 39 * mm],
+        colWidths=[24 * mm, 30 * mm, 26 * mm, 24 * mm],
     )
     facts.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
 
     supplier_box = Table(
         [[Paragraph("SUPPLIER", s["label"])], _address_block(purchase_order.supplier, s)],
-        colWidths=[70 * mm],
+        colWidths=[64 * mm],
     )
     supplier_box.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -146,11 +167,11 @@ def render_purchase_order_pdf(purchase_order) -> bytes:
         ("BACKGROUND", (0, 0), (-1, -1), BAND),
     ]))
 
-    header = Table([[facts, supplier_box]], colWidths=[104 * mm, 70 * mm])
+    header = Table([[facts, supplier_box]], colWidths=[110 * mm, 64 * mm])
     header.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (0, 0), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
     ]))
     story += [header, Spacer(1, 7 * mm)]
 
@@ -160,11 +181,19 @@ def render_purchase_order_pdf(purchase_order) -> bytes:
         Paragraph("QTY", s["head"]), Paragraph("UNIT PRICE", s["head"]),
         Paragraph("AMOUNT", s["head"]),
     ]]
+    from .lines import describe_item
+    from .serializers import PurchaseOrderItemSerializer
+
+    def unit_of(item):
+        return PurchaseOrderItemSerializer().get_unit(item)
+
     for n, item in enumerate(purchase_order.items.all(), start=1):
+        title, detail = describe_item(item)
+        text = f"<b>{title}</b>" + (f"<br/><font size='7.5' color='#6b7280'>{detail}</font>" if detail else "")
         rows.append([
             Paragraph(str(n), s["cell"]),
-            Paragraph(item.description or "—", s["cell"]),
-            Paragraph(str(item.quantity), s["num"]),
+            Paragraph(text, s["cell"]),
+            Paragraph(f"{item.quantity} {unit_of(item)}", s["num"]),
             Paragraph(_money(item.unit_price, currency), s["num"]),
             Paragraph(_money(item.line_total, currency), s["num"]),
         ])
@@ -237,5 +266,9 @@ def render_purchase_order_pdf(purchase_order) -> bytes:
     ]))
     story += [sign]
 
-    doc.build(story)
+    if purchase_order.status in UNAPPROVED:
+        stamp = _watermark("DRAFT")
+        doc.build(story, onFirstPage=stamp, onLaterPages=stamp)
+    else:
+        doc.build(story)
     return buf.getvalue()

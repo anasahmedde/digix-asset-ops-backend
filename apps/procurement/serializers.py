@@ -24,9 +24,42 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
     # A line that buys complete assets names them, so the receiving form
     # knows the line is serialised and which registry entries are arriving.
     procured_asset_codes = serializers.SerializerMethodField()
+    # What the line is, from what it points at: "Digital Display · 55\" · DGX-… · complete asset".
+    line_title = serializers.SerializerMethodField()
+    line_detail = serializers.SerializerMethodField()
 
     def get_procured_asset_codes(self, obj):
         return list(obj.procured_devices.values_list("asset_code", flat=True))
+
+    unit = serializers.SerializerMethodField()
+
+    def get_unit(self, obj):
+        comps = list(obj.asset_components.all()) if hasattr(obj, "asset_components") else []
+        if comps:
+            c = comps[0]
+            if c.unit:
+                return c.unit
+            if c.inventory_unit_type_id:
+                return c.inventory_unit_type.unit or "piece"
+            if c.inventory_item_id and c.inventory_item.material_type_id:
+                return c.inventory_item.material_type.unit or "piece"
+        if obj.procured_devices.exists():
+            return "asset"
+        if obj.inventory_unit_type_id:
+            return obj.inventory_unit_type.unit or "piece"
+        if obj.inventory_item_id and obj.inventory_item.material_type_id:
+            return obj.inventory_item.material_type.unit or "piece"
+        if obj.material_type_id:
+            return obj.material_type.unit or "piece"
+        return "piece"
+
+    def get_line_title(self, obj):
+        from .lines import describe_item
+        return describe_item(obj)[0]
+
+    def get_line_detail(self, obj):
+        from .lines import describe_item
+        return describe_item(obj)[1]
     inventory_item_sku = serializers.CharField(
         source="inventory_item.sku", read_only=True, default=None
     )
@@ -39,10 +72,10 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
         model = PurchaseOrderItem
         fields = [
             "id", "asset_type", "asset_type_name", "device_model", "device_model_name",
-            "material_type", "material_type_name", "bom_line", "description", "procured_asset_codes",
+            "material_type", "material_type_name", "bom_line", "description", "line_title", "line_detail", "procured_asset_codes",
             "inventory_item", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name",
-            "quantity", "unit_price", "received_quantity", "line_total",
+            "quantity", "unit", "unit_price", "received_quantity", "line_total",
         ]
         # received_quantity is owned by goods receiving — never writable via the API.
         read_only_fields = ["line_total", "received_quantity"]

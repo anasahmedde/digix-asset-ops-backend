@@ -135,7 +135,7 @@ class _InstallationCommonMixin(serializers.Serializer):
     vendor_name = serializers.CharField(source="vendor.name", read_only=True, default=None)
     # Whichever vendor was assigned — registered supplier or hand-entered.
     vendor_display = serializers.SerializerMethodField()
-    project_name = serializers.CharField(source="device.project.name", read_only=True, default=None)
+    project_name = serializers.SerializerMethodField()
     poc_name = serializers.CharField(source="device.assigned_client.contact_person", read_only=True, default=None)
     poc_phone = serializers.CharField(source="device.assigned_client.contact_phone", read_only=True, default=None)
     client_names = serializers.SerializerMethodField()
@@ -155,6 +155,16 @@ class _InstallationCommonMixin(serializers.Serializer):
 
     def get_device_name(self, obj):
         return _asset_name(obj)
+
+    def get_project_name(self, obj):
+        """The project the asset belongs to — its own link, or its scope row."""
+        device = obj.device
+        if device is None:
+            return None
+        if device.project_id:
+            return device.project.name
+        scope = device.project_scope_items.select_related("project").first()
+        return scope.project.name if scope else None
 
     def get_vendor_display(self, obj):
         """The assigned vendor, whether registered or hand-entered."""

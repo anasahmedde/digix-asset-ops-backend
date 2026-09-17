@@ -34,6 +34,17 @@ def project_devices(project):
     )
 
 
+def component_unit(component) -> str:
+    """The unit of measure a component is counted in."""
+    if component.unit:
+        return component.unit
+    if component.inventory_unit_type_id:
+        return component.inventory_unit_type.unit or "piece"
+    if component.inventory_item_id and component.inventory_item.material_type_id:
+        return component.inventory_item.material_type.unit or "piece"
+    return "piece"
+
+
 def component_unit_price(component):
     """(unit price, where it came from) for one component line.
 
@@ -103,6 +114,29 @@ def build_plan(project):
     for device in devices:
         asset_total = Decimal("0")
         asset_unpriced = 0
+        if device.source != device.Source.INHOUSE:
+            # Bought complete from a vendor: one price, no parts list, no route.
+            price = None if device.purchase_price is None else money(device.purchase_price)
+            if price is None:
+                unpriced += 1
+            else:
+                materials_total += price
+            assets.append({
+                "id": str(device.pk),
+                "asset_code": device.asset_code,
+                "asset_name": device.display_name or "",
+                "vendor_asset": True,
+                "source": device.source,
+                "asset_price": price,
+                "supply_vendor_name": device.supply_vendor_name,
+                "lines": 0,
+                "materials_total": money(price or 0),
+                "unpriced_lines": 0 if price is not None else 1,
+                "steps": [],
+                "production_total": money(0),
+                "asset_total": money(price or 0),
+            })
+            continue
         components = list(device.components.all())
         for component in components:
             price, source = component_unit_price(component)
@@ -119,6 +153,7 @@ def build_plan(project):
                 "asset_name": device.display_name or "",
                 "name": component.name,
                 "quantity": component.quantity,
+                "unit": component_unit(component),
                 "unit_price": price,
                 "price_source": source,
                 "line_total": line_total,
@@ -144,6 +179,9 @@ def build_plan(project):
             "id": str(device.pk),
             "asset_code": device.asset_code,
             "asset_name": device.display_name or "",
+            "vendor_asset": False,
+            "source": device.source,
+            "asset_price": None,
             "lines": len(components),
             "materials_total": money(asset_total),
             "unpriced_lines": asset_unpriced,
@@ -261,7 +299,14 @@ def build_actuals(project):
         lines = []
         asset_total = Decimal("0")
         outstanding = 0
-        for component in device.components.all():
+        vendor_asset = device.source != device.Source.INHOUSE
+        if vendor_asset:
+            # The complete asset costs what we paid once it has arrived.
+            if device.status != device.Status.PROCURED and device.purchase_price is not None:
+                asset_total = money(device.purchase_price)
+            else:
+                outstanding = 1
+        for component in ([] if vendor_asset else device.components.all()):
             price, source = component_actual(component)
             issued = component.issued_quantity
             line_total = money(price * issued) if (price is not None and issued) else None
@@ -272,6 +317,7 @@ def build_actuals(project):
                 "component": str(component.pk),
                 "name": component.name,
                 "required": component.quantity,
+                "unit": component_unit(component),
                 "issued": issued,
                 "unit_price": price,
                 "price_source": source,
@@ -283,7 +329,7 @@ def build_actuals(project):
         # no actual yet is not free — it is simply not known.
         steps = []
         asset_production = Decimal("0")
-        for step in sorted(device.production_steps.all(), key=lambda x: x.step_number):
+        for step in ([] if vendor_asset else sorted(device.production_steps.all(), key=lambda x: x.step_number)):
             actual = None if step.actual_cost is None else money(step.actual_cost)
             if actual is not None:
                 asset_production += actual
@@ -319,6 +365,8 @@ def build_actuals(project):
             "asset_code": device.asset_code,
             "asset_name": device.display_name or "",
             "source": device.source,
+            "vendor_asset": vendor_asset,
+            "asset_price": None if not vendor_asset else (None if device.purchase_price is None else money(device.purchase_price)),
             "lines": lines,
             "steps": steps,
             "work_orders": work_orders,
@@ -376,11 +424,24 @@ def build_boq(project):
     A BOM is per asset; the BOQ is what the buyer works from — one row per
     component with the total quantity across every asset on the project.
     """
-    devices = project_devices(project).prefetch_related(
+    devices = project_devices(project).select_related("asset_type").prefetch_related(
         "components__inventory_item__material_type", "components__inventory_unit_type",
     )
     rows = {}
     for device in devices:
+        if device.source != device.Source.INHOUSE:
+            # A complete asset is one line of its own on the bill.
+            label = device.display_name or (device.asset_type.name if device.asset_type_id else device.asset_code)
+            price = None if device.purchase_price is None else money(device.purchase_price)
+            rows[("asset", device.pk)] = {
+                "name": f"{label} (complete asset)",
+                "unit": "asset",
+                "quantity": 1,
+                "unit_price": price,
+                "price_source": "Vendor price" if price is not None else "No price on record",
+                "assets": [f"{device.asset_code} ×1"],
+            }
+            continue
         for component in device.components.all():
             key = (
                 ("item", component.inventory_item_id) if component.inventory_item_id

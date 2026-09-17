@@ -6,7 +6,7 @@ from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -595,6 +595,33 @@ class DeviceViewSet(viewsets.ModelViewSet):
         log_export(request.user, "device", len(rows), export_params(request))
         return xlsx_response("assets", "Assets", columns, rows)
 
+    @action(detail=True, methods=["post"], url_path="ready-for-installation")
+    def ready_for_installation(self, request, pk=None):
+        """The build is finished: a finished route takes the asset to In Stock so
+        it can be assigned to a site. Already stocked assets pass straight through."""
+        device = self.get_object()
+        if device.status == Device.Status.IN_STOCK:
+            return Response(DeviceDetailSerializer(device, context={"request": request}).data)
+        if device.status != Device.Status.IN_PRODUCTION:
+            return Response(
+                {"detail": f"{device.asset_code} is {device.get_status_display()} — only an asset in production is finished into stock."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # A vendor-supplied asset has no route of its own to finish.
+        if device.source == Device.Source.INHOUSE and not device.route_complete:
+            return Response(
+                {"detail": "The production route is not finished yet — complete or skip every operation first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        device._transition_user = request.user
+        device._transition_reason = (
+            "Production route complete — ready to assign for installation"
+            if device.source == Device.Source.INHOUSE else "Vendor-supplied asset in hand — ready to assign for installation"
+        )
+        device.status = Device.Status.IN_STOCK
+        device.save(update_fields=["status", "updated_at"])
+        return Response(DeviceDetailSerializer(device, context={"request": request}).data)
+
     @action(detail=True, methods=["post"], url_path="label")
     def label(self, request, pk=None):
         """Generate (or refresh) the printable QR/barcode label for this device.
@@ -700,6 +727,16 @@ def _budget_block_response(component):
     )
 
 
+def _refuse_if_vendor_asset(device, what: str):
+    """A vendor-supplied asset arrives complete: it is bought, not built, so
+    it carries no components or production route of its own."""
+    if device is not None and device.source != Device.Source.INHOUSE:
+        raise ValidationError({
+            "device": f"{device.asset_code} is {device.get_source_display()} — it arrives complete "
+                      f"from the vendor and has no {what} of its own."
+        })
+
+
 class AssetComponentViewSet(viewsets.ModelViewSet):
     queryset = (
         AssetComponent.objects.select_related(
@@ -736,6 +773,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         self._refuse_if_locked(serializer.validated_data.get("device"))
+        _refuse_if_vendor_asset(serializer.validated_data.get("device"), "components" if isinstance(self, AssetComponentViewSet) else "production route")
         super().perform_create(serializer)
 
     def perform_update(self, serializer):
@@ -782,11 +820,15 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         )
         if already_open + quantity > component.outstanding_quantity:
             return Response({"quantity": [
-                f"{already_open} already waiting with the store on this line."
+                f"Only {component.undecided_quantity} of this line is still to be decided "
+                f"({already_open} already asked for)."
             ]}, status=400)
 
         with transaction.atomic():
-            component.fulfilment = AssetComponent.Fulfilment.FROM_STOCK
+            component.fulfilment = (
+                AssetComponent.Fulfilment.PROCUREMENT if component.procure_quantity
+                else AssetComponent.Fulfilment.FROM_STOCK
+            )
             component.save(update_fields=["fulfilment", "updated_at"])
             issuance_request = IssuanceRequest.objects.create(
                 item=component.inventory_item,
@@ -821,25 +863,36 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             return Response(
                 {"detail": "This requirement is already fully covered."}, status=400
             )
-        component.fulfilment = AssetComponent.Fulfilment.PROCUREMENT
-        component.save(update_fields=["fulfilment", "updated_at"])
-        # The goods still come through the store: queue the issue now, marked
-        # as waiting on procurement, so it is issued from stock once received.
+        undecided = component.undecided_quantity
+        if undecided == 0:
+            return Response({"quantity": ["Every unit of this line already has a decision."]}, status=400)
+        try:
+            quantity = int(request.data.get("quantity", undecided))
+        except (TypeError, ValueError):
+            return Response({"quantity": ["Must be a whole number."]}, status=400)
+        if quantity < 1:
+            return Response({"quantity": ["Buy at least one."]}, status=400)
+        if quantity > undecided:
+            return Response({"quantity": [
+                f"Only {undecided} of this line is still to be decided."
+            ]}, status=400)
         from apps.inventory.models import IssuanceRequest
 
-        already_open = component.issuance_requests.exclude(
-            status=IssuanceRequest.Status.CANCELLED
-        ).exclude(status=IssuanceRequest.Status.FULFILLED).exists()
-        if not already_open and component.outstanding_quantity > 0:
+        with transaction.atomic():
+            component.fulfilment = AssetComponent.Fulfilment.PROCUREMENT
+            component.save(update_fields=["fulfilment", "updated_at"])
+            # The goods still come through the store: queue the issue now,
+            # marked as waiting on procurement, for exactly what is being bought.
             IssuanceRequest.objects.create(
                 item=component.inventory_item,
                 unit_type=component.inventory_unit_type,
-                quantity_requested=component.outstanding_quantity,
+                quantity_requested=quantity,
                 source=IssuanceRequest.Source.PROJECT,
                 purpose=f"{component.device.asset_code} · {component.name} — procurement in progress",
                 project=component.device.project,
                 asset_component=component,
                 requested_by=request.user,
+                awaiting_procurement=True,
             )
         # Journalled on the asset so the decision is visible there, but the
         # build has not started, so the status is left alone.
@@ -847,7 +900,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             device=component.device,
             event_type=DeviceLifecycleEvent.EventType.NOTE,
             description=(
-                f"{component.name} × {component.outstanding_quantity} flagged for procurement"
+                f"{component.name} × {quantity} flagged for procurement"
             ),
             performed_by=request.user,
             metadata={"component": str(component.pk)},
@@ -1057,6 +1110,7 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         self._refuse_if_locked(serializer.validated_data.get("device"))
+        _refuse_if_vendor_asset(serializer.validated_data.get("device"), "components" if isinstance(self, AssetComponentViewSet) else "production route")
         super().perform_create(serializer)
 
     def perform_update(self, serializer):
@@ -1126,6 +1180,22 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
         )
         return Response(ProductionStepSerializer(steps, many=True).data)
 
+    @action(detail=True, methods=["post"], url_path="decide")
+    def decide(self, request, pk=None):
+        """Execution decision for one operation: done in-house. (Giving it to a
+        workshop is a work order, raised from the project.)"""
+        step = self.get_object()
+        if step.work_orders.exclude(status="cancelled").exists():
+            return Response(
+                {"detail": f"'{step.name}' is on a work order — cancel that first to bring it in-house."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        step.location = ProductionStep.Location.IN_HOUSE
+        step.workshop = None
+        step.workshop_name = ""
+        step.save(update_fields=["location", "workshop", "workshop_name", "updated_at"])
+        return Response(ProductionStepSerializer(step).data)
+
     @action(detail=True, methods=["post"])
     def transition(self, request, pk=None):
         """Advance one step, stamping the time that matters for that move."""
@@ -1144,8 +1214,10 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
 
         if new_status == step.status:
             return Response({"detail": "The step is already in that status."}, status=400)
-        if not step.can_transition_to(new_status):
-            allowed = ", ".join(ProductionStep.VALID_TRANSITIONS.get(step.status, ())) or "none"
+        if new_status not in step.manual_moves:
+            if step.hold_reason:
+                return Response({"detail": step.hold_reason}, status=400)
+            allowed = ", ".join(step.manual_moves) or "none"
             return Response(
                 {"detail": f"Cannot move from '{step.status}' to '{new_status}'. Allowed: {allowed}."},
                 status=400,
