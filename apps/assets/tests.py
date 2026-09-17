@@ -1811,7 +1811,8 @@ def test_lay_out_a_route_mixing_inhouse_and_workshop(admin_client, inhouse_asset
 
     a = _step(admin_client, inhouse_asset, 1, "Frame welding")
     assert a.status_code == 201, a.content
-    assert a.data["location"] == "in_house"
+    # Where it happens is the project's call, made in Execution; until then it is open.
+    assert a.data["location"] == "undecided" and a.data["location_display"] == "Not decided"
 
     b = _step(admin_client, inhouse_asset, 2, "Painting",
               location="external", workshop=str(painter.id))
@@ -1860,37 +1861,47 @@ def test_vendor_built_assets_have_no_production_route(admin_client, db):
 
 
 @pytest.mark.django_db
-def test_a_step_going_out_and_coming_back_is_tracked(admin_client, inhouse_asset, db):
-    from apps.assets.models import DeviceLifecycleEvent
+def test_a_step_on_a_work_order_follows_it(admin_client, inhouse_asset, db):
+    """Giving an operation to a workshop is a work order: raising it marks
+    the step 'Work Order Raised', completing it completes the step, and a
+    cancelled order hands the decision back to the project."""
+    from apps.assets.models import ProductionStep
     from apps.suppliers.models import Supplier
+    from apps.workorders.models import WorkOrder
 
     painter = Supplier.objects.create(name="Ali Paint Works")
-    step_id = _step(
-        admin_client, inhouse_asset, 1, "Painting", location="external", workshop=str(painter.id)
-    ).data["id"]
+    step_id = _step(admin_client, inhouse_asset, 1, "Painting").data["id"]
+    step = ProductionStep.objects.get(pk=step_id)
+    assert step.location == "undecided"
 
-    out = admin_client.post(
+    # Nobody moves a workshop step by hand.
+    r = admin_client.post(
         f"/api/assets/production-steps/{step_id}/transition/", {"status": "sent_out"}, format="json",
     )
-    assert out.status_code == 200, out.content
-    assert out.data["sent_at"] is not None
+    assert r.status_code == 400, r.content
 
-    back = admin_client.post(
-        f"/api/assets/production-steps/{step_id}/transition/", {"status": "returned"}, format="json",
-    )
-    assert back.status_code == 200, back.content
-    assert back.data["returned_at"] is not None
+    order = WorkOrder.objects.create(title="Painting", supplier=painter, production_step=step, device=inhouse_asset)
+    step.refresh_from_db()
+    assert step.location == "external" and step.workshop == painter
+    assert step.status == "sent_out" and step.sent_at is not None
+    detail = admin_client.get(f"/api/assets/production-steps/{step_id}/").json()
+    assert detail["allowed_transitions"] == [] and "work order" in detail["hold_reason"].lower()
 
-    done = admin_client.post(
-        f"/api/assets/production-steps/{step_id}/transition/", {"status": "completed"}, format="json",
-    )
-    assert done.status_code == 200, done.content
-    assert done.data["completed_at"] is not None
+    order.status = WorkOrder.Status.COMPLETED
+    order.save(update_fields=["status"])
+    step.refresh_from_db()
+    assert step.status == "completed" and step.completed_at is not None
 
-    notes = DeviceLifecycleEvent.objects.filter(
-        device=inhouse_asset, event_type=DeviceLifecycleEvent.EventType.NOTE
-    )
-    assert any("Ali Paint Works" in n.description for n in notes)
+    # A cancelled order gives the decision back.
+    other_id = _step(admin_client, inhouse_asset, 2, "Drying").data["id"]
+    other = ProductionStep.objects.get(pk=other_id)
+    order2 = WorkOrder.objects.create(title="Drying", supplier=painter, production_step=other, device=inhouse_asset)
+    other.refresh_from_db()
+    assert other.status == "sent_out"
+    order2.status = WorkOrder.Status.CANCELLED
+    order2.save(update_fields=["status"])
+    other.refresh_from_db()
+    assert other.location == "undecided" and other.status == "pending"
 
 
 @pytest.mark.django_db
@@ -2316,17 +2327,20 @@ def test_component_set_is_saved_and_reused_per_asset_type():
 
 
 @_pytest.mark.django_db
-def test_vendor_supplied_asset_enters_production_without_components(admin_client, db):
-    """The vendor builds it, so there is no parts list of ours to demand."""
+def test_vendor_supplied_asset_never_enters_production(admin_client, db):
+    """A vendor-supplied asset arrives complete: it is bought, not built, so
+    production is neither offered nor allowed for it."""
     from apps.assets.models import Device
 
     asset = Device.objects.create(asset_code="AST-VP-1", source=Device.Source.VENDOR_SUPPLIED)
+    detail = admin_client.get(f"/api/assets/devices/{asset.id}/").json()
+    assert "in_production" not in detail["allowed_transitions"]
+    assert "in_stock" in detail["allowed_transitions"]
     r = admin_client.post(
         f"/api/assets/devices/{asset.id}/transition/",
         {"status": "in_production", "reason": "vendor building it"}, format="json",
     )
-    assert r.status_code == 200, r.content
-    assert r.data["status"] == "in_production"
+    assert r.status_code == 400, r.content
 
     # An in-house build with nothing on it still has to be itemised first.
     inhouse = Device.objects.create(asset_code="AST-VP-2", source=Device.Source.INHOUSE)

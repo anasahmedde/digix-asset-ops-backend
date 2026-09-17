@@ -191,6 +191,10 @@ class Device(TimeStampedModel):
         "procurement.PurchaseOrderItem", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="procured_devices",
     )
+    # A vendor-supplied asset on a project is sent to Procurement from the
+    # project's Execution tab once the budget is approved; standalone assets
+    # go straight to the to-buy list.
+    procurement_requested_at = models.DateTimeField(null=True, blank=True)
     supplier = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True, related_name="devices"
     )
@@ -270,6 +274,9 @@ class Device(TimeStampedModel):
 
     def can_transition_to(self, new_status: str) -> bool:
         allowed = self.VALID_TRANSITIONS.get(self.status, ())
+        # A vendor-supplied asset arrives complete: it is never built here.
+        if new_status == self.Status.IN_PRODUCTION and self.source != self.Source.INHOUSE:
+            return False
         return new_status in allowed
 
     @property
@@ -291,6 +298,12 @@ class Device(TimeStampedModel):
         return self.components.filter(
             models.Q(issued_quantity__gt=0) | models.Q(purchase_order_item__isnull=False)
         ).exists()
+
+    @property
+    def route_complete(self) -> bool:
+        """Every operation on the route is done (or skipped) — the build is finished."""
+        steps = list(self.production_steps.all())
+        return bool(steps) and all(s.status in ("completed", "skipped") for s in steps)
 
 
 class ProductionRouteTemplate(TimeStampedModel):
@@ -402,23 +415,28 @@ class ProductionStep(TimeStampedModel):
     """
 
     class Location(models.TextChoices):
+        # Where an operation happens is the project's call, made in Execution.
+        UNDECIDED = "undecided", "Not decided"
         IN_HOUSE = "in_house", "In-house"
         EXTERNAL = "external", "Outside Workshop"
 
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         IN_PROGRESS = "in_progress", "In Progress"
-        SENT_OUT = "sent_out", "Sent to Workshop"
+        SENT_OUT = "sent_out", "Work Order Raised"
         RETURNED = "returned", "Returned from Workshop"
         COMPLETED = "completed", "Completed"
         SKIPPED = "skipped", "Skipped"
 
     # An external operation is only meaningfully "sent"/"returned"; an in-house
     # one just runs. Both converge on completed.
+    # The moves a person makes on an in-house operation. A step on a work
+    # order is not moved by hand: Work Order Raised and Completed follow the
+    # work order itself (see workorders.signals).
     VALID_TRANSITIONS = {
-        Status.PENDING: (Status.IN_PROGRESS, Status.SENT_OUT, Status.SKIPPED),
-        Status.IN_PROGRESS: (Status.COMPLETED, Status.SENT_OUT, Status.SKIPPED),
-        Status.SENT_OUT: (Status.RETURNED, Status.SKIPPED),
+        Status.PENDING: (Status.IN_PROGRESS, Status.COMPLETED),
+        Status.IN_PROGRESS: (Status.COMPLETED,),
+        Status.SENT_OUT: (),
         Status.RETURNED: (Status.IN_PROGRESS, Status.COMPLETED),
         Status.COMPLETED: (),
         Status.SKIPPED: (),
@@ -427,7 +445,7 @@ class ProductionStep(TimeStampedModel):
     device = models.ForeignKey(Device, on_delete=models.CASCADE, related_name="production_steps")
     step_number = models.PositiveSmallIntegerField()
     name = models.CharField(max_length=200, help_text="e.g. Frame welding, Panaflex pasting")
-    location = models.CharField(max_length=12, choices=Location.choices, default=Location.IN_HOUSE)
+    location = models.CharField(max_length=12, choices=Location.choices, default=Location.UNDECIDED)
     # Where the work goes when it leaves the building.
     workshop = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
@@ -462,6 +480,30 @@ class ProductionStep(TimeStampedModel):
 
     def can_transition_to(self, new_status) -> bool:
         return new_status in self.VALID_TRANSITIONS.get(self.status, ())
+
+    @property
+    def on_project(self) -> bool:
+        device = self.device
+        return bool(device.project_id) or device.project_scope_items.exists()
+
+    @property
+    def manual_moves(self) -> tuple:
+        """What a person may move this step to right now."""
+        if self.location == self.Location.EXTERNAL:
+            return ()  # follows its work order
+        if self.location == self.Location.UNDECIDED and self.on_project:
+            return ()  # the project decides first
+        return self.VALID_TRANSITIONS.get(self.status, ())
+
+    @property
+    def hold_reason(self) -> str:
+        if self.status in (self.Status.COMPLETED, self.Status.SKIPPED):
+            return ""
+        if self.location == self.Location.EXTERNAL:
+            return "On a work order — its status follows the work order."
+        if self.location == self.Location.UNDECIDED and self.on_project:
+            return "Decide in the project's Execution tab whether this is done in-house or on a work order."
+        return ""
 
     @property
     def workshop_display(self):
@@ -599,6 +641,27 @@ class AssetComponent(TimeStampedModel):
     def outstanding_quantity(self) -> int:
         """How much of this requirement is still to be covered."""
         return max(0, self.quantity - self.issued_quantity)
+
+    def _open_requests(self):
+        return [
+            r for r in self.issuance_requests.all()
+            if r.status not in ("cancelled", "fulfilled")
+        ]
+
+    @property
+    def stock_requested_quantity(self) -> int:
+        """How much the store has been asked to issue from inventory."""
+        return sum(r.outstanding_quantity for r in self._open_requests() if not r.awaiting_procurement)
+
+    @property
+    def procure_quantity(self) -> int:
+        """How much has been decided to buy (each Procure decision is a request)."""
+        return sum(r.outstanding_quantity for r in self._open_requests() if r.awaiting_procurement)
+
+    @property
+    def undecided_quantity(self) -> int:
+        """What is still to be covered and has no decision on it yet."""
+        return max(0, self.outstanding_quantity - self.stock_requested_quantity - self.procure_quantity)
 
     @property
     def available_quantity(self) -> int:

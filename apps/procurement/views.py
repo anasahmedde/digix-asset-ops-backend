@@ -12,6 +12,7 @@ from rest_framework.response import Response
 
 from common.permissions import FinanceWriteElseRead, PurchaseOrderActionElseRead
 
+from .lines import describe_asset, describe_component, line_text
 from .models import PurchaseOrder, PurchaseOrderItem
 from .serializers import (
     PurchaseOrderFromShortageSerializer,
@@ -164,7 +165,15 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 source__in=(Device.Source.VENDOR_SUPPLIED, Device.Source.VENDOR_TURNKEY),
                 status=Device.Status.PROCURED,
             )
+            # On a project the buy is decided in Execution; a standalone asset
+            # is simply bought.
+            .filter(
+                Q(procurement_requested_at__isnull=False)
+                | Q(procurement_item__isnull=False)
+                | Q(project__isnull=True, project_scope_items__isnull=True)
+            )
             .select_related("project", "asset_type", "procurement_item__purchase_order")
+            .distinct()
             .order_by("asset_code")
         )
         if project_id:
@@ -184,6 +193,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 "project": project_pk,
                 "project_name": project_name,
                 "required_quantity": 1,
+                "unit": "asset",
                 "outstanding_quantity": 0 if d.procurement_item_id else 1,
                 "available_quantity": None,
                 "unit_price": d.purchase_price,
@@ -196,8 +206,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 ),
             })
 
+        def _to_buy(c):
+            # Each Procure decision is an awaiting request; a line flagged before
+            # quantities were recorded falls back to everything outstanding.
+            decided = c.procure_quantity
+            return decided if decided else (c.outstanding_quantity if not c._open_requests() else 0)
+
         for c in components:
-            if c.outstanding_quantity <= 0:
+            if c.outstanding_quantity <= 0 or (_to_buy(c) <= 0 and not c.purchase_order_item_id):
                 continue
             project_pk, project_name = project_of(c.device)
             rows.append({
@@ -210,7 +226,12 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 "project": project_pk,
                 "project_name": project_name,
                 "required_quantity": c.quantity,
-                "outstanding_quantity": c.outstanding_quantity,
+                "unit": c.unit or (
+                    (c.inventory_unit_type.unit or "piece") if c.inventory_unit_type_id
+                    else (c.inventory_item.material_type.unit or "piece")
+                    if c.inventory_item_id and c.inventory_item.material_type_id else "piece"
+                ),
+                "outstanding_quantity": _to_buy(c),
                 "available_quantity": c.available_quantity,
                 "inventory_item": str(c.inventory_item_id) if c.inventory_item_id else None,
                 "inventory_unit_type": (
@@ -300,7 +321,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             for device in devices:
                 item = PurchaseOrderItem.objects.create(
                     purchase_order=purchase_order,
-                    description=f"{device.display_name or device.asset_code} — complete asset",
+                    description=line_text(*describe_asset(device)),
                     quantity=1,
                     unit_price=price_for(device.pk, device.purchase_price),
                     device_model=device.device_model,
@@ -309,12 +330,13 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 device.procurement_item = item
                 device.save(update_fields=["procurement_item", "updated_at"])
             for component in components:
-                quantity = component.outstanding_quantity
+                decided = component.procure_quantity
+                quantity = decided if decided else component.outstanding_quantity
                 if quantity < 1:
                     continue
                 item = PurchaseOrderItem.objects.create(
                     purchase_order=purchase_order,
-                    description=component.name,
+                    description=line_text(*describe_component(component)),
                     quantity=quantity,
                     unit_price=price_for(component.pk, (
                         component.inventory_unit_type.unit_cost
@@ -374,8 +396,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         if new_status == PurchaseOrder.Status.APPROVED:
             purchase_order.approved_by = request.user
             update_fields += ["approved_by"]
+            # The order date is the day the Group Head approved it — stamped,
+            # never typed. That approval is what commits the company.
+            if not purchase_order.order_date:
+                purchase_order.order_date = timezone.localdate()
+                update_fields += ["order_date"]
 
-        # The order date is the day it was placed — stamped, never typed.
+        # An order that somehow reached placement without approval on record
+        # still gets a date the day it is placed.
         if new_status == PurchaseOrder.Status.ORDERED and not purchase_order.order_date:
             purchase_order.order_date = timezone.localdate()
             update_fields += ["order_date"]

@@ -6,3 +6,6 @@ class WorkordersConfig(AppConfig):
     name = "apps.workorders"
     label = "workorders"
     verbose_name = "Work Orders"
+
+    def ready(self):
+        import apps.workorders.signals  # noqa: F401
