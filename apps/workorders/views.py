@@ -20,8 +20,8 @@ def _spawn_project_if_needed(work_order: WorkOrder):
     """On approval, create the delivery Project sourced from this Work Order."""
     from apps.teams.models import Project
 
-    if work_order.order_type == WorkOrder.OrderType.SUPPLY:
-        return  # pure purchase — no installation project
+    if work_order.order_type in (WorkOrder.OrderType.SUPPLY, WorkOrder.OrderType.PRODUCTION):
+        return  # a purchase, or one operation of a route: nothing to install
     if Project.objects.filter(source_work_order=work_order).exists():
         return
     Project.objects.create(

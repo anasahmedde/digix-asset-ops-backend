@@ -346,9 +346,8 @@ class DeviceViewSet(viewsets.ModelViewSet):
                     device=device,
                     step_number=step.step_number,
                     name=step.name,
-                    location=step.location,
-                    workshop=step.workshop,
-                    workshop_name=step.workshop_name,
+                    # Where each operation happens is decided per project, so a
+                    # standard route supplies the operations only.
                     expected_days=step.expected_days,
                 )
                 for step in template.steps.all()
