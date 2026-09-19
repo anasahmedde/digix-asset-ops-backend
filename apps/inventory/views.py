@@ -7,6 +7,7 @@ from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from common.permissions import (
@@ -17,6 +18,7 @@ from common.permissions import (
 )
 
 from .models import (
+    ReorderRequest,
     GoodsReceipt,
     GoodsReceiptLine,
     InventoryCategory,
@@ -28,6 +30,7 @@ from .models import (
     StockMovement,
 )
 from .serializers import (
+    ReorderRequestSerializer,
     GoodsReceiptLineInspectSerializer,
     GoodsReceiptLineSerializer,
     GoodsReceiptSerializer,
@@ -569,3 +572,90 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         name = issuance_request.request_number or "issue-slip"
         response["Content-Disposition"] = f'attachment; filename="{name}.pdf"'
         return response
+
+
+class LowStockView(APIView):
+    """Everything at or below its reorder level: stock items and unique
+    products alike, with the open reorder request on each, if any."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        live = {
+            ("item", r.item_id): r for r in
+            ReorderRequest.objects.filter(status__in=("open", "ordered"), item__isnull=False)
+            .select_related("purchase_order_item__purchase_order")
+        }
+        live.update({
+            ("unit_type", r.unit_type_id): r for r in
+            ReorderRequest.objects.filter(status__in=("open", "ordered"), unit_type__isnull=False)
+            .select_related("purchase_order_item__purchase_order")
+        })
+
+        def open_request(kind, pk):
+            r = live.get((kind, pk))
+            if r is None:
+                return None
+            return {
+                "id": str(r.pk), "status": r.status, "status_display": r.get_status_display(),
+                "quantity": r.quantity,
+                "po_number": r.purchase_order_item.purchase_order.po_number if r.purchase_order_item_id else None,
+            }
+
+        rows = []
+        items = (
+            InventoryItem.objects.select_related("material_type")
+            .filter(min_stock_level__gt=0, quantity__lte=F("min_stock_level"))
+            .order_by("material_type__name")
+        )
+        for it in items:
+            rows.append({
+                "kind": "generic", "id": str(it.pk),
+                "name": it.material_type.name if it.material_type_id else it.sku, "code": it.sku,
+                "unit": (it.material_type.unit if it.material_type_id else None) or "piece",
+                "on_hand": it.quantity, "reorder_level": it.min_stock_level,
+                "shortfall": max(it.min_stock_level - it.quantity, 0),
+                "unit_cost": it.unit_cost,
+                "open_request": open_request("item", it.pk),
+            })
+        products = InventoryUnitType.objects.filter(min_stock_level__gt=0, is_active=True).order_by("name")
+        for p in products:
+            on_hand = p.in_stock_count
+            if on_hand > p.min_stock_level:
+                continue
+            rows.append({
+                "kind": "unique", "id": str(p.pk), "name": p.name, "code": p.type_code,
+                "unit": p.unit or "piece", "on_hand": on_hand, "reorder_level": p.min_stock_level,
+                "shortfall": max(p.min_stock_level - on_hand, 0),
+                "unit_cost": p.unit_cost,
+                "open_request": open_request("unit_type", p.pk),
+            })
+        return Response({"results": rows, "count": len(rows), "unrequested": sum(1 for r in rows if not r["open_request"])})
+
+
+class ReorderRequestViewSet(viewsets.ModelViewSet):
+    """Reorder requests: raised from Low Stock, bought under To Procure."""
+
+    queryset = ReorderRequest.objects.select_related(
+        "item__material_type", "unit_type", "purchase_order_item__purchase_order", "requested_by",
+    ).all()
+    serializer_class = ReorderRequestSerializer
+    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    filterset_fields = ["status", "item", "unit_type"]
+    http_method_names = ["get", "post", "head", "options"]
+
+    def perform_create(self, serializer):
+        serializer.save(requested_by=self.request.user)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        """Withdraw a request that has not been ordered yet."""
+        req = self.get_object()
+        if req.status == ReorderRequest.Status.ORDERED:
+            return Response({"detail": f"Already on {req.purchase_order_item.purchase_order.po_number} — cancel that order instead."}, status=400)
+        if req.status != ReorderRequest.Status.OPEN:
+            return Response({"detail": f"This request is {req.get_status_display().lower()}."}, status=400)
+        req.status = ReorderRequest.Status.CANCELLED
+        req.notes = (req.notes + "\n" if req.notes else "") + (request.data.get("reason") or "Withdrawn.").strip()
+        req.save(update_fields=["status", "notes", "updated_at"])
+        return Response(ReorderRequestSerializer(req).data)

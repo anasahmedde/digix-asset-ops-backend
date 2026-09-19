@@ -1313,3 +1313,69 @@ def test_the_log_reads_a_request_by_its_own_number(ops):
     assert r.status_code == 200, r.content
     assert [u["serial_number"] for u in r.data["request"]["issued_units"]] == ["LP-1", "LP-2", "LP-3"]
     assert r.data["request"]["status"] == "fulfilled"
+
+
+@pytest.mark.django_db
+def test_low_stock_is_listed_and_bought_through_a_reorder_request(ops):
+    """Stock at or below its reorder level shows under Low Stock; a reorder
+    request goes to To Procure, on a purchase order, and closes when the goods
+    are received. One open request per component; Procurement can send it back."""
+    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine, InventoryUnitType, ReorderRequest
+    from apps.procurement.models import PurchaseOrder
+    from apps.suppliers.models import Supplier
+
+    c = _client(ops)
+    tape_mt = MaterialType.objects.create(name="Low Tape", unit="roll")
+    tape = InventoryItem.objects.create(material_type=tape_mt, quantity=2, min_stock_level=5, unit_cost=80)
+    plenty_mt = MaterialType.objects.create(name="Plenty Bolt", unit="piece")
+    InventoryItem.objects.create(material_type=plenty_mt, quantity=50, min_stock_level=5)
+    player = InventoryUnitType.objects.create(name="Low Player", unit="piece", min_stock_level=2, unit_cost=900)
+
+    low = c.get("/api/inventory/low-stock/").json()
+    by_name = {r["name"]: r for r in low["results"]}
+    assert "Low Tape" in by_name and "Plenty Bolt" not in by_name and "Low Player" in by_name
+    assert by_name["Low Tape"]["on_hand"] == 2 and by_name["Low Tape"]["reorder_level"] == 5 and by_name["Low Tape"]["shortfall"] == 3
+    assert by_name["Low Player"]["kind"] == "unique" and by_name["Low Player"]["open_request"] is None
+
+    r = c.post("/api/inventory/reorder-requests/", {"item": str(tape.id), "quantity": 10, "reason": "Below reorder level"}, format="json")
+    assert r.status_code == 201, r.content
+    rr = ReorderRequest.objects.get(pk=r.data["id"])
+    assert rr.status == "open" and rr.requested_by == ops and r.data["name"] == "Low Tape" and r.data["kind"] == "generic"
+    r2 = c.post("/api/inventory/reorder-requests/", {"item": str(tape.id), "quantity": 4}, format="json")
+    assert r2.status_code == 400 and "already open" in str(r2.data)
+    assert c.get("/api/inventory/low-stock/").json()["results"][0]["open_request"]["status"] == "open"
+
+    # To Procure lists it; a purchase order takes it.
+    rows = c.get("/api/procurement/purchase-orders/requisitions/").json()["results"]
+    line = next(x for x in rows if x.get("kind") == "reorder")
+    assert line["reorder"] == str(rr.id) and line["asset_code"] == "Stock" and line["outstanding_quantity"] == 10 and line["unit"] == "roll"
+    supplier = Supplier.objects.create(name="Tape Supplier")
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {"supplier": str(supplier.id), "reorders": [str(rr.id)], "prices": {str(rr.id): "75"}}, format="json")
+    assert r.status_code == 201, r.content
+    po = PurchaseOrder.objects.get(pk=r.data["id"])
+    po_item = po.items.get()
+    assert po_item.inventory_item == tape and po_item.quantity == 10 and po_item.unit_price == 75 and "stock replenishment" in po_item.description
+    rr.refresh_from_db()
+    assert rr.status == "ordered" and rr.purchase_order_item == po_item
+    assert c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"reorder": str(rr.id), "reason": "no"}, format="json").status_code == 400
+
+    # Received into stock: the request is done and the item is above its level.
+    po.status = PurchaseOrder.Status.ORDERED
+    po.save(update_fields=["status"])
+    receipt = GoodsReceipt.objects.create(purchase_order=po, reference="DN-LOW")
+    gl = GoodsReceiptLine.objects.create(receipt=receipt, po_item=po_item, quantity=10)
+    r = c.post(f"/api/inventory/receipt-lines/{gl.id}/inspect/", {"accepted_quantity": 10, "rejected_quantity": 0, "route": "generic", "generic": {}}, format="json")
+    assert r.status_code == 200, r.content
+    rr.refresh_from_db()
+    tape.refresh_from_db()
+    assert rr.status == "received" and tape.quantity == 12
+    assert "Low Tape" not in {x["name"] for x in c.get("/api/inventory/low-stock/").json()["results"]}
+
+    # A request Procurement sends back is withdrawn with the reason; Inventory can raise it again.
+    r = c.post("/api/inventory/reorder-requests/", {"unit_type": str(player.id), "quantity": 3}, format="json")
+    assert r.status_code == 201, r.content
+    r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"reorder": r.data["id"], "reason": "Model discontinued"}, format="json")
+    assert r.status_code == 200, r.content
+    back = ReorderRequest.objects.get(unit_type=player)
+    assert back.status == "cancelled" and "Model discontinued" in back.notes
+    assert c.post("/api/inventory/reorder-requests/", {"unit_type": str(player.id), "quantity": 3}, format="json").status_code == 201

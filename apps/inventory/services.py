@@ -443,6 +443,10 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
                 issue_stock_for_component(component, user, take)
                 remaining -= take
 
+    # Stock bought against a reorder request has arrived: the request is done.
+    if accepted_quantity and po_item is not None:
+        po_item.reorder_requests.filter(status="ordered").update(status="received")
+
     line.inspection_status = (
         GoodsReceiptLine.Inspection.PASSED if accepted_quantity
         else GoodsReceiptLine.Inspection.REJECTED

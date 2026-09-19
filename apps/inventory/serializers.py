@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from .models import (
+    ReorderRequest,
     GoodsReceipt,
     GoodsReceiptLine,
     InventoryCategory,
@@ -734,3 +735,48 @@ class IssuanceRequestIssueSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1)
     received_by = serializers.CharField(required=False, allow_blank=True, default="")
     notes = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class ReorderRequestSerializer(serializers.ModelSerializer):
+    """A request to buy stock that fell to its reorder level."""
+
+    item_sku = serializers.CharField(source="item.sku", read_only=True, default=None)
+    unit_type_name = serializers.CharField(source="unit_type.name", read_only=True, default=None)
+    name = serializers.CharField(read_only=True)
+    code = serializers.CharField(read_only=True)
+    kind = serializers.CharField(read_only=True)
+    unit = serializers.CharField(read_only=True)
+    on_hand = serializers.IntegerField(read_only=True)
+    reorder_level = serializers.IntegerField(read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    po_number = serializers.CharField(source="purchase_order_item.purchase_order.po_number", read_only=True, default=None)
+    requested_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReorderRequest
+        fields = [
+            "id", "item", "item_sku", "unit_type", "unit_type_name", "name", "code", "kind", "unit",
+            "quantity", "reason", "status", "status_display", "purchase_order_item", "po_number",
+            "on_hand", "reorder_level", "requested_by", "requested_by_name", "notes", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "status", "purchase_order_item", "requested_by", "created_at", "updated_at"]
+
+    def get_requested_by_name(self, obj):
+        user = obj.requested_by
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
+
+    def validate(self, attrs):
+        item = attrs.get("item")
+        unit_type = attrs.get("unit_type")
+        if bool(item) == bool(unit_type):
+            raise serializers.ValidationError({"item": ["Name one stock item or one unique product."]})
+        if (attrs.get("quantity") or 0) < 1:
+            raise serializers.ValidationError({"quantity": ["Ask for at least one."]})
+        if self.instance is None:
+            live = ReorderRequest.objects.filter(status__in=(ReorderRequest.Status.OPEN, ReorderRequest.Status.ORDERED))
+            live = live.filter(item=item) if item else live.filter(unit_type=unit_type)
+            if live.exists():
+                raise serializers.ValidationError({"detail": "A reorder request for this component is already open."})
+        return attrs

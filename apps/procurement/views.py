@@ -126,6 +126,18 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         if not reason:
             return Response({"reason": ["Say why it is going back."]}, status=400)
 
+        from apps.inventory.models import ReorderRequest
+
+        reorder = ReorderRequest.objects.filter(pk=request.data.get("reorder")).first() if request.data.get("reorder") else None
+        if reorder is not None:
+            # A stock reorder has no project; it is simply withdrawn, reason on record.
+            if reorder.status == ReorderRequest.Status.ORDERED:
+                return Response({"detail": f"'{reorder.name}' is already on {reorder.purchase_order_item.purchase_order.po_number} — cancel that order first."}, status=400)
+            reorder.status = ReorderRequest.Status.CANCELLED
+            reorder.notes = (reorder.notes + "\n" if reorder.notes else "") + f"Sent back by Procurement: {reason}"
+            reorder.save(update_fields=["status", "notes", "updated_at"])
+            return Response({"detail": f"The reorder of {reorder.name} is withdrawn; Inventory can raise it again."})
+
         component = AssetComponent.objects.filter(pk=request.data.get("component")).select_related("device").first()
         device = Device.objects.filter(pk=request.data.get("device")).first() if not component else None
         if component is None and device is None:
@@ -265,6 +277,44 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 ),
             })
 
+        # Stock that fell to its reorder level, asked to be bought from Inventory › Low Stock.
+        from apps.inventory.models import ReorderRequest
+
+        reorders = (
+            ReorderRequest.objects.filter(status__in=(ReorderRequest.Status.OPEN, ReorderRequest.Status.ORDERED))
+            .select_related("item__material_type", "unit_type", "purchase_order_item__purchase_order")
+            .order_by("created_at")
+        )
+        if project_id:
+            reorders = reorders.none()
+        if request.query_params.get("unordered") in ("1", "true", "True"):
+            reorders = reorders.filter(purchase_order_item__isnull=True)
+        for rr in reorders:
+            rows.append({
+                "kind": "reorder",
+                "reorder": str(rr.pk),
+                "component": None,
+                "device": None,
+                "name": f"{rr.name} — stock replenishment",
+                "asset": None,
+                "asset_code": "Stock",
+                "project": None,
+                "project_name": None,
+                "required_quantity": rr.quantity,
+                "unit": rr.unit,
+                "outstanding_quantity": 0 if rr.purchase_order_item_id else rr.quantity,
+                "available_quantity": rr.on_hand,
+                "reorder_level": rr.reorder_level,
+                "unit_price": rr.unit_type.unit_cost if rr.unit_type_id else (rr.item.unit_cost if rr.item_id else None),
+                "last_unit_price": rr.unit_type.unit_cost if rr.unit_type_id else (rr.item.unit_cost if rr.item_id else None),
+                "supply_vendor_name": None,
+                "inventory_item": str(rr.item_id) if rr.item_id else None,
+                "inventory_unit_type": str(rr.unit_type_id) if rr.unit_type_id else None,
+                "purchase_order_item": str(rr.purchase_order_item_id) if rr.purchase_order_item_id else None,
+                "po_number": rr.purchase_order_item.purchase_order.po_number if rr.purchase_order_item_id else None,
+                "reason": rr.reason,
+            })
+
         def _to_buy(c):
             # Each Procure decision is an awaiting request; a line flagged before
             # quantities were recorded falls back to everything outstanding.
@@ -323,13 +373,25 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         supplier_id = request.data.get("supplier")
         component_ids = request.data.get("components") or []
         device_ids = request.data.get("devices") or []
+        reorder_ids = request.data.get("reorders") or []
         prices = request.data.get("prices") or {}
         if not supplier_id:
             return Response({"supplier": ["Choose the supplier to buy from."]}, status=400)
-        if not isinstance(component_ids, list) or not isinstance(device_ids, list):
-            return Response({"components": ["Send lists of requirement and asset ids."]}, status=400)
-        if not component_ids and not device_ids:
+        if not isinstance(component_ids, list) or not isinstance(device_ids, list) or not isinstance(reorder_ids, list):
+            return Response({"components": ["Send lists of requirement, asset and reorder ids."]}, status=400)
+        if not component_ids and not device_ids and not reorder_ids:
             return Response({"components": ["Pick at least one requirement."]}, status=400)
+        from apps.inventory.models import ReorderRequest
+
+        reorders = list(
+            ReorderRequest.objects.filter(pk__in=reorder_ids)
+            .select_related("item__material_type", "unit_type", "purchase_order_item__purchase_order")
+        ) if reorder_ids else []
+        if len(reorders) != len(set(map(str, reorder_ids))):
+            return Response({"reorders": ["Unknown reorder request(s)."]}, status=400)
+        ordered = [rr.name for rr in reorders if rr.status != ReorderRequest.Status.OPEN]
+        if ordered:
+            return Response({"reorders": [f"Not open any more: {', '.join(ordered)}"]}, status=400)
         if not Supplier.objects.filter(pk=supplier_id).exists():
             return Response({"supplier": ["Unknown supplier."]}, status=400)
 
@@ -412,6 +474,22 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 )
                 component.purchase_order_item = item
                 component.save(update_fields=["purchase_order_item", "updated_at"])
+            for rr in reorders:
+                item = PurchaseOrderItem.objects.create(
+                    purchase_order=purchase_order,
+                    description=f"{rr.name} — stock replenishment (reorder level {rr.reorder_level} {rr.unit})",
+                    quantity=rr.quantity,
+                    unit_price=price_for(rr.pk, (
+                        rr.unit_type.unit_cost if rr.unit_type_id
+                        else (rr.item.unit_cost if rr.item_id else None)
+                    )),
+                    material_type=rr.item.material_type if rr.item_id and rr.item.material_type_id else None,
+                    inventory_item=rr.item,
+                    inventory_unit_type=rr.unit_type,
+                )
+                rr.purchase_order_item = item
+                rr.status = ReorderRequest.Status.ORDERED
+                rr.save(update_fields=["purchase_order_item", "status", "updated_at"])
             purchase_order.recalc_total()
 
         return Response(
@@ -451,6 +529,13 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         update_fields = ["status", "updated_at"]
         old_status_display = purchase_order.get_status_display()
         purchase_order.status = new_status
+        if new_status == PurchaseOrder.Status.CANCELLED:
+            # Stock reorders on this order go back to the queue to be bought again.
+            from apps.inventory.models import ReorderRequest
+
+            ReorderRequest.objects.filter(purchase_order_item__purchase_order=purchase_order, status="ordered").update(
+                status=ReorderRequest.Status.OPEN, purchase_order_item=None,
+            )
 
         if new_status == PurchaseOrder.Status.APPROVED:
             purchase_order.approved_by = request.user
