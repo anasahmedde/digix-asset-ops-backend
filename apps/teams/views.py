@@ -39,8 +39,60 @@ from .serializers import (
 class ProjectViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["status", "phase", "contract_type", "client", "site", "manager"]
-    search_fields = ["name", "location", "description"]
+    search_fields = ["name", "location", "description", "client__name", "site__name", "sites__name"]
     ordering_fields = ["created_at", "start_date", "target_date", "progress"]
+
+    @staticmethod
+    def _activity(project):
+        """What has already happened on a project, in the words a user reads.
+
+        Stock issued, purchase orders raised or work orders placed are records
+        other people rely on; a project carrying any of them is not deleted.
+        """
+        from apps.procurement.models import PurchaseOrderItem
+        from apps.workorders.models import WorkOrder
+
+        found = []
+        issued = (
+            project.inventory_issuances.exists()
+            or project.issuance_requests.filter(quantity_issued__gt=0).exists()
+        )
+        if issued:
+            found.append("stock issued to it")
+        # Lines raised for its requirements, for its vendor-built assets, or
+        # for the components of assets on its scope.
+        orders = (
+            PurchaseOrderItem.objects.filter(
+                Q(bom_line__project=project)
+                | Q(procured_devices__project_scope_items__project=project)
+                | Q(asset_components__device__project_scope_items__project=project)
+            )
+            .exclude(purchase_order__status="cancelled")
+            .distinct()
+            .count()
+        )
+        if orders:
+            found.append(f"{orders} purchase order line(s) raised for it")
+        wos = project.work_orders.exclude(status=WorkOrder.Status.CANCELLED).count()
+        if wos:
+            found.append(f"{wos} work order(s)")
+        return found
+
+    def destroy(self, request, *args, **kwargs):
+        """A project with no activity can go; one with activity is kept."""
+        project = self.get_object()
+        activity = self._activity(project)
+        if activity:
+            return Response(
+                {
+                    "detail": (
+                        f"'{project.name}' has {', '.join(activity)}. Projects with activity are kept "
+                        "for the record — move it to On Hold or Order Lost instead."
+                    )
+                },
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
 
     def get_queryset(self):
         return (

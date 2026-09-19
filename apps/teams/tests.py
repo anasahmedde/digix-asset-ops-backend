@@ -820,3 +820,83 @@ def test_actuals_document_prints_the_complete_table(db):
     for needle in ("ACTUAL COST", built.asset_code, bought.asset_code, "Complete asset from the vendor",
                    "Doc cutting", "Travelling", "ACTUAL TO DATE", "120,000.00", "650.00"):
         assert needle in text, needle
+
+
+# ---------------------------------------------------------------------------
+# Deleting a project
+# ---------------------------------------------------------------------------
+@pytest.mark.django_db
+def test_a_project_with_no_activity_can_be_deleted():
+    """Scope, milestones and requirements go with it; assets are only unlinked."""
+    from apps.teams.models import ProjectMilestone, ProjectScopeItem
+
+    ops = User.objects.create_user(username="del-ops", password="x", role="ops_manager")
+    brand = Brand.objects.create(name="DelBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="D-1")
+    device = Device.objects.create(device_model=dm, asset_code="AST-DEL-1", serial_number="DEL-1")
+    project = Project.objects.create(name="Mistaken entry", phase="query")
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    ProjectMilestone.objects.create(project=project, title="Kick-off", due_date="2026-10-01", order=1)
+
+    r = _client(ops).delete(f"/api/teams/projects/{project.pk}/")
+    assert r.status_code == 204, r.content
+    assert not Project.objects.filter(pk=project.pk).exists()
+    assert not ProjectScopeItem.objects.filter(device=device).exists()
+    device.refresh_from_db()
+    assert device.project_id is None
+
+
+@pytest.mark.django_db
+def test_a_project_with_activity_is_kept():
+    """Stock issued or a work order placed: the project stays for the record."""
+    from apps.suppliers.models import Supplier
+    from apps.workorders.models import WorkOrder
+
+    ops = User.objects.create_user(username="keep-ops", password="x", role="ops_manager")
+    project = Project.objects.create(name="Live rollout", phase="production")
+    shop = Supplier.objects.create(name="Keep Works")
+    WorkOrder.objects.create(title="Frames", supplier=shop, project=project)
+
+    r = _client(ops).delete(f"/api/teams/projects/{project.pk}/")
+    assert r.status_code == 400, r.content
+    assert "1 work order(s)" in r.data["detail"] and "On Hold" in r.data["detail"]
+    assert Project.objects.filter(pk=project.pk).exists()
+
+    # A purchase order raised for a component of an asset on its scope counts too.
+    from decimal import Decimal
+
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.teams.models import ProjectScopeItem
+
+    ordered = Project.objects.create(name="Ordered rollout", phase="production")
+    brand = Brand.objects.create(name="KeepBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="K-1")
+    device = Device.objects.create(device_model=dm, asset_code="AST-KEEP-1", serial_number="KEEP-1")
+    ProjectScopeItem.objects.create(project=ordered, device=device, quantity=1)
+    po = PurchaseOrder.objects.create(supplier=shop, ordered_by=ops, status=PurchaseOrder.Status.DRAFT)
+    line = PurchaseOrderItem.objects.create(purchase_order=po, description="Frame steel", quantity=2, unit_price=Decimal("10"))
+    AssetComponent.objects.create(device=device, name="Frame steel", quantity=2, purchase_order_item=line)
+    r = _client(ops).delete(f"/api/teams/projects/{ordered.pk}/")
+    assert r.status_code == 400 and "1 purchase order line(s)" in r.data["detail"], r.data
+    # Cancelled orders do not hold a project back.
+    po.status = PurchaseOrder.Status.CANCELLED
+    po.save(update_fields=["status"])
+    assert _client(ops).delete(f"/api/teams/projects/{ordered.pk}/").status_code == 204
+
+    # Only managers delete at all.
+    tech = User.objects.create_user(username="keep-tech", password="x", role="technician")
+    empty = Project.objects.create(name="Nothing yet", phase="query")
+    assert _client(tech).delete(f"/api/teams/projects/{empty.pk}/").status_code == 403
+
+
+@pytest.mark.django_db
+def test_projects_are_searched_by_client_and_site_too():
+    from apps.clients.models import Client
+
+    ops = User.objects.create_user(username="search-ops", password="x", role="ops_manager")
+    acme = Client.objects.create(name="Acme Retail")
+    Project.objects.create(name="Window displays", client=acme, phase="query")
+    Project.objects.create(name="Kiosks", phase="query")
+
+    names = [p["name"] for p in _client(ops).get("/api/teams/projects/", {"search": "acme"}).json()["results"]]
+    assert names == ["Window displays"]
