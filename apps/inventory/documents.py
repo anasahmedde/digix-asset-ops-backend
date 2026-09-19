@@ -164,7 +164,7 @@ def render_issue_slip_pdf(issuance_request) -> bytes:
         Paragraph(str(req.quantity_issued), s["cell"]),
         Paragraph(str(req.outstanding_quantity), s["cell"]),
     ]
-    items = Table([head, line], colWidths=[30 * mm, 72 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm])
+    items = Table([head, line], colWidths=[30 * mm, 60 * mm, 16 * mm, 24 * mm, 20 * mm, 24 * mm])
     items.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), BAND),
         ("LINEBELOW", (0, 0), (-1, 0), 0.5, RULE),
