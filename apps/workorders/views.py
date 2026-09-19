@@ -1,3 +1,4 @@
+from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -7,7 +8,7 @@ from rest_framework.response import Response
 
 from common.permissions import AdminManagerWriteElseRead
 
-from .models import WorkOrder
+from .models import WorkOrder, WorkOrderItem
 from .pdf import build_work_order_pdf
 from .serializers import (
     WorkOrderListSerializer,
@@ -20,8 +21,8 @@ def _spawn_project_if_needed(work_order: WorkOrder):
     """On approval, create the delivery Project sourced from this Work Order."""
     from apps.teams.models import Project
 
-    if work_order.order_type in (WorkOrder.OrderType.SUPPLY, WorkOrder.OrderType.PRODUCTION):
-        return  # a purchase, or one operation of a route: nothing to install
+    if work_order.order_type in (WorkOrder.OrderType.SUPPLY, WorkOrder.OrderType.PRODUCTION, WorkOrder.OrderType.SERVICES):
+        return  # a purchase, or services rendered: nothing to install
     if Project.objects.filter(source_work_order=work_order).exists():
         return
     Project.objects.create(
@@ -66,6 +67,17 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         new_status = ser.validated_data["status"]
         now = timezone.now()
 
+        # The same sign-off as a purchase order: the Group Head approves;
+        # Operations move the order everywhere else.
+        role = getattr(request.user, "role", "")
+        if role == "group_head" and new_status not in (WorkOrder.Status.APPROVED, WorkOrder.Status.DRAFT):
+            return Response(
+                {"detail": "The Group Head signs work orders off; Operations move them otherwise."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if new_status == WorkOrder.Status.APPROVED and role not in ("super_admin", "group_head"):
+            return Response({"detail": "Work orders are approved by the Group Head."}, status=status.HTTP_403_FORBIDDEN)
+
         update_fields = ["status", "updated_at"]
         work_order.status = new_status
 
@@ -73,6 +85,10 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             work_order.approved_by = request.user
             work_order.approved_at = now
             update_fields += ["approved_by", "approved_at"]
+            # The order date is the day it was signed off.
+            if work_order.order_date is None:
+                work_order.order_date = timezone.localdate()
+                update_fields.append("order_date")
         elif new_status == WorkOrder.Status.ISSUED:
             work_order.issued_at = now
             update_fields += ["issued_at"]
@@ -83,6 +99,173 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             _spawn_project_if_needed(work_order)
 
         return Response(WorkOrderSerializer(work_order).data)
+
+    # ── Requests from Execution, and the orders raised from them ──────────
+
+    @action(detail=False, methods=["get"], url_path="requests")
+    def requests(self, request):
+        """Operations Execution asked to give to a vendor, waiting for an order.
+
+        The project decides *that* an operation goes out; here the vendor is
+        chosen and the order raised — one draft for as many operations as go
+        to the same vendor.
+        """
+        from apps.assets.models import ProductionStep
+        from apps.teams.models import ProjectScopeItem
+
+        steps = (
+            ProductionStep.objects.filter(
+                location=ProductionStep.Location.EXTERNAL, work_order_requested_at__isnull=False,
+            )
+            .exclude(status__in=(ProductionStep.Status.COMPLETED, ProductionStep.Status.SKIPPED))
+            .select_related("device", "device__project", "device__device_model")
+            .order_by("work_order_requested_at")
+        )
+        scope = {
+            r["device_id"]: (str(r["project_id"]), r["project__name"])
+            for r in ProjectScopeItem.objects.values("device_id", "project_id", "project__name")
+        }
+        rows = []
+        for step in steps:
+            if step.live_work_orders().exists():
+                continue
+            device = step.device
+            if device.project_id:
+                project, project_name = str(device.project_id), device.project.name
+            else:
+                project, project_name = scope.get(device.id, (None, None))
+            rows.append({
+                "step": str(step.pk),
+                "step_number": step.step_number,
+                "operation": step.name,
+                "device": str(device.pk),
+                "asset_code": device.asset_code,
+                "asset_name": device.display_name or str(device.device_model),
+                "project": project,
+                "project_name": project_name,
+                "planned_cost": step.planned_cost,
+                "requested_at": step.work_order_requested_at,
+                "notes": step.notes,
+            })
+        return Response({"results": rows})
+
+    @action(detail=False, methods=["post"], url_path="raise")
+    def raise_wo(self, request):
+        """One draft work order, to one vendor, for the chosen requests.
+
+        Body: steps (ids), supplier, optional amounts {step: amount},
+        expected_delivery, terms, notes. Each operation becomes a line priced
+        at the amount given or the step's planned cost. The order lands in the
+        list as a draft for the same approval a purchase order gets.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        from apps.assets.models import ProductionStep
+        from apps.suppliers.models import Supplier
+        from apps.teams.models import Project, ProjectScopeItem
+
+        step_ids = [str(x) for x in (request.data.get("steps") or [])]
+        supplier = Supplier.objects.filter(pk=request.data.get("supplier")).first()
+        if supplier is None:
+            return Response({"supplier": ["Choose the vendor."]}, status=400)
+        steps = list(
+            ProductionStep.objects.filter(pk__in=step_ids)
+            .select_related("device", "device__project", "device__asset_type", "device__device_model")
+        )
+        if not steps or len(steps) != len(set(step_ids)):
+            return Response({"steps": ["Pick at least one request."]}, status=400)
+        for step in steps:
+            if step.live_work_orders().exists():
+                return Response({"steps": [f"'{step.name}' on {step.device.asset_code} is already on a work order."]}, status=400)
+            if step.status in (ProductionStep.Status.COMPLETED, ProductionStep.Status.SKIPPED):
+                return Response({"steps": [f"'{step.name}' on {step.device.asset_code} is already finished."]}, status=400)
+
+        amounts = request.data.get("amounts") or {}
+
+        def amount_for(step):
+            raw = amounts.get(str(step.pk))
+            if raw in (None, ""):
+                return step.planned_cost or Decimal("0")
+            try:
+                return Decimal(str(raw))
+            except InvalidOperation:
+                return step.planned_cost or Decimal("0")
+
+        scope = {
+            r["device_id"]: r["project_id"]
+            for r in ProjectScopeItem.objects.filter(device_id__in=[s.device_id for s in steps]).values("device_id", "project_id")
+        }
+        project_ids = {s.device.project_id or scope.get(s.device_id) for s in steps} - {None}
+        project = Project.objects.filter(pk=next(iter(project_ids))).first() if len(project_ids) == 1 else None
+        devices = {s.device_id for s in steps}
+        device = steps[0].device if len(devices) == 1 else None
+        codes = sorted({s.device.asset_code for s in steps})
+        title = (
+            f"{steps[0].name} — {steps[0].device.asset_code}" if len(steps) == 1
+            else f"{len(steps)} operations — {', '.join(codes)}"
+        )
+        if project is not None:
+            title = f"{title} — {project.name}"
+
+        with transaction.atomic():
+            order = WorkOrder.objects.create(
+                title=title[:300],
+                description=(request.data.get("notes") or "").strip(),
+                order_type=WorkOrder.OrderType.SERVICES,
+                supplier=supplier,
+                client=project.client if project is not None else None,
+                site=(
+                    device.current_site if device is not None and device.current_site_id
+                    else (project.site if project is not None else None)
+                ),
+                project=project,
+                device=device,
+                production_step=steps[0] if len(steps) == 1 else None,
+                expected_delivery=request.data.get("expected_delivery") or None,
+                terms_conditions=(request.data.get("terms") or "").strip(),
+                created_by=request.user,
+            )
+            for step in steps:
+                WorkOrderItem.objects.create(
+                    work_order=order,
+                    asset_type=step.device.asset_type,
+                    device_model=step.device.device_model,
+                    description=f"{step.name} on {step.device.display_name or step.device.asset_code}",
+                    quantity=1,
+                    unit_price=amount_for(step),
+                    production_step=step,
+                )
+            order.recalc_total()
+        return Response(WorkOrderSerializer(order).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"], url_path="requests/send-back")
+    def send_back(self, request):
+        """Hand a request back to the project: the operation is undecided
+        again, and the reason is written on the asset for Execution to read."""
+        from apps.assets.models import DeviceLifecycleEvent, ProductionStep
+
+        step = ProductionStep.objects.filter(pk=request.data.get("step")).select_related("device").first()
+        if step is None:
+            return Response({"step": ["Pick the request to send back."]}, status=400)
+        if step.live_work_orders().exists():
+            return Response({"step": [f"'{step.name}' is already on a work order — cancel that instead."]}, status=400)
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            return Response({"reason": ["Say why it is going back."]}, status=400)
+        with transaction.atomic():
+            step.location = ProductionStep.Location.UNDECIDED
+            step.workshop = None
+            step.workshop_name = ""
+            step.work_order_requested_at = None
+            step.save(update_fields=["location", "workshop", "workshop_name", "work_order_requested_at", "updated_at"])
+            DeviceLifecycleEvent.objects.create(
+                device=step.device,
+                event_type=DeviceLifecycleEvent.EventType.NOTE,
+                description=f"Work order request for '{step.name}' sent back by Work Orders: {reason}",
+                performed_by=request.user,
+                metadata={"step": str(step.pk), "sent_back": True, "reason": reason},
+            )
+        return Response({"detail": f"'{step.name}' on {step.device.asset_code} is back with the project to decide.", "step": str(step.pk)})
 
     @action(detail=True, methods=["get"], url_path="print")
     def print_pdf(self, request, pk=None):

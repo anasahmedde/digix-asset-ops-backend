@@ -110,6 +110,65 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         )
         return Response(payload, status=drf_status.HTTP_201_CREATED)
 
+    @action(detail=False, methods=["post"], url_path="requisitions/send-back")
+    def send_back_requisition(self, request):
+        """Hand a To-Procure line back to the project.
+
+        Body: component or device, and a reason. The Procure decision is
+        undone — the line is 'Not decided' again in Execution — and the reason
+        is journalled on the asset. A line already on a purchase order stays;
+        cancel the order first.
+        """
+        from apps.assets.models import AssetComponent, Device, DeviceLifecycleEvent
+        from apps.inventory.models import IssuanceRequest
+
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            return Response({"reason": ["Say why it is going back."]}, status=400)
+
+        component = AssetComponent.objects.filter(pk=request.data.get("component")).select_related("device").first()
+        device = Device.objects.filter(pk=request.data.get("device")).first() if not component else None
+        if component is None and device is None:
+            return Response({"detail": "Pick the line to send back."}, status=400)
+
+        with transaction.atomic():
+            if component is not None:
+                po_item = component.purchase_order_item
+                if po_item is not None and po_item.purchase_order.status != PurchaseOrder.Status.CANCELLED:
+                    return Response({"detail": (
+                        f"'{component.name}' is already on {po_item.purchase_order.po_number} — cancel that order first."
+                    )}, status=400)
+                bought = component.procure_quantity
+                # Only the buy is undone; anything the store was asked for stays asked.
+                component.issuance_requests.filter(awaiting_procurement=True).exclude(
+                    status=IssuanceRequest.Status.CANCELLED
+                ).update(status=IssuanceRequest.Status.CANCELLED)
+                component.purchase_order_item = None
+                component.refresh_from_db(fields=["purchase_order_item"])
+                component.fulfilment = (
+                    AssetComponent.Fulfilment.FROM_STOCK if component.stock_requested_quantity
+                    else AssetComponent.Fulfilment.PENDING
+                )
+                component.save(update_fields=["fulfilment", "purchase_order_item", "updated_at"])
+                asset, what = component.device, f"'{component.name}' × {bought or component.outstanding_quantity}"
+            else:
+                if device.procurement_item_id and device.procurement_item.purchase_order.status != PurchaseOrder.Status.CANCELLED:
+                    return Response({"detail": (
+                        f"{device.asset_code} is already on {device.procurement_item.purchase_order.po_number} — cancel that order first."
+                    )}, status=400)
+                device.procurement_requested_at = None
+                device.save(update_fields=["procurement_requested_at", "updated_at"])
+                asset, what = device, f"the complete asset {device.asset_code}"
+            DeviceLifecycleEvent.objects.create(
+                device=asset,
+                event_type=DeviceLifecycleEvent.EventType.NOTE,
+                description=f"Procurement sent {what} back to the project: {reason}",
+                performed_by=request.user,
+                metadata={"sent_back": True, "reason": reason,
+                          **({"component": str(component.pk)} if component is not None else {})},
+            )
+        return Response({"detail": f"{what[0].upper() + what[1:]} is back with the project to decide."})
+
     @action(detail=False, methods=["get"])
     def requisitions(self, request):
         """Asset requirements the project flagged to be bought.

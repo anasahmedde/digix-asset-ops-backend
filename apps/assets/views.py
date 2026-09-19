@@ -1192,18 +1192,29 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="decide")
     def decide(self, request, pk=None):
-        """Execution decision for one operation: done in-house. (Giving it to a
-        workshop is a work order, raised from the project.)"""
+        """Execution decision for one operation: done in-house, or given to a
+        vendor. 'external' asks for a work order — the request lands under
+        Work Orders › Requests, where the vendor is chosen and the order raised."""
         step = self.get_object()
-        if step.work_orders.exclude(status="cancelled").exists():
+        if step.live_work_orders().exists():
             return Response(
-                {"detail": f"'{step.name}' is on a work order — cancel that first to bring it in-house."},
+                {"detail": f"'{step.name}' is on a work order — cancel that first to change the decision."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        step.location = ProductionStep.Location.IN_HOUSE
+        if step.status in (ProductionStep.Status.COMPLETED, ProductionStep.Status.SKIPPED):
+            return Response({"detail": f"'{step.name}' is already finished."}, status=400)
+        where = request.data.get("location", ProductionStep.Location.IN_HOUSE)
+        if where == ProductionStep.Location.EXTERNAL:
+            step.location = ProductionStep.Location.EXTERNAL
+            step.work_order_requested_at = timezone.now()
+        elif where == ProductionStep.Location.IN_HOUSE:
+            step.location = ProductionStep.Location.IN_HOUSE
+            step.work_order_requested_at = None
+        else:
+            return Response({"location": ["Choose 'in_house' or 'external'."]}, status=400)
         step.workshop = None
         step.workshop_name = ""
-        step.save(update_fields=["location", "workshop", "workshop_name", "updated_at"])
+        step.save(update_fields=["location", "workshop", "workshop_name", "work_order_requested_at", "updated_at"])
         return Response(ProductionStepSerializer(step).data)
 
     @action(detail=True, methods=["post"])

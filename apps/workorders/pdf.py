@@ -23,6 +23,18 @@ def _company():
     return Company.objects.filter(is_primary=True).first() or Company.objects.first()
 
 
+def _draft_stamp(canvas, doc):
+    """A DRAFT stamp across the page until the order is approved."""
+    canvas.saveState()
+    canvas.setFont("Helvetica-Bold", 96)
+    canvas.setFillColor(colors.Color(0.55, 0.55, 0.55, alpha=0.18))
+    width, height = A4
+    canvas.translate(width / 2, height / 2)
+    canvas.rotate(35)
+    canvas.drawCentredString(0, 0, "DRAFT")
+    canvas.restoreState()
+
+
 def build_work_order_pdf(work_order) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -82,7 +94,7 @@ def build_work_order_pdf(work_order) -> bytes:
     ]
     meta = Table(
         [[
-            Paragraph("SUPPLIER", label),
+            Paragraph("VENDOR", label),
             Paragraph("DETAILS", label),
         ], [
             Paragraph("<br/>".join(supplier_block), body),
@@ -136,5 +148,8 @@ def build_work_order_pdf(work_order) -> bytes:
 
     elements += [Spacer(1, 16), Paragraph("Authorised signature: ______________________________", small)]
 
-    doc.build(elements)
+    if work_order.status in ("draft", "pending_approval"):
+        doc.build(elements, onFirstPage=_draft_stamp, onLaterPages=_draft_stamp)
+    else:
+        doc.build(elements)
     return buffer.getvalue()

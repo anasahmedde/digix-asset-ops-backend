@@ -21,6 +21,10 @@ from common.models import TimeStampedModel
 
 class WorkOrder(TimeStampedModel):
     class OrderType(models.TextChoices):
+        # What a work order is: services a vendor performs for us — an
+        # operation of a build given to a workshop, installation labour, a
+        # repair. Goods are bought on purchase orders, not here.
+        SERVICES = "services", "Services"
         SUPPLY = "supply", "Supply / Purchase"
         INSTALLATION = "installation", "Installation"
         SUPPLY_INSTALL = "supply_install", "Supply & Installation"
@@ -49,7 +53,7 @@ class WorkOrder(TimeStampedModel):
     wo_number = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
     title = models.CharField(max_length=300)
     description = models.TextField(blank=True)
-    order_type = models.CharField(max_length=20, choices=OrderType.choices, default=OrderType.SUPPLY_INSTALL)
+    order_type = models.CharField(max_length=20, choices=OrderType.choices, default=OrderType.SERVICES)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
 
     supplier = models.ForeignKey(
@@ -145,6 +149,12 @@ class WorkOrderItem(TimeStampedModel):
     )
     device_model = models.ForeignKey(
         "assets.DeviceModel", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_order_items"
+    )
+    # The operation of a build this line pays for, when the order came from a
+    # production route. One order can carry several operations for one vendor.
+    production_step = models.ForeignKey(
+        "assets.ProductionStep", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="work_order_items",
     )
     description = models.CharField(max_length=300)
     quantity = models.PositiveIntegerField(default=1)

@@ -468,6 +468,9 @@ class ProductionStep(TimeStampedModel):
     sent_at = models.DateTimeField(null=True, blank=True)
     returned_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+    # When Execution asked for a work order. Cleared once one is raised, or
+    # when the decision changes.
+    work_order_requested_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True)
 
     class Meta:
@@ -480,6 +483,33 @@ class ProductionStep(TimeStampedModel):
 
     def can_transition_to(self, new_status) -> bool:
         return new_status in self.VALID_TRANSITIONS.get(self.status, ())
+
+    def live_work_orders(self):
+        """Work orders covering this operation — named on the order itself
+        (older single-step orders) or on one of its lines — not cancelled."""
+        from apps.workorders.models import WorkOrder
+
+        return (
+            WorkOrder.objects.filter(
+                models.Q(production_step=self) | models.Q(items__production_step=self)
+            )
+            .exclude(status=WorkOrder.Status.CANCELLED)
+            .distinct()
+            .order_by("created_at")
+        )
+
+    @property
+    def live_work_order(self):
+        return self.live_work_orders().last()
+
+    @property
+    def work_order_requested(self) -> bool:
+        """Execution asked for a work order that nobody has raised yet."""
+        return (
+            self.location == self.Location.EXTERNAL
+            and self.work_order_requested_at is not None
+            and not self.live_work_orders().exists()
+        )
 
     @property
     def on_project(self) -> bool:
@@ -500,6 +530,8 @@ class ProductionStep(TimeStampedModel):
         if self.status in (self.Status.COMPLETED, self.Status.SKIPPED):
             return ""
         if self.location == self.Location.EXTERNAL:
+            if self.work_order_requested:
+                return "Work order requested — raise it under Work Orders › Requests; the status then follows the order."
             return "On a work order — its status follows the work order."
         if self.location == self.Location.UNDECIDED and self.on_project:
             return "Decide in the project's Execution tab whether this is done in-house or on a work order."
@@ -511,6 +543,8 @@ class ProductionStep(TimeStampedModel):
             return None
         if self.workshop_id:
             return self.workshop.name
+        if self.work_order_requested:
+            return "Work order requested"
         return self.workshop_name or "Unnamed workshop"
 
 

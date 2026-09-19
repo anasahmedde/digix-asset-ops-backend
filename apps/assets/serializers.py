@@ -914,14 +914,14 @@ class ProductionStepSerializer(serializers.ModelSerializer):
     work_order = serializers.SerializerMethodField()
 
     def get_work_order(self, obj):
-        orders = getattr(obj, "_prefetched_objects_cache", {}).get("work_orders")
-        orders = list(orders) if orders is not None else list(obj.work_orders.all())
-        live = [o for o in orders if o.status != "cancelled"]
-        if not live:
+        o = obj.live_work_order
+        if o is None:
             return None
-        o = sorted(live, key=lambda x: x.created_at)[-1]
         return {"id": str(o.pk), "wo_number": o.wo_number, "status": o.status,
                 "status_display": o.get_status_display(), "amount": o.total_amount}
+
+    # Execution asked for a work order; Work Orders › Requests has it.
+    work_order_requested = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = ProductionStep
@@ -929,6 +929,7 @@ class ProductionStepSerializer(serializers.ModelSerializer):
             "id", "device", "step_number", "name",
             "location", "location_display", "workshop", "workshop_name", "workshop_display",
             "status", "status_display", "allowed_transitions", "hold_reason", "decision_pending", "work_order",
+            "work_order_requested", "work_order_requested_at",
             "assigned_to", "assigned_to_name", "expected_days", "planned_cost", "actual_cost",
             "started_at", "sent_at", "returned_at", "completed_at",
             "notes", "created_at",

@@ -379,7 +379,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             step = ProductionStep.objects.filter(pk=request.data.get("production_step"), device=device).first()
             if step is None:
                 return Response({"production_step": ["That operation is not on this asset's route."]}, status=400)
-            if step.work_orders.exclude(status="cancelled").exists():
+            if step.live_work_orders().exists():
                 return Response({"production_step": [f"'{step.name}' already has a work order."]}, status=400)
             if step.status in ("completed", "skipped"):
                 return Response({"production_step": [f"'{step.name}' is already finished."]}, status=400)
@@ -395,7 +395,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             amount = Decimal("0")
 
         if step is not None:
-            order_type = WorkOrder.OrderType.PRODUCTION
+            order_type = WorkOrder.OrderType.SERVICES
         else:
             order_type = (
                 WorkOrder.OrderType.SUPPLY_INSTALL
@@ -427,6 +427,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     f"{step.name} on {device.display_name or device.asset_code}" if step is not None
                     else f"{device.display_name or device.asset_code} ({device.get_source_display()})"
                 ),
+                production_step=step,
                 quantity=1,
                 unit_price=amount,
             )
