@@ -989,19 +989,37 @@ def test_unique_product_can_be_opened_with_stock_already_on_the_shelf():
     c = APIClient()
     c.force_authenticate(user)
 
+    # Stock on the shelf means a serial for every unit — none typed, no item.
     r = c.post("/api/inventory/products/", {
         "name": "Opening Media Player", "opening_quantity": 3,
+    }, format="json")
+    assert r.status_code == 400 and "each of the 3" in str(r.data["opening_serials"])
+    r = c.post("/api/inventory/products/", {
+        "name": "Opening Media Player", "opening_quantity": 3, "opening_serials": ["OMP-1", "OMP-2"],
+    }, format="json")
+    assert r.status_code == 400 and "opening_serials" in r.data
+    r = c.post("/api/inventory/products/", {
+        "name": "Opening Media Player", "opening_quantity": 3, "opening_serials": ["OMP-1", "omp-1", "OMP-3"],
+    }, format="json")
+    assert r.status_code == 400 and "repeated" in str(r.data["opening_serials"])
+
+    r = c.post("/api/inventory/products/", {
+        "name": "Opening Media Player", "opening_quantity": 3, "opening_serials": [" OMP-1 ", "OMP-2", "OMP-3"],
     }, format="json")
     assert r.status_code == 201, r.content
     assert r.data["in_stock_count"] == 3
 
     unit_type = InventoryUnitType.objects.get(pk=r.data["id"])
     units = list(unit_type.units.order_by("serial_number"))
-    assert len(units) == 3
-    # Provisional serials derived from the product code, each with its own code.
-    assert units[0].serial_number == f"{unit_type.type_code}-0001"
+    assert [u.serial_number for u in units] == ["OMP-1", "OMP-2", "OMP-3"]
     assert len({u.unit_code for u in units}) == 3
     assert all(u.unit_code for u in units)
+
+    # A serial already in inventory cannot be opened a second time.
+    r = c.post("/api/inventory/products/", {
+        "name": "Second Player", "opening_quantity": 1, "opening_serials": ["OMP-2"],
+    }, format="json")
+    assert r.status_code == 400 and "OMP-2" in str(r.data["opening_serials"])
 
     # Opening at zero is the normal case and creates nothing.
     r = c.post("/api/inventory/products/", {"name": "Empty Product"}, format="json")
@@ -1010,8 +1028,8 @@ def test_unique_product_can_be_opened_with_stock_already_on_the_shelf():
 
 
 @pytest.mark.django_db
-def test_provisional_serials_can_be_corrected_on_a_bare_unit():
-    """Opening stock exists to be corrected once the units are found on the shelf.
+def test_opening_stock_units_can_be_corrected_on_a_bare_unit():
+    """A serial typed at opening can still be corrected later.
 
     A product opened with nothing but a name raises units carrying neither a
     material type nor a model name, so the identity rule is asked at
@@ -1024,7 +1042,7 @@ def test_provisional_serials_can_be_corrected_on_a_bare_unit():
     c.force_authenticate(user)
 
     r = c.post("/api/inventory/products/", {
-        "name": "Unidentified Player", "opening_quantity": 2,
+        "name": "Unidentified Player", "opening_quantity": 2, "opening_serials": ["UP-A", "UP-B"],
     }, format="json")
     assert r.status_code == 201, r.content
     unit_type = InventoryUnitType.objects.get(pk=r.data["id"])
@@ -1132,3 +1150,30 @@ def test_a_request_names_one_thing_to_issue(ops, items):
     }, format="json")
     assert r.status_code == 400
     assert "item" in r.data
+
+
+@pytest.mark.django_db
+def test_a_new_component_opens_its_ledger_with_the_opening_stock(ops):
+    """'Add Component' asks for opening stock and a rate: the stock typed there
+    is journalled as the component's opening movement, priced at that rate."""
+    from apps.inventory.models import StockMovement
+
+    rope = MaterialType.objects.create(name="Opening Rope", unit="meter")
+    r = _client(ops).post("/api/inventory/items/", {
+        "material_type": str(rope.id), "quantity": 40, "min_stock_level": 5, "unit_cost": "12.50",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    moves = list(StockMovement.objects.filter(item_id=r.data["id"]))
+    assert len(moves) == 1
+    assert moves[0].movement_type == "opening" and moves[0].quantity == 40
+    assert moves[0].reference == "Opening stock" and "12.50 per meter" in moves[0].notes
+    assert moves[0].performed_by == ops
+    listed = _client(ops).get("/api/inventory/movements/", {"item": r.data["id"]}).json()
+    rows = listed.get("results", listed)
+    assert [m["movement_type"] for m in rows] == ["opening"]
+
+    # Opened empty: nothing to journal yet.
+    tape = MaterialType.objects.create(name="Opening Tape", unit="roll")
+    r = _client(ops).post("/api/inventory/items/", {"material_type": str(tape.id), "quantity": 0}, format="json")
+    assert r.status_code == 201, r.content
+    assert not StockMovement.objects.filter(item_id=r.data["id"]).exists()

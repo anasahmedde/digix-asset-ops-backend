@@ -72,10 +72,14 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
     # Uses the list queryset's annotation when present, else the model property.
     in_stock_count = serializers.SerializerMethodField()
     # Stock already on the shelf when the product is first opened. Serialized
-    # items need a serial each, so provisional ones are generated from the type
-    # code for the storekeeper to correct as the units are found.
+    # items need a serial each, typed here — one per unit, all different, none
+    # already in inventory. Opening at zero needs none.
     opening_quantity = serializers.IntegerField(
         write_only=True, required=False, min_value=0, max_value=500, default=0
+    )
+    opening_serials = serializers.ListField(
+        child=serializers.CharField(max_length=200, allow_blank=True),
+        write_only=True, required=False, default=list,
     )
 
     class Meta:
@@ -87,15 +91,50 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
             "unit_cost", "min_stock_level", "is_high_value",
             "default_has_warranty", "default_warranty_type", "default_warranty_months",
             "supplier", "supplier_name",
-            "in_stock_count", "opening_quantity", "notes", "is_active", "created_at", "updated_at",
+            "in_stock_count", "opening_quantity", "opening_serials", "notes", "is_active",
+            "created_at", "updated_at",
         ]
         read_only_fields = ["id", "type_code", "created_at", "updated_at"]
 
     def get_in_stock_count(self, obj):
         return getattr(obj, "stock_count", None) or obj.in_stock_count
 
+    def _validate_opening_stock(self, attrs):
+        """Stock on the shelf needs a serial per unit; opened empty, none."""
+        if self.instance is not None:
+            return attrs
+        opening = attrs.get("opening_quantity") or 0
+        serials = [(sn or "").strip() for sn in attrs.get("opening_serials") or []]
+        if opening == 0:
+            attrs["opening_serials"] = []
+            return attrs
+        if len(serials) != opening or any(not sn for sn in serials):
+            raise serializers.ValidationError({
+                "opening_serials": [f"Type a serial number for each of the {opening} unit(s) on the shelf."],
+            })
+        seen, repeated = set(), []
+        for sn in serials:
+            key = sn.lower()
+            if key in seen and sn not in repeated:
+                repeated.append(sn)
+            seen.add(key)
+        if repeated:
+            raise serializers.ValidationError({
+                "opening_serials": [f"Each unit needs its own serial — repeated: {', '.join(repeated)}."],
+            })
+        from .models import InventoryUnit
+
+        taken = list(InventoryUnit.objects.filter(serial_number__in=serials).values_list("serial_number", flat=True))
+        if taken:
+            raise serializers.ValidationError({
+                "opening_serials": [f"Already in inventory: {', '.join(sorted(taken))}."],
+            })
+        attrs["opening_serials"] = serials
+        return attrs
+
     def create(self, validated_data):
         opening = validated_data.pop("opening_quantity", 0) or 0
+        serials = validated_data.pop("opening_serials", []) or []
         unit_type = super().create(validated_data)
         if opening:
             from .models import InventoryUnit
@@ -103,17 +142,17 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
             # Saved one at a time, not bulk_create: each unit's unit_code is
             # generated in save(), and bulk_create would leave them all blank
             # against a unique column.
-            for n in range(1, opening + 1):
+            for serial in serials:
                 InventoryUnit.objects.create(
                     unit_type=unit_type,
-                    serial_number=f"{unit_type.type_code}-{n:04d}",
+                    serial_number=serial,
                     material_type=unit_type.material_type,
                     category=unit_type.category,
                     brand=unit_type.brand,
                     model_name=unit_type.model_name,
                     supplier=unit_type.supplier,
                     purchase_price=unit_type.unit_cost,
-                    notes="Opening stock — provisional serial, replace it with the real one.",
+                    notes="Opening stock.",
                 )
         return unit_type
 
@@ -121,6 +160,7 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
         # Opening stock is a fact about the moment the product was opened; it
         # is not something an edit can replay.
         validated_data.pop("opening_quantity", None)
+        validated_data.pop("opening_serials", None)
         return super().update(instance, validated_data)
 
     def validate_name(self, value):
@@ -137,7 +177,7 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 "default_warranty_months": "Set the warranty term in months, or clear the warranty default."
             })
-        return attrs
+        return self._validate_opening_stock(attrs)
 
 
 class InventoryUnitSerializer(serializers.ModelSerializer):
@@ -319,7 +359,8 @@ class InventoryUnitBulkSerializer(InventoryUnitSerializer):
 
 class StockMovementSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.material_type.name", read_only=True, default=None)
-    performed_by_name = serializers.CharField(source="performed_by.get_full_name", read_only=True, default=None)
+    # Who moved it: their name, or their login when no name is on file.
+    performed_by_name = serializers.SerializerMethodField()
     # Where this stock came from: the delivery, the order behind it, and who
     # supplied it. Without these a movement says a number changed but not why.
     grn_number = serializers.CharField(
@@ -331,6 +372,12 @@ class StockMovementSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(
         source="goods_receipt_line.receipt.purchase_order.supplier.name", read_only=True, default=None
     )
+
+    def get_performed_by_name(self, obj):
+        user = obj.performed_by
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
 
     class Meta:
         model = StockMovement

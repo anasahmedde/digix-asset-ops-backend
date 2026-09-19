@@ -303,6 +303,8 @@ class StockMovement(TimeStampedModel):
         OUT = "out", "Stock Out"
         TRANSFER = "transfer", "Transfer"
         ADJUSTMENT = "adjustment", "Adjustment"
+        # The balance a component is opened with, before any receipt or issue.
+        OPENING = "opening", "Opening Stock"
 
     item = models.ForeignKey(InventoryItem, on_delete=models.CASCADE, related_name="movements")
     movement_type = models.CharField(max_length=15, choices=MovementType.choices)

@@ -114,6 +114,36 @@ class PaymentTerms(TimeStampedModel):
         return self.name
 
 
+class UnitOfMeasure(TimeStampedModel):
+    """A unit components are counted in — piece, meter, kg, or whatever the
+    business calls its own. Maintained under Setup; every unit dropdown reads
+    from here. Components store the unit's name, so renaming one here does
+    not rewrite history."""
+
+    name = models.CharField(max_length=50, unique=True)
+    symbol = models.CharField(max_length=20, blank=True, help_text="Short form, e.g. m, kg, pc")
+    description = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        verbose_name = "unit of measure"
+        verbose_name_plural = "units of measure"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+    def usage_count(self) -> int:
+        """How many component definitions count in this unit."""
+        from apps.assets.models import MaterialType
+        from apps.inventory.models import InventoryUnitType
+
+        return (
+            MaterialType.objects.filter(unit__iexact=self.name).count()
+            + InventoryUnitType.objects.filter(unit__iexact=self.name).count()
+        )
+
+
 class TermsTemplate(TimeStampedModel):
     """Terms & conditions / safety instruction templates for printed documents."""
 

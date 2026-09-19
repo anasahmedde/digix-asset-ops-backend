@@ -73,6 +73,26 @@ class InventoryItemViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
     filterset_fields = ["location", "category", "material_type", "watch_on_dashboard"]
     search_fields = ["sku", "material_type__name", "category__name"]
+
+    def perform_create(self, serializer):
+        """A component opened with stock starts its ledger with that balance.
+
+        The quantity typed on 'Add Component' is the opening stock; from then
+        on stock only moves through receipts, issues and returns, so the
+        opening entry is what makes the first number traceable.
+        """
+        item = serializer.save()
+        if item.quantity > 0:
+            unit = item.material_type.unit if item.material_type_id else "piece"
+            rate = f" at {item.unit_cost} per {unit}" if item.unit_cost is not None else ""
+            StockMovement.objects.create(
+                item=item,
+                movement_type=StockMovement.MovementType.OPENING,
+                quantity=item.quantity,
+                reference="Opening stock",
+                notes=f"Opening balance of {item.quantity} {unit}{rate}.",
+                performed_by=self.request.user,
+            )
     ordering_fields = ["quantity", "total_value", "material_type__name", "created_at"]
 
     def get_queryset(self):
