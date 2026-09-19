@@ -38,12 +38,58 @@ def apply_issuance_stock_out(issuance, user):
     return item
 
 
-def issue_stock_for_component(component, user, quantity):
+def _settle_requests_for_component(component, issued, *, exclude=None):
+    """Stock that reached a requirement counts against the requests raised for it.
+
+    Goods can reach a requirement without passing through the store's queue —
+    bought for it and issued straight from inspection, for instance. The open
+    requests for that requirement are settled in the order they were raised,
+    and once the requirement is fully covered anything still owed on the queue
+    is closed, since there is nothing left to hand over.
+    """
+    from .models import IssuanceRequest
+
+    open_requests = (
+        IssuanceRequest.objects.select_for_update()
+        .filter(asset_component=component)
+        .exclude(status=IssuanceRequest.Status.CANCELLED)
+        .order_by("created_at")
+    )
+    if exclude is not None:
+        open_requests = open_requests.exclude(pk=exclude.pk)
+    remaining = issued
+    for req in open_requests:
+        owed = req.outstanding_quantity
+        if owed <= 0:
+            continue
+        if remaining > 0:
+            take = min(owed, remaining)
+            req.quantity_issued += take
+            req.notes = (req.notes + "\n" if req.notes else "") + (
+                f"{take} covered by stock issued straight to the requirement."
+            )
+            from django.utils import timezone as _tz
+
+            req.last_issued_at = _tz.now()
+            req.sync_status()
+            req.save(update_fields=["quantity_issued", "notes", "status", "last_issued_at", "updated_at"])
+            remaining -= take
+        elif component.outstanding_quantity == 0:
+            req.status = IssuanceRequest.Status.CANCELLED
+            req.notes = (req.notes + "\n" if req.notes else "") + (
+                "Closed — the requirement was already covered from stock."
+            )
+            req.save(update_fields=["status", "notes", "updated_at"])
+
+
+def issue_stock_for_component(component, user, quantity, *, via_request=None):
     """Draw ``quantity`` out of the warehouse to cover an asset requirement.
 
     This is the only place a component moves stock, and it runs when the
     project decides to cover the requirement from inventory — never when the
     requirement itself is written down. Caller must wrap in transaction.atomic().
+    ``via_request`` is the store request being served, if any; other open
+    requests for the same requirement are settled by what was issued.
     """
     device_code = component.device.asset_code
 
@@ -113,6 +159,7 @@ def issue_stock_for_component(component, user, quantity):
     component.save(update_fields=["issued_quantity", "fulfilment", "inventory_unit", "updated_at"])
 
     record_build_progress(component, user, f"Issued {quantity} × {component.name} from inventory")
+    _settle_requests_for_component(component, 0 if via_request is not None else quantity, exclude=via_request)
     return {"units": issued_units, "quantity": quantity}
 
 
@@ -210,6 +257,26 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
     created_units = []
     inventory_item = None
 
+    # A line bought for a component opened in inventory is filed the way that
+    # component was opened; the inspector is told, not asked.
+    ordered_kind = None
+    ordered_name = ""
+    if po_item is not None and po_item.inventory_unit_type_id:
+        ordered_kind, ordered_name = GoodsReceiptLine.Route.UNIQUE, po_item.inventory_unit_type.name
+    elif po_item is not None and po_item.inventory_item_id:
+        ordered_kind = GoodsReceiptLine.Route.GENERIC
+        mt = po_item.inventory_item.material_type
+        ordered_name = mt.name if mt is not None else po_item.inventory_item.sku
+    if accepted_quantity and ordered_kind:
+        if not route:
+            route = ordered_kind
+        elif route != ordered_kind:
+            how = "unique items" if ordered_kind == GoodsReceiptLine.Route.UNIQUE else "generic stock"
+            what = "the unique product" if ordered_kind == GoodsReceiptLine.Route.UNIQUE else "the stock item"
+            raise serializers.ValidationError({
+                "route": f"This line was bought for {what} '{ordered_name}' — it is filed as {how}.",
+            })
+
     if accepted_quantity:
         if route == GoodsReceiptLine.Route.GENERIC:
             generic = generic or {}
@@ -255,7 +322,7 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
                 # Stock put somewhere new on this delivery: record where.
                 inventory_item.storage_location = generic["storage_location"].strip()
             inventory_item.quantity += accepted_quantity
-            inventory_item.save(update_fields=["quantity", "updated_at"])
+            inventory_item.save(update_fields=["quantity", "storage_location", "updated_at"])
             StockMovement.objects.create(
                 item=inventory_item,
                 movement_type=StockMovement.MovementType.IN,
@@ -421,7 +488,31 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
     # A request raised against a build moves that requirement along, so it goes
     # through the same path the requirement has always used.
     if request_row.asset_component_id:
-        result = issue_stock_for_component(request_row.asset_component, user, quantity)
+        component = request_row.asset_component
+        if component.outstanding_quantity == 0:
+            # Covered without passing through the queue: nothing left to hand
+            # over, so the request closes rather than failing.
+            request_row.status = IssuanceRequest.Status.CANCELLED
+            request_row.notes = (request_row.notes + "\n" if request_row.notes else "") + (
+                "Closed — the requirement was already covered from stock."
+            )
+            request_row.save(update_fields=["status", "notes", "updated_at"])
+            return {
+                "quantity": 0, "serials": [], "closed": True,
+                "reason": (
+                    f"{component.device.asset_code} · {component.name} is already fully covered "
+                    f"({component.issued_quantity} of {component.quantity} issued) — nothing left to hand over, "
+                    "so this request is closed."
+                ),
+            }
+        if quantity > component.outstanding_quantity:
+            raise serializers.ValidationError({
+                "quantity": (
+                    f"Only {component.outstanding_quantity} of this requirement is still outstanding on "
+                    f"{component.device.asset_code} — issue that much."
+                )
+            })
+        result = issue_stock_for_component(component, user, quantity, via_request=request_row)
         serials = [u.serial_number for u in result["units"]]
     elif request_row.item_id:
         item = InventoryItem.objects.select_for_update().get(pk=request_row.item_id)
@@ -458,14 +549,17 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
             {"detail": "This request does not name anything to issue."}
         )
 
+    from django.utils import timezone as _tz
+
     request_row.quantity_issued += quantity
     request_row.issued_by = user
+    request_row.last_issued_at = _tz.now()
     if received_by:
         request_row.received_by = received_by
     if serials:
         request_row.issued_serials = [*(request_row.issued_serials or []), *serials]
     request_row.sync_status()
     request_row.save(update_fields=[
-        "quantity_issued", "issued_by", "received_by", "issued_serials", "status", "updated_at",
+        "quantity_issued", "issued_by", "last_issued_at", "received_by", "issued_serials", "status", "updated_at",
     ])
     return {"quantity": quantity, "serials": serials}

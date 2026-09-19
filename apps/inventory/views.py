@@ -542,6 +542,8 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
             "request": IssuanceRequestSerializer(issuance_request).data,
             "issued": result["quantity"],
             "serials": result["serials"],
+            "closed": result.get("closed", False),
+            "reason": result.get("reason", ""),
         })
 
     @action(detail=True, methods=["post"])

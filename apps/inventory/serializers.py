@@ -418,6 +418,33 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
     stocked_unit_count = serializers.SerializerMethodField()
     # The unit the delivered quantity is counted in.
     unit = serializers.SerializerMethodField()
+    # What the order line was bought for. A component is opened in inventory
+    # before it is ever ordered, so by the time goods arrive the kind is known
+    # and inspection only has to show it.
+    kind = serializers.SerializerMethodField()
+    known_component = serializers.SerializerMethodField()
+
+    def get_kind(self, obj):
+        po = obj.po_item
+        if po is not None and po.inventory_unit_type_id:
+            return "unique"
+        if (po is not None and po.inventory_item_id) or obj.inventory_item_id:
+            return "generic"
+        if po is not None and po.procured_devices.exists():
+            return "asset"
+        return None
+
+    def get_known_component(self, obj):
+        po = obj.po_item
+        if po is not None and po.inventory_unit_type_id:
+            return po.inventory_unit_type.name
+        item = (po.inventory_item if po is not None and po.inventory_item_id else None) or (
+            obj.inventory_item if obj.inventory_item_id else None
+        )
+        if item is not None:
+            name = item.material_type.name if item.material_type_id else item.sku
+            return f"{name} · {item.sku}" if item.sku and name != item.sku else name
+        return None
 
     def get_unit(self, obj):
         po = obj.po_item
@@ -440,7 +467,7 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             "quantity", "unit", "batch_number", "serial_numbers",
             "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
             "inspected_by", "inspected_by_name", "inspected_at", "inspection_notes",
-            "stocked_unit_count", "created_at",
+            "stocked_unit_count", "kind", "known_component", "created_at",
         ]
         read_only_fields = fields
 
@@ -617,6 +644,29 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
     # until the PO is received and inspected into stock.
     awaiting_procurement = serializers.SerializerMethodField()
     po_number = serializers.SerializerMethodField()
+    # For a unique item: every serial handed over, with where each unit stands now.
+    issued_units = serializers.SerializerMethodField()
+
+    def get_issued_units(self, obj):
+        serials = obj.issued_serials or []
+        if not serials:
+            return []
+        units = {
+            u.serial_number: u
+            for u in InventoryUnit.objects.filter(serial_number__in=serials).only(
+                "serial_number", "unit_code", "status"
+            )
+        }
+        out = []
+        for sn in serials:
+            unit = units.get(sn)
+            out.append({
+                "serial_number": sn,
+                "unit_code": unit.unit_code if unit else None,
+                "status": unit.status if unit else None,
+                "status_display": unit.get_status_display() if unit else None,
+            })
+        return out
 
     def get_awaiting_procurement(self, obj):
         if not obj.awaiting_procurement:
@@ -642,12 +692,12 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "project", "project_name", "asset_component", "asset_code", "component_name",
             "maintenance_schedule", "maintenance_title",
             "requested_by", "requested_by_name", "issued_by", "issued_by_name",
-            "received_by", "issued_serials", "awaiting_procurement", "po_number",
+            "received_by", "issued_serials", "issued_units", "last_issued_at", "awaiting_procurement", "po_number",
             "status", "status_display", "notes", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "request_number", "quantity_issued", "issued_by", "issued_serials",
-            "received_by", "status", "requested_by", "created_at", "updated_at",
+            "id", "request_number", "quantity_issued", "issued_by", "issued_serials", "issued_units",
+            "last_issued_at", "received_by", "status", "requested_by", "created_at", "updated_at",
         ]
 
     def _name(self, user):

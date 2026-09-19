@@ -1177,3 +1177,139 @@ def test_a_new_component_opens_its_ledger_with_the_opening_stock(ops):
     r = _client(ops).post("/api/inventory/items/", {"material_type": str(tape.id), "quantity": 0}, format="json")
     assert r.status_code == 201, r.content
     assert not StockMovement.objects.filter(item_id=r.data["id"]).exists()
+
+
+@pytest.mark.django_db
+def test_inspection_knows_the_kind_from_the_order(ops):
+    """The component was opened in inventory before it was ordered, so the
+    delivered line says whether it is generic or unique — and cannot be filed
+    the other way."""
+    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine, InventoryUnitType
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.suppliers.models import Supplier
+
+    c = _client(ops)
+    supplier = Supplier.objects.create(name="Kind Supplier")
+    cable_mt = MaterialType.objects.create(name="Kind Cable", unit="meter")
+    cable = InventoryItem.objects.create(material_type=cable_mt, quantity=3)
+    player = InventoryUnitType.objects.create(name="Kind Player 55in", unit="piece")
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED)
+    cable_po = PurchaseOrderItem.objects.create(
+        purchase_order=po, inventory_item=cable, material_type=cable_mt, description="Cable", quantity=20, unit_price=5,
+    )
+    player_po = PurchaseOrderItem.objects.create(
+        purchase_order=po, inventory_unit_type=player, description="Player", quantity=2, unit_price=900,
+    )
+    receipt = GoodsReceipt.objects.create(purchase_order=po, reference="DN-K")
+    cable_line = GoodsReceiptLine.objects.create(receipt=receipt, po_item=cable_po, quantity=20)
+    player_line = GoodsReceiptLine.objects.create(receipt=receipt, po_item=player_po, quantity=2)
+
+    listed = {r["id"]: r for r in c.get("/api/inventory/receipt-lines/", {"page_size": 100}).json()["results"]}
+    assert listed[str(cable_line.id)]["kind"] == "generic" and listed[str(cable_line.id)]["known_component"].startswith("Kind Cable")
+    assert listed[str(player_line.id)]["kind"] == "unique" and listed[str(player_line.id)]["known_component"] == "Kind Player 55in"
+
+    # Filing a unique product as generic stock is refused, and vice versa.
+    r = c.post(f"/api/inventory/receipt-lines/{player_line.id}/inspect/", {
+        "accepted_quantity": 2, "rejected_quantity": 0, "route": "generic", "generic": {},
+    }, format="json")
+    assert r.status_code == 400 and "Kind Player 55in" in str(r.data["route"]), r.content
+    r = c.post(f"/api/inventory/receipt-lines/{cable_line.id}/inspect/", {
+        "accepted_quantity": 20, "rejected_quantity": 0, "route": "unique",
+        "units": [{"serial_number": f"K-{n}"} for n in range(20)],
+    }, format="json")
+    assert r.status_code == 400 and "Kind Cable" in str(r.data["route"]), r.content
+
+    # Filed the way the order says, without naming the component again.
+    r = c.post(f"/api/inventory/receipt-lines/{cable_line.id}/inspect/", {
+        "accepted_quantity": 20, "rejected_quantity": 0, "route": "generic", "generic": {"storage_location": "Rack K"},
+    }, format="json")
+    assert r.status_code == 200, r.content
+    cable.refresh_from_db()
+    assert cable.quantity == 23 and cable.storage_location == "Rack K"
+    r = c.post(f"/api/inventory/receipt-lines/{player_line.id}/inspect/", {
+        "accepted_quantity": 2, "rejected_quantity": 0, "route": "unique",
+        "units": [{"serial_number": "KP-1"}, {"serial_number": "KP-2"}],
+    }, format="json")
+    assert r.status_code == 200, r.content
+    assert player.units.count() == 2 and set(player.units.values_list("serial_number", flat=True)) == {"KP-1", "KP-2"}
+
+
+@pytest.mark.django_db
+def test_requests_follow_the_requirement_they_cover(ops):
+    """Stock issued straight to a requirement settles the request raised for
+    it; a request whose requirement is already covered closes instead of
+    failing."""
+    from django.db import transaction
+
+    from apps.assets.models import AssetComponent, Brand, Device, DeviceModel
+    from apps.inventory.models import IssuanceRequest
+    from apps.inventory.services import issue_stock_for_component
+
+    brand = Brand.objects.create(name="ReqBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="R-1")
+    device = Device.objects.create(device_model=dm, asset_code="AST-REQ-1", serial_number="REQ-1")
+    stand_mt = MaterialType.objects.create(name="Req Stand", unit="piece")
+    stand = InventoryItem.objects.create(material_type=stand_mt, quantity=13)
+
+    # 1. Issued straight to the requirement (as inspection does): the request settles.
+    comp = AssetComponent.objects.create(device=device, name="Req Stand", quantity=1, inventory_item=stand)
+    req = IssuanceRequest.objects.create(item=stand, quantity_requested=1, asset_component=comp, source="project")
+    with transaction.atomic():
+        issue_stock_for_component(comp, ops, 1)
+    req.refresh_from_db()
+    assert req.quantity_issued == 1 and req.status == "fulfilled" and "straight to the requirement" in req.notes
+
+    # 2. A request left open on a requirement that is already covered: the
+    #    store's attempt closes it with a reason, rather than an error.
+    device2 = Device.objects.create(device_model=dm, asset_code="AST-REQ-2", serial_number="REQ-2")
+    comp2 = AssetComponent.objects.create(device=device2, name="Req Stand 2", quantity=1, inventory_item=stand, issued_quantity=1)
+    req2 = IssuanceRequest.objects.create(item=stand, quantity_requested=1, asset_component=comp2, source="project")
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req2.id}/issue/", {"quantity": 1, "received_by": "Ali"}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["issued"] == 0 and r.data["closed"] is True and "already fully covered" in r.data["reason"]
+    req2.refresh_from_db()
+    assert req2.status == "cancelled"
+    stand.refresh_from_db()
+    assert stand.quantity == 12   # only the first issue moved stock
+
+    # 3. Asking for more than the requirement still needs is refused plainly.
+    device3 = Device.objects.create(device_model=dm, asset_code="AST-REQ-3", serial_number="REQ-3")
+    comp3 = AssetComponent.objects.create(device=device3, name="Req Stand 3", quantity=2, inventory_item=stand)
+    req3 = IssuanceRequest.objects.create(item=stand, quantity_requested=2, asset_component=comp3, source="project")
+    comp3.issued_quantity = 1
+    comp3.save(update_fields=["issued_quantity"])
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req3.id}/issue/", {"quantity": 2}, format="json")
+    assert r.status_code == 400 and "Only 1" in str(r.data["quantity"]), r.content
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req3.id}/issue/", {"quantity": 1, "received_by": "Site team"}, format="json")
+    assert r.status_code == 200, r.content
+    req3.refresh_from_db()
+    assert req3.quantity_issued == 1 and req3.received_by == "Site team"
+    comp3.refresh_from_db()
+    assert comp3.issued_quantity == 2
+
+
+@pytest.mark.django_db
+def test_the_log_reads_a_request_by_its_own_number(ops):
+    """A hand-over keeps the request's MR number, records when it happened,
+    and lists every serial that went out with where each unit stands."""
+    from apps.inventory.models import InventoryUnit, InventoryUnitType, IssuanceRequest
+
+    player = InventoryUnitType.objects.create(name="Log Player", unit="piece")
+    for sn in ("LP-1", "LP-2", "LP-3"):
+        InventoryUnit.objects.create(unit_type=player, serial_number=sn, model_name="LP")
+    req = IssuanceRequest.objects.create(unit_type=player, quantity_requested=3, source="project", purpose="Log test")
+    c = _client(ops)
+
+    r = c.post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 2, "received_by": "Site team"}, format="json")
+    assert r.status_code == 200, r.content
+    body = r.data["request"]
+    assert body["request_number"] == req.request_number and body["request_number"].startswith("MR-")
+    assert body["last_issued_at"] is not None and body["quantity_issued"] == 2
+    assert [u["serial_number"] for u in body["issued_units"]] == ["LP-1", "LP-2"]
+    assert all(u["status"] == "issued" and u["unit_code"] for u in body["issued_units"])
+
+    # The balance goes out later under the same number; the log shows all three.
+    r = c.post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 1}, format="json")
+    assert r.status_code == 200, r.content
+    assert [u["serial_number"] for u in r.data["request"]["issued_units"]] == ["LP-1", "LP-2", "LP-3"]
+    assert r.data["request"]["status"] == "fulfilled"
