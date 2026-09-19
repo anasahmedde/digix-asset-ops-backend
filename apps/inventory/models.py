@@ -540,6 +540,9 @@ class IssuanceRequest(TimeStampedModel):
     issued_serials = models.JSONField(default=list, blank=True)
     # The most recent hand-over against this request — the date the log shows.
     last_issued_at = models.DateTimeField(null=True, blank=True)
+    # Every hand-over, one by one: when, how much, to whom, by whom, which
+    # serials. `received_by` keeps the latest name for the list; this is the record.
+    handovers = models.JSONField(default=list, blank=True)
 
     status = models.CharField(
         max_length=12, choices=Status.choices, default=Status.PENDING, db_index=True

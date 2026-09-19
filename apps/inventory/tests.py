@@ -1379,3 +1379,44 @@ def test_low_stock_is_listed_and_bought_through_a_reorder_request(ops):
     back = ReorderRequest.objects.get(unit_type=player)
     assert back.status == "cancelled" and "Model discontinued" in back.notes
     assert c.post("/api/inventory/reorder-requests/", {"unit_type": str(player.id), "quantity": 3}, format="json").status_code == 201
+
+
+@pytest.mark.django_db
+def test_the_slip_and_the_export_carry_every_hand_over(ops):
+    """Two hand-overs to two people are both on record; the slip says who the
+    material was issued to with code, UOM and balance; the Excel export has a
+    row per hand-over."""
+    import io as _io
+
+    from openpyxl import load_workbook
+    from pypdf import PdfReader
+
+    from apps.inventory.models import InventoryUnit, InventoryUnitType, IssuanceRequest
+
+    player = InventoryUnitType.objects.create(name="Slip Player", unit="piece")
+    for sn in ("SL-1", "SL-2", "SL-3"):
+        InventoryUnit.objects.create(unit_type=player, serial_number=sn, model_name="SL")
+    req = IssuanceRequest.objects.create(unit_type=player, quantity_requested=3, source="maintenance", purpose="Screen swap at Mall")
+    c = _client(ops)
+    assert c.post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 2, "received_by": "Hassan Ali · warehouse"}, format="json").status_code == 200
+    r = c.post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 1, "received_by": "Site team B"}, format="json")
+    assert r.status_code == 200, r.content
+    body = r.data["request"]
+    assert [(h["quantity"], h["received_by"], h["serials"]) for h in body["handovers"]] == [
+        (2, "Hassan Ali · warehouse", ["SL-1", "SL-2"]), (1, "Site team B", ["SL-3"]),
+    ]
+    assert all(h["issued_by"] == "inv-ops" for h in body["handovers"])
+
+    pdf = c.get(f"/api/inventory/issuance-requests/{req.id}/slip/")
+    assert pdf.status_code == 200
+    text = "".join(p.extract_text() for p in PdfReader(_io.BytesIO(pdf.content)).pages)
+    for needle in ("ISSUED TO", "Hassan Ali", "Site team B", "UOM", "BALANCE", "Hand-overs", "SL-3", "Authorised by", "Maintenance"):
+        assert needle in text, needle
+    assert "Screen swap at Mall" in text
+
+    x = c.get("/api/inventory/issuance-requests/export/")
+    assert x.status_code == 200 and "spreadsheet" in x["Content-Type"]
+    ws = load_workbook(_io.BytesIO(x.content)).active
+    rows = [row for row in ws.iter_rows(min_row=2, values_only=True) if row[0] == req.request_number]
+    assert [(row[6], row[7]) for row in rows] == [(2, "Hassan Ali · warehouse"), (1, "Site team B")]
+    assert rows[0][5] == "piece" and rows[0][4] == "Unique item" and rows[0][12] == 0

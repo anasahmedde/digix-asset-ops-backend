@@ -46,14 +46,68 @@ def _who(user):
     return user.get_full_name() or user.username
 
 
+def _against(req):
+    """What the material was issued against, and what to call that field."""
+    if req.asset_component_id:
+        component = req.asset_component
+        return "Asset / Job", f"{component.device.asset_code} · {component.name}"
+    if req.maintenance_schedule_id:
+        return "Maintenance Job", req.maintenance_schedule.title
+    if req.project_id:
+        return "Project", req.project.name
+    return "Against", "—"
+
+
+def _purpose_text(req, against):
+    """The purpose in its own words — never a repeat of the job reference."""
+    text = (req.purpose or "").strip()
+    if against and against != "—" and text.startswith(against):
+        text = text[len(against):].strip(" —-·")
+    if text:
+        return text[0].upper() + text[1:]
+    if req.source == "project":
+        return "Build requirement" + (f" — {req.project.name}" if req.project_id else "")
+    if req.source == "maintenance":
+        return "Maintenance job"
+    return req.get_source_display()
+
+
+def _unit_of(req):
+    if req.unit_type_id:
+        return req.unit_type.unit or "piece"
+    if req.item_id and req.item.material_type_id:
+        return req.item.material_type.unit or "piece"
+    return "piece"
+
+
+def _code_of(req):
+    if req.unit_type_id:
+        return req.unit_type.type_code
+    return req.item.sku if req.item_id else ""
+
+
+def _receivers(req):
+    """Everyone who took material against this request, in order, once each."""
+    names = []
+    for h in req.handovers or []:
+        name = (h.get("received_by") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    if not names and req.received_by:
+        names.append(req.received_by)
+    return names
+
+
 def render_issue_slip_pdf(issuance_request) -> bytes:
-    """One slip for one request, listing what has actually been handed over."""
+    """One slip for one request: what was issued, to whom, against what, and
+    who handed it over — the record the store and the receiver both sign."""
+    req = issuance_request
     s = _styles()
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm,
-        title=f"Issue Slip {issuance_request.request_number}",
+        title=f"Material Issue Slip {req.request_number}",
         author=COMPANY_NAME,
     )
     story: list = []
@@ -73,28 +127,24 @@ def render_issue_slip_pdf(issuance_request) -> bytes:
     ]))
     story += [masthead, Spacer(1, 7 * mm)]
 
-    # --- What it was issued for -----------------------------------------
     def field(label, value):
         return [Paragraph(label.upper(), s["label"]), Paragraph(str(value or "—"), s["body"])]
 
-    against = "—"
-    if issuance_request.asset_component_id:
-        component = issuance_request.asset_component
-        against = f"{component.device.asset_code} · {component.name}"
-    elif issuance_request.maintenance_schedule_id:
-        against = f"Maintenance · {issuance_request.maintenance_schedule.title}"
-    elif issuance_request.project_id:
-        against = issuance_request.project.name
+    against_label, against = _against(req)
+    receivers = _receivers(req)
+    issued_to = ", ".join(receivers) if receivers else "—"
+    when = (req.last_issued_at or req.updated_at)
+    requested_by = _who(req.requested_by) if req.requested_by_id else "—"
+    requested_on = req.created_at.date().isoformat()
 
     facts = Table(
         [
-            field("Request No.", issuance_request.request_number)
-            + field("Date", issuance_request.updated_at.date().isoformat()),
-            field("Raised For", issuance_request.get_source_display()) + field("Against", against),
-            field("Project", issuance_request.project.name if issuance_request.project_id else "—")
-            + field("Purpose", issuance_request.purpose),
+            field("Slip No.", req.request_number) + field("Date", when.date().isoformat()),
+            field("Issued To", issued_to) + field("Raised For", req.get_source_display()),
+            field("Project", req.project.name if req.project_id else "—") + field(against_label, against),
+            field("Purpose", _purpose_text(req, against)) + field("Requested By", f"{requested_by} · {requested_on}"),
         ],
-        colWidths=[24 * mm, 63 * mm, 22 * mm, 65 * mm],
+        colWidths=[24 * mm, 63 * mm, 24 * mm, 63 * mm],
     )
     facts.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -103,23 +153,24 @@ def render_issue_slip_pdf(issuance_request) -> bytes:
     ]))
     story += [facts, Spacer(1, 4 * mm)]
 
-    # --- What went out ---------------------------------------------------
-    rows = [[
-        Paragraph("ITEM", s["head"]),
-        Paragraph("REQUESTED", s["head"]),
-        Paragraph("ISSUED", s["head"]),
-    ], [
-        Paragraph(issuance_request.what, s["cell"]),
-        Paragraph(str(issuance_request.quantity_requested), s["cell"]),
-        Paragraph(str(issuance_request.quantity_issued), s["cell"]),
-    ]]
-    items = Table(rows, colWidths=[114 * mm, 30 * mm, 30 * mm])
+    # --- The line: code, description, unit, quantities -------------------
+    unit = _unit_of(req)
+    head = [Paragraph(h, s["head"]) for h in ("CODE", "DESCRIPTION", "UOM", "REQUESTED", "ISSUED", "BALANCE")]
+    line = [
+        Paragraph(_code_of(req) or "—", s["cell"]),
+        Paragraph(req.unit_type.name if req.unit_type_id else (req.item.material_type.name if req.item_id and req.item.material_type_id else req.what), s["cell"]),
+        Paragraph(unit, s["cell"]),
+        Paragraph(str(req.quantity_requested), s["cell"]),
+        Paragraph(str(req.quantity_issued), s["cell"]),
+        Paragraph(str(req.outstanding_quantity), s["cell"]),
+    ]
+    items = Table([head, line], colWidths=[30 * mm, 72 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm])
     items.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), BAND),
         ("LINEBELOW", (0, 0), (-1, 0), 0.5, RULE),
         ("LINEBELOW", (0, 1), (-1, -1), 0.25, RULE),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+        ("ALIGN", (3, 0), (-1, -1), "RIGHT"),
         ("TOPPADDING", (0, 0), (-1, -1), 5),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ("LEFTPADDING", (0, 0), (-1, -1), 5),
@@ -127,47 +178,68 @@ def render_issue_slip_pdf(issuance_request) -> bytes:
     ]))
     story += [items, Spacer(1, 5 * mm)]
 
-    serials = issuance_request.issued_serials or []
-    if serials:
-        story += [Paragraph("<b>Serial numbers issued</b>", s["body"]), Spacer(1, 2 * mm)]
-        # Three to a row keeps a long list readable on one page.
-        grid = [serials[i:i + 3] for i in range(0, len(serials), 3)]
-        grid = [[Paragraph(x, s["cell"]) for x in row] + [""] * (3 - len(row)) for row in grid]
-        serial_table = Table(grid, colWidths=[58 * mm] * 3)
-        serial_table.setStyle(TableStyle([
+    # --- Each hand-over: when, how much, by whom, to whom, which serials ---
+    handovers = req.handovers or []
+    if handovers:
+        story += [Paragraph("<b>Hand-overs</b>", s["body"]), Spacer(1, 2 * mm)]
+        rows = [[Paragraph(h, s["head"]) for h in ("DATE", "QTY", "ISSUED BY", "RECEIVED BY", "SERIAL NUMBERS / NOTE")]]
+        for h in handovers:
+            detail = ", ".join(h.get("serials") or []) or (h.get("note") or "—")
+            rows.append([
+                Paragraph((h.get("at") or "")[:10], s["cell"]),
+                Paragraph(f"{h.get('quantity', '')} {unit}", s["cell"]),
+                Paragraph(h.get("issued_by") or "—", s["cell"]),
+                Paragraph(h.get("received_by") or "—", s["cell"]),
+                Paragraph(detail, s["cell"]),
+            ])
+        hand = Table(rows, colWidths=[22 * mm, 22 * mm, 34 * mm, 34 * mm, 62 * mm])
+        hand.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), BAND),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.5, RULE),
+            ("LINEBELOW", (0, 1), (-1, -1), 0.25, RULE),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("GRID", (0, 0), (-1, -1), 0.25, RULE),
             ("TOPPADDING", (0, 0), (-1, -1), 4),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
         ]))
-        story += [serial_table, Spacer(1, 5 * mm)]
+        story += [hand, Spacer(1, 5 * mm)]
+    else:
+        serials = req.issued_serials or []
+        if serials:
+            story += [Paragraph("<b>Serial numbers issued</b>", s["body"]), Spacer(1, 2 * mm)]
+            grid = [serials[i:i + 3] for i in range(0, len(serials), 3)]
+            grid = [[Paragraph(x, s["cell"]) for x in row] + [""] * (3 - len(row)) for row in grid]
+            serial_table = Table(grid, colWidths=[58 * mm] * 3)
+            serial_table.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("GRID", (0, 0), (-1, -1), 0.25, RULE),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story += [serial_table, Spacer(1, 5 * mm)]
 
-    if issuance_request.notes:
-        story += [
-            Paragraph(f"<b>Notes</b><br/>{issuance_request.notes}", s["cell"]),
-            Spacer(1, 4 * mm),
-        ]
+    if req.notes:
+        story += [Paragraph(f"<b>Remarks</b><br/>{req.notes.replace(chr(10), '<br/>')}", s["cell"]), Spacer(1, 4 * mm)]
 
-    # --- Who handed it over, who took it --------------------------------
+    # --- Signatures: who handed it over, who took it, who authorised -----
     story += [Spacer(1, 10 * mm)]
     sign = Table(
         [
-            [Paragraph("", s["body"]), Paragraph("", s["body"])],
-            [Paragraph("Issued by", s["label"]), Paragraph("Received by", s["label"])],
-            [
-                Paragraph(_who(issuance_request.issued_by), s["body"]),
-                Paragraph(issuance_request.received_by or "—", s["body"]),
-            ],
+            [Paragraph("", s["body"]), Paragraph("", s["body"]), Paragraph("", s["body"])],
+            [Paragraph("Issued by (store)", s["label"]), Paragraph("Received by", s["label"]), Paragraph("Authorised by", s["label"])],
+            [Paragraph(_who(req.issued_by), s["body"]), Paragraph(issued_to, s["body"]), Paragraph("", s["body"])],
         ],
-        colWidths=[80 * mm, 80 * mm],
+        colWidths=[56 * mm, 56 * mm, 56 * mm],
     )
     sign.setStyle(TableStyle([
         ("LINEBELOW", (0, 0), (0, 0), 0.5, INK),
         ("LINEBELOW", (1, 0), (1, 0), 0.5, INK),
+        ("LINEBELOW", (2, 0), (2, 0), 0.5, INK),
         ("TOPPADDING", (0, 0), (-1, 0), 12),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (0, -1), 14),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
     ]))
     story += [sign]
 

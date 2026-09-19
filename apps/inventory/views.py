@@ -561,6 +561,46 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         issuance_request.save(update_fields=["status", "updated_at"])
         return Response(IssuanceRequestSerializer(issuance_request).data)
 
+    @action(detail=False, methods=["get"], url_path="export")
+    def export_log(self, request):
+        """The issuance log as Excel — one row per hand-over."""
+        from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
+
+        qs = self.filter_queryset(self.get_queryset()).filter(quantity_issued__gt=0).order_by("-last_issued_at", "-updated_at")
+        columns = [
+            "Request No.", "Date", "Component", "Code", "Kind", "UOM", "Qty Issued", "Received By", "Issued By",
+            "Serial Numbers", "Requested", "Issued Total", "Balance", "Status", "Raised For", "Project", "Asset",
+            "Component Line", "Purpose", "Requested By",
+        ]
+        rows = []
+
+        def name_of(user):
+            return (user.get_full_name() or user.username) if user else ""
+
+        for r in qs[:EXPORT_MAX_ROWS]:
+            if r.unit_type_id:
+                name, code, kind, unit = r.unit_type.name, r.unit_type.type_code, "Unique item", r.unit_type.unit or "piece"
+            elif r.item_id:
+                mt = r.item.material_type if r.item.material_type_id else None
+                name, code, kind, unit = (mt.name if mt else r.item.sku), r.item.sku, "Generic stock", (mt.unit if mt else None) or "piece"
+            else:
+                name, code, kind, unit = r.what, "", "", "piece"
+            handovers = r.handovers or [{
+                "at": (r.last_issued_at or r.updated_at).isoformat(), "quantity": r.quantity_issued,
+                "received_by": r.received_by, "issued_by": name_of(r.issued_by), "serials": r.issued_serials or [],
+            }]
+            for h in handovers:
+                rows.append([
+                    r.request_number, (h.get("at") or "")[:10], name, code, kind, unit, h.get("quantity"),
+                    h.get("received_by") or "", h.get("issued_by") or "", ", ".join(h.get("serials") or []),
+                    r.quantity_requested, r.quantity_issued, r.outstanding_quantity, r.get_status_display(),
+                    r.get_source_display(), r.project.name if r.project_id else "",
+                    r.asset_component.device.asset_code if r.asset_component_id else "",
+                    r.asset_component.name if r.asset_component_id else "", r.purpose, name_of(r.requested_by),
+                ])
+        log_export(request.user, "issuance_request", len(rows), export_params(request))
+        return xlsx_response("issuance-log", "Issuance Log", columns, rows)
+
     @action(detail=True, methods=["get"])
     def slip(self, request, pk=None):
         """The issue slip: what went out, what for, and who handled it."""

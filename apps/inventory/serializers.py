@@ -693,11 +693,11 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "project", "project_name", "asset_component", "asset_code", "component_name",
             "maintenance_schedule", "maintenance_title",
             "requested_by", "requested_by_name", "issued_by", "issued_by_name",
-            "received_by", "issued_serials", "issued_units", "last_issued_at", "awaiting_procurement", "po_number",
+            "received_by", "issued_serials", "issued_units", "handovers", "last_issued_at", "awaiting_procurement", "po_number",
             "status", "status_display", "notes", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "request_number", "quantity_issued", "issued_by", "issued_serials", "issued_units",
+            "id", "request_number", "quantity_issued", "issued_by", "issued_serials", "issued_units", "handovers",
             "last_issued_at", "received_by", "status", "requested_by", "created_at", "updated_at",
         ]
 

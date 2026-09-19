@@ -71,8 +71,12 @@ def _settle_requests_for_component(component, issued, *, exclude=None):
             from django.utils import timezone as _tz
 
             req.last_issued_at = _tz.now()
+            req.handovers = [*(req.handovers or []), {
+                "at": req.last_issued_at.isoformat(), "quantity": take, "received_by": "",
+                "issued_by": "", "serials": [], "note": "Issued straight to the requirement.",
+            }]
             req.sync_status()
-            req.save(update_fields=["quantity_issued", "notes", "status", "last_issued_at", "updated_at"])
+            req.save(update_fields=["quantity_issued", "notes", "status", "last_issued_at", "handovers", "updated_at"])
             remaining -= take
         elif component.outstanding_quantity == 0:
             req.status = IssuanceRequest.Status.CANCELLED
@@ -555,15 +559,25 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
 
     from django.utils import timezone as _tz
 
+    now = _tz.now()
     request_row.quantity_issued += quantity
     request_row.issued_by = user
-    request_row.last_issued_at = _tz.now()
+    request_row.last_issued_at = now
     if received_by:
         request_row.received_by = received_by
     if serials:
         request_row.issued_serials = [*(request_row.issued_serials or []), *serials]
+    request_row.handovers = [*(request_row.handovers or []), {
+        "at": now.isoformat(),
+        "quantity": quantity,
+        "received_by": received_by or "",
+        "issued_by": (user.get_full_name() or user.username) if user else "",
+        "serials": list(serials),
+        "note": notes or "",
+    }]
     request_row.sync_status()
     request_row.save(update_fields=[
-        "quantity_issued", "issued_by", "last_issued_at", "received_by", "issued_serials", "status", "updated_at",
+        "quantity_issued", "issued_by", "last_issued_at", "received_by", "issued_serials", "handovers",
+        "status", "updated_at",
     ])
     return {"quantity": quantity, "serials": serials}
