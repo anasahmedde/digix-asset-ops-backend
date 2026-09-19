@@ -705,6 +705,31 @@ class DeviceViewSet(viewsets.ModelViewSet):
         return response
 
 
+def _approved_budget_project(device):
+    """The project whose approved budget priced this asset, if any."""
+    from apps.teams.models import ProjectScopeItem
+
+    plan = getattr(device.project, "cost_plan", None) if device.project_id else None
+    if plan is not None and plan.status == "approved":
+        return device.project
+    row = (
+        ProjectScopeItem.objects.filter(device=device, project__cost_plan__status="approved")
+        .select_related("project").first()
+    )
+    return row.project if row else None
+
+
+def _refuse_if_priced_in_approved_budget(device):
+    """Prices are not structure: they may change while the budget is open,
+    and are fixed once it is approved — revise the budget to change them."""
+    project = _approved_budget_project(device) if device is not None else None
+    if project is not None:
+        raise PermissionDenied(
+            f"{device.asset_code} is priced in the approved budget of {project.name} — "
+            "revise that budget to change prices."
+        )
+
+
 def _budget_block_response(component):
     """A 400 when the asset's project has a budget that is not approved yet.
 
@@ -775,8 +800,16 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         _refuse_if_vendor_asset(serializer.validated_data.get("device"), "components" if isinstance(self, AssetComponentViewSet) else "production route")
         super().perform_create(serializer)
 
+    # Cost fields a planner may type while the budget is open; everything
+    # else on a component is structure and freezes with execution.
+    PRICE_FIELDS = {"planned_unit_price"}
+
     def perform_update(self, serializer):
-        self._refuse_if_locked(serializer.instance.device)
+        touched = set(serializer.validated_data)
+        if touched and touched <= self.PRICE_FIELDS:
+            _refuse_if_priced_in_approved_budget(serializer.instance.device)
+        else:
+            self._refuse_if_locked(serializer.instance.device)
         super().perform_update(serializer)
 
     def perform_destroy(self, instance):
@@ -1123,8 +1156,16 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
         _refuse_if_vendor_asset(serializer.validated_data.get("device"), "components" if isinstance(self, AssetComponentViewSet) else "production route")
         super().perform_create(serializer)
 
+    # Cost fields a planner may type while the budget is open; the route
+    # itself (names, order, where) freezes with execution.
+    PRICE_FIELDS = {"planned_cost", "actual_cost", "notes"}
+
     def perform_update(self, serializer):
-        self._refuse_if_locked(serializer.instance.device)
+        touched = set(serializer.validated_data)
+        if touched and touched <= self.PRICE_FIELDS:
+            _refuse_if_priced_in_approved_budget(serializer.instance.device)
+        else:
+            self._refuse_if_locked(serializer.instance.device)
         super().perform_update(serializer)
 
     def perform_destroy(self, instance):

@@ -2620,3 +2620,34 @@ def test_the_store_is_only_asked_for_what_the_shelf_holds(admin_client, project_
     # That one is now promised to the queue: the shelf has nothing free.
     r = _ask_store(admin_client, generic, 1)
     assert r.status_code == 400 and "Only 0 in stock" in str(r.data["quantity"]), r.content
+
+
+@pytest.mark.django_db
+def test_prices_follow_the_budget_not_the_build_lock(admin_client, project_build, stock_refs):
+    """Once parts move the build is fixed, but a planner can still type
+    prices — until the budget is approved, when prices are fixed too."""
+    from apps.teams.costing import get_or_create_plan
+
+    generic = project_build["generic"]
+    step = _step(admin_client, project_build["device"], 1, "Cutting").data["id"]
+    # Parts issued: the asset is in execution and its structure is locked.
+    assert _ask_store(admin_client, generic, 1).status_code == 200
+    assert _store_issues(admin_client, generic).status_code == 200
+    project_build["device"].refresh_from_db()
+    assert project_build["device"].is_locked
+
+    r = admin_client.patch(f"/api/assets/components/{generic.id}/", {"quantity": 9}, format="json")
+    assert r.status_code == 403 and "in execution" in r.data["detail"]
+    r = admin_client.patch(f"/api/assets/components/{generic.id}/", {"planned_unit_price": "162.00"}, format="json")
+    assert r.status_code == 200, r.content
+    r = admin_client.patch(f"/api/assets/production-steps/{step}/", {"planned_cost": "900"}, format="json")
+    assert r.status_code == 200, r.content
+    r = admin_client.patch(f"/api/assets/production-steps/{step}/", {"name": "Laser cutting"}, format="json")
+    assert r.status_code == 403 and "in execution" in r.data["detail"]
+
+    # Approved budget: prices are fixed too, and the message says which budget.
+    plan = get_or_create_plan(project_build["project"])
+    plan.status = "approved"
+    plan.save(update_fields=["status"])
+    r = admin_client.patch(f"/api/assets/components/{generic.id}/", {"planned_unit_price": "170.00"}, format="json")
+    assert r.status_code == 403 and "approved budget" in r.data["detail"] and project_build["project"].name in r.data["detail"]
