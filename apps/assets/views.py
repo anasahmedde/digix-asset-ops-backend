@@ -823,6 +823,17 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
                 f"({already_open} already asked for)."
             ]}, status=400)
 
+        # The store can only give what is on the shelf and not already promised.
+        on_shelf = component.available_quantity
+        free = max(on_shelf - already_open, 0)
+        if on_shelf <= 0:
+            return Response({"quantity": ["Nothing in stock — procure this line instead."]}, status=400)
+        if quantity > free:
+            return Response({"quantity": [
+                f"Only {free} in stock" + (f" not already asked for" if already_open else "")
+                + f" — ask the store for {free} and procure the rest."
+            ]}, status=400)
+
         with transaction.atomic():
             component.fulfilment = (
                 AssetComponent.Fulfilment.PROCUREMENT if component.procure_quantity

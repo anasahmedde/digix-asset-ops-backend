@@ -1595,16 +1595,21 @@ def test_cannot_issue_more_than_the_requirement(admin_client, project_build):
 
 
 @pytest.mark.django_db
-def test_issuing_more_than_stock_is_refused_with_a_hint(admin_client, project_build, stock_refs):
+def test_asking_for_more_than_stock_is_refused_with_a_hint(admin_client, project_build, stock_refs):
+    """The shelf sets the limit at decision time: the store is asked for what
+    it holds and the rest goes to procurement — it never queues a shortfall."""
     stock_refs["item"].quantity = 1
     stock_refs["item"].save(update_fields=["quantity"])
     component = project_build["generic"]
-    # Asking is always allowed — the shortfall is the store's problem to report.
-    assert _ask_store(admin_client, component).status_code == 200
-
-    r = _store_issues(admin_client, component)
+    r = _ask_store(admin_client, component)          # defaults to the whole requirement (4)
     assert r.status_code == 400, r.content
-    assert "procure the shortfall" in str(r.data["quantity"])
+    assert "Only 1 in stock" in str(r.data["quantity"]) and "procure the rest" in str(r.data["quantity"])
+
+    assert _ask_store(admin_client, component, 1).status_code == 200
+    r = _store_issues(admin_client, component)
+    assert r.status_code == 200, r.content
+    stock_refs["item"].refresh_from_db()
+    assert stock_refs["item"].quantity == 0
 
 
 @pytest.mark.django_db
@@ -2589,3 +2594,29 @@ def test_a_copied_route_leaves_the_decision_to_the_project(admin_client, inhouse
     assert [s.name for s in copied] == ["Cutting", "Painting"]
     assert {s.location for s in copied} == {"undecided"}
     assert all(s.workshop_id is None for s in copied)
+
+
+@pytest.mark.django_db
+def test_the_store_is_only_asked_for_what_the_shelf_holds(admin_client, project_build):
+    """No stock, no inventory decision; part stock, the request stops at the
+    shelf and the rest is for procurement; stock already queued counts."""
+    from apps.inventory.models import InventoryItem
+
+    generic = project_build["generic"]
+    item = InventoryItem.objects.get(pk=generic.inventory_item_id)
+
+    item.quantity = 0
+    item.save(update_fields=["quantity"])
+    r = _ask_store(admin_client, generic, 1)
+    assert r.status_code == 400 and "Nothing in stock" in str(r.data["quantity"]), r.content
+
+    item.quantity = 1
+    item.save(update_fields=["quantity"])
+    r = _ask_store(admin_client, generic, 2)
+    assert r.status_code == 400 and "Only 1 in stock" in str(r.data["quantity"]), r.content
+    r = _ask_store(admin_client, generic, 1)
+    assert r.status_code in (200, 201), r.content
+
+    # That one is now promised to the queue: the shelf has nothing free.
+    r = _ask_store(admin_client, generic, 1)
+    assert r.status_code == 400 and "Only 0 in stock" in str(r.data["quantity"]), r.content
