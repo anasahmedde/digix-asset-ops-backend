@@ -182,9 +182,12 @@ def render_issue_slip_pdf(issuance_request) -> bytes:
     handovers = req.handovers or []
     if handovers:
         story += [Paragraph("<b>Hand-overs</b>", s["body"]), Spacer(1, 2 * mm)]
-        rows = [[Paragraph(h, s["head"]) for h in ("DATE", "QTY", "ISSUED BY", "RECEIVED BY", "SERIAL NUMBERS / NOTE")]]
+        # Serial numbers belong to unique items only; a stock line carries a note.
+        serialised = bool(req.unit_type_id)
+        last = "SERIAL NOS" if serialised else "NOTE"
+        rows = [[Paragraph(h, s["head"]) for h in ("DATE", "QTY", "ISSUED BY", "RECEIVED BY", last)]]
         for h in handovers:
-            detail = ", ".join(h.get("serials") or []) or (h.get("note") or "—")
+            detail = (", ".join(h.get("serials") or []) or "—") if serialised else (h.get("note") or "—")
             rows.append([
                 Paragraph((h.get("at") or "")[:10], s["cell"]),
                 Paragraph(f"{h.get('quantity', '')} {unit}", s["cell"]),
