@@ -1420,3 +1420,27 @@ def test_the_slip_and_the_export_carry_every_hand_over(ops):
     rows = [row for row in ws.iter_rows(min_row=2, values_only=True) if row[0] == req.request_number]
     assert [(row[6], row[7]) for row in rows] == [(2, "Hassan Ali · warehouse"), (1, "Site team B")]
     assert rows[0][5] == "piece" and rows[0][4] == "Unique item" and rows[0][12] == 0
+
+
+@pytest.mark.django_db
+def test_requests_are_numbered_in_sequence(ops):
+    """MR and PR numbers follow the numbering scheme like every other document."""
+    import re
+
+    from apps.inventory.models import IssuanceRequest, ReorderRequest
+
+    mt = MaterialType.objects.create(name="Numbered Rope", unit="meter")
+    item = InventoryItem.objects.create(material_type=mt, quantity=1, min_stock_level=5)
+    a = IssuanceRequest.objects.create(item=item, quantity_requested=1, source="other")
+    b = IssuanceRequest.objects.create(item=item, quantity_requested=1, source="other")
+    assert re.fullmatch(r"MR-\d{4}-\d{5}", a.request_number), a.request_number
+    assert int(b.request_number[-5:]) == int(a.request_number[-5:]) + 1
+
+    r = _client(ops).post("/api/inventory/reorder-requests/", {"item": str(item.id), "quantity": 10}, format="json")
+    assert r.status_code == 201, r.content
+    assert re.fullmatch(r"PR-\d{4}-\d{5}", r.data["request_number"]), r.data["request_number"]
+    low = _client(ops).get("/api/inventory/low-stock/").json()["results"]
+    assert next(x for x in low if x["name"] == "Numbered Rope")["open_request"]["request_number"] == r.data["request_number"]
+    row = next(x for x in _client(ops).get("/api/procurement/purchase-orders/requisitions/").json()["results"] if x.get("kind") == "reorder" and x["reorder"] == r.data["id"])
+    assert row["request_number"] == r.data["request_number"]
+    assert str(ReorderRequest.objects.get(pk=r.data["id"])).startswith("PR-")

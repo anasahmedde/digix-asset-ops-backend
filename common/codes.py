@@ -46,6 +46,7 @@ _FALLBACK_PREFIXES = {
     "goods_receipt": "GRN",
     "issuance": "ISS",
     "material_request": "MR",
+    "purchase_requisition": "PR",
     "inventory_item": "ITM",
     "inventory_unit": "IVU",
     "inventory_unit_type": "IVT",

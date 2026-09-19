@@ -377,8 +377,9 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             device.status = "active"
             device.save(update_fields=["status", "updated_at"])
 
-            # 23: the client's warranty on our asset runs from the day it goes
-            # live. Only the term is typed; the dates follow from today.
+            # The client's warranty on our asset runs from the day it was
+            # installed — the asset's installation date — not from the day the
+            # term happens to be typed. Only the term is entered.
             raw_months = request.data.get("client_warranty_months")
             if raw_months not in (None, ""):
                 try:
@@ -390,7 +391,9 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
 
                     from apps.warranties.models import Warranty
 
-                    start = timezone.localdate()
+                    from .signals import installation_date_for
+
+                    start = installation_date_for(installation) or timezone.localdate()
                     existing = device.warranties.filter(
                         warranty_type="client", component__isnull=True
                     ).exclude(status__in=("void", "reissued")).order_by("-end_date").first()

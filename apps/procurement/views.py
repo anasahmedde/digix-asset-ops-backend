@@ -293,6 +293,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             rows.append({
                 "kind": "reorder",
                 "reorder": str(rr.pk),
+                "request_number": rr.request_number,
                 "component": None,
                 "device": None,
                 "name": f"{rr.name} — stock replenishment",

@@ -68,6 +68,8 @@ class NumberingScheme(TimeStampedModel):
         TICKET = "ticket", "Ticket"
         GOODS_RECEIPT = "goods_receipt", "Goods Receipt"
         ISSUANCE = "issuance", "Inventory Issuance"
+        MATERIAL_REQUEST = "material_request", "Material Request (MR)"
+        PURCHASE_REQUISITION = "purchase_requisition", "Purchase Requisition (PR)"
         INVENTORY_ITEM = "inventory_item", "Inventory Item (SKU)"
         INVENTORY_UNIT = "inventory_unit", "Inventory Unit (Unique Item)"
         INVENTORY_UNIT_TYPE = "inventory_unit_type", "Inventory Product (Unique Item Type)"

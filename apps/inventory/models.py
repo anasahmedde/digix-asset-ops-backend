@@ -610,6 +610,8 @@ class ReorderRequest(TimeStampedModel):
         RECEIVED = "received", "Received"
         CANCELLED = "cancelled", "Cancelled"
 
+    # Purchase requisition number — PR-YYYY-00001 — from the numbering scheme.
+    request_number = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
     item = models.ForeignKey(
         InventoryItem, on_delete=models.SET_NULL, null=True, blank=True, related_name="reorder_requests"
     )
@@ -632,7 +634,14 @@ class ReorderRequest(TimeStampedModel):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"Reorder {self.quantity} × {self.name}"
+        return f"{self.request_number} · {self.quantity} × {self.name}"
+
+    def save(self, *args, **kwargs):
+        if not self.request_number:
+            self.request_number = generate_code(
+                "purchase_requisition", model=type(self), field="request_number"
+            )
+        super().save(*args, **kwargs)
 
     @property
     def kind(self) -> str:

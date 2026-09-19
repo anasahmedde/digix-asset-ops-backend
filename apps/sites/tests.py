@@ -1226,3 +1226,26 @@ def test_installation_health_reports_the_thing_to_act_on(db):
     body = health()
     assert body["health"] == "overdue"
     assert "past the due date" in body["health_reason"]
+
+
+@pytest.mark.django_db
+def test_client_warranty_runs_from_the_installation_date(installation, ops):
+    """The term may be typed days after the job; the cover still starts on the
+    day the asset was installed — the date the asset shows."""
+    from datetime import timedelta as td
+
+    from apps.sites.signals import _anchor_client_warranties, installation_date_for
+    from apps.warranties.models import Warranty
+
+    installed = timezone.now() - td(days=9)
+    installation.completed_at = installed
+    installation.save(update_fields=["completed_at"])
+    today = timezone.localdate()
+    warranty = Warranty.objects.create(
+        device=installation.device, warranty_type="client", status="active",
+        start_date=today, end_date=today + td(days=365), months=12,
+    )
+    _anchor_client_warranties(installation)
+    warranty.refresh_from_db()
+    assert warranty.start_date == installation_date_for(installation) == timezone.localdate(installed)
+    assert (warranty.end_date.year, warranty.end_date.month) == ((warranty.start_date.year + 1), warranty.start_date.month)

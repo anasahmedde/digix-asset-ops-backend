@@ -637,7 +637,7 @@ class LowStockView(APIView):
             if r is None:
                 return None
             return {
-                "id": str(r.pk), "status": r.status, "status_display": r.get_status_display(),
+                "id": str(r.pk), "request_number": r.request_number, "status": r.status, "status_display": r.get_status_display(),
                 "quantity": r.quantity,
                 "po_number": r.purchase_order_item.purchase_order.po_number if r.purchase_order_item_id else None,
             }

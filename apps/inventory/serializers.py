@@ -755,11 +755,11 @@ class ReorderRequestSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReorderRequest
         fields = [
-            "id", "item", "item_sku", "unit_type", "unit_type_name", "name", "code", "kind", "unit",
+            "id", "request_number", "item", "item_sku", "unit_type", "unit_type_name", "name", "code", "kind", "unit",
             "quantity", "reason", "status", "status_display", "purchase_order_item", "po_number",
             "on_hand", "reorder_level", "requested_by", "requested_by_name", "notes", "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "status", "purchase_order_item", "requested_by", "created_at", "updated_at"]
+        read_only_fields = ["id", "request_number", "status", "purchase_order_item", "requested_by", "created_at", "updated_at"]
 
     def get_requested_by_name(self, obj):
         user = obj.requested_by
