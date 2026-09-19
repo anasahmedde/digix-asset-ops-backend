@@ -1206,7 +1206,7 @@ def test_inspection_knows_the_kind_from_the_order(ops):
 
     listed = {r["id"]: r for r in c.get("/api/inventory/receipt-lines/", {"page_size": 100}).json()["results"]}
     assert listed[str(cable_line.id)]["kind"] == "generic" and listed[str(cable_line.id)]["known_component"].startswith("Kind Cable")
-    assert listed[str(player_line.id)]["kind"] == "unique" and listed[str(player_line.id)]["known_component"] == "Kind Player 55in"
+    assert listed[str(player_line.id)]["kind"] == "unique" and listed[str(player_line.id)]["known_component"].startswith("Kind Player 55in")
 
     # Filing a unique product as generic stock is refused, and vice versa.
     r = c.post(f"/api/inventory/receipt-lines/{player_line.id}/inspect/", {

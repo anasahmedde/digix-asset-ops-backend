@@ -413,9 +413,13 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
     device_model_name = serializers.CharField(
         source="po_item.device_model.name", read_only=True, default=None
     )
-    inspected_by_name = serializers.CharField(
-        source="inspected_by.get_full_name", read_only=True, default=None
-    )
+    inspected_by_name = serializers.SerializerMethodField()
+
+    def get_inspected_by_name(self, obj):
+        user = obj.inspected_by
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
     stocked_unit_count = serializers.SerializerMethodField()
     # The receipt this line arrived on: where from, when, who booked it in.
     source = serializers.CharField(source="receipt.source", read_only=True, default=None)
@@ -450,27 +454,102 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
     kind = serializers.SerializerMethodField()
     known_component = serializers.SerializerMethodField()
 
-    def get_kind(self, obj):
+    def _product(self, obj):
+        """The unique product a line is for, from whichever link it has: the
+        order line, the units it became, or the return's note naming it."""
         po = obj.po_item
         if po is not None and po.inventory_unit_type_id:
-            return "unique"
-        if (po is not None and po.inventory_item_id) or obj.inventory_item_id:
-            return "generic"
-        if po is not None and po.procured_devices.exists():
+            return po.inventory_unit_type
+        units = list(obj.units.all()[:1])
+        if units and units[0].unit_type_id:
+            return units[0].unit_type
+        stash = obj.inspection_notes or ""
+        if "unit_type:" in stash:
+            pk = stash.split("unit_type:", 1)[1].split()[0]
+            return InventoryUnitType.objects.filter(pk=pk).first()
+        return None
+
+    def _item(self, obj):
+        po = obj.po_item
+        if po is not None and po.inventory_item_id:
+            return po.inventory_item
+        return obj.inventory_item if obj.inventory_item_id else None
+
+    def _asset(self, obj):
+        """The complete asset a line delivers, when the order line bought one."""
+        po = obj.po_item
+        if po is None:
+            return None
+        return po.procured_devices.first()
+
+    def get_kind(self, obj):
+        if self._asset(obj) is not None:
             return "asset"
+        if self._product(obj) is not None or obj.routed_to == "unique":
+            return "unique"
+        if self._item(obj) is not None or obj.routed_to == "generic":
+            return "generic"
+        return None
+
+    def _legacy_label(self, obj):
+        """Units filed before products existed: read make and model off the
+        unit itself, else what the order line said."""
+        units = list(obj.units.all()[:1])
+        if units:
+            u = units[0]
+            label = u.model_name or (u.material_type.name if u.material_type_id else "")
+            if label and u.brand_id:
+                label = f"{u.brand.name} {label}"
+            if label:
+                return label
+        po = obj.po_item
+        if po is not None:
+            if po.device_model_id:
+                return str(po.device_model)
+            if po.material_type_id:
+                return po.material_type.name
+            return po.description or None
         return None
 
     def get_known_component(self, obj):
-        po = obj.po_item
-        if po is not None and po.inventory_unit_type_id:
-            return po.inventory_unit_type.name
-        item = (po.inventory_item if po is not None and po.inventory_item_id else None) or (
-            obj.inventory_item if obj.inventory_item_id else None
-        )
+        asset = self._asset(obj)
+        if asset is not None:
+            label = asset.display_name or (asset.asset_type.name if asset.asset_type_id else "Asset")
+            return f"{label} · {asset.asset_code}"
+        product = self._product(obj)
+        if product is not None:
+            return f"{product.name} · {product.type_code}" if product.type_code else product.name
+        item = self._item(obj)
         if item is not None:
             name = item.material_type.name if item.material_type_id else item.sku
             return f"{name} · {item.sku}" if item.sku and name != item.sku else name
-        return None
+        return self._legacy_label(obj)
+
+    # What the line became: the stock row or the product its units belong to.
+    stocked_code = serializers.SerializerMethodField()
+    stocked_name = serializers.SerializerMethodField()
+
+    def get_stocked_code(self, obj):
+        asset = self._asset(obj)
+        if asset is not None:
+            return asset.asset_code
+        product = self._product(obj)
+        if product is not None:
+            return product.type_code
+        item = self._item(obj)
+        return item.sku if item is not None else None
+
+    def get_stocked_name(self, obj):
+        asset = self._asset(obj)
+        if asset is not None:
+            return asset.display_name or asset.asset_code
+        product = self._product(obj)
+        if product is not None:
+            return product.name
+        item = self._item(obj)
+        if item is not None:
+            return item.material_type.name if item.material_type_id else item.sku
+        return self._legacy_label(obj)
 
     def get_unit(self, obj):
         po = obj.po_item
@@ -496,6 +575,7 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             "stocked_unit_count", "kind", "known_component", "created_at",
             "source", "source_display", "reference", "received_at", "received_by_name",
             "routed_to_display", "inspection_status_display", "stocked_item_sku", "storage_location", "stocked_units",
+            "stocked_code", "stocked_name",
         ]
         read_only_fields = fields
 
