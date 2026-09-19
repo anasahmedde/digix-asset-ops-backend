@@ -417,6 +417,31 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
         source="inspected_by.get_full_name", read_only=True, default=None
     )
     stocked_unit_count = serializers.SerializerMethodField()
+    # The receipt this line arrived on: where from, when, who booked it in.
+    source = serializers.CharField(source="receipt.source", read_only=True, default=None)
+    source_display = serializers.CharField(source="receipt.get_source_display", read_only=True, default=None)
+    reference = serializers.CharField(source="receipt.reference", read_only=True, default=None)
+    received_at = serializers.DateTimeField(source="receipt.created_at", read_only=True, default=None)
+    received_by_name = serializers.SerializerMethodField()
+    routed_to_display = serializers.CharField(source="get_routed_to_display", read_only=True, default=None)
+    inspection_status_display = serializers.CharField(source="get_inspection_status_display", read_only=True, default=None)
+    # What the line became in the warehouse.
+    stocked_item_sku = serializers.CharField(source="inventory_item.sku", read_only=True, default=None)
+    storage_location = serializers.CharField(source="inventory_item.storage_location", read_only=True, default=None)
+    stocked_units = serializers.SerializerMethodField()
+
+    def get_received_by_name(self, obj):
+        user = obj.receipt.received_by if obj.receipt_id else None
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
+
+    def get_stocked_units(self, obj):
+        return [
+            {"serial_number": u.serial_number, "unit_code": u.unit_code, "status": u.status, "status_display": u.get_status_display()}
+            for u in obj.units.all()
+        ]
+
     # The unit the delivered quantity is counted in.
     unit = serializers.SerializerMethodField()
     # What the order line was bought for. A component is opened in inventory
@@ -469,6 +494,8 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
             "inspected_by", "inspected_by_name", "inspected_at", "inspection_notes",
             "stocked_unit_count", "kind", "known_component", "created_at",
+            "source", "source_display", "reference", "received_at", "received_by_name",
+            "routed_to_display", "inspection_status_display", "stocked_item_sku", "storage_location", "stocked_units",
         ]
         read_only_fields = fields
 

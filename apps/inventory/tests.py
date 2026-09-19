@@ -1444,3 +1444,35 @@ def test_requests_are_numbered_in_sequence(ops):
     row = next(x for x in _client(ops).get("/api/procurement/purchase-orders/requisitions/").json()["results"] if x.get("kind") == "reorder" and x["reorder"] == r.data["id"])
     assert row["request_number"] == r.data["request_number"]
     assert str(ReorderRequest.objects.get(pk=r.data["id"])).startswith("PR-")
+
+
+@pytest.mark.django_db
+def test_the_receiving_log_lists_inspected_lines_and_exports(ops, received_line):
+    """An inspected line reads as a log entry — where from, what, accepted and
+    rejected, filed into, serials — and the Excel export has a row for it."""
+    import io as _io
+
+    from openpyxl import load_workbook
+
+    line = received_line["line"]
+    c = _client(ops)
+    r = c.post(f"/api/inventory/receipt-lines/{line.id}/inspect/", {
+        "accepted_quantity": 8, "rejected_quantity": 2, "route": "generic",
+        "generic": {"storage_location": "Rack L"}, "notes": "Two drums dented",
+    }, format="json")
+    assert r.status_code == 200, r.content
+
+    rows = c.get("/api/inventory/receipt-lines/", {"inspection_status": "passed", "page_size": 100}).json()["results"]
+    entry = next(x for x in rows if x["id"] == str(line.id))
+    assert entry["source_display"] == "Purchase Order" and entry["reference"] == "DN-1" and entry["received_at"]
+    assert entry["accepted_quantity"] == 8 and entry["rejected_quantity"] == 2 and entry["routed_to_display"]
+    assert entry["stocked_item_sku"] and entry["storage_location"] == "Rack L" and entry["inspection_status_display"].startswith("Passed")
+
+    x = c.get("/api/inventory/receipt-lines/export/")
+    assert x.status_code == 200 and "spreadsheet" in x["Content-Type"]
+    ws = load_workbook(_io.BytesIO(x.content)).active
+    hdr = [cell.value for cell in ws[1]]
+    row = next(row for row in ws.iter_rows(min_row=2, values_only=True) if row[0] == line.receipt.grn_number)
+    got = dict(zip(hdr, row))
+    assert got["Received Qty"] == 10 and got["Accepted"] == 8 and got["Rejected"] == 2 and got["Placed At"] == "Rack L"
+    assert got["UOM"] == "meter" and str(got["Result"]).startswith("Passed") and got["Notes"] == "Two drums dented"

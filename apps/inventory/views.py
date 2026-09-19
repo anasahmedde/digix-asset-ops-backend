@@ -330,6 +330,38 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
     ]
     ordering_fields = ["created_at", "inspected_at"]
 
+    @action(detail=False, methods=["get"], url_path="export")
+    def export_receiving(self, request):
+        """The receiving log as Excel — one row per inspected delivery line."""
+        from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
+
+        qs = (
+            self.filter_queryset(self.get_queryset())
+            .exclude(inspection_status=GoodsReceiptLine.Inspection.PENDING)
+            .order_by("-inspected_at", "-created_at")
+        )
+        ser = GoodsReceiptLineSerializer(qs[:EXPORT_MAX_ROWS], many=True)
+        columns = [
+            "GRN", "Received", "Inspected", "Source", "PO", "Supplier", "Reference", "Component", "Code", "Kind",
+            "UOM", "Received Qty", "Accepted", "Rejected", "Batch", "Filed Into", "Serial Numbers",
+            "Placed At", "Inspected By", "Result", "Notes",
+        ]
+        rows = []
+        for line in ser.data:
+            rows.append([
+                line["grn_number"], (line.get("received_at") or "")[:10], (line.get("inspected_at") or "")[:10],
+                line.get("source_display"), line.get("po_number"), line.get("supplier_name"), line.get("reference"),
+                line.get("known_component") or line.get("po_item_description") or line.get("material_name"),
+                line.get("stocked_item_sku") or "", {"generic": "Generic stock", "unique": "Unique item", "asset": "Whole asset"}.get(line.get("kind") or "", ""),
+                line.get("unit"), line["quantity"], line.get("accepted_quantity"), line.get("rejected_quantity"),
+                line.get("batch_number"), line.get("routed_to_display"),
+                ", ".join(u["serial_number"] for u in line.get("stocked_units") or []) or ", ".join(line.get("serial_numbers") or []),
+                line.get("storage_location"), line.get("inspected_by_name"), line.get("inspection_status_display"),
+                line.get("inspection_notes"),
+            ])
+        log_export(request.user, "goods_receipt_line", len(rows), export_params(request))
+        return xlsx_response("receiving-log", "Receiving Log", columns, rows)
+
     @action(detail=False, methods=["get"], url_path="pending")
     def pending(self, request):
         """The technician's inspection queue."""
