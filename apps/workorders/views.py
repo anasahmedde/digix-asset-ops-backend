@@ -77,6 +77,11 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             )
         if new_status == WorkOrder.Status.APPROVED and role not in ("super_admin", "group_head"):
             return Response({"detail": "Work orders are approved by the Group Head."}, status=status.HTTP_403_FORBIDDEN)
+        if new_status == WorkOrder.Status.COMPLETED:
+            return Response(
+                {"detail": "Delivered work is completed by inspecting it — Work Orders › Work Receiving."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         update_fields = ["status", "updated_at"]
         work_order.status = new_status
@@ -92,6 +97,9 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         elif new_status == WorkOrder.Status.ISSUED:
             work_order.issued_at = now
             update_fields += ["issued_at"]
+        elif new_status == WorkOrder.Status.DELIVERED:
+            work_order.delivered_at = now
+            update_fields += ["delivered_at"]
 
         work_order.save(update_fields=update_fields)
 
@@ -266,6 +274,51 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
                 metadata={"step": str(step.pk), "sent_back": True, "reason": reason},
             )
         return Response({"detail": f"'{step.name}' on {step.device.asset_code} is back with the project to decide.", "step": str(step.pk)})
+
+    @action(detail=True, methods=["post"], url_path="inspect")
+    def inspect(self, request, pk=None):
+        """Work receiving: the delivered work is inspected.
+
+        Body: result ("accepted" | "rework"), notes. Accepted completes the
+        order — and every operation on it; rework sends it back to the vendor
+        (in progress again). Who inspected, when and the notes stay on the order.
+        """
+        work_order = self.get_object()
+        if work_order.status not in (WorkOrder.Status.DELIVERED, WorkOrder.Status.PARTIALLY_DELIVERED):
+            return Response(
+                {"detail": f"'{work_order.wo_number}' is {work_order.get_status_display().lower()} — only delivered work is inspected."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        result = request.data.get("result")
+        if result not in (WorkOrder.InspectionResult.ACCEPTED, WorkOrder.InspectionResult.REWORK):
+            return Response({"result": ["Choose 'accepted' or 'rework'."]}, status=400)
+        notes = (request.data.get("notes") or "").strip()
+        if result == WorkOrder.InspectionResult.REWORK and not notes:
+            return Response({"notes": ["Say what has to be redone."]}, status=400)
+        now = timezone.now()
+        stamp = f"[{timezone.localtime(now):%Y-%m-%d %H:%M}] {request.user.get_full_name() or request.user.username}: "
+        work_order.inspected_by = request.user
+        work_order.inspected_at = now
+        work_order.inspection_result = result
+        work_order.inspection_notes = (
+            (work_order.inspection_notes + "\n" if work_order.inspection_notes else "")
+            + stamp + (notes or ("Accepted" if result == "accepted" else ""))
+        ).strip()
+        work_order.status = (
+            WorkOrder.Status.COMPLETED if result == WorkOrder.InspectionResult.ACCEPTED else WorkOrder.Status.IN_PROGRESS
+        )
+        work_order.save(update_fields=[
+            "inspected_by", "inspected_at", "inspection_result", "inspection_notes", "status", "updated_at",
+        ])
+        return Response(WorkOrderSerializer(work_order).data)
+
+    @action(detail=False, methods=["get"], url_path="receiving")
+    def receiving(self, request):
+        """Delivered work waiting to be inspected."""
+        qs = self.filter_queryset(self.get_queryset()).filter(
+            status__in=(WorkOrder.Status.DELIVERED, WorkOrder.Status.PARTIALLY_DELIVERED)
+        ).order_by("delivered_at", "updated_at")
+        return Response({"results": WorkOrderSerializer(qs, many=True).data})
 
     @action(detail=True, methods=["get"], url_path="print")
     def print_pdf(self, request, pk=None):

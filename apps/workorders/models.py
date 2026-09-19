@@ -37,8 +37,8 @@ class WorkOrder(TimeStampedModel):
         ISSUED = "issued", "Issued to Supplier"
         IN_PROGRESS = "in_progress", "In Progress"
         PARTIALLY_DELIVERED = "partially_delivered", "Partially Delivered"
-        DELIVERED = "delivered", "Delivered"
-        COMPLETED = "completed", "Completed"
+        DELIVERED = "delivered", "Delivered — awaiting inspection"
+        COMPLETED = "completed", "Completed — inspected"
         CANCELLED = "cancelled", "Cancelled"
 
     class Currency(models.TextChoices):
@@ -102,6 +102,19 @@ class WorkOrder(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="approved_work_orders"
     )
     approved_at = models.DateTimeField(null=True, blank=True)
+    # Work receiving: the vendor delivers, we inspect. Accepted work completes
+    # the order; work sent back for rework goes to the vendor again.
+    class InspectionResult(models.TextChoices):
+        ACCEPTED = "accepted", "Accepted"
+        REWORK = "rework", "Sent back for rework"
+
+    inspected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="inspected_work_orders"
+    )
+    inspected_at = models.DateTimeField(null=True, blank=True)
+    inspection_result = models.CharField(max_length=10, choices=InspectionResult.choices, blank=True)
+    inspection_notes = models.TextField(blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
     issued_at = models.DateTimeField(null=True, blank=True)
 
     VALID_TRANSITIONS = {

@@ -917,8 +917,17 @@ class ProductionStepSerializer(serializers.ModelSerializer):
         o = obj.live_work_order
         if o is None:
             return None
-        return {"id": str(o.pk), "wo_number": o.wo_number, "status": o.status,
-                "status_display": o.get_status_display(), "amount": o.total_amount}
+        inspector = o.inspected_by
+        return {
+            "id": str(o.pk), "wo_number": o.wo_number, "status": o.status,
+            "status_display": o.get_status_display(), "amount": o.total_amount,
+            "supplier_name": o.supplier.name if o.supplier_id else None,
+            "delivered_at": o.delivered_at,
+            "inspected_by_name": (inspector.get_full_name() or inspector.username) if inspector else None,
+            "inspected_at": o.inspected_at,
+            "inspection_result": o.inspection_result or None,
+            "inspection_notes": o.inspection_notes or "",
+        }
 
     # Execution asked for a work order; Work Orders › Requests has it.
     work_order_requested = serializers.BooleanField(read_only=True)

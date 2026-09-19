@@ -87,13 +87,24 @@ def test_execution_asks_work_orders_raises_group_head_approves(build):
     assert not Project.objects.filter(source_work_order=order).exists()   # services: nothing to install
     assert head.post(f"/api/work-orders/{order.id}/transition/", {"status": "issued"}, format="json").status_code == 403
 
-    # The document prints, and the ordinary flow finishes both operations.
+    # The document prints; the vendor delivers; inspection completes both operations.
     assert ops.get(f"/api/work-orders/{order.id}/print/").status_code == 200
-    for st in ("issued", "in_progress", "delivered", "completed"):
+    for st in ("issued", "in_progress", "delivered"):
         assert ops.post(f"/api/work-orders/{order.id}/transition/", {"status": st}, format="json").status_code == 200
     for step in (cut, paint):
         step.refresh_from_db()
+        assert step.status == "returned"
+    r = ops.post(f"/api/work-orders/{order.id}/transition/", {"status": "completed"}, format="json")
+    assert r.status_code == 400 and "Work Receiving" in r.data["detail"]
+    assert [w["wo_number"] for w in ops.get("/api/work-orders/receiving/").json()["results"]] == [order.wo_number]
+    r = ops.post(f"/api/work-orders/{order.id}/inspect/", {"result": "accepted", "notes": "Finish is good"}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["status"] == "completed" and r.data["inspected_by_name"] == "wo-ops" and r.data["inspection_result"] == "accepted"
+    for step in (cut, paint):
+        step.refresh_from_db()
         assert step.status == "completed"
+    detail = ops.get(f"/api/assets/production-steps/{cut.id}/").json()
+    assert detail["work_order"]["inspected_by_name"] == "wo-ops" and detail["work_order"]["inspection_result"] == "accepted"
     assemble.refresh_from_db()
     assert assemble.status == "pending" and assemble.location == "in_house"
 
@@ -146,3 +157,31 @@ def test_new_work_orders_are_services(db):
     r = ops.post("/api/work-orders/", {"title": "Repair visit", "supplier": str(vendor.id), "items": []}, format="json")
     assert r.status_code == 201, r.content
     assert r.data["order_type"] == "services" and r.data["order_type_display"] == "Services"
+
+
+@pytest.mark.django_db
+def test_delivered_work_is_inspected_before_it_completes(build):
+    """Rework sends the order back to the vendor with the reason on record;
+    accepting it later completes the operation."""
+    ops, _ = _client("ops_manager", "ops5")
+    paint = build["steps"][1]
+    ops.post(f"/api/assets/production-steps/{paint.id}/decide/", {"location": "external"}, format="json")
+    order_id = ops.post("/api/work-orders/raise/", {"steps": [str(paint.id)], "supplier": str(build["vendor"].id)}, format="json").data["id"]
+    assert ops.post(f"/api/work-orders/{order_id}/inspect/", {"result": "accepted"}, format="json").status_code == 400
+    for st in ("pending_approval",):
+        ops.post(f"/api/work-orders/{order_id}/transition/", {"status": st}, format="json")
+    head, _ = _client("group_head", "head5")
+    head.post(f"/api/work-orders/{order_id}/transition/", {"status": "approved"}, format="json")
+    for st in ("issued", "in_progress", "delivered"):
+        assert ops.post(f"/api/work-orders/{order_id}/transition/", {"status": st}, format="json").status_code == 200
+    r = ops.post(f"/api/work-orders/{order_id}/inspect/", {"result": "rework"}, format="json")
+    assert r.status_code == 400 and "redone" in str(r.data["notes"])
+    r = ops.post(f"/api/work-orders/{order_id}/inspect/", {"result": "rework", "notes": "Paint runs on two panels"}, format="json")
+    assert r.status_code == 200 and r.data["status"] == "in_progress" and "Paint runs" in r.data["inspection_notes"]
+    paint.refresh_from_db()
+    assert paint.status == "sent_out"
+    assert ops.post(f"/api/work-orders/{order_id}/transition/", {"status": "delivered"}, format="json").status_code == 200
+    r = ops.post(f"/api/work-orders/{order_id}/inspect/", {"result": "accepted", "notes": "Redone, good"}, format="json")
+    assert r.status_code == 200 and r.data["status"] == "completed" and r.data["delivered_at"]
+    paint.refresh_from_db()
+    assert paint.status == "completed"

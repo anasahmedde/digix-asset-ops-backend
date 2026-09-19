@@ -38,7 +38,8 @@ def drive_step(step, order: WorkOrder):
             if step.status == ProductionStep.Status.SENT_OUT:
                 step.status = ProductionStep.Status.PENDING
                 fields.append("status")
-    elif order.status in (WorkOrder.Status.DELIVERED, WorkOrder.Status.COMPLETED):
+    elif order.status == WorkOrder.Status.COMPLETED:
+        # Inspected and accepted: the operation is done.
         if step.status != ProductionStep.Status.COMPLETED:
             step.status = ProductionStep.Status.COMPLETED
             fields.append("status")
@@ -48,6 +49,14 @@ def drive_step(step, order: WorkOrder):
             if step.completed_at is None:
                 step.completed_at = now
                 fields.append("completed_at")
+    elif order.status in (WorkOrder.Status.DELIVERED, WorkOrder.Status.PARTIALLY_DELIVERED):
+        # Back from the workshop, waiting for inspection.
+        if step.status == ProductionStep.Status.SENT_OUT:
+            step.status = ProductionStep.Status.RETURNED
+            fields.append("status")
+            if step.returned_at is None:
+                step.returned_at = now
+                fields.append("returned_at")
     else:
         if step.location != ProductionStep.Location.EXTERNAL or step.workshop_id != order.supplier_id:
             step.location = ProductionStep.Location.EXTERNAL

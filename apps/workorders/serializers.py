@@ -19,6 +19,13 @@ class WorkOrderItemSerializer(serializers.ModelSerializer):
 
 class WorkOrderListSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(source="supplier.name", read_only=True)
+    project_name = serializers.CharField(source="project.name", read_only=True, default=None)
+    inspected_by_name = serializers.SerializerMethodField()
+    inspection_result_display = serializers.CharField(source="get_inspection_result_display", read_only=True, default=None)
+
+    def get_inspected_by_name(self, obj):
+        user = obj.inspected_by
+        return (user.get_full_name() or user.username) if user else None
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
@@ -28,9 +35,10 @@ class WorkOrderListSerializer(serializers.ModelSerializer):
         model = WorkOrder
         fields = [
             "id", "wo_number", "title", "order_type", "order_type_display",
-            "status", "status_display", "supplier", "supplier_name",
+            "status", "status_display", "supplier", "supplier_name", "project_name",
             "client_name", "site_name", "currency", "total_amount",
-            "expected_delivery", "created_at",
+            "expected_delivery", "delivered_at", "inspected_by_name", "inspected_at",
+            "inspection_result", "inspection_result_display", "inspection_notes", "created_at",
         ]
 
 
@@ -42,12 +50,27 @@ class WorkOrderSerializer(serializers.ModelSerializer):
     payment_terms_name = serializers.CharField(source="payment_terms.name", read_only=True, default=None)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     order_type_display = serializers.CharField(source="get_order_type_display", read_only=True)
-    created_by_name = serializers.CharField(source="created_by.get_full_name", read_only=True, default=None)
-    approved_by_name = serializers.CharField(source="approved_by.get_full_name", read_only=True, default=None)
+    # Names fall back to the login when no full name is on file.
+    created_by_name = serializers.SerializerMethodField()
+    approved_by_name = serializers.SerializerMethodField()
+
+    def get_created_by_name(self, obj):
+        user = obj.created_by
+        return (user.get_full_name() or user.username) if user else None
+
+    def get_approved_by_name(self, obj):
+        user = obj.approved_by
+        return (user.get_full_name() or user.username) if user else None
 
     project_name = serializers.CharField(source="project.name", read_only=True, default=None)
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
     production_step_name = serializers.CharField(source="production_step.name", read_only=True, default=None)
+    inspected_by_name = serializers.SerializerMethodField()
+    inspection_result_display = serializers.CharField(source="get_inspection_result_display", read_only=True, default=None)
+
+    def get_inspected_by_name(self, obj):
+        user = obj.inspected_by
+        return (user.get_full_name() or user.username) if user else None
 
     class Meta:
         model = WorkOrder
@@ -60,10 +83,13 @@ class WorkOrderSerializer(serializers.ModelSerializer):
             "safety_instructions", "warranty_months",
             "currency", "order_date", "expected_delivery", "total_amount", "notes",
             "items", "created_by", "created_by_name", "approved_by", "approved_by_name",
+            "delivered_at", "inspected_by", "inspected_by_name", "inspected_at",
+            "inspection_result", "inspection_result_display", "inspection_notes",
             "approved_at", "issued_at", "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "wo_number", "total_amount", "created_by", "approved_by",
+            "delivered_at", "inspected_by", "inspected_at", "inspection_result", "inspection_notes",
             "approved_at", "issued_at", "created_at", "updated_at",
         ]
 
