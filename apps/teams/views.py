@@ -36,6 +36,56 @@ from .serializers import (
 )
 
 
+def _installations_for(devices):
+    """What the Installation Tracker knows about these assets, by device id.
+
+    Execution should not have to send people hunting: the job on the tracker,
+    who it went to, the stage it has reached and when it is due all read here.
+    """
+    from apps.sites.models import DeviceInstallation, InstallationStep
+
+    jobs = (
+        DeviceInstallation.objects
+        .filter(device__in=devices)
+        .select_related("site", "installed_by", "vendor")
+        .prefetch_related("steps")
+        .order_by("device_id", "-installed_at")
+    )
+    out = {}
+    for job in jobs:
+        # The live job wins; a finished one stands until a new one opens.
+        if job.device_id in out and out[job.device_id]["completed_at"] is None:
+            continue
+        steps = sorted(job.steps.all(), key=lambda s: s.step_number)
+        done = [s for s in steps if s.status == InstallationStep.StepStatus.COMPLETED]
+        current = next(
+            (s for s in steps if s.status not in (
+                InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.SKIPPED,
+            )),
+            None,
+        )
+        crew = job.installed_by
+        out[job.device_id] = {
+            "id": str(job.pk),
+            "site_name": job.site.name if job.site_id else None,
+            "installed_by_name": (crew.get_full_name() or crew.username) if crew else None,
+            "vendor_name": job.vendor.name if job.vendor_id else (job.external_vendor_name or None),
+            "due_date": job.due_date,
+            "installed_at": job.installed_at,
+            "completed_at": job.completed_at,
+            "steps_done": len(done),
+            "steps_total": len(steps),
+            "progress": round(len(done) / len(steps) * 100) if steps else 0,
+            "stage": (
+                "Complete" if job.completed_at is not None
+                else (current.custom_label or current.get_step_type_display()) if current is not None
+                else "Not started"
+            ),
+            "stage_status": current.get_status_display() if current is not None else None,
+        }
+    return out
+
+
 class ProjectViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["status", "phase", "contract_type", "client", "site", "manager"]
@@ -177,6 +227,8 @@ class ProjectViewSet(viewsets.ModelViewSet):
         assets = []
         totals = {"required": 0, "issued": 0, "outstanding": 0,
                   "awaiting_decision": 0, "to_procure": 0}
+        installs = _installations_for(devices)
+        from apps.assets.serializers import assignee_label
 
         for device in devices:
             if device.source != Device.Source.INHOUSE:
@@ -207,6 +259,11 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     "components": [],
                     "steps": [],
                     "route_complete": False,
+                    "installation": installs.get(device.pk),
+                    "assigned_to_display": assignee_label(
+                        device.assigned_technician, device.assigned_vendor_name,
+                        device.assigned_vendor_contact,
+                    ),
                 })
                 continue
             components = list(device.components.all())
@@ -238,6 +295,11 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 # The route's own decisions: each operation in-house or on a work order.
                 "steps": ProductionStepSerializer(steps, many=True).data,
                 "route_complete": bool(steps) and all(x.status in ("completed", "skipped") for x in steps),
+                "installation": installs.get(device.pk),
+                "assigned_to_display": assignee_label(
+                    device.assigned_technician, device.assigned_vendor_name,
+                    device.assigned_vendor_contact,
+                ),
             })
 
         return Response({"project": str(project.pk), "assets": assets, "totals": totals})

@@ -599,6 +599,17 @@ class DeviceViewSet(viewsets.ModelViewSet):
         log_export(request.user, "device", len(rows), export_params(request))
         return xlsx_response("assets", "Assets", columns, rows)
 
+    @action(detail=True, methods=["get"], url_path="bom")
+    def bom_document(self, request, pk=None):
+        """The asset's bill of materials as a PDF, for the floor."""
+        from .documents import render_bom_pdf
+
+        device = self.get_object()
+        pdf = render_bom_pdf(device)
+        response = HttpResponse(pdf, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="bom-{device.asset_code}.pdf"'
+        return response
+
     @action(detail=True, methods=["post"], url_path="ready-for-installation")
     def ready_for_installation(self, request, pk=None):
         """The build is finished: a finished route takes the asset to In Stock so
