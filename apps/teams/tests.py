@@ -989,3 +989,36 @@ def test_a_bought_asset_that_has_not_arrived_costs_nothing_yet():
     asset = c.get(f"/api/teams/projects/{project.id}/actuals/").json()["assets"][0]
     assert asset["asset_arrived"] is False and asset["outstanding"] == 1
     assert Decimal(str(asset["actual_total"])) == Decimal("0"), "nothing is spent until it arrives"
+
+
+@pytest.mark.django_db
+def test_the_scope_line_says_where_the_asset_goes():
+    """The registry does not ask where an asset is — the project's Scope line
+    does, and the asset follows it."""
+    from apps.sites.models import Site
+    from apps.teams.models import ProjectScopeItem
+
+    brand = Brand.objects.create(name="Scope Site Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="SS-1")
+    device = Device.objects.create(device_model=dm, asset_code="AST-SITE-1", serial_number="SITE-1")
+    project = Project.objects.create(name="Scope Site Rollout")
+    mall = Site.objects.create(name="Mall One", address="1 Road")
+    tower = Site.objects.create(name="Tower Two", address="2 Road")
+    assert device.current_site_id is None
+
+    item = ProjectScopeItem.objects.create(project=project, device=device, quantity=1, site=mall)
+    device.refresh_from_db()
+    assert device.current_site_id == mall.pk, "scoping it to a site puts it there"
+
+    # Moving the line moves the asset with it.
+    item.site = tower
+    item.save(update_fields=["site"])
+    device.refresh_from_db()
+    assert device.current_site_id == tower.pk
+
+    # Clearing the line leaves the asset where it is: paperwork does not move
+    # something that is already standing somewhere.
+    item.site = None
+    item.save(update_fields=["site"])
+    device.refresh_from_db()
+    assert device.current_site_id == tower.pk
