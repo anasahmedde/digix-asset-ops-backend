@@ -132,7 +132,16 @@ def build_plan(project):
                 "vendor_asset": True,
                 "source": device.source,
                 "asset_price": price,
-                "supply_vendor_name": device.supply_vendor_name,
+                # Nobody supplies it until the purchase order says so.
+                "supply_vendor_name": (
+                    device.procurement_item.purchase_order.supplier.name
+                    if device.procurement_item_id and device.procurement_item.purchase_order.supplier_id
+                    else None
+                ),
+                "po_number": (
+                    device.procurement_item.purchase_order.po_number
+                    if device.procurement_item_id else None
+                ),
                 "lines": 0,
                 "materials_total": money(price or 0),
                 "unpriced_lines": 0 if price is not None else 1,

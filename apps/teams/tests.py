@@ -1022,3 +1022,47 @@ def test_the_scope_line_says_where_the_asset_goes():
     item.save(update_fields=["site"])
     device.refresh_from_db()
     assert device.current_site_id == tower.pk
+
+
+@pytest.mark.django_db
+def test_a_bought_asset_names_its_vendor_only_once_an_order_does():
+    """Nobody supplies an asset until the purchase order says so, so the plan
+    names no vendor before one exists and reads it off the order after."""
+    from decimal import Decimal
+
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.suppliers.models import Supplier
+
+    brand = Brand.objects.create(name="Vendor Name Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="VN-1")
+    project = Project.objects.create(name="Vendor Name Rollout")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-VEND-1", serial_number="VEND-1",
+        source="vendor_supplied", project=project,
+    )
+    ops = _U.objects.create_user(username="vend-ops", password="x", role="ops_manager")
+    c = _C()
+    c.force_authenticate(ops)
+
+    asset = c.get(f"/api/teams/projects/{project.id}/plan/").json()["assets"][0]
+    assert asset["supply_vendor_name"] is None and asset["po_number"] is None
+
+    # A name typed onto the asset is not a vendor either — only an order is.
+    device.supply_vendor_name = "Somebody Somebody"
+    device.save(update_fields=["supply_vendor_name"])
+    asset = c.get(f"/api/teams/projects/{project.id}/plan/").json()["assets"][0]
+    assert asset["supply_vendor_name"] is None, "a typed name is not a purchase"
+
+    supplier = Supplier.objects.create(name="Screens Limited")
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED)
+    device.procurement_item = PurchaseOrderItem.objects.create(
+        purchase_order=po, description="Screen", quantity=1, unit_price=Decimal("4800"),
+    )
+    device.save(update_fields=["procurement_item"])
+
+    asset = c.get(f"/api/teams/projects/{project.id}/plan/").json()["assets"][0]
+    assert asset["supply_vendor_name"] == "Screens Limited"
+    assert asset["po_number"] == po.po_number
