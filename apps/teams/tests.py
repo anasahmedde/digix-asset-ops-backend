@@ -63,9 +63,9 @@ def test_project_scope_and_milestones():
     assert len(detail.data["milestones"]) == 1
 
     # phase is writable through the normal update flow
-    r = c.patch(f"/api/teams/projects/{project.pk}/", {"phase": "delivery"}, format="json")
+    r = c.patch(f"/api/teams/projects/{project.pk}/", {"phase": "installation"}, format="json")
     assert r.status_code == 200, r.content
-    assert r.data["phase"] == "delivery"
+    assert r.data["phase"] == "installation"
 
 
 @pytest.mark.django_db
@@ -356,7 +356,7 @@ def test_project_and_bom_line_link_back_to_quotation():
     )
 
     project = Project.objects.create(
-        name="Project: Facade refresh", phase="order_confirmation",
+        name="Project: Facade refresh", phase="planning",
         client=customer, source_quotation=quotation,
     )
     line = ProjectBOMLine.objects.create(
@@ -1066,3 +1066,86 @@ def test_a_bought_asset_names_its_vendor_only_once_an_order_does():
     asset = c.get(f"/api/teams/projects/{project.id}/plan/").json()["assets"][0]
     assert asset["supply_vendor_name"] == "Screens Limited"
     assert asset["po_number"] == po.po_number
+
+
+@pytest.mark.django_db
+def test_each_phase_says_how_far_it_has_got():
+    """A phase is work, so its bar is counted from the work: parts issued,
+    operations finished, installation steps done, assets handed over."""
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.assets.models import ProductionStep
+    from apps.sites.models import DeviceInstallation, InstallationStep, Site
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    brand = Brand.objects.create(name="Phase Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="PH-1")
+    project = Project.objects.create(name="Phase Rollout")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-PHASE-1", serial_number="PHASE-1", source="inhouse",
+    )
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    material = MaterialType.objects.create(name="Phase Panel", unit="piece")
+    item = InventoryItem.objects.create(material_type=material, quantity=10)
+    AssetComponent.objects.create(device=device, name="Phase Panel", quantity=4, inventory_item=item)
+    cut = ProductionStep.objects.create(device=device, step_number=1, name="Cutting")
+    ProductionStep.objects.create(device=device, step_number=2, name="Fitting")
+
+    bars = phase_progress(project)
+    assert bars["procurement"]["done"] == 0 and bars["procurement"]["total"] == 4
+    assert bars["production"]["total"] == 2 and bars["production"]["percent"] == 0
+    assert bars["handover"]["total"] == 1 and bars["handover"]["percent"] == 0
+    assert bars["planning"]["percent"] == 0, "no budget submitted yet"
+
+    # Half the parts in, one operation done.
+    component = device.components.get()
+    component.issued_quantity = 2
+    component.save(update_fields=["issued_quantity"])
+    cut.status = ProductionStep.Status.COMPLETED
+    cut.save(update_fields=["status"])
+    bars = phase_progress(project)
+    assert bars["procurement"]["percent"] == 50
+    assert bars["production"]["percent"] == 50
+
+    # An installation opened, half its checklist worked through.
+    site = Site.objects.create(name="Phase Site", address="1 Road")
+    job = DeviceInstallation(device=device, site=site, installed_at=timezone.now())
+    job._skip_default_steps = True
+    job.save()
+    for n, status in enumerate((InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.NOT_STARTED), start=1):
+        InstallationStep.objects.create(
+            installation=job, step_type=InstallationStep.StepType.SURVEY, step_number=n, status=status,
+        )
+    bars = phase_progress(project)
+    assert bars["installation"]["percent"] == 50, bars["installation"]
+
+    # Handed over once the asset is running.
+    device.status = Device.Status.ACTIVE
+    device.save(update_fields=["status"])
+    assert phase_progress(project)["handover"]["percent"] == 100
+
+
+@pytest.mark.django_db
+def test_approving_the_budget_moves_the_project_off_planning():
+    """Planning ends when the figure is agreed; the order stops reading as
+    still being planned."""
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+
+    project, device, cable, po = _planned_project()
+    assert project.phase == Project.Phase.PLANNING and project.status == Project.Status.PLANNING
+
+    ops = _U.objects.create_user(username="phase-ops", password="x", role="ops_manager")
+    head = _U.objects.create_user(username="phase-head", password="x", role="group_head")
+    c, h = _C(), _C()
+    c.force_authenticate(ops)
+    h.force_authenticate(head)
+    assert c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json").status_code == 200
+    assert h.post(f"/api/teams/projects/{project.id}/approve-budget/", {}, format="json").status_code == 200
+
+    project.refresh_from_db()
+    assert project.phase == Project.Phase.PROCUREMENT
+    assert project.status == Project.Status.ON_TRACK

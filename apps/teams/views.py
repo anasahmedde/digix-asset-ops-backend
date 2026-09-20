@@ -575,7 +575,16 @@ class ProjectViewSet(viewsets.ModelViewSet):
             plan.approved_total = summary["total"]
             update.append("approved_total")
             project.budget = summary["total"]
-            project.save(update_fields=["budget", "updated_at"])
+            moved = ["budget", "updated_at"]
+            # Planning is over once the figure is agreed: the order moves on to
+            # getting the parts in, and stops reading as still being planned.
+            if project.phase == Project.Phase.PLANNING:
+                project.phase = Project.Phase.PROCUREMENT
+                moved.append("phase")
+            if project.status == Project.Status.PLANNING:
+                project.status = Project.Status.ON_TRACK
+                moved.append("status")
+            project.save(update_fields=moved)
         plan.save(update_fields=update)
         return Response(build_plan(project))
 

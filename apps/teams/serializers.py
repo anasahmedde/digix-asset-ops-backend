@@ -180,14 +180,22 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
             "progress", "start_date", "target_date", "completed_date",
             "manager", "manager_name", "budget", "notes", "sites", "site_names",
             "bottlenecks", "members", "scope_items", "milestones",
-            "created_at", "updated_at",
+            "phase_progress", "created_at", "updated_at",
         ]
         # The budget is what planning arrives at and approval freezes — not a
         # number typed when the project is opened.
         read_only_fields = ["id", "budget", "created_at", "updated_at"]
 
+    # How far each phase of the work has got, counted from the work itself.
+    phase_progress = serializers.SerializerMethodField()
+
     def get_progress(self, obj):
         return obj.computed_progress()
+
+    def get_phase_progress(self, obj):
+        from .phases import phase_progress
+
+        return phase_progress(obj)
 
 
 class ProjectCostLineSerializer(serializers.ModelSerializer):
