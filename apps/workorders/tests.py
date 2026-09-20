@@ -252,3 +252,119 @@ def test_an_operation_external_with_no_order_is_not_stranded(build):
     ops.post(f"/api/assets/production-steps/{cut.id}/decide/", {"location": "external"}, format="json")
     cut.refresh_from_db()
     assert cut.on_a_work_order is True and cut.manual_moves == ()
+
+
+@pytest.mark.django_db
+def test_one_job_on_an_order_is_delivered_whole_not_partly(build):
+    """Nothing is 'partly' about a single job: it is in or it is not."""
+    ops, _ = _client("ops_manager", "ops8")
+    paint = build["steps"][1]
+    ops.post(f"/api/assets/production-steps/{paint.id}/decide/", {"location": "external"}, format="json")
+    order_id = ops.post("/api/work-orders/raise/", {
+        "steps": [str(paint.id)], "supplier": str(build["vendor"].id),
+    }, format="json").data["id"]
+    head, _ = _client("group_head", "head8")
+    ops.post(f"/api/work-orders/{order_id}/transition/", {"status": "pending_approval"}, format="json")
+    head.post(f"/api/work-orders/{order_id}/transition/", {"status": "approved"}, format="json")
+    for st in ("issued", "in_progress"):
+        ops.post(f"/api/work-orders/{order_id}/transition/", {"status": st}, format="json")
+
+    r = ops.post(f"/api/work-orders/{order_id}/transition/", {"status": "partially_delivered"}, format="json")
+    assert r.status_code == 400 and "one job on this order" in r.data["detail"], r.content
+    assert ops.get(f"/api/work-orders/{order_id}/").json()["line_count"] == 1
+
+
+@pytest.mark.django_db
+def test_a_vendor_sends_jobs_in_one_at_a_time(build):
+    """Three jobs on one order: one comes in and is inspected while the others
+    are still on the bench, and the order finishes only when all are accepted."""
+    ops, _ = _client("ops_manager", "ops9")
+    head, _ = _client("group_head", "head9")
+    cut, paint, assemble = build["steps"]
+    for step in (cut, paint, assemble):
+        ops.post(f"/api/assets/production-steps/{step.id}/decide/", {"location": "external"}, format="json")
+    r = ops.post("/api/work-orders/raise/", {
+        "steps": [str(cut.id), str(paint.id), str(assemble.id)], "supplier": str(build["vendor"].id),
+    }, format="json")
+    order_id = r.data["id"]
+    ops.post(f"/api/work-orders/{order_id}/transition/", {"status": "pending_approval"}, format="json")
+    head.post(f"/api/work-orders/{order_id}/transition/", {"status": "approved"}, format="json")
+    for st in ("issued", "in_progress"):
+        ops.post(f"/api/work-orders/{order_id}/transition/", {"status": st}, format="json")
+
+    detail = ops.get(f"/api/work-orders/{order_id}/").json()
+    by_step = {i["operation"]: i for i in detail["items"]}
+    assert detail["line_count"] == 3
+    assert all(i["line_state"] == "with_vendor" for i in detail["items"])
+
+    # A part delivery has to say which jobs came in.
+    r = ops.post(f"/api/work-orders/{order_id}/transition/", {"status": "partially_delivered"}, format="json")
+    assert r.status_code == 400 and "which jobs" in str(r.data["items"])
+
+    # Cutting comes in on its own.
+    r = ops.post(f"/api/work-orders/{order_id}/transition/", {
+        "status": "partially_delivered", "items": [by_step["Cutting"]["id"]],
+    }, format="json")
+    assert r.status_code == 200, r.content
+    detail = ops.get(f"/api/work-orders/{order_id}/").json()
+    states = {i["operation"]: i["line_state"] for i in detail["items"]}
+    assert states == {"Cutting": "awaiting_inspection", "Painting": "with_vendor", "Assembly": "with_vendor"}
+    assert detail["status"] == "partially_delivered" and detail["delivered_at"]
+    cut.refresh_from_db(); paint.refresh_from_db()
+    assert cut.status == "returned" and paint.status == "sent_out", "only what came in is back"
+
+    # It is inspected on its own, and only that operation is finished.
+    r = ops.post(f"/api/work-orders/{order_id}/inspect/", {"result": "accepted", "notes": "Clean cut"}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["status"] == "in_progress", "the vendor still has two jobs"
+    cut.refresh_from_db(); paint.refresh_from_db()
+    assert cut.status == "completed" and paint.status == "sent_out"
+    detail = ops.get(f"/api/work-orders/{order_id}/").json()
+    line = next(i for i in detail["items"] if i["operation"] == "Cutting")
+    assert line["line_state"] == "accepted" and line["inspected_by_name"] == "wo-ops9" and "Clean cut" in line["inspection_notes"]
+    assert line["delivered_at"] and line["inspected_at"]
+
+    # He sends the next one in on its own: a part delivery can follow a part
+    # delivery until the last job is in.
+    detail = ops.get(f"/api/work-orders/{order_id}/").json()
+    by_step = {i["operation"]: i for i in detail["items"]}
+    r = ops.post(f"/api/work-orders/{order_id}/transition/", {
+        "status": "partially_delivered", "items": [by_step["Painting"]["id"]],
+    }, format="json")
+    assert r.status_code == 200, r.content
+    detail = ops.get(f"/api/work-orders/{order_id}/").json()
+    states = {i["operation"]: i["line_state"] for i in detail["items"]}
+    assert states == {"Cutting": "accepted", "Painting": "awaiting_inspection", "Assembly": "with_vendor"}
+
+    # The rest come in together; one is sent back and comes in again.
+    r = ops.post(f"/api/work-orders/{order_id}/transition/", {"status": "delivered"}, format="json")
+    assert r.status_code == 200 and r.data["status"] == "delivered", r.content
+    detail = ops.get(f"/api/work-orders/{order_id}/").json()
+    by_step = {i["operation"]: i for i in detail["items"]}
+    assert by_step["Painting"]["line_state"] == "awaiting_inspection"
+    r = ops.post(f"/api/work-orders/{order_id}/inspect/", {
+        "result": "rework", "notes": "Runs on the top edge", "items": [by_step["Painting"]["id"]],
+    }, format="json")
+    assert r.status_code == 200, r.content
+    # Painting is back on the bench and Assembly is still on the desk: part in,
+    # part out.
+    assert r.data["status"] == "partially_delivered"
+    paint.refresh_from_db()
+    assert paint.status == "sent_out", "back on the bench"
+
+    assert ops.post(f"/api/work-orders/{order_id}/inspect/", {
+        "result": "accepted", "items": [by_step["Assembly"]["id"]],
+    }, format="json").status_code == 200
+    assert ops.get(f"/api/work-orders/{order_id}/").json()["status"] == "in_progress"
+
+    # Painting is redone, comes in and passes: now the order is finished.
+    r = ops.post(f"/api/work-orders/{order_id}/transition/", {"status": "delivered"}, format="json")
+    assert r.status_code == 200, r.content
+    r = ops.post(f"/api/work-orders/{order_id}/inspect/", {"result": "accepted", "notes": "Redone"}, format="json")
+    assert r.status_code == 200 and r.data["status"] == "completed", r.content
+    for step in (cut, paint, assemble):
+        step.refresh_from_db()
+        assert step.status == "completed"
+    detail = ops.get(f"/api/work-orders/{order_id}/").json()
+    assert all(i["line_state"] == "accepted" for i in detail["items"])
+    assert detail["lines_awaiting_inspection"] == 0 and detail["lines_with_vendor"] == 0

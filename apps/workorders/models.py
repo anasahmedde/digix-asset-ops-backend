@@ -123,7 +123,9 @@ class WorkOrder(TimeStampedModel):
         Status.APPROVED: (Status.ISSUED, Status.CANCELLED),
         Status.ISSUED: (Status.IN_PROGRESS, Status.CANCELLED),
         Status.IN_PROGRESS: (Status.PARTIALLY_DELIVERED, Status.DELIVERED, Status.CANCELLED),
-        Status.PARTIALLY_DELIVERED: (Status.DELIVERED, Status.CANCELLED),
+        # A vendor can keep sending jobs in one at a time, so a part delivery
+        # can follow a part delivery until the last job is in.
+        Status.PARTIALLY_DELIVERED: (Status.PARTIALLY_DELIVERED, Status.DELIVERED, Status.CANCELLED),
         Status.DELIVERED: (Status.COMPLETED,),
         Status.COMPLETED: (),
         Status.CANCELLED: (),
@@ -174,6 +176,20 @@ class WorkOrderItem(TimeStampedModel):
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     received_quantity = models.PositiveIntegerField(default=0)
 
+    # A vendor with three jobs on one order can finish one and send it in while
+    # the others are still on his bench, so each line carries its own delivery
+    # and its own verdict. The order follows its lines.
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    inspected_at = models.DateTimeField(null=True, blank=True)
+    inspected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="work_order_lines_inspected",
+    )
+    inspection_result = models.CharField(
+        max_length=10, choices=WorkOrder.InspectionResult.choices, blank=True
+    )
+    inspection_notes = models.TextField(blank=True)
+
     class Meta:
         ordering = ["id"]
 
@@ -183,3 +199,26 @@ class WorkOrderItem(TimeStampedModel):
     @property
     def line_total(self) -> Decimal:
         return (self.unit_price or Decimal("0")) * self.quantity
+
+    @property
+    def accepted(self) -> bool:
+        """The work on this line was inspected and passed — it is finished."""
+        return self.inspection_result == WorkOrder.InspectionResult.ACCEPTED
+
+    @property
+    def awaiting_inspection(self) -> bool:
+        """It has come in and nobody has looked at it yet."""
+        return self.delivered_at is not None and not self.accepted
+
+    @property
+    def with_vendor(self) -> bool:
+        """Still out: never delivered, or sent back to be redone."""
+        return self.delivered_at is None and not self.accepted
+
+    @property
+    def line_state(self) -> str:
+        if self.accepted:
+            return "accepted"
+        if self.delivered_at is not None:
+            return "awaiting_inspection"
+        return "rework" if self.inspection_result else "with_vendor"

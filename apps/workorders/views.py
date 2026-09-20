@@ -37,6 +37,25 @@ def _spawn_project_if_needed(work_order: WorkOrder):
     )
 
 
+def _status_from_lines(work_order) -> str:
+    """Where an order stands once its lines have been looked at.
+
+    Every job accepted and the order is finished; anything still waiting keeps
+    it on the receiving desk; otherwise the vendor has work in hand again.
+    """
+    from .models import WorkOrder
+
+    lines = list(work_order.items.all())
+    if lines and all(i.accepted for i in lines):
+        return WorkOrder.Status.COMPLETED
+    if any(i.awaiting_inspection for i in lines):
+        return (
+            WorkOrder.Status.PARTIALLY_DELIVERED if any(i.with_vendor for i in lines)
+            else WorkOrder.Status.DELIVERED
+        )
+    return WorkOrder.Status.IN_PROGRESS
+
+
 class WorkOrderViewSet(viewsets.ModelViewSet):
     queryset = (
         WorkOrder.objects.select_related(
@@ -83,6 +102,43 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Which lines came in. A whole delivery is everything still out; a part
+        # delivery is the lines the vendor names, and there has to be something
+        # left for it to be a part of.
+        lines = None
+        if new_status in (WorkOrder.Status.DELIVERED, WorkOrder.Status.PARTIALLY_DELIVERED):
+            outstanding = [i for i in work_order.items.all() if i.with_vendor]
+            if not outstanding:
+                return Response(
+                    {"detail": f"Nothing on {work_order.wo_number} is still with the vendor."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if new_status == WorkOrder.Status.PARTIALLY_DELIVERED:
+                if len(work_order.items.all()) < 2:
+                    return Response(
+                        {"detail": (
+                            "There is one job on this order — it is either delivered or it is not."
+                        )},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                wanted = {str(i) for i in (request.data.get("items") or [])}
+                if not wanted:
+                    return Response(
+                        {"items": ["Say which jobs the vendor has finished."]},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                lines = [i for i in outstanding if str(i.pk) in wanted]
+                if len(lines) != len(wanted):
+                    return Response(
+                        {"items": ["Pick jobs from this order that are still with the vendor."]},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if len(lines) == len(outstanding):
+                    # Everything came in after all: that is a whole delivery.
+                    new_status = WorkOrder.Status.DELIVERED
+            else:
+                lines = outstanding
+
         update_fields = ["status", "updated_at"]
         work_order.status = new_status
 
@@ -97,11 +153,19 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         elif new_status == WorkOrder.Status.ISSUED:
             work_order.issued_at = now
             update_fields += ["issued_at"]
-        elif new_status == WorkOrder.Status.DELIVERED:
-            work_order.delivered_at = now
-            update_fields += ["delivered_at"]
+        elif new_status in (WorkOrder.Status.DELIVERED, WorkOrder.Status.PARTIALLY_DELIVERED):
+            # The order is dated from the first thing that came in.
+            if work_order.delivered_at is None or new_status == WorkOrder.Status.DELIVERED:
+                work_order.delivered_at = now
+                update_fields += ["delivered_at"]
 
         work_order.save(update_fields=update_fields)
+
+        if lines:
+            for line in lines:
+                line.delivered_at = now
+                line.inspection_result = ""
+                line.save(update_fields=["delivered_at", "inspection_result", "updated_at"])
 
         if new_status == WorkOrder.Status.APPROVED:
             _spawn_project_if_needed(work_order)
@@ -282,11 +346,13 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="inspect")
     def inspect(self, request, pk=None):
-        """Work receiving: the delivered work is inspected.
+        """Work receiving: the delivered work is inspected, job by job.
 
-        Body: result ("accepted" | "rework"), notes. Accepted completes the
-        order — and every operation on it; rework sends it back to the vendor
-        (in progress again). Who inspected, when and the notes stay on the order.
+        Body: result ("accepted" | "rework"), notes, and optionally ``items``
+        naming which of the delivered jobs this verdict covers — everything
+        waiting, when it says nothing. Accepted finishes those jobs and their
+        operations; rework sends them back to the vendor with the reason. The
+        order completes only once every job on it has been accepted.
         """
         work_order = self.get_object()
         if work_order.status not in (WorkOrder.Status.DELIVERED, WorkOrder.Status.PARTIALLY_DELIVERED):
@@ -300,21 +366,48 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         notes = (request.data.get("notes") or "").strip()
         if result == WorkOrder.InspectionResult.REWORK and not notes:
             return Response({"notes": ["Say what has to be redone."]}, status=400)
+
+        waiting = [i for i in work_order.items.all() if i.awaiting_inspection]
+        wanted = {str(i) for i in (request.data.get("items") or [])}
+        if wanted:
+            lines = [i for i in waiting if str(i.pk) in wanted]
+            if len(lines) != len(wanted):
+                return Response({"items": ["Pick jobs on this order that are waiting to be inspected."]}, status=400)
+        else:
+            lines = waiting
+
         now = timezone.now()
-        stamp = f"[{timezone.localtime(now):%Y-%m-%d %H:%M}] {request.user.get_full_name() or request.user.username}: "
-        work_order.inspected_by = request.user
-        work_order.inspected_at = now
-        work_order.inspection_result = result
-        work_order.inspection_notes = (
-            (work_order.inspection_notes + "\n" if work_order.inspection_notes else "")
-            + stamp + (notes or ("Accepted" if result == "accepted" else ""))
-        ).strip()
-        work_order.status = (
-            WorkOrder.Status.COMPLETED if result == WorkOrder.InspectionResult.ACCEPTED else WorkOrder.Status.IN_PROGRESS
-        )
-        work_order.save(update_fields=[
-            "inspected_by", "inspected_at", "inspection_result", "inspection_notes", "status", "updated_at",
-        ])
+        who = request.user.get_full_name() or request.user.username
+        stamp = f"[{timezone.localtime(now):%Y-%m-%d %H:%M}] {who}: "
+        body = notes or ("Accepted" if result == WorkOrder.InspectionResult.ACCEPTED else "")
+
+        with transaction.atomic():
+            for line in lines:
+                line.inspected_by = request.user
+                line.inspected_at = now
+                line.inspection_result = result
+                line.inspection_notes = (
+                    (line.inspection_notes + "\n" if line.inspection_notes else "") + stamp + body
+                ).strip()
+                if result == WorkOrder.InspectionResult.REWORK:
+                    # Back on the vendor's bench until he sends it in again.
+                    line.delivered_at = None
+                line.save(update_fields=[
+                    "inspected_by", "inspected_at", "inspection_result", "inspection_notes",
+                    "delivered_at", "updated_at",
+                ])
+
+            work_order.inspected_by = request.user
+            work_order.inspected_at = now
+            work_order.inspection_result = result
+            work_order.inspection_notes = (
+                (work_order.inspection_notes + "\n" if work_order.inspection_notes else "") + stamp + body
+            ).strip()
+            work_order.status = _status_from_lines(work_order)
+            work_order.save(update_fields=[
+                "inspected_by", "inspected_at", "inspection_result", "inspection_notes", "status", "updated_at",
+            ])
+        work_order.refresh_from_db()
         return Response(WorkOrderSerializer(work_order).data)
 
     @action(detail=False, methods=["get"], url_path="receiving")

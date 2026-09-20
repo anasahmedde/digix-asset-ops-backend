@@ -21,6 +21,23 @@ def _steps_of(order: WorkOrder):
     return list(steps.values())
 
 
+
+def _line_for(order: WorkOrder, step):
+    """This order's line for that operation, read fresh — the caller may have
+    just changed it."""
+    return WorkOrderItem.objects.filter(work_order=order, production_step=step).first()
+
+
+def _in_delivery(order: WorkOrder, step) -> bool:
+    """The order has reached the stage where its lines come in and are looked at."""
+    if order.status in (
+        WorkOrder.Status.DELIVERED, WorkOrder.Status.PARTIALLY_DELIVERED, WorkOrder.Status.COMPLETED,
+    ):
+        return True
+    line = _line_for(order, step)
+    return line is not None and (line.delivered_at is not None or bool(line.inspection_result))
+
+
 def drive_step(step, order: WorkOrder):
     """Bring one operation in line with the order that covers it."""
     from apps.assets.models import ProductionStep
@@ -38,25 +55,40 @@ def drive_step(step, order: WorkOrder):
             if step.status == ProductionStep.Status.SENT_OUT:
                 step.status = ProductionStep.Status.PENDING
                 fields.append("status")
-    elif order.status == WorkOrder.Status.COMPLETED:
-        # Inspected and accepted: the operation is done.
-        if step.status != ProductionStep.Status.COMPLETED:
-            step.status = ProductionStep.Status.COMPLETED
+    elif _in_delivery(order, step):
+        # The operation follows its own line, not the order as a whole: one job
+        # on a three-job order can be in, inspected and done while the other
+        # two are still on the vendor's bench.
+        line = _line_for(order, step)
+        if line is not None:
+            done = line.accepted
+            back = line.delivered_at is not None
+        else:
+            # An older order named a single step on the order itself.
+            done = order.status == WorkOrder.Status.COMPLETED
+            back = True
+        if done:
+            if step.status != ProductionStep.Status.COMPLETED:
+                step.status = ProductionStep.Status.COMPLETED
+                fields.append("status")
+                if step.returned_at is None:
+                    step.returned_at = now
+                    fields.append("returned_at")
+                if step.completed_at is None:
+                    step.completed_at = now
+                    fields.append("completed_at")
+        elif back:
+            # In from the workshop, waiting for inspection.
+            if step.status == ProductionStep.Status.SENT_OUT:
+                step.status = ProductionStep.Status.RETURNED
+                fields.append("status")
+                if step.returned_at is None:
+                    step.returned_at = now
+                    fields.append("returned_at")
+        elif step.status in (ProductionStep.Status.RETURNED, ProductionStep.Status.IN_PROGRESS):
+            # Still out, or sent back to be redone.
+            step.status = ProductionStep.Status.SENT_OUT
             fields.append("status")
-            if step.returned_at is None:
-                step.returned_at = now
-                fields.append("returned_at")
-            if step.completed_at is None:
-                step.completed_at = now
-                fields.append("completed_at")
-    elif order.status in (WorkOrder.Status.DELIVERED, WorkOrder.Status.PARTIALLY_DELIVERED):
-        # Back from the workshop, waiting for inspection.
-        if step.status == ProductionStep.Status.SENT_OUT:
-            step.status = ProductionStep.Status.RETURNED
-            fields.append("status")
-            if step.returned_at is None:
-                step.returned_at = now
-                fields.append("returned_at")
     else:
         if step.location != ProductionStep.Location.EXTERNAL or step.workshop_id != order.supplier_id:
             step.location = ProductionStep.Location.EXTERNAL
