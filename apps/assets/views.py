@@ -219,18 +219,21 @@ class DeviceViewSet(viewsets.ModelViewSet):
         # or an external vendor — and names them in the journalled reason.
         if new_status == Device.Status.ASSIGNED:
             technician = ser.validated_data.get("assigned_technician")
-            vendor = (ser.validated_data.get("assigned_vendor_name") or "").strip()
-            contact = (ser.validated_data.get("assigned_vendor_contact") or "").strip()
+            supplier = ser.validated_data.get("assigned_vendor")
+            vendor, contact = _vendor_details(ser.validated_data)
 
             # Only a turnkey job has an installing vendor, and there our
             # technician oversees them; every other route is one or the
             # other, so naming a technician clears the vendor.
             vendor_route = device.source == Device.Source.VENDOR_TURNKEY
+            keeps_vendor = vendor_route or not technician
             device.assigned_technician = technician
-            device.assigned_vendor_name = vendor if (vendor_route or not technician) else ""
-            device.assigned_vendor_contact = contact if (vendor_route or not technician) else ""
+            device.assigned_vendor = supplier if keeps_vendor else None
+            device.assigned_vendor_name = vendor if keeps_vendor else ""
+            device.assigned_vendor_contact = contact if keeps_vendor else ""
             update_fields += [
-                "assigned_technician", "assigned_vendor_name", "assigned_vendor_contact",
+                "assigned_technician", "assigned_vendor", "assigned_vendor_name",
+                "assigned_vendor_contact",
             ]
 
             site = ser.validated_data.get("current_site") or device.current_site
@@ -287,15 +290,17 @@ class DeviceViewSet(viewsets.ModelViewSet):
 
         previous = DeviceDetailSerializer(device, context={"request": request}).data["assigned_to_display"]
         technician = ser.validated_data.get("assigned_technician")
-        vendor = (ser.validated_data.get("assigned_vendor_name") or "").strip()
-        contact = (ser.validated_data.get("assigned_vendor_contact") or "").strip()
+        supplier = ser.validated_data.get("assigned_vendor")
+        vendor, contact = _vendor_details(ser.validated_data)
 
-        vendor_route = device.source == Device.Source.VENDOR_TURNKEY
+        keeps_vendor = device.source == Device.Source.VENDOR_TURNKEY or not technician
         device.assigned_technician = technician
-        device.assigned_vendor_name = vendor if (vendor_route or not technician) else ""
-        device.assigned_vendor_contact = contact if (vendor_route or not technician) else ""
+        device.assigned_vendor = supplier if keeps_vendor else None
+        device.assigned_vendor_name = vendor if keeps_vendor else ""
+        device.assigned_vendor_contact = contact if keeps_vendor else ""
         device.save(update_fields=[
-            "assigned_technician", "assigned_vendor_name", "assigned_vendor_contact", "updated_at",
+            "assigned_technician", "assigned_vendor", "assigned_vendor_name",
+            "assigned_vendor_contact", "updated_at",
         ])
 
         new_label = assignee_label(technician, vendor, contact)
@@ -728,6 +733,21 @@ def _refuse_if_priced_in_approved_budget(device):
             f"{device.asset_code} is priced in the approved budget of {project.name} — "
             "revise that budget to change prices."
         )
+
+
+def _vendor_details(data):
+    """(name, contact) of the installing vendor.
+
+    A vendor picked from the register names itself and brings its own contact;
+    one that is not on the register is described by hand.
+    """
+    supplier = data.get("assigned_vendor")
+    contact = (data.get("assigned_vendor_contact") or "").strip()
+    if supplier is None:
+        return (data.get("assigned_vendor_name") or "").strip(), contact
+    if not contact:
+        contact = " · ".join(x for x in (supplier.contact_person, supplier.contact_phone) if x)
+    return supplier.name, contact
 
 
 def _budget_block_response(component):

@@ -3,6 +3,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from apps.sites.models import Site
+from apps.suppliers.models import Supplier
 
 from .models import (
     AssetCode,
@@ -31,7 +32,8 @@ def validate_assignee(attrs, *, allow_both=False):
     action and the edit form, so all three enforce the same rule and wording.
     """
     technician = attrs.get("assigned_technician")
-    vendor = (attrs.get("assigned_vendor_name") or "").strip()
+    picked = attrs.get("assigned_vendor")
+    vendor = picked.name if picked is not None else (attrs.get("assigned_vendor_name") or "").strip()
     if not technician and not vendor:
         raise serializers.ValidationError({
             "assigned_technician": "Say who this asset is assigned to — a technician or a vendor."
@@ -559,7 +561,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "components",
             "assigned_technician", "technician_name", "technician_employee_id",
             "technician_job_title", "technician_phone",
-            "assigned_vendor_name", "assigned_vendor_contact", "assigned_to_display",
+            "assigned_vendor", "assigned_vendor_name", "assigned_vendor_contact", "assigned_to_display",
             "supply_vendor_name", "supply_vendor_contact",
             "is_locked", "route_complete", "procurement_item", "procurement_po_number",
             "procurement_requested_at", "copy_from",
@@ -768,9 +770,12 @@ class DeviceTransitionSerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=Device.Status.choices)
     reason = serializers.CharField()
     # Moving to `assigned` must say who it went to: an internal technician
-    # (picked from the manpower records) or an external vendor typed by hand.
+    # (picked from the manpower records) or a vendor from the register.
     assigned_technician = serializers.PrimaryKeyRelatedField(
         queryset=get_user_model().objects.all(), required=False, allow_null=True
+    )
+    assigned_vendor = serializers.PrimaryKeyRelatedField(
+        queryset=Supplier.objects.all(), required=False, allow_null=True
     )
     assigned_vendor_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
     assigned_vendor_contact = serializers.CharField(required=False, allow_blank=True, max_length=100)
@@ -899,6 +904,9 @@ class DeviceAssignmentSerializer(serializers.Serializer):
 
     assigned_technician = serializers.PrimaryKeyRelatedField(
         queryset=get_user_model().objects.all(), required=False, allow_null=True
+    )
+    assigned_vendor = serializers.PrimaryKeyRelatedField(
+        queryset=Supplier.objects.all(), required=False, allow_null=True
     )
     assigned_vendor_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
     assigned_vendor_contact = serializers.CharField(required=False, allow_blank=True, max_length=100)

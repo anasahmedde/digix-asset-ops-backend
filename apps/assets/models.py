@@ -234,6 +234,13 @@ class Device(TimeStampedModel):
     assigned_technician = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="assigned_devices"
     )
+    # Picked from the vendors on the register. The name is kept alongside so a
+    # vendor recorded before the register existed still reads correctly, and so
+    # removing a vendor does not erase who did the work.
+    assigned_vendor = models.ForeignKey(
+        "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installing_devices", help_text="Vendor installing this asset",
+    )
     assigned_vendor_name = models.CharField(
         max_length=200, blank=True, help_text="External vendor installing this asset",
     )
