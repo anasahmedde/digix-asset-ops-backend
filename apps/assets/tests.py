@@ -2775,5 +2775,7 @@ def test_the_due_date_agreed_at_assignment_lands_on_the_tracker(admin_client, in
     assert job.due_date == due
     # The three dates are distinct: it was assigned today, it is due later,
     # and nothing has been installed yet.
-    assert job.installed_at.date() == timezone.localdate()
+    # localdate() of the stamp, not .date(): the stamp is UTC and the day
+    # rolls over five hours earlier there than it does here.
+    assert timezone.localdate(job.installed_at) == timezone.localdate()
     assert job.completed_at is None

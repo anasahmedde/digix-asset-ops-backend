@@ -84,6 +84,50 @@ class Project(TimeStampedModel):
         Phase.INSTALLATION, Phase.HANDOVER,
     )
 
+    def phase_from_work(self):
+        """The first phase that is not finished — that is where the project is.
+
+        A phase is done when its bar reads 100%. When every one of them does,
+        the project sits on the last phase with nothing left in it. On Hold and
+        Order Lost are off-ramps somebody chooses, so the work does not
+        overrule them.
+        """
+        if self.phase in (self.Phase.ON_HOLD, self.Phase.LOST):
+            return self.phase
+        from .phases import phase_progress
+
+        bars = phase_progress(self)
+        for phase in self.MAIN_PHASE_ORDER:
+            if bars[phase]["percent"] < 100:
+                return phase
+        return self.MAIN_PHASE_ORDER[-1]
+
+    def sync_phase(self):
+        """Put the stored phase back in step with the work, and say what it is.
+
+        The phase is stored rather than worked out on demand because lists are
+        filtered by it. Storing it means it can fall behind, so reading it is
+        also when it gets corrected — which costs a write only on the read
+        where the work has actually moved on.
+        """
+        settled = self.phase_from_work()
+        changed = []
+        if settled != self.phase:
+            self.phase = settled
+            changed.append("phase")
+        # Everything finished is the one status the work can declare on its
+        # own; the rest are judgements somebody makes about how it is going.
+        if (
+            settled == self.MAIN_PHASE_ORDER[-1]
+            and self.status != self.Status.COMPLETED
+            and self.computed_progress() >= 100
+        ):
+            self.status = self.Status.COMPLETED
+            changed.append("status")
+        if changed:
+            self.save(update_fields=[*changed, "updated_at"])
+        return settled
+
     def computed_progress(self):
         """How far the order has got, derived rather than hand-typed.
 

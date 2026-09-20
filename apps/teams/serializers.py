@@ -120,7 +120,21 @@ class ProjectMilestoneSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
-class ProjectListSerializer(serializers.ModelSerializer):
+class _PhaseFollowsTheWorkMixin:
+    """Brings the stored phase back in step before the project is rendered.
+
+    Done here rather than with a read-only field because the phase still has
+    to be writable: On Hold and Order Lost are set by hand, and a method field
+    would silently drop them. Syncing mutates the instance, so the ordinary
+    model fields then render the corrected value.
+    """
+
+    def to_representation(self, instance):
+        instance.sync_phase()
+        return super().to_representation(instance)
+
+
+class ProjectListSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
     assets_count = serializers.IntegerField(source="devices.count", read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
@@ -153,7 +167,7 @@ class ProjectListSerializer(serializers.ModelSerializer):
         return obj.computed_progress()
 
 
-class ProjectDetailSerializer(serializers.ModelSerializer):
+class ProjectDetailSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     # Who the work is for, with the contact the team will actually ring.
     client_contact_person = serializers.CharField(

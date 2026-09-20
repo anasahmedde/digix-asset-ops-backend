@@ -57,15 +57,18 @@ def test_project_scope_and_milestones():
     assert r.status_code == 201, r.content
 
     detail = c.get(f"/api/teams/projects/{project.pk}/")
-    assert detail.data["phase"] == "production"
-    assert detail.data["phase_display"] == "Production"
+    # The phase follows the work, not the value the project was created with:
+    # nothing has been budgeted or built, so it reads as still being planned
+    # however it was set by hand.
+    assert detail.data["phase"] == "planning"
+    assert detail.data["phase_display"] == "Planning"
     assert len(detail.data["scope_items"]) == 1
     assert len(detail.data["milestones"]) == 1
 
-    # phase is writable through the normal update flow
-    r = c.patch(f"/api/teams/projects/{project.pk}/", {"phase": "installation"}, format="json")
+    # The off-ramps are the ones somebody still chooses.
+    r = c.patch(f"/api/teams/projects/{project.pk}/", {"phase": "on_hold"}, format="json")
     assert r.status_code == 200, r.content
-    assert r.data["phase"] == "installation"
+    assert r.data["phase"] == "on_hold"
 
 
 @pytest.mark.django_db
@@ -1347,3 +1350,105 @@ def test_progress_ignores_the_phase_label_and_counts_the_work():
     # The label never moved, and that is the point.
     project.refresh_from_db()
     assert project.phase == Project.Phase.PLANNING
+
+
+@pytest.mark.django_db
+def test_the_phase_is_the_first_one_not_finished():
+    """The label used to be moved by hand and got left behind.
+
+    A phase is done when its bar reads 100%, so the project is in the first
+    one that is not. Reading the project is when the stored label catches up,
+    which is what keeps list filters honest.
+    """
+    from apps.assets.models import ProductionStep
+    from apps.teams.models import ProjectBudget, ProjectScopeItem
+
+    brand = Brand.objects.create(name="Phase Sync Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="PSY-1")
+    project = Project.objects.create(name="Phase Sync Rollout", phase=Project.Phase.PLANNING)
+    material = MaterialType.objects.create(name="Sync Panel", unit="piece")
+    item = InventoryItem.objects.create(material_type=material, quantity=50)
+    device = Device.objects.create(device_model=dm, asset_code="AST-PSY-1", source="inhouse")
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    component = AssetComponent.objects.create(
+        device=device, name="Sync Panel", quantity=2, inventory_item=item,
+    )
+    step = ProductionStep.objects.create(device=device, step_number=1, name="Assemble")
+
+    # No budget: planning is the first unfinished phase.
+    assert project.sync_phase() == Project.Phase.PLANNING
+
+    plan = ProjectBudget.objects.create(project=project, status=ProjectBudget.Status.APPROVED)
+    assert plan.status == ProjectBudget.Status.APPROVED
+    assert project.sync_phase() == Project.Phase.PROCUREMENT
+
+    component.issued_quantity = 2
+    component.save(update_fields=["issued_quantity"])
+    assert project.sync_phase() == Project.Phase.PRODUCTION
+
+    step.status = ProductionStep.Status.COMPLETED
+    step.save(update_fields=["status"])
+    assert project.sync_phase() == Project.Phase.INSTALLATION
+
+    # The stored field really moved, so a filter on it finds the project.
+    project.refresh_from_db()
+    assert project.phase == Project.Phase.INSTALLATION
+    assert Project.objects.filter(phase=Project.Phase.INSTALLATION, pk=project.pk).exists()
+
+
+@pytest.mark.django_db
+def test_an_off_ramp_is_not_overruled_by_the_work():
+    """On Hold and Order Lost are somebody's decision, not the work's."""
+    from apps.teams.models import ProjectScopeItem
+
+    brand = Brand.objects.create(name="Off Ramp Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="OFR-1")
+    project = Project.objects.create(name="Off Ramp Rollout", phase=Project.Phase.ON_HOLD)
+    device = Device.objects.create(device_model=dm, asset_code="AST-OFR-1", source="inhouse")
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+
+    assert project.sync_phase() == Project.Phase.ON_HOLD
+    project.refresh_from_db()
+    assert project.phase == Project.Phase.ON_HOLD
+
+
+@pytest.mark.django_db
+def test_a_project_completes_itself_when_every_phase_is_done():
+    """Nothing left in any phase is the one status the work can declare."""
+    from apps.clients.models import Client
+    from apps.sites.models import DeviceInstallation, HandoverRecord, InstallationStep, Site
+    from apps.teams.models import ProjectBudget, ProjectScopeItem
+
+    brand = Brand.objects.create(name="Complete Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="CMP-1")
+    site = Site.objects.create(name="Complete Site", address="1 Road")
+    client = Client.objects.create(name="Complete Client")
+    project = Project.objects.create(
+        name="Complete Rollout", phase=Project.Phase.PLANNING, client=client,
+    )
+    ProjectBudget.objects.create(project=project, status=ProjectBudget.Status.APPROVED)
+
+    # Bought whole, so procurement and production are done when it arrives.
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-CMP-1", source="vendor_supplied",
+        current_site=site, status=Device.Status.ACTIVE,
+    )
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+
+    job = DeviceInstallation(device=device, site=site, installed_at=timezone.now())
+    job._skip_default_steps = True
+    job.save()
+    job.steps.all().delete()
+    InstallationStep.objects.create(
+        installation=job, step_type=InstallationStep.StepType.SURVEY, step_number=1,
+        status=InstallationStep.StepStatus.COMPLETED,
+    )
+    HandoverRecord.objects.create(
+        installation=job, device=device, client=client, site=site,
+        handover_date=timezone.localdate(), accepted_by_name="Site Manager",
+    )
+
+    assert project.computed_progress() == 100
+    assert project.sync_phase() == Project.Phase.HANDOVER
+    project.refresh_from_db()
+    assert project.status == Project.Status.COMPLETED
