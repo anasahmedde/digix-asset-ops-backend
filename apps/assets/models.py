@@ -146,9 +146,13 @@ class Device(TimeStampedModel):
 
     asset_code = models.CharField(max_length=50, unique=True, db_index=True)
     # Not entered by hand: every asset gets a generated asset_code with a
-    # QR/barcode label, and the serial defaults to it. Kept as its own
-    # field so a manufacturer serial can still be recorded when there is one.
-    serial_number = models.CharField(max_length=200, unique=True, blank=True)
+    # QR/barcode label, and that is what identifies it here. The serial is the
+    # manufacturer's own, recorded only where the thing actually carries one —
+    # most assets do not, so the field is empty far more often than not.
+    serial_number = models.CharField(
+        max_length=200, unique=True, blank=True, null=True, default=None,
+        help_text="The manufacturer's serial, where there is one. Assets are identified by their asset code.",
+    )
     mobile_id = models.CharField(max_length=200, blank=True, help_text="Linked CMS device ID")
     mac_address = models.CharField(max_length=17, blank=True)
     imei = models.CharField(max_length=20, blank=True)
@@ -284,11 +288,29 @@ class Device(TimeStampedModel):
     def save(self, *args, **kwargs):
         if not self.asset_code:
             self.asset_code = generate_code("asset", model=type(self), field="asset_code")
-        # Fall back to the generated code so the unique constraint never sees
-        # two blanks.
+        # No serial is NULL, never "" — the unique index tolerates any number
+        # of assets that have none, but only one empty string.
         if not self.serial_number:
-            self.serial_number = self.asset_code
+            self.serial_number = None
         super().save(*args, **kwargs)
+
+    @property
+    def project_on(self):
+        """The project this asset belongs to.
+
+        An asset reaches a project one of two ways: its own link, or a Scope
+        row added from the project. Callers that check only the field miss
+        every asset scoped from the project screen, which is most of them.
+        """
+        if self.project_id:
+            return self.project
+        from apps.teams.models import ProjectScopeItem
+
+        row = (
+            ProjectScopeItem.objects.filter(device=self)
+            .select_related("project").first()
+        )
+        return row.project if row is not None else None
 
     def can_transition_to(self, new_status: str) -> bool:
         allowed = self.VALID_TRANSITIONS.get(self.status, ())

@@ -582,7 +582,7 @@ class DeviceViewSet(viewsets.ModelViewSet):
         for d in qs:
             rows.append([
                 d.asset_code,
-                d.serial_number,
+                d.serial_number or "",
                 d.display_name,
                 str(d.device_model) if d.device_model_id else "",
                 d.asset_type.name if d.asset_type_id else "",

@@ -54,9 +54,14 @@ def _validate_lines(purchase_order, lines):
 
         serials = [str(s).strip() for s in line.get("serial_numbers") or []]
         line["serial_numbers"] = serials
+        if po_item.procured_devices.exists():
+            # A complete asset bought from a vendor. The registry issued its
+            # asset code when it was defined, and that is what identifies it,
+            # so there is no serial to collect at the door.
+            line["serial_numbers"] = serials = []
         # Serialized either because the line names a device model or because it
         # names an opened unique product.
-        if po_item.device_model_id or po_item.inventory_unit_type_id:
+        elif po_item.device_model_id or po_item.inventory_unit_type_id:
             if len(serials) != line["quantity"]:
                 raise serializers.ValidationError({
                     label: (
@@ -66,20 +71,6 @@ def _validate_lines(purchase_order, lines):
                 })
             if any(not s for s in serials):
                 raise serializers.ValidationError({label: "Serial numbers cannot be blank."})
-        elif po_item.procured_devices.exists():
-            # A complete asset bought from a vendor. It is already in the
-            # registry, so serials are optional here — given, they are stamped
-            # on the arriving assets (one per unit) and may repeat what was
-            # typed at registration.
-            if serials and len(serials) != line["quantity"]:
-                raise serializers.ValidationError({
-                    label: (
-                        f"'{po_item.description}' arrives as {line['quantity']} asset(s): give one "
-                        f"serial number each, or none."
-                    )
-                })
-            own = set(po_item.procured_devices.values_list("serial_number", flat=True))
-            serials = [x for x in serials if x not in own]
         elif not po_item.material_type_id:
             raise serializers.ValidationError(
                 {label: "line has no unique product, device model or material type"}
@@ -162,19 +153,16 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
 
                 today = timezone.localdate()
                 months = line.get("warranty_months")
-                typed = line.get("serial_numbers") or []
-                for idx, device in enumerate(arriving):
+                for device in arriving:
                     device._transition_user = user
                     device._transition_reason = f"Received against {purchase_order.po_number}"
                     device.status = "in_stock"
                     device.purchase_date = today
                     device.purchase_price = po_item.unit_price
                     device.supplier = purchase_order.supplier
-                    fields = ["status", "purchase_date", "purchase_price", "supplier", "updated_at"]
-                    if idx < len(typed) and typed[idx] and typed[idx] != device.serial_number:
-                        device.serial_number = typed[idx]
-                        fields.append("serial_number")
-                    device.save(update_fields=fields)
+                    device.save(update_fields=[
+                        "status", "purchase_date", "purchase_price", "supplier", "updated_at",
+                    ])
                     if months:
                         Warranty.objects.create(
                             device=device,

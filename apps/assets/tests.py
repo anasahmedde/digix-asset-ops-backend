@@ -1665,8 +1665,8 @@ def test_register_an_asset_without_a_serial(admin_client, db):
     )
     assert r.status_code == 201, r.content
     assert r.data["asset_code"].startswith("DGX-")
-    # Serial falls back to the generated code so the unique index is safe.
-    assert r.data["serial_number"] == r.data["asset_code"]
+    # The asset code identifies it. No serial is invented to fill the field.
+    assert r.data["serial_number"] is None
 
 
 @pytest.mark.django_db
@@ -1679,7 +1679,9 @@ def test_two_assets_without_serials_do_not_collide(admin_client, db):
             "/api/assets/devices/", {"device_model": str(model.id)}, format="json",
         )
         assert r.status_code == 201, r.content
-        codes.add(r.data["serial_number"])
+        # None of them has a serial, and the unique index tolerates that.
+        assert r.data["serial_number"] is None
+        codes.add(r.data["asset_code"])
     assert len(codes) == 3
 
 

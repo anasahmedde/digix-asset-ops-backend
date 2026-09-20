@@ -1242,3 +1242,71 @@ def test_procurement_can_send_a_line_back_to_the_project():
     assert r.status_code == 200, r.content
     vendor_asset.refresh_from_db()
     assert vendor_asset.procurement_requested_at is None
+
+
+@pytest.mark.django_db
+def test_receiving_a_complete_asset_asks_for_no_serial_number(people, supplier):
+    """An asset bought whole arrives under the code the registry gave it.
+
+    Nobody types a serial for it at the door: the asset already exists, the
+    line names it, and the receipt brings it into stock as it stands.
+    """
+    from apps.assets.models import AssetType, Device
+
+    kind = AssetType.objects.create(name="GRN Whole Standee")
+    device = Device.objects.create(
+        asset_type=kind, display_name="Foyer Standee",
+        source=Device.Source.VENDOR_SUPPLIED,
+    )
+    # Defining an asset invents no serial for it.
+    assert device.serial_number is None
+
+    ops = _client(people["ops"])
+    r = ops.post("/api/procurement/purchase-orders/raise-po/", {
+        "supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)],
+        "prices": {str(device.pk): "9000.00"},
+    }, format="json")
+    assert r.status_code == 201, r.content
+    po_id, item_id = r.data["id"], r.data["items"][0]["id"]
+
+    # The line names the asset by its code and prints no "S/N" beside it.
+    assert device.asset_code in r.data["items"][0]["line_detail"]
+    assert "S/N" not in r.data["items"][0]["line_detail"]
+    assert r.data["items"][0]["procured_asset_codes"] == [device.asset_code]
+
+    assert ops.post(f"/api/procurement/purchase-orders/{po_id}/transition/",
+                    {"status": "pending_approval"}, format="json").status_code == 200
+    gh = _client(people["group_head"])
+    assert gh.post(f"/api/procurement/purchase-orders/{po_id}/transition/",
+                   {"status": "approved"}, format="json").status_code == 200
+    store = _client(people["finance"])
+    assert store.post(f"/api/procurement/purchase-orders/{po_id}/transition/",
+                      {"status": "ordered"}, format="json").status_code == 200
+
+    # No serial_numbers key at all — the receipt is accepted.
+    r = _receive(store, po_id, [{"po_item": item_id, "quantity": 1}])
+    assert r.status_code == 201, r.content
+
+    device.refresh_from_db()
+    assert device.status == "in_stock"
+    # Still no serial: receiving did not invent one either.
+    assert device.serial_number is None
+
+
+@pytest.mark.django_db
+def test_two_assets_with_no_serial_can_both_exist(people, supplier):
+    """Most assets have no manufacturer serial, so "none" cannot be unique."""
+    from apps.assets.models import AssetType, Device
+
+    kind = AssetType.objects.create(name="GRN Plain Kind")
+    a = Device.objects.create(asset_type=kind, source=Device.Source.VENDOR_SUPPLIED)
+    b = Device.objects.create(asset_type=kind, source=Device.Source.VENDOR_SUPPLIED)
+    assert a.serial_number is None and b.serial_number is None
+    assert a.asset_code != b.asset_code
+
+    # A real manufacturer serial is still recorded, and still has to be unique.
+    a.serial_number = "MFR-REAL-1"
+    a.save(update_fields=["serial_number"])
+    b.serial_number = "MFR-REAL-1"
+    with pytest.raises(Exception):
+        b.save(update_fields=["serial_number"])
