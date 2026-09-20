@@ -503,6 +503,17 @@ class ProductionStep(TimeStampedModel):
         return self.live_work_orders().last()
 
     @property
+    def on_a_work_order(self) -> bool:
+        """The operation is genuinely in a vendor's hands, or queued to be.
+
+        An operation marked external with no live order and no request behind
+        it is external in name only — nothing is going to move it, so it stays
+        the floor's to run rather than waiting forever on an order that does
+        not exist.
+        """
+        return self.work_order_requested or self.live_work_orders().exists()
+
+    @property
     def work_order_requested(self) -> bool:
         """Execution asked for a work order that nobody has raised yet."""
         return (
@@ -519,7 +530,7 @@ class ProductionStep(TimeStampedModel):
     @property
     def manual_moves(self) -> tuple:
         """What a person may move this step to right now."""
-        if self.location == self.Location.EXTERNAL:
+        if self.location == self.Location.EXTERNAL and self.on_a_work_order:
             return ()  # follows its work order
         if self.location == self.Location.UNDECIDED and self.on_project:
             return ()  # the project decides first
@@ -529,7 +540,7 @@ class ProductionStep(TimeStampedModel):
     def hold_reason(self) -> str:
         if self.status in (self.Status.COMPLETED, self.Status.SKIPPED):
             return ""
-        if self.location == self.Location.EXTERNAL:
+        if self.location == self.Location.EXTERNAL and self.on_a_work_order:
             if self.work_order_requested:
                 return "Work order requested — raise it under Work Orders › Requests; the status then follows the order."
             return "On a work order — its status follows the work order."

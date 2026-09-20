@@ -140,6 +140,10 @@ class _InstallationCommonMixin(serializers.Serializer):
     poc_phone = serializers.CharField(source="device.assigned_client.contact_phone", read_only=True, default=None)
     client_names = serializers.SerializerMethodField()
     progress = serializers.SerializerMethodField()
+    # The checklist in plain numbers, so a summary card can read "3 of 6 done"
+    # without fetching every step.
+    steps_done = serializers.SerializerMethodField()
+    steps_total = serializers.SerializerMethodField()
     client_delays = serializers.SerializerMethodField()
     on_hold_steps = serializers.SerializerMethodField()
     escalated = serializers.SerializerMethodField()
@@ -190,6 +194,12 @@ class _InstallationCommonMixin(serializers.Serializer):
             return 0
         completed = steps.filter(status="completed").count()
         return round((completed / steps.count()) * 100)
+
+    def get_steps_done(self, obj):
+        return sum(1 for s in obj.steps.all() if s.status == InstallationStep.StepStatus.COMPLETED)
+
+    def get_steps_total(self, obj):
+        return len(obj.steps.all())
 
     def get_client_delays(self, obj):
         return sum(1 for d in obj.delays.all() if d.cause == InstallationDelay.Cause.CLIENT)
@@ -287,7 +297,7 @@ class DeviceInstallationListSerializer(_InstallationCommonMixin, serializers.Mod
             "vendor", "vendor_name", "external_vendor_name", "external_vendor_contact", "vendor_display",
             "installed_at", "removed_at", "due_date", "completed_at",
             "escalated", "escalation_state",
-            "progress", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
+            "progress", "steps_done", "steps_total", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
         ]
         read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
 
@@ -353,7 +363,7 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
             "due_date", "completed_at",
             "escalated", "escalation_state",
             "position_label", "notes", "photos", "steps", "delays", "step_types",
-            "handover", "progress", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
+            "handover", "progress", "steps_done", "steps_total", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
         ]
         read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
 

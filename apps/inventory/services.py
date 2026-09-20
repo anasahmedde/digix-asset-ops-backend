@@ -201,6 +201,13 @@ def record_build_progress(component, user, description):
         device._transition_reason = "Build started — every component fulfilled"
         device.save(update_fields=["status", "updated_at"])
 
+    # …and it finishes on its own when the route was already done: the parts
+    # were the only thing outstanding.
+    from apps.assets.services import finish_build_if_done
+
+    device.refresh_from_db()
+    finish_build_if_done(device, user)
+
 
 def return_stock_for_component(component, user):
     """Put back everything issued against a requirement (undo)."""

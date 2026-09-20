@@ -225,3 +225,30 @@ def test_delivered_work_is_inspected_before_it_completes(build):
     assert r.status_code == 200 and r.data["status"] == "completed" and r.data["delivered_at"]
     paint.refresh_from_db()
     assert paint.status == "completed"
+
+
+@pytest.mark.django_db
+def test_an_operation_external_with_no_order_is_not_stranded(build):
+    """Marked external but nothing was ever raised for it: nothing is coming to
+    move it, so the floor can still run and close it."""
+    from apps.suppliers.models import Supplier
+
+    ops, _ = _client("ops_manager", "ops7")
+    paint = build["steps"][1]
+    paint.location = "external"
+    paint.workshop = Supplier.objects.create(name="Stranded Works")
+    paint.save(update_fields=["location", "workshop"])
+    paint.refresh_from_db()
+
+    assert paint.on_a_work_order is False
+    assert paint.hold_reason == ""
+    detail = ops.get(f"/api/assets/production-steps/{paint.id}/").json()
+    assert detail["allowed_transitions"], "the operation has a way forward"
+    r = ops.post(f"/api/assets/production-steps/{paint.id}/transition/", {"status": "completed"}, format="json")
+    assert r.status_code == 200, r.content
+
+    # Once a real order covers it, it follows the order again.
+    cut = build["steps"][0]
+    ops.post(f"/api/assets/production-steps/{cut.id}/decide/", {"location": "external"}, format="json")
+    cut.refresh_from_db()
+    assert cut.on_a_work_order is True and cut.manual_moves == ()

@@ -1722,18 +1722,21 @@ def test_issuing_parts_journals_and_starts_the_build(admin_client, project_build
         assert r.status_code == 200, r.content
 
     device.refresh_from_db()
-    # Everything is in hand now, so the floor starts.
-    assert device.status == Device.Status.IN_PRODUCTION
+    # Everything is in hand, so the floor starts — and this asset has no
+    # operations to do, so the same moment finishes the build: it is stock.
+    assert device.status == Device.Status.IN_STOCK
 
     note = DeviceLifecycleEvent.objects.filter(
         device=device, event_type=DeviceLifecycleEvent.EventType.NOTE
     ).latest("created_at")
     assert "Comp Media Player" in note.description
 
-    moved = DeviceLifecycleEvent.objects.filter(
-        device=device, event_type=DeviceLifecycleEvent.EventType.STATUS_CHANGE
-    ).latest("created_at")
-    assert moved.to_value == "in_production"
+    moves = list(
+        DeviceLifecycleEvent.objects.filter(
+            device=device, event_type=DeviceLifecycleEvent.EventType.STATUS_CHANGE
+        ).order_by("created_at").values_list("to_value", flat=True)
+    )
+    assert moves[-2:] == ["in_production", "in_stock"]
 
 
 @pytest.mark.django_db
@@ -2651,3 +2654,85 @@ def test_prices_follow_the_budget_not_the_build_lock(admin_client, project_build
     plan.save(update_fields=["status"])
     r = admin_client.patch(f"/api/assets/components/{generic.id}/", {"planned_unit_price": "170.00"}, format="json")
     assert r.status_code == 403 and "approved budget" in r.data["detail"] and project_build["project"].name in r.data["detail"]
+
+
+@pytest.mark.django_db
+def test_a_finished_build_puts_itself_into_stock(db):
+    """Parts all issued and every operation closed: the asset is stock. Nobody
+    edits a status — the last piece of work is what moves it."""
+    from django.db import transaction
+
+    from apps.assets.models import AssetComponent, MaterialType, ProductionStep
+    from apps.assets.services import build_is_complete
+    from apps.inventory.models import InventoryItem
+    from apps.inventory.services import issue_stock_for_component
+
+    brand = Brand.objects.create(name="Done Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="DN-1")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-DONE-1", serial_number="DONE-1", source="inhouse",
+    )
+    material = MaterialType.objects.create(name="Done Panel", unit="piece")
+    stock = InventoryItem.objects.create(material_type=material, quantity=10)
+    component = AssetComponent.objects.create(device=device, name="Done Panel", quantity=2, inventory_item=stock)
+    cut = ProductionStep.objects.create(device=device, step_number=1, name="Cutting")
+    fit = ProductionStep.objects.create(device=device, step_number=2, name="Fitting")
+    user = User.objects.create_user(username="done-ops", password="x", role="ops_manager")
+
+    # Parts in hand: the build starts, but the route is still open.
+    with transaction.atomic():
+        issue_stock_for_component(component, user, 2)
+    device.refresh_from_db()
+    assert device.status == Device.Status.IN_PRODUCTION and not build_is_complete(device)
+
+    # One operation left: still on the floor.
+    cut.status = ProductionStep.Status.COMPLETED
+    cut.save(update_fields=["status"])
+    device.refresh_from_db()
+    assert device.status == Device.Status.IN_PRODUCTION
+
+    # The last one closes and the asset becomes stock, with the reason on record.
+    fit.status = ProductionStep.Status.SKIPPED
+    fit.save(update_fields=["status"])
+    device.refresh_from_db()
+    assert device.status == Device.Status.IN_STOCK
+    note = device.lifecycle_events.filter(to_value=Device.Status.IN_STOCK).first()
+    assert note is not None and "Build complete" in note.description
+
+
+@pytest.mark.django_db
+def test_an_unfinished_or_vendor_build_is_left_alone(db):
+    """A part still owed keeps the asset on the floor; a vendor asset has no
+    build of ours to finish, and a bare record is not 'built' either."""
+    from apps.assets.models import AssetComponent, MaterialType, ProductionStep
+    from apps.assets.services import build_is_complete, finish_build_if_done
+    from apps.inventory.models import InventoryItem
+
+    brand = Brand.objects.create(name="Open Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="OP-1")
+    material = MaterialType.objects.create(name="Open Panel", unit="piece")
+    stock = InventoryItem.objects.create(material_type=material, quantity=10)
+
+    short = Device.objects.create(
+        device_model=dm, asset_code="AST-OPEN-1", serial_number="OPEN-1",
+        source="inhouse", status=Device.Status.IN_PRODUCTION,
+    )
+    AssetComponent.objects.create(device=short, name="Open Panel", quantity=2, inventory_item=stock, issued_quantity=1)
+    step = ProductionStep.objects.create(device=short, step_number=1, name="Cutting")
+    step.status = ProductionStep.Status.COMPLETED
+    step.save(update_fields=["status"])
+    short.refresh_from_db()
+    assert short.status == Device.Status.IN_PRODUCTION, "a part is still owed"
+
+    vendor_asset = Device.objects.create(
+        device_model=dm, asset_code="AST-OPEN-2", serial_number="OPEN-2",
+        source="vendor_supplied", status=Device.Status.PROCURED,
+    )
+    assert build_is_complete(vendor_asset) is False
+    assert finish_build_if_done(vendor_asset) is False
+
+    bare = Device.objects.create(
+        device_model=dm, asset_code="AST-OPEN-3", serial_number="OPEN-3",
+        source="inhouse", status=Device.Status.PROCURED,
+    )
+    assert build_is_complete(bare) is False, "nothing to build is not the same as built"

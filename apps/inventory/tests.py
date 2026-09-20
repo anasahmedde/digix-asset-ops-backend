@@ -978,7 +978,14 @@ def test_the_asset_starts_building_once_its_parts_are_issued(inspector, ops, ord
         f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7}, format="json",
     ).status_code == 200
     device.refresh_from_db()
-    assert device.status == Device.Status.IN_PRODUCTION
+    # The parts were the whole build — this asset has no operations to run —
+    # so the same hand-over that starts it also finishes it.
+    assert device.status == Device.Status.IN_STOCK
+    moves = list(
+        device.lifecycle_events.filter(event_type="status_change")
+        .order_by("created_at").values_list("to_value", flat=True)
+    )
+    assert moves[-2:] == ["in_production", "in_stock"]
 
 
 @pytest.mark.django_db
