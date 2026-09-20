@@ -156,10 +156,11 @@ def issue_stock_for_component(component, user, quantity, *, via_request=None):
         )
 
     component.issued_quantity += quantity
-    component.fulfilment = (
-        AssetComponentFulfilment.FULFILLED if component.outstanding_quantity == 0
-        else AssetComponentFulfilment.FROM_STOCK
-    )
+    if component.outstanding_quantity == 0:
+        component.fulfilment = AssetComponentFulfilment.FULFILLED
+    elif component.fulfilment != AssetComponentFulfilment.PROCUREMENT:
+        # A line partly bought stays 'to be procured' until the rest arrives.
+        component.fulfilment = AssetComponentFulfilment.FROM_STOCK
     component.save(update_fields=["issued_quantity", "fulfilment", "inventory_unit", "updated_at"])
 
     record_build_progress(component, user, f"Issued {quantity} × {component.name} from inventory")
@@ -433,19 +434,13 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
                 status=BOMAllocation.Status.ALLOCATED, allocated_by=user,
             )
 
-    # Goods bought *for* a specific requirement belong to it. Issue them
-    # straight through so the project shows the line covered and the asset is
-    # ready to build, rather than leaving the stock to be claimed by anything
-    # else that happens to need the same material.
+    # Goods bought *for* a requirement land in stock like any other delivery.
+    # The store hands them over against the material request the Procure
+    # decision raised, and that issue — not the receipt — is what covers the
+    # line on the project. Here those requests are only told the goods are in.
+    ready_requests = []
     if accepted_quantity and po_item is not None:
-        remaining = accepted_quantity
-        for component in po_item.asset_components.select_related("device").all():
-            if remaining <= 0:
-                break
-            take = min(component.outstanding_quantity, remaining)
-            if take > 0:
-                issue_stock_for_component(component, user, take)
-                remaining -= take
+        ready_requests = _requests_ready_to_issue(po_item, accepted_quantity, trace)
 
     # Stock bought against a reorder request has arrived: the request is done.
     if accepted_quantity and po_item is not None:
@@ -465,7 +460,31 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
         "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
         "inspected_by", "inspected_at", "inspection_notes", "inventory_item", "updated_at",
     ])
-    return {"inventory_item": inventory_item, "units": created_units}
+    return {"inventory_item": inventory_item, "units": created_units, "ready_requests": ready_requests}
+
+
+def _requests_ready_to_issue(po_item, accepted_quantity, trace):
+    """Tell the material requests waiting on this purchase line that the goods
+    are in stock. Returns their numbers, so the inspector is pointed at them."""
+    from django.utils import timezone
+
+    from .models import IssuanceRequest
+
+    rows = (
+        IssuanceRequest.objects.select_for_update()
+        .filter(asset_component__purchase_order_item=po_item, awaiting_procurement=True)
+        .exclude(status__in=[IssuanceRequest.Status.CANCELLED, IssuanceRequest.Status.FULFILLED])
+        .order_by("created_at")
+    )
+    stamp = timezone.localtime().strftime("%d %b %Y %H:%M")
+    numbers = []
+    for req in rows:
+        req.notes = (req.notes + "\n" if req.notes else "") + (
+            f"{stamp}: {accepted_quantity} received into stock ({trace}) — ready to issue."
+        )
+        req.save(update_fields=["notes", "updated_at"])
+        numbers.append(req.request_number)
+    return numbers
 
 
 def issue_against_request(request_row, user, quantity, *, received_by="", notes=""):
@@ -497,6 +516,18 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
     # through the same path the requirement has always used.
     if request_row.asset_component_id:
         component = request_row.asset_component
+        if request_row.awaiting_procurement and component.outstanding_quantity > 0:
+            po_item = component.purchase_order_item
+            if po_item is None:
+                raise serializers.ValidationError({"detail": (
+                    f"{component.name} is to be procured and nothing has been ordered yet — "
+                    "Procurement raises the purchase order first."
+                )})
+            if po_item.stocked_quantity <= 0:
+                raise serializers.ValidationError({"detail": (
+                    f"{component.name} is on {po_item.purchase_order.po_number} and nothing has been "
+                    "received into stock yet — inspect the delivery first."
+                )})
         if component.outstanding_quantity == 0:
             # Covered without passing through the queue: nothing left to hand
             # over, so the request closes rather than failing.

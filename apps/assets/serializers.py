@@ -264,6 +264,10 @@ class AssetComponentSerializer(serializers.ModelSerializer):
     po_number = serializers.CharField(
         source="purchase_order_item.purchase_order.po_number", read_only=True, default=None
     )
+    # How much of what was bought for this line has passed inspection into
+    # stock, and the material requests the store issues it against.
+    po_stocked_quantity = serializers.SerializerMethodField()
+    procure_requests = serializers.SerializerMethodField()
     source_label = serializers.SerializerMethodField()
     increase_requested_by_name = serializers.CharField(
         source="increase_requested_by.get_full_name", read_only=True, default=None
@@ -277,7 +281,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "inventory_item", "inventory_item_name", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name", "available_quantity",
             "fulfilment", "issued_quantity", "outstanding_quantity", "stock_requested_quantity", "procure_quantity", "undecided_quantity",
-            "purchase_order_item", "po_number", "planned_unit_price",
+            "purchase_order_item", "po_number", "po_stocked_quantity", "procure_requests", "planned_unit_price",
             "pending_increase", "increase_reason", "increase_notes",
             "increase_requested_by_name", "increase_requested_at",
             "inventory_unit", "inventory_unit_code", "source_label",
@@ -296,6 +300,14 @@ class AssetComponentSerializer(serializers.ModelSerializer):
         if obj.inventory_item_id:
             return obj.inventory_item.quantity
         return None
+
+    def get_po_stocked_quantity(self, obj):
+        if obj.purchase_order_item_id is None:
+            return 0
+        return obj.purchase_order_item.stocked_quantity
+
+    def get_procure_requests(self, obj):
+        return [r.request_number for r in obj._open_requests() if r.awaiting_procurement]
 
     def get_source_label(self, obj):
         if obj.inventory_unit_type_id:

@@ -151,6 +151,46 @@ def test_a_cancelled_order_hands_every_operation_back(build):
 
 
 @pytest.mark.django_db
+def test_an_operation_on_a_work_order_costs_what_the_order_charges(build):
+    """The project's actuals price a vendor's operation from the work-order
+    line — like a bought part from its PO — and refuse a typed figure for it;
+    an in-house operation is typed by hand."""
+    from decimal import Decimal
+
+    ops, _ = _client("ops_manager", "ops6")
+    cut, paint, assemble = build["steps"]
+    for step in (cut, paint):
+        ops.post(f"/api/assets/production-steps/{step.id}/decide/", {"location": "external"}, format="json")
+    r = ops.post("/api/work-orders/raise/", {
+        "steps": [str(cut.id), str(paint.id)], "supplier": str(build["vendor"].id), "amounts": {str(paint.id): "1000"},
+    }, format="json")
+    assert r.status_code == 201, r.content
+    wo_number = r.data["wo_number"]
+
+    actuals = ops.get(f"/api/teams/projects/{build['project'].id}/actuals/").json()
+    steps = {s["name"]: s for s in actuals["assets"][0]["steps"]}
+    assert Decimal(str(steps["Cutting"]["actual_cost"])) == Decimal("400") and steps["Cutting"]["actual_source"] == f"Work order · {wo_number}"
+    assert steps["Cutting"]["actual_editable"] is False and steps["Cutting"]["work_order"]["supplier"] == "Ali Paint Works"
+    assert Decimal(str(steps["Painting"]["actual_cost"])) == Decimal("1000")
+    assert steps["Assembly"]["actual_cost"] is None and steps["Assembly"]["actual_editable"] is True
+    # Counted once, on the operations — not again as a whole-asset order.
+    assert actuals["assets"][0]["work_orders"] == []
+    assert Decimal(str(actuals["production_actual"])) == Decimal("1400")
+    assert Decimal(str(actuals["work_orders_actual"])) == Decimal("0")
+
+    # Typing a cost for the vendor's operation is refused; the in-house one is recorded.
+    r = ops.patch(f"/api/assets/production-steps/{cut.id}/", {"actual_cost": "450"}, format="json")
+    assert r.status_code == 400 and wo_number in str(r.data["actual_cost"]), r.content
+    r = ops.patch(f"/api/assets/production-steps/{assemble.id}/", {"actual_cost": "250"}, format="json")
+    assert r.status_code == 200, r.content
+    actuals = ops.get(f"/api/teams/projects/{build['project'].id}/actuals/").json()
+    steps = {s["name"]: s for s in actuals["assets"][0]["steps"]}
+    assert Decimal(str(steps["Assembly"]["actual_cost"])) == Decimal("250") and steps["Assembly"]["actual_source"] == "Recorded by hand"
+    assert Decimal(str(actuals["production_actual"])) == Decimal("1650")
+    assert Decimal(str(actuals["assets"][0]["actual_total"])) == Decimal("1650")
+
+
+@pytest.mark.django_db
 def test_new_work_orders_are_services(db):
     ops, _ = _client("ops_manager", "ops4")
     vendor = Supplier.objects.create(name="Any Vendor")

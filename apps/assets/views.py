@@ -1156,16 +1156,31 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
         _refuse_if_vendor_asset(serializer.validated_data.get("device"), "components" if isinstance(self, AssetComponentViewSet) else "production route")
         super().perform_create(serializer)
 
-    # Cost fields a planner may type while the budget is open; the route
-    # itself (names, order, where) freezes with execution.
-    PRICE_FIELDS = {"planned_cost", "actual_cost", "notes"}
+    # The planned cost may be typed while the budget is open and freezes with
+    # approval; the route itself (names, order, where) freezes with execution.
+    PRICE_FIELDS = {"planned_cost"}
+    # What the work really cost is recorded while it happens — after approval,
+    # while execution is locked — so these fields are never frozen.
+    EXECUTION_FIELDS = {"actual_cost", "notes"}
 
     def perform_update(self, serializer):
         touched = set(serializer.validated_data)
-        if touched and touched <= self.PRICE_FIELDS:
-            _refuse_if_priced_in_approved_budget(serializer.instance.device)
+        step = serializer.instance
+        if "actual_cost" in touched:
+            # An operation given to a vendor costs what its work order charges,
+            # the way a bought part costs what its PO charged — not typed in.
+            order = step.live_work_order
+            if order is not None:
+                raise ValidationError({"actual_cost": [
+                    f"'{step.name}' is on work order {order.wo_number} — its cost is what that order "
+                    "charges, not typed in."
+                ]})
+        if touched and touched <= self.EXECUTION_FIELDS:
+            pass
+        elif touched and touched <= self.PRICE_FIELDS | self.EXECUTION_FIELDS:
+            _refuse_if_priced_in_approved_budget(step.device)
         else:
-            self._refuse_if_locked(serializer.instance.device)
+            self._refuse_if_locked(step.device)
         super().perform_update(serializer)
 
     def perform_destroy(self, instance):

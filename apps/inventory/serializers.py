@@ -751,7 +751,10 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
     # True while the goods are still being bought: the store cannot issue
     # until the PO is received and inspected into stock.
     awaiting_procurement = serializers.SerializerMethodField()
+    # Raised by a Procure decision: the goods come in on a PO and are issued from here.
+    procured = serializers.BooleanField(source="awaiting_procurement", read_only=True)
     po_number = serializers.SerializerMethodField()
+    po_received_quantity = serializers.SerializerMethodField()
     # For a unique item: every serial handed over, with where each unit stands now.
     issued_units = serializers.SerializerMethodField()
 
@@ -776,13 +779,21 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             })
         return out
 
-    def get_awaiting_procurement(self, obj):
-        if not obj.awaiting_procurement:
-            return False
+    def _po_line(self, obj):
         component = obj.asset_component
-        line = component.purchase_order_item if component is not None else None
-        # Still being bought until the order line has been received.
-        return line is None or line.received_quantity < line.quantity
+        return component.purchase_order_item if component is not None else None
+
+    def get_awaiting_procurement(self, obj):
+        """True while the store cannot issue: the goods are still being bought."""
+        if not obj.awaiting_procurement or obj.status in ("fulfilled", "cancelled"):
+            return False
+        line = self._po_line(obj)
+        # On order until something has passed inspection into stock.
+        return line is None or line.stocked_quantity <= 0
+
+    def get_po_received_quantity(self, obj):
+        line = self._po_line(obj)
+        return line.stocked_quantity if line is not None else 0
 
     def get_po_number(self, obj):
         component = obj.asset_component
@@ -801,6 +812,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "maintenance_schedule", "maintenance_title",
             "requested_by", "requested_by_name", "issued_by", "issued_by_name",
             "received_by", "issued_serials", "issued_units", "handovers", "last_issued_at", "awaiting_procurement", "po_number",
+            "procured", "po_received_quantity",
             "status", "status_display", "notes", "created_at", "updated_at",
         ]
         read_only_fields = [

@@ -403,6 +403,8 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
                 if result["inventory_item"] else None
             ),
             "stocked_units": InventoryUnitSerializer(result["units"], many=True).data,
+            # Material requests waiting on this line: the store issues against them.
+            "ready_requests": result.get("ready_requests", []),
         })
 
 

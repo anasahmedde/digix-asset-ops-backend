@@ -333,7 +333,7 @@ def render_actuals_pdf(project, actuals: dict) -> bytes:
                         Paragraph(f"&nbsp;&nbsp;&nbsp;{st['step_number']}. {st['name']}  <font color='#6b7280'>{status}</font>", s["cell"]),
                         "", "",
                         Paragraph(_money(st.get("planned_cost")), s["num"]),
-                        Paragraph("Planned" if st.get("planned_cost") is not None else "", s["cell"]),
+                        Paragraph(st.get("actual_source") or ("Planned" if st.get("planned_cost") is not None else ""), s["cell"]),
                         Paragraph(_money(st.get("actual_cost")), s["num"]),
                     ])
         if asset.get("work_orders"):

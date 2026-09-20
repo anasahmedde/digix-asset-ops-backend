@@ -879,7 +879,7 @@ def test_receipt_stocks_the_row_the_po_line_named(inspector, db):
 def ordered_requirement(db):
     """A requirement with a PO raised against it, delivered and awaiting inspection."""
     from apps.assets.models import AssetComponent, Brand, Device, DeviceModel
-    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine, InventoryItem
+    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine, InventoryItem, IssuanceRequest
     from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
     from apps.suppliers.models import Supplier
     from apps.teams.models import Project
@@ -904,38 +904,66 @@ def ordered_requirement(db):
     )
     component.purchase_order_item = po_item
     component.save(update_fields=["purchase_order_item"])
+    # The Procure decision queued the issue, waiting on the delivery.
+    request_row = IssuanceRequest.objects.create(
+        item=item, quantity_requested=7, source="project", asset_component=component,
+        project=project, awaiting_procurement=True, purpose="Auto Cable — procurement in progress",
+    )
 
     receipt = GoodsReceipt.objects.create(purchase_order=po)
     line = GoodsReceiptLine.objects.create(receipt=receipt, po_item=po_item, quantity=7)
-    return {"line": line, "component": component, "item": item, "device": device}
+    return {"line": line, "component": component, "item": item, "device": device, "request": request_row}
 
 
 @pytest.mark.django_db
-def test_inspection_closes_the_requirement_it_was_bought_for(inspector, ordered_requirement):
-    component = ordered_requirement["component"]
-    item = ordered_requirement["item"]
+def test_bought_goods_are_stocked_then_issued_against_the_request(inspector, ops, ordered_requirement):
+    """A Procure decision opens a material request as well as the To Procure
+    line. The delivery goes into stock; the store issues it against that
+    request, and only that issue covers the line on the project."""
+    component, item, req = ordered_requirement["component"], ordered_requirement["item"], ordered_requirement["request"]
+
+    # Before the delivery the store cannot issue: the request is on order.
+    row = _client(ops).get(f"/api/inventory/issuance-requests/{req.id}/").json()
+    assert row["awaiting_procurement"] is True and row["procured"] is True and row["po_received_quantity"] == 0
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7}, format="json")
+    assert r.status_code == 400 and "nothing has been received into stock" in r.data["detail"], r.content
 
     r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{ordered_requirement['line'].id}/inspect/",
         {"route": "generic", "accepted_quantity": 7}, format="json",
     )
     assert r.status_code == 200, r.content
+    assert r.data["ready_requests"] == [req.request_number]
 
-    component.refresh_from_db()
-    assert component.issued_quantity == 7
-    assert component.outstanding_quantity == 0
-    assert component.fulfilment == "fulfilled", "no longer 'to be procured'"
-
-    # Stock came in and went straight out to the asset it was bought for.
+    # In stock, not on the asset: the line is still to be issued.
     item.refresh_from_db()
+    component.refresh_from_db()
+    assert item.quantity == 7
+    assert component.issued_quantity == 0 and component.fulfilment == "procurement"
+    detail = _client(ops).get(f"/api/assets/components/{component.id}/").json()
+    assert detail["po_stocked_quantity"] == 7 and detail["procure_requests"] == [req.request_number]
+    row = _client(ops).get(f"/api/inventory/issuance-requests/{req.id}/").json()
+    assert row["awaiting_procurement"] is False and row["po_received_quantity"] == 7 and row["status"] == "pending"
+    assert "ready to issue" in row["notes"]
+
+    # The store hands it over against the request — that covers the line.
+    r = _client(ops).post(
+        f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7, "received_by": "Site team"}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    component.refresh_from_db()
+    item.refresh_from_db()
+    req.refresh_from_db()
+    assert component.issued_quantity == 7 and component.fulfilment == "fulfilled"
     assert item.quantity == 0
+    assert req.status == "fulfilled" and req.received_by == "Site team"
 
 
 @pytest.mark.django_db
-def test_the_asset_starts_building_once_its_parts_arrive(inspector, ordered_requirement):
+def test_the_asset_starts_building_once_its_parts_are_issued(inspector, ops, ordered_requirement):
     from apps.assets.models import Device
 
-    device = ordered_requirement["device"]
+    device, req = ordered_requirement["device"], ordered_requirement["request"]
     assert device.status == Device.Status.PROCURED
 
     r = _client(inspector).post(
@@ -943,24 +971,36 @@ def test_the_asset_starts_building_once_its_parts_arrive(inspector, ordered_requ
         {"route": "generic", "accepted_quantity": 7}, format="json",
     )
     assert r.status_code == 200, r.content
+    device.refresh_from_db()
+    assert device.status == Device.Status.PROCURED, "in stock is not yet in hand"
 
+    assert _client(ops).post(
+        f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7}, format="json",
+    ).status_code == 200
     device.refresh_from_db()
     assert device.status == Device.Status.IN_PRODUCTION
 
 
 @pytest.mark.django_db
-def test_a_short_delivery_only_covers_what_arrived(inspector, ordered_requirement):
-    component = ordered_requirement["component"]
+def test_a_short_delivery_only_lets_the_store_issue_what_arrived(inspector, ops, ordered_requirement):
+    component, req = ordered_requirement["component"], ordered_requirement["request"]
     r = _client(inspector).post(
         f"/api/inventory/receipt-lines/{ordered_requirement['line'].id}/inspect/",
         {"route": "generic", "accepted_quantity": 4, "rejected_quantity": 3}, format="json",
     )
     assert r.status_code == 200, r.content
 
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7}, format="json")
+    assert r.status_code == 400, r.content
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 4}, format="json")
+    assert r.status_code == 200, r.content
+
     component.refresh_from_db()
+    req.refresh_from_db()
     assert component.issued_quantity == 4
     assert component.outstanding_quantity == 3
-    assert component.fulfilment == "from_stock", "still partly outstanding"
+    assert component.fulfilment == "procurement", "the rest is still to be procured"
+    assert req.status == "partial" and req.outstanding_quantity == 3
 
 
 @pytest.mark.django_db
@@ -1251,7 +1291,7 @@ def test_requests_follow_the_requirement_they_cover(ops):
     stand_mt = MaterialType.objects.create(name="Req Stand", unit="piece")
     stand = InventoryItem.objects.create(material_type=stand_mt, quantity=13)
 
-    # 1. Issued straight to the requirement (as inspection does): the request settles.
+    # 1. Issued straight to the requirement (a direct issue): the request settles.
     comp = AssetComponent.objects.create(device=device, name="Req Stand", quantity=1, inventory_item=stand)
     req = IssuanceRequest.objects.create(item=stand, quantity_requested=1, asset_component=comp, source="project")
     with transaction.atomic():

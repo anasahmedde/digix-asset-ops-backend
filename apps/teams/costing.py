@@ -267,6 +267,38 @@ def _name(user):
     return user.get_full_name() or user.username
 
 
+def step_work_order_charges(steps):
+    """What the vendor charges for each operation given out, by step id.
+
+    An operation sits on a work order either as one of its lines (a services
+    order raised from Requests) or, on older single-operation orders, as the
+    order itself — then the order's amount is the charge. Cancelled orders do
+    not count; if more than one is live, the most recent one is taken.
+    """
+    from apps.workorders.models import WorkOrder, WorkOrderItem
+
+    if not steps:
+        return {}
+    ids = [s.pk for s in steps]
+    charges = {}
+    for line in (
+        WorkOrderItem.objects.filter(production_step_id__in=ids)
+        .exclude(work_order__status=WorkOrder.Status.CANCELLED)
+        .select_related("work_order__supplier")
+        .order_by("work_order__created_at", "created_at")
+    ):
+        charges[line.production_step_id] = (line.work_order, money(line.line_total))
+    for order in (
+        WorkOrder.objects.filter(production_step_id__in=ids)
+        .exclude(status=WorkOrder.Status.CANCELLED)
+        .select_related("supplier")
+        .order_by("created_at")
+    ):
+        if order.production_step_id not in charges:
+            charges[order.production_step_id] = (order, money(order.total_amount))
+    return charges
+
+
 def component_actual(component):
     """(unit price, where it came from) for what a requirement actually cost.
 
@@ -325,12 +357,31 @@ def build_actuals(project):
             })
         materials_actual += asset_total
 
-        # The build itself: each operation as it actually cost. A step with
-        # no actual yet is not free — it is simply not known.
+        # The build itself: each operation as it actually cost. One given to
+        # a vendor costs what its work order charges — the way a bought part
+        # costs what its purchase order charged — and is not typed in. One
+        # done on our own floor is recorded by hand once it is known; until
+        # then it is not free, simply not known.
         steps = []
         asset_production = Decimal("0")
-        for step in ([] if vendor_asset else sorted(device.production_steps.all(), key=lambda x: x.step_number)):
-            actual = None if step.actual_cost is None else money(step.actual_cost)
+        device_steps = [] if vendor_asset else sorted(device.production_steps.all(), key=lambda x: x.step_number)
+        charges = step_work_order_charges(device_steps)
+        for step in device_steps:
+            charge = charges.get(step.pk)
+            if charge is not None:
+                order, actual = charge
+                source = f"Work order · {order.wo_number}"
+                on_order = {
+                    "id": str(order.pk),
+                    "wo_number": order.wo_number,
+                    "status": order.status,
+                    "status_display": order.get_status_display(),
+                    "supplier": order.supplier.name if order.supplier_id else "",
+                }
+            else:
+                actual = None if step.actual_cost is None else money(step.actual_cost)
+                source = "Recorded by hand" if actual is not None else ""
+                on_order = None
             if actual is not None:
                 asset_production += actual
             steps.append({
@@ -338,16 +389,23 @@ def build_actuals(project):
                 "step_number": step.step_number,
                 "name": step.name,
                 "status": step.status,
+                "location": step.location,
                 "planned_cost": None if step.planned_cost is None else money(step.planned_cost),
                 "actual_cost": actual,
+                "actual_source": source,
+                "actual_editable": on_order is None,
+                "work_order": on_order,
             })
         production_actual += asset_production
 
-        # A vendor-built asset costs what its work orders come to.
+        # A vendor-built asset costs what its work orders come to. An order
+        # whose lines are this asset's operations is already counted above,
+        # operation by operation, so it is not added again here.
+        counted = {order.pk for order, _ in charges.values()}
         work_orders = []
         asset_work_orders = Decimal("0")
         for order in device.work_orders.all():
-            if order.status == "cancelled":
+            if order.status == "cancelled" or order.pk in counted:
                 continue
             amount = money(order.total_amount)
             asset_work_orders += amount
