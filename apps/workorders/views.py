@@ -130,8 +130,10 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             .order_by("work_order_requested_at")
         )
         scope = {
-            r["device_id"]: (str(r["project_id"]), r["project__name"])
-            for r in ProjectScopeItem.objects.values("device_id", "project_id", "project__name")
+            r["device_id"]: (str(r["project_id"]), r["project__name"], r["project__target_date"])
+            for r in ProjectScopeItem.objects.values(
+                "device_id", "project_id", "project__name", "project__target_date"
+            )
         }
         rows = []
         for step in steps:
@@ -140,8 +142,9 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             device = step.device
             if device.project_id:
                 project, project_name = str(device.project_id), device.project.name
+                project_due = device.project.target_date
             else:
-                project, project_name = scope.get(device.id, (None, None))
+                project, project_name, project_due = scope.get(device.id, (None, None, None))
             rows.append({
                 "step": str(step.pk),
                 "step_number": step.step_number,
@@ -151,6 +154,8 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
                 "asset_name": device.display_name or str(device.device_model),
                 "project": project,
                 "project_name": project_name,
+                # When the project needs it — what the order is dated from.
+                "project_target_date": project_due,
                 "planned_cost": step.planned_cost,
                 "requested_at": step.work_order_requested_at,
                 "notes": step.notes,

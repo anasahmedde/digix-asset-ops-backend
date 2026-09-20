@@ -204,9 +204,9 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         # An asset belongs to a project by its own field OR by a Scope row, so
         # both have to be honoured here as well.
         scope_by_device = {
-            row["device_id"]: (row["project_id"], row["project__name"])
+            row["device_id"]: (row["project_id"], row["project__name"], row["project__target_date"])
             for row in ProjectScopeItem.objects.values(
-                "device_id", "project_id", "project__name"
+                "device_id", "project_id", "project__name", "project__target_date"
             )
         }
 
@@ -222,10 +222,15 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             components = components.filter(purchase_order_item__isnull=True)
 
         def project_of(device):
+            """(id, name, target date) of the project this asset is being bought for.
+
+            The target date is what the buyer needs it by, so the order can be
+            dated from the plan instead of from memory.
+            """
             if device.project_id:
-                return str(device.project_id), device.project.name
+                return str(device.project_id), device.project.name, device.project.target_date
             scoped = scope_by_device.get(device.id)
-            return (str(scoped[0]), scoped[1]) if scoped else (None, None)
+            return (str(scoped[0]), scoped[1], scoped[2]) if scoped else (None, None, None)
 
         rows = []
         # Vendor-built assets: the whole asset is what gets bought.
@@ -252,7 +257,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         if request.query_params.get("unordered") in ("1", "true", "True"):
             devices = devices.filter(procurement_item__isnull=True)
         for d in devices:
-            project_pk, project_name = project_of(d)
+            project_pk, project_name, project_due = project_of(d)
             label = d.display_name or (d.asset_type.name if d.asset_type_id else d.asset_code)
             rows.append({
                 "kind": "asset",
@@ -263,6 +268,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 "asset_code": d.asset_code,
                 "project": project_pk,
                 "project_name": project_name,
+                "project_target_date": project_due,
                 "required_quantity": 1,
                 "unit": "asset",
                 "outstanding_quantity": 0 if d.procurement_item_id else 1,
@@ -301,6 +307,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 "asset_code": "Stock",
                 "project": None,
                 "project_name": None,
+                # Replenishing the shelf answers to no project's date.
+                "project_target_date": None,
                 "required_quantity": rr.quantity,
                 "unit": rr.unit,
                 "outstanding_quantity": 0 if rr.purchase_order_item_id else rr.quantity,
@@ -325,7 +333,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         for c in components:
             if c.outstanding_quantity <= 0 or (_to_buy(c) <= 0 and not c.purchase_order_item_id):
                 continue
-            project_pk, project_name = project_of(c.device)
+            project_pk, project_name, project_due = project_of(c.device)
             rows.append({
                 "kind": "component",
                 "device": None,
@@ -335,6 +343,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 "asset_code": c.device.asset_code,
                 "project": project_pk,
                 "project_name": project_name,
+                "project_target_date": project_due,
                 "required_quantity": c.quantity,
                 "unit": c.unit or (
                     (c.inventory_unit_type.unit or "piece") if c.inventory_unit_type_id
