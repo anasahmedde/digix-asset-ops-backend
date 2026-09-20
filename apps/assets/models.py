@@ -295,6 +295,42 @@ class Device(TimeStampedModel):
         super().save(*args, **kwargs)
 
     @property
+    def client_for(self):
+        """Whose asset this is, from wherever the answer was recorded.
+
+        Its own client where somebody set one. Otherwise the client the
+        project was raised for, and failing that the client whose site it
+        stands on — both of which were entered once already.
+        """
+        if self.assigned_client_id:
+            return self.assigned_client
+        # Additional clients are exactly that — extras who also see the asset,
+        # not the party it was sold to. The project answers that.
+        project = self.project_on
+        if project is not None and project.client_id:
+            return project.client
+        if self.current_site_id and self.current_site.client_id:
+            return self.current_site.client
+        return None
+
+    @property
+    def display_image(self):
+        """The picture to show for this asset, wherever one exists.
+
+        The asset's own image field is the one somebody set deliberately. Where
+        none was set, the gallery stands in — which is where the photograph the
+        technician takes on completion ends up, so an installed asset stops
+        showing a placeholder.
+        """
+        if self.image:
+            return self.image
+        photo = (
+            self.images.filter(is_primary=True).first()
+            or self.images.order_by("sort_order", "created_at").first()
+        )
+        return photo.image if photo is not None else None
+
+    @property
     def project_on(self):
         """The project this asset belongs to.
 

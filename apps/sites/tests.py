@@ -41,6 +41,13 @@ def installation(db, tech):
     )
 
 
+def _signed_page(name="signed-handover.pdf"):
+    """Stand-in for the certificate coming back from site."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    return SimpleUploadedFile(name, b"%PDF-1.4 signed", content_type="application/pdf")
+
+
 def _client(user):
     c = APIClient()
     c.force_authenticate(user)
@@ -310,7 +317,8 @@ def test_handover_happy_path(installation, ops):
     client = _client(ops)
     resp = client.post(
         f"/api/sites/installations/{installation.pk}/handover/",
-        {"accepted_by_name": "Mr. Client POC", "acceptance_notes": "All good"},
+        {"accepted_by_name": "Mr. Client POC", "acceptance_notes": "All good",
+         "signed_document": _signed_page()},
         format="multipart",
     )
     assert resp.status_code == 201, resp.data
@@ -347,13 +355,13 @@ def test_handover_twice_rejected(installation, ops):
     client = _client(ops)
     first = client.post(
         f"/api/sites/installations/{installation.pk}/handover/",
-        {"accepted_by_name": "Once"},
+        {"accepted_by_name": "Once", "signed_document": _signed_page()},
         format="multipart",
     )
     assert first.status_code == 201
     again = client.post(
         f"/api/sites/installations/{installation.pk}/handover/",
-        {"accepted_by_name": "Twice"},
+        {"accepted_by_name": "Twice", "signed_document": _signed_page()},
         format="multipart",
     )
     assert again.status_code == 400
@@ -377,10 +385,15 @@ def test_handover_requires_client_when_device_has_none(installation, ops):
     device = installation.device
     device.assigned_client = None
     device.save(update_fields=["assigned_client"])
+    # Nothing anywhere names a client: not the asset, not a project, not the
+    # site it stands on. Only then is there genuinely nobody to hand it to.
+    device.clients.clear()
+    installation.site.client = None
+    installation.site.save(update_fields=["client"])
     client = _client(ops)
     resp = client.post(
         f"/api/sites/installations/{installation.pk}/handover/",
-        {"accepted_by_name": "No Client"},
+        {"accepted_by_name": "No Client", "signed_document": _signed_page()},
         format="multipart",
     )
     assert resp.status_code == 400
@@ -391,7 +404,7 @@ def test_assigned_installer_and_supervisor_can_handover(installation, tech):
     _complete_non_handover_steps(installation)
     r = _client(tech).post(
         f"/api/sites/installations/{installation.pk}/handover/",
-        {"accepted_by_name": "Installer Handover"},
+        {"accepted_by_name": "Installer Handover", "signed_document": _signed_page()},
         format="multipart",
     )
     assert r.status_code == 201, r.content
@@ -410,7 +423,7 @@ def test_assigned_installer_and_supervisor_can_handover(installation, tech):
     supervisor = User.objects.create_user(username="site-super", password="x", role="supervisor")
     r2 = _client(supervisor).post(
         f"/api/sites/installations/{inst2.pk}/handover/",
-        {"accepted_by_name": "Supervisor Handover"},
+        {"accepted_by_name": "Supervisor Handover", "signed_document": _signed_page()},
         format="multipart",
     )
     assert r2.status_code == 201, r2.content
@@ -436,7 +449,8 @@ def test_handover_reanchors_warranty_even_when_steps_already_done(installation, 
     paper_date = (today - td(days=30)).isoformat()
     r = _client(ops).post(
         f"/api/sites/installations/{installation.pk}/handover/",
-        {"accepted_by_name": "Paper Acceptance", "handover_date": paper_date},
+        {"accepted_by_name": "Paper Acceptance", "handover_date": paper_date,
+         "signed_document": _signed_page()},
         format="multipart",
     )
     assert r.status_code == 201, r.content
@@ -829,7 +843,7 @@ def test_handover_client_falls_back_to_project_then_site(installation, ops):
     _complete_non_handover_steps(installation)
     r = _client(ops).post(
         f"/api/sites/installations/{installation.pk}/handover/",
-        {"accepted_by_name": "Fallback POC"},
+        {"accepted_by_name": "Fallback POC", "signed_document": _signed_page()},
         format="multipart",
     )
     assert r.status_code == 201, r.content
@@ -1341,3 +1355,104 @@ def test_reordering_needs_the_order(ops, checklist):
     )
     assert r.status_code == 400
     assert "steps" in r.data
+
+
+@pytest.fixture
+def handover_ready(db, ops):
+    """An installed asset on a project raised for a named client."""
+    from django.utils import timezone
+
+    from apps.assets.models import AssetType, Device
+    from apps.clients.models import Client
+    from apps.sites.models import DeviceInstallation, Site
+    from apps.teams.models import Project, ProjectScopeItem
+
+    owner = Client.objects.create(name="Handover Owner")
+    stranger = Client.objects.create(name="Somebody Else")
+    site = Site.objects.create(name="Handover Guard Site", address="1 Road")
+    project = Project.objects.create(name="Handover Guard Rollout", client=owner)
+    kind = AssetType.objects.create(name="Handover Guard Kind")
+    device = Device.objects.create(
+        asset_type=kind, current_site=site, status=Device.Status.INSTALLED,
+    )
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    job = DeviceInstallation(device=device, site=site, installed_at=timezone.now())
+    job._skip_default_steps = True
+    job.save()
+    return {"job": job, "device": device, "owner": owner, "stranger": stranger}
+
+
+@pytest.mark.django_db
+def test_handover_refuses_a_client_the_project_never_named(ops, handover_ready):
+    """Two people could otherwise disagree about whose asset it is.
+
+    The client was settled when the project was raised. Naming a different one
+    at handover would hand the asset to somebody the order was never sold to,
+    so it is refused and says where to change it.
+    """
+    r = _client(ops).post(
+        f"/api/sites/installations/{handover_ready['job'].id}/handover/",
+        {
+            "accepted_by_name": "Site Manager",
+            "client": str(handover_ready["stranger"].id),
+            "signed_document": _signed_page(),
+        },
+        format="multipart",
+    )
+    assert r.status_code == 400, r.content
+    assert "Handover Owner" in str(r.data["client"])
+
+
+@pytest.mark.django_db
+def test_handover_takes_the_project_client_without_being_told(ops, handover_ready):
+    """Nobody re-types what the project already recorded."""
+    from apps.sites.models import HandoverRecord
+
+    r = _client(ops).post(
+        f"/api/sites/installations/{handover_ready['job'].id}/handover/",
+        {"accepted_by_name": "Site Manager", "signed_document": _signed_page()},
+        format="multipart",
+    )
+    assert r.status_code in (200, 201), r.content
+
+    record = HandoverRecord.objects.get(installation=handover_ready["job"])
+    assert record.client == handover_ready["owner"]
+
+
+@pytest.mark.django_db
+def test_handover_needs_the_signed_document(ops, handover_ready):
+    """The client's signature is the handover, so there is no handover without it.
+
+    Recording one on a promise that the paperwork will follow leaves an asset
+    marked as accepted with nothing to show for it.
+    """
+    from apps.sites.models import HandoverRecord
+
+    r = _client(ops).post(
+        f"/api/sites/installations/{handover_ready['job'].id}/handover/",
+        {"accepted_by_name": "Site Manager"}, format="multipart",
+    )
+    assert r.status_code == 400, r.content
+    assert "signed_document" in r.data
+    assert not HandoverRecord.objects.filter(installation=handover_ready["job"]).exists()
+
+
+@pytest.mark.django_db
+def test_the_signed_document_is_kept_on_the_record(ops, handover_ready):
+    """What was signed stays attached to what it settled."""
+    from apps.sites.models import HandoverRecord
+
+    r = _client(ops).post(
+        f"/api/sites/installations/{handover_ready['job'].id}/handover/",
+        {"accepted_by_name": "Site Manager", "signed_document": _signed_page()},
+        format="multipart",
+    )
+    assert r.status_code in (200, 201), r.content
+
+    record = HandoverRecord.objects.get(installation=handover_ready["job"])
+    assert record.signed_document, "the signed certificate should be filed against the handover"
+    # Uploads are stored under a generated name, so what matters is that the
+    # file is there and readable, not what it was called on somebody's laptop.
+    assert record.signed_document.name.endswith(".pdf")
+    with record.signed_document.open("rb") as fh:
+        assert fh.read().startswith(b"%PDF")

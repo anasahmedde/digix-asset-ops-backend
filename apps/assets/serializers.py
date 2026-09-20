@@ -414,6 +414,12 @@ def _client_names(device):
     for client in device.clients.all():
         if client.name not in names:
             names.append(client.name)
+    if not names:
+        # Nothing on the asset, so read where the work was set up: the project
+        # it is scoped to, else the client whose site it stands on.
+        client = device.client_for
+        if client is not None:
+            names.append(client.name)
     return names
 
 
@@ -432,7 +438,17 @@ class DeviceListSerializer(serializers.ModelSerializer):
     device_model_name = serializers.StringRelatedField(source="device_model", read_only=True)
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
-    client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+    # The picture to show: the asset's own where one was set, else the primary
+    # photo in its gallery. Declared, not inferred — a bare property name in
+    # `fields` serialises the file object itself and breaks the response.
+    display_image = serializers.ImageField(read_only=True)
+    # Not assigned_client.name: an asset scoped to a project belongs to that
+    # project's client without anybody naming it twice.
+    client_name = serializers.SerializerMethodField()
+
+    def get_client_name(self, obj):
+        client = obj.client_for
+        return client.name if client is not None else None
     client_names = serializers.SerializerMethodField()
     project_name = serializers.SerializerMethodField()
     warranty_status = serializers.SerializerMethodField()
@@ -444,7 +460,7 @@ class DeviceListSerializer(serializers.ModelSerializer):
             "id", "asset_code", "serial_number", "display_name", "project", "project_name",
             "asset_type", "asset_type_name",
             "device_model", "device_model_name",
-            "status", "status_display", "source", "image", "current_site", "site_name",
+            "status", "status_display", "source", "image", "display_image", "current_site", "site_name",
             "assigned_client", "client_name", "client_names",
             "installation_date", "warranty_status", "created_at",
         ]
@@ -464,7 +480,17 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     brand_name = serializers.CharField(source="device_model.brand.name", read_only=True, default=None)
     site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
-    client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+    # The picture to show: the asset's own where one was set, else the primary
+    # photo in its gallery. Declared, not inferred — a bare property name in
+    # `fields` serialises the file object itself and breaks the response.
+    display_image = serializers.ImageField(read_only=True)
+    # Not assigned_client.name: an asset scoped to a project belongs to that
+    # project's client without anybody naming it twice.
+    client_name = serializers.SerializerMethodField()
+
+    def get_client_name(self, obj):
+        client = obj.client_for
+        return client.name if client is not None else None
     client_names = serializers.SerializerMethodField()
     project_name = serializers.SerializerMethodField()
     # Contract chip (PR-01): rental/sold context from the parent project.
@@ -552,7 +578,8 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "device_model", "device_model_name", "brand_name",
             "length_in", "width_in", "depth_in", "diagonal_inches",
             "hardware_revision",
-            "status", "status_display", "source", "source_display", "allowed_transitions", "image", "images",
+            "status", "status_display", "source", "source_display", "allowed_transitions",
+            "image", "display_image", "images",
             "purchase_date", "purchase_price", "supplier", "supplier_name",
             "planned_installation_cost", "actual_installation_cost",
             "invoice_reference", "batch_number",

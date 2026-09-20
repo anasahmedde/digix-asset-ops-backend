@@ -110,11 +110,13 @@ def test_progress_is_computed():
     from apps.teams.models import ProjectMilestone
 
     c = _client(ops)
-    # no milestones -> phase position along the 11-step ladder
-    p = Project.objects.create(name="Ladder", phase="production")  # index 4 of 10
-    assert c.get(f"/api/teams/projects/{p.pk}/").data["progress"] == 40
+    # No milestones: progress is the five phase bars averaged, and a project
+    # with nothing on it has done none of the work — whatever phase somebody
+    # has set it to by hand.
+    p = Project.objects.create(name="Ladder", phase="production")
+    assert c.get(f"/api/teams/projects/{p.pk}/").data["progress"] == 0
 
-    # milestones override the ladder: 2 of 4 done -> 50
+    # milestones override the phases: 2 of 4 done -> 50
     for i in range(4):
         ProjectMilestone.objects.create(project=p, title=f"M{i}", order=i)
     for m in list(p.milestones.all())[:2]:
@@ -1122,8 +1124,10 @@ def test_each_phase_says_how_far_it_has_got():
     bars = phase_progress(project)
     assert bars["installation"]["percent"] == 50, bars["installation"]
 
-    # Handed over once the asset is running.
-    device.status = Device.Status.ACTIVE
+    # Handed over once the client has it. Running is not the same thing — see
+    # test_handing_over_needs_the_client_to_have_accepted_it — so this uses the
+    # state that means the client owns it outright.
+    device.status = Device.Status.CLIENT_PROPERTY
     device.save(update_fields=["status"])
     assert phase_progress(project)["handover"]["percent"] == 100
 
@@ -1207,8 +1211,8 @@ def test_a_phase_is_split_evenly_between_the_assets():
     bars = phase_progress(project)
     assert bars["production"]["percent"] == 33 and bars["production"]["total"] == 3
 
-    # And handing over: one asset running out of three.
-    devices[2].status = Device.Status.ACTIVE
+    # And handing over: one of three now belongs to the client.
+    devices[2].status = Device.Status.CLIENT_PROPERTY
     devices[2].save(update_fields=["status"])
     bars = phase_progress(project)
     assert bars["handover"]["percent"] == 33
@@ -1250,3 +1254,96 @@ def test_a_vendor_asset_clears_procurement_and_production_when_it_arrives():
     assert bars["production"]["percent"] == 100, "nobody here builds it"
     assert bars["installation"]["percent"] == 0, "still to be put in"
     assert bars["handover"]["percent"] == 0
+
+
+@pytest.mark.django_db
+def test_handing_over_needs_the_client_to_have_accepted_it():
+    """An asset the crew switched on has not been handed over.
+
+    Handing over is the client accepting it on the Installation Tracker. Until
+    that record exists the phase has not moved for that asset, however live it
+    is — otherwise the bar would say a project was delivered while the client
+    had signed nothing.
+    """
+    from apps.clients.models import Client
+    from apps.sites.models import DeviceInstallation, HandoverRecord, Site
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    brand = Brand.objects.create(name="Handover Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="HO-1")
+    project = Project.objects.create(name="Handover Rollout")
+    site = Site.objects.create(name="Handover Site", address="1 Road")
+    client = Client.objects.create(name="Handover Client")
+
+    devices = []
+    for n in range(2):
+        d = Device.objects.create(
+            device_model=dm, asset_code=f"AST-HO-{n}", source="vendor_supplied",
+            current_site=site, status=Device.Status.ACTIVE,
+        )
+        ProjectScopeItem.objects.create(project=project, device=d, quantity=1)
+        devices.append(d)
+
+    # Both are live, neither has been accepted by anybody.
+    assert phase_progress(project)["handover"]["percent"] == 0
+
+    job = DeviceInstallation(device=devices[0], site=site, installed_at=timezone.now())
+    job._skip_default_steps = True
+    job.save()
+    HandoverRecord.objects.create(
+        installation=job, device=devices[0], client=client, site=site,
+        handover_date=timezone.localdate(), accepted_by_name="Site Manager",
+    )
+    bars = phase_progress(project)
+    assert bars["handover"]["percent"] == 50
+    assert bars["handover"]["note"] == "1 of 2 assets handed over"
+
+    # An asset that became the client's own property is past handing over.
+    devices[1].status = Device.Status.CLIENT_PROPERTY
+    devices[1].save(update_fields=["status"])
+    assert phase_progress(project)["handover"]["percent"] == 100
+
+
+@pytest.mark.django_db
+def test_progress_ignores_the_phase_label_and_counts_the_work():
+    """A project can be finished while the marker still says Planning.
+
+    The phase is set by hand and gets forgotten. Every parts issued, every
+    asset built and installed is recorded as it happens, so the overall figure
+    reads those instead — otherwise a project with all its work done reported
+    a fifth of it because nobody moved the label.
+    """
+    from apps.assets.models import ProductionStep
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    brand = Brand.objects.create(name="Progress Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="PRG-1")
+    # The label is left where it started, deliberately.
+    project = Project.objects.create(name="Progress Rollout", phase=Project.Phase.PLANNING)
+    material = MaterialType.objects.create(name="Progress Panel", unit="piece")
+    item = InventoryItem.objects.create(material_type=material, quantity=50)
+
+    device = Device.objects.create(device_model=dm, asset_code="AST-PRG-1", source="inhouse")
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    component = AssetComponent.objects.create(
+        device=device, name="Progress Panel", quantity=4, inventory_item=item,
+    )
+    step = ProductionStep.objects.create(device=device, step_number=1, name="Assemble")
+
+    # Nothing done yet, and no budget: none of the five phases has moved.
+    assert project.computed_progress() == 0
+
+    # Parts in and the route finished: two of five phases done, so two fifths.
+    component.issued_quantity = 4
+    component.save(update_fields=["issued_quantity"])
+    step.status = ProductionStep.Status.COMPLETED
+    step.save(update_fields=["status"])
+    bars = phase_progress(project)
+    assert bars["procurement"]["percent"] == 100 and bars["production"]["percent"] == 100
+    assert project.computed_progress() == 40
+
+    # The label never moved, and that is the point.
+    project.refresh_from_db()
+    assert project.phase == Project.Phase.PLANNING

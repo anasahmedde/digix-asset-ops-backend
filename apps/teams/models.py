@@ -87,10 +87,12 @@ class Project(TimeStampedModel):
     def computed_progress(self):
         """How far the order has got, derived rather than hand-typed.
 
-        Milestones win where a team keeps them. Otherwise it is the phases
-        themselves: each one counts for its share, and the phase being worked
-        on counts for however much of it is done, so the figure moves as the
-        work moves instead of jumping a step at a time.
+        Milestones win where a team keeps them. Otherwise it is the phases,
+        each worth an equal share of the project and each filled by its own
+        work. It deliberately does not consult the stored phase: that is a
+        label somebody sets by hand, and a project whose parts are all in and
+        whose assets are all built has made that progress whether or not
+        anybody remembered to move the marker.
         """
         milestones = list(self.milestones.all())
         if milestones:
@@ -103,10 +105,11 @@ class Project(TimeStampedModel):
             return self.progress or 0
         from .phases import phase_progress
 
-        done_phases = self.MAIN_PHASE_ORDER.index(self.phase)
-        share = 100 / len(self.MAIN_PHASE_ORDER)
-        here = phase_progress(self).get(self.phase, {}).get("percent", 0)
-        return min(100, round(done_phases * share + here * share / 100))
+        bars = phase_progress(self)
+        return min(100, round(
+            sum(bars[phase]["percent"] for phase in self.MAIN_PHASE_ORDER)
+            / len(self.MAIN_PHASE_ORDER)
+        ))
 
 
 class ProjectScopeItem(TimeStampedModel):

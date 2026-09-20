@@ -137,6 +137,24 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
     ]
     ordering_fields = ["installed_at", "due_date", "completed_at", "created_at"]
 
+    @action(detail=True, methods=["get"], url_path="handover-document")
+    def handover_document(self, request, pk=None):
+        """The handover certificate as a PDF.
+
+        Printed before the visit it carries blank lines for the client to sign;
+        once a handover has been recorded it prints what was agreed instead.
+        """
+        from django.http import HttpResponse
+
+        from .documents import render_handover_pdf
+
+        installation = self.get_object()
+        pdf = render_handover_pdf(installation)
+        response = HttpResponse(pdf, content_type="application/pdf")
+        name = f"handover-{installation.device.asset_code}"
+        response["Content-Disposition"] = f'attachment; filename="{name}.pdf"'
+        return response
+
     @action(detail=True, methods=["post"], url_path="reorder-steps")
     def reorder_steps(self, request, pk=None):
         """Put this installation's checklist in the order given.
@@ -400,38 +418,9 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             device.status = "active"
             device.save(update_fields=["status", "updated_at"])
 
-            # The client's warranty on our asset runs from the day it was
-            # installed — the asset's installation date — not from the day the
-            # term happens to be typed. Only the term is entered.
-            raw_months = request.data.get("client_warranty_months")
-            if raw_months not in (None, ""):
-                try:
-                    months = int(raw_months)
-                except (TypeError, ValueError):
-                    months = 0
-                if months > 0:
-                    from dateutil.relativedelta import relativedelta
-
-                    from apps.warranties.models import Warranty
-
-                    from .signals import installation_date_for
-
-                    start = installation_date_for(installation) or timezone.localdate()
-                    existing = device.warranties.filter(
-                        warranty_type="client", component__isnull=True
-                    ).exclude(status__in=("void", "reissued")).order_by("-end_date").first()
-                    if existing is not None:
-                        existing.start_date = start
-                        existing.end_date = start + relativedelta(months=months)
-                        existing.months = months
-                        existing.status = "active"
-                        existing.save(update_fields=["start_date", "end_date", "months", "status", "updated_at"])
-                    else:
-                        Warranty.objects.create(
-                            device=device, warranty_type="client", status="active",
-                            start_date=start, end_date=start + relativedelta(months=months),
-                            months=months,
-                        )
+            # What we promise the client is a commercial commitment, not
+            # something the technician on site settles. Client warranties are
+            # raised by the supervisor under Warranties.
 
         installation.refresh_from_db()
         installation._prefetched_objects_cache = {}
@@ -472,14 +461,21 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         ser = HandoverCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         device = installation.device
-        # Sensible defaults: the asset's own client, else the client its
-        # project was sold to, else the site's client — always overridable.
-        client = (
-            ser.validated_data.get("client")
-            or device.assigned_client
-            or (device.project.client if device.project_id else None)
-            or installation.site.client
-        )
+        # Who the asset belongs to was settled when the work was set up, and
+        # handing it to anybody else would contradict the project it was sold
+        # under. Where that answer exists it stands; a caller may only name a
+        # client when nothing else has.
+        settled = device.client_for
+        asked = ser.validated_data.get("client")
+        if settled is not None and asked is not None and asked != settled:
+            return Response(
+                {"client": (
+                    f"This asset belongs to {settled.name}, which was set when the work was "
+                    f"raised. Change it there rather than at handover."
+                )},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        client = settled or asked
         if client is None:
             return Response(
                 {"client": "The asset has no client yet — pick the client receiving it."},
@@ -508,7 +504,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 handover_date=ser.validated_data.get("handover_date") or timezone.localdate(),
                 accepted_by_name=ser.validated_data["accepted_by_name"],
                 acceptance_notes=ser.validated_data.get("acceptance_notes", ""),
-                signature=ser.validated_data.get("signature"),
+                signed_document=ser.validated_data.get("signed_document"),
                 performed_by=user,
             )
             device.assigned_client = client

@@ -155,6 +155,13 @@ class ProjectListSerializer(serializers.ModelSerializer):
 
 class ProjectDetailSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
+    # Who the work is for, with the contact the team will actually ring.
+    client_contact_person = serializers.CharField(
+        source="client.contact_person", read_only=True, default=None
+    )
+    client_contact_phone = serializers.CharField(
+        source="client.contact_phone", read_only=True, default=None
+    )
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     manager_name = serializers.CharField(source="manager.get_full_name", read_only=True, default=None)
     bottlenecks = ProjectBottleneckSerializer(many=True, read_only=True)
@@ -174,7 +181,8 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
         model = Project
         fields = [
             "id", "name", "description", "location", "image",
-            "client", "client_name", "site", "site_name",
+            "client", "client_name", "client_contact_person", "client_contact_phone",
+            "site", "site_name",
             "status", "status_display", "phase", "phase_display",
             "contract_type", "contract_type_display", "rental_end_date",
             "progress", "start_date", "target_date", "completed_date",

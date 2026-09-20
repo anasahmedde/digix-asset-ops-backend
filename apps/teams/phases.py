@@ -50,7 +50,7 @@ def phase_progress(project) -> dict:
     to finish, and nothing has been.
     """
     from apps.assets.models import Device
-    from apps.sites.models import DeviceInstallation, InstallationStep
+    from apps.sites.models import DeviceInstallation, HandoverRecord, InstallationStep
 
     from .models import Project, ProjectBudget
 
@@ -136,10 +136,20 @@ def phase_progress(project) -> dict:
     if devices and not latest:
         installation["note"] = "No installation opened yet"
 
-    # ── Handing over: an asset is handed over when it is running ──
+    # ── Handing over: accepted by the client, not merely switched on ──
+    # Running is not the same as handed over. An asset is handed over when the
+    # client has accepted it on the Installation Tracker and it is live, or
+    # when it has already become the client's own property.
+    accepted = set(
+        HandoverRecord.objects.filter(device_id__in=device_ids)
+        .values_list("device_id", flat=True)
+    )
     handover = _even_split(
         [
-            1.0 if d.status in (Device.Status.ACTIVE, Device.Status.CLIENT_PROPERTY) else 0.0
+            1.0 if (
+                d.status == Device.Status.CLIENT_PROPERTY
+                or (d.pk in accepted and d.status == Device.Status.ACTIVE)
+            ) else 0.0
             for d in devices
         ],
         "handed over",
