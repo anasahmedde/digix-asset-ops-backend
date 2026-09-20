@@ -124,6 +124,13 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     # What will actually print, so an older order with no terms of its own
     # still shows the house standard for editing.
     effective_terms = serializers.SerializerMethodField()
+    # Who the order is for — worked out from what its lines point at.
+    raised_for = serializers.SerializerMethodField()
+
+    def get_raised_for(self, obj):
+        from .purpose import describe_purpose
+
+        return describe_purpose(obj)
 
     def get_effective_terms(self, obj):
         from .documents import DEFAULT_TERMS
@@ -135,7 +142,7 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         fields = [
             "id", "po_number", "supplier", "supplier_name",
             "status", "status_display", "currency", "order_date", "expected_delivery",
-            "total_amount", "notes", "terms", "effective_terms",
+            "total_amount", "notes", "terms", "effective_terms", "raised_for",
             "ordered_by", "ordered_by_name", "approved_by", "approved_by_name",
             "items", "created_at", "updated_at",
         ]

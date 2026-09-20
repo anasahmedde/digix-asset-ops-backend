@@ -322,9 +322,16 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
                     .first()
                 )
             if inventory_item is None:
+                # A component carries its own category; the caller does not
+                # get to disagree with it.
+                from apps.assets.models import MaterialType
+
+                own_category = MaterialType.objects.filter(
+                    pk=material_type_id
+                ).values_list("category_id", flat=True).first()
                 inventory_item = InventoryItem.objects.create(
                     material_type_id=material_type_id,
-                    category_id=generic.get("category"),
+                    category_id=own_category or generic.get("category"),
                     quantity=0,
                     min_stock_level=generic.get("min_stock_level", 5),
                     unit_cost=generic.get("unit_cost") or (po_item.unit_price if po_item else None),

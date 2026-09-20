@@ -723,6 +723,28 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         source="item.material_type.name", read_only=True, default=None
     )
     unit_type_name = serializers.StringRelatedField(source="unit_type", read_only=True)
+    # The units this request will draw, in the order the store will draw them.
+    # Issuing picks oldest-first, so naming them here is the same list, before
+    # the fact rather than after it.
+    next_units = serializers.SerializerMethodField()
+
+    def get_next_units(self, obj):
+        from .models import InventoryUnit
+
+        type_id = obj.unit_type_id
+        if type_id is None and obj.asset_component_id:
+            type_id = obj.asset_component.inventory_unit_type_id
+        if type_id is None:
+            return []
+        units = (
+            InventoryUnit.objects
+            .filter(unit_type_id=type_id, status=InventoryUnit.Status.IN_STOCK)
+            .order_by("created_at")[:25]
+        )
+        return [
+            {"serial_number": u.serial_number, "unit_code": u.unit_code}
+            for u in units
+        ]
     # Quantities read with their unit of measure (piece, meter, box…).
     unit = serializers.SerializerMethodField()
 
@@ -732,7 +754,21 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         if obj.item_id and obj.item.material_type_id:
             return obj.item.material_type.unit or "piece"
         return "piece"
-    project_name = serializers.CharField(source="project.name", read_only=True, default=None)
+    # The project the material is for. A request raised against an asset's
+    # component belongs to that asset's project, whether or not the request
+    # itself names one, so the store can always see who is waiting.
+    project_name = serializers.SerializerMethodField()
+
+    def get_project_name(self, obj):
+        if obj.project_id:
+            return obj.project.name
+        component = obj.asset_component
+        if component is not None:
+            project = component.device.project_on
+            if project is not None:
+                return project.name
+        return None
+
     asset_code = serializers.CharField(
         source="asset_component.device.asset_code", read_only=True, default=None
     )
@@ -809,6 +845,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "quantity_requested", "quantity_issued", "outstanding_quantity", "available_quantity",
             "source", "source_display", "purpose",
             "project", "project_name", "asset_component", "asset_code", "component_name",
+            "next_units",
             "maintenance_schedule", "maintenance_title",
             "requested_by", "requested_by_name", "issued_by", "issued_by_name",
             "received_by", "issued_serials", "issued_units", "handovers", "last_issued_at", "awaiting_procurement", "po_number",
