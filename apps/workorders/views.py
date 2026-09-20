@@ -62,7 +62,10 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             "supplier", "client", "site", "payment_terms", "terms_template",
             "created_by", "approved_by",
         )
-        .prefetch_related("items", "items__asset_type", "items__device_model")
+        .prefetch_related(
+            "items", "items__asset_type", "items__device_model",
+            "items__production_step__device",
+        )
         .all()
     )
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]

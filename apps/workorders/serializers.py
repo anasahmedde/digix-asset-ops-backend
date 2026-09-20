@@ -48,9 +48,31 @@ class WorkOrderItemSerializer(serializers.ModelSerializer):
         ]
 
 
+def _assets_on(order):
+    """The assets an order is working on, named once each and in order.
+
+    An order carries them on its lines (one order, several operations for one
+    vendor); an older one named a single asset on the order itself.
+    """
+    codes = []
+    for item in order.items.all():
+        step = item.production_step
+        device = step.device if step is not None else None
+        if device is not None and device.asset_code not in codes:
+            codes.append(device.asset_code)
+    if not codes and order.device_id:
+        codes.append(order.device.asset_code)
+    return codes
+
+
 class WorkOrderListSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(source="supplier.name", read_only=True)
     project_name = serializers.CharField(source="project.name", read_only=True, default=None)
+    # What the work is for: the project it belongs to and the assets worked on.
+    asset_codes = serializers.SerializerMethodField()
+
+    def get_asset_codes(self, obj):
+        return _assets_on(obj)
     inspected_by_name = serializers.SerializerMethodField()
     inspection_result_display = serializers.CharField(source="get_inspection_result_display", read_only=True, default=None)
 
@@ -70,7 +92,7 @@ class WorkOrderListSerializer(serializers.ModelSerializer):
             "client_name", "site_name", "currency", "total_amount",
             "expected_delivery", "delivered_at", "inspected_by_name", "inspected_at",
             "inspection_result", "inspection_result_display", "inspection_notes",
-            "line_count", "lines_awaiting_inspection", "lines_with_vendor", "created_at",
+            "asset_codes", "line_count", "lines_awaiting_inspection", "lines_with_vendor", "created_at",
         ]
 
     line_count = serializers.SerializerMethodField()
@@ -117,10 +139,14 @@ class WorkOrderSerializer(serializers.ModelSerializer):
     line_count = serializers.SerializerMethodField()
     lines_awaiting_inspection = serializers.SerializerMethodField()
     lines_with_vendor = serializers.SerializerMethodField()
+    asset_codes = serializers.SerializerMethodField()
 
     def get_inspected_by_name(self, obj):
         user = obj.inspected_by
         return (user.get_full_name() or user.username) if user else None
+
+    def get_asset_codes(self, obj):
+        return _assets_on(obj)
 
     def get_line_count(self, obj):
         return len(obj.items.all())
@@ -144,7 +170,7 @@ class WorkOrderSerializer(serializers.ModelSerializer):
             "items", "created_by", "created_by_name", "approved_by", "approved_by_name",
             "delivered_at", "inspected_by", "inspected_by_name", "inspected_at",
             "inspection_result", "inspection_result_display", "inspection_notes",
-            "line_count", "lines_awaiting_inspection", "lines_with_vendor",
+            "asset_codes", "line_count", "lines_awaiting_inspection", "lines_with_vendor",
             "approved_at", "issued_at", "created_at", "updated_at",
         ]
         read_only_fields = [
