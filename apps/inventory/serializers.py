@@ -723,17 +723,49 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         source="item.material_type.name", read_only=True, default=None
     )
     unit_type_name = serializers.StringRelatedField(source="unit_type", read_only=True)
+    # The code the store knows the component by — the one down the Unique
+    # Components list, which is what anybody looks it up by.
+    unit_type_code = serializers.SerializerMethodField()
     # The units this request will draw, in the order the store will draw them.
     # Issuing picks oldest-first, so naming them here is the same list, before
     # the fact rather than after it.
     next_units = serializers.SerializerMethodField()
 
+    def _unique_product_id(self, obj):
+        """The unique product behind this request, named either way it can be.
+
+        A request either names the product outright or reaches it through the
+        asset requirement it was raised to cover.
+        """
+        if obj.unit_type_id:
+            return obj.unit_type_id
+        if obj.asset_component_id:
+            return obj.asset_component.inventory_unit_type_id
+        return None
+
+    # What the material is going into, by the name people call it.
+    asset_name = serializers.CharField(
+        source="asset_component.device.display_name", read_only=True, default=None,
+    )
+    maintenance_title = serializers.CharField(
+        source="maintenance_schedule.title", read_only=True, default=None,
+    )
+
+    def get_unit_type_code(self, obj):
+        from .models import InventoryUnitType
+
+        type_id = self._unique_product_id(obj)
+        if type_id is None:
+            return None
+        return (
+            InventoryUnitType.objects.filter(pk=type_id)
+            .values_list("type_code", flat=True).first()
+        )
+
     def get_next_units(self, obj):
         from .models import InventoryUnit
 
-        type_id = obj.unit_type_id
-        if type_id is None and obj.asset_component_id:
-            type_id = obj.asset_component.inventory_unit_type_id
+        type_id = self._unique_product_id(obj)
         if type_id is None:
             return []
         units = (
@@ -845,7 +877,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "quantity_requested", "quantity_issued", "outstanding_quantity", "available_quantity",
             "source", "source_display", "purpose",
             "project", "project_name", "asset_component", "asset_code", "component_name",
-            "next_units",
+            "next_units", "unit_type_code", "asset_name",
             "maintenance_schedule", "maintenance_title",
             "requested_by", "requested_by_name", "issued_by", "issued_by_name",
             "received_by", "issued_serials", "issued_units", "handovers", "last_issued_at", "awaiting_procurement", "po_number",

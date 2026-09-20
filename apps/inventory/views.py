@@ -182,13 +182,30 @@ class InventoryUnitTypeViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"])
     def units(self, request, pk=None):
-        """The physical units registered against this product."""
+        """The physical units registered against this product.
+
+        ``?in_store=1`` narrows it to the ones the store still holds. A unit
+        that was issued, scrapped or registered as an asset has left, and
+        listing it as stock overstates the shelf; where it went is the
+        issuance log's business, not this list's.
+        """
         product = self.get_object()
         qs = product.units.select_related("supplier", "goods_receipt_line__receipt").all()
+        if request.query_params.get("in_store") in ("1", "true", "True"):
+            qs = qs.exclude(status__in=GONE_FROM_STORE)
+        status = request.query_params.get("status")
+        if status:
+            qs = qs.filter(status__in=[s.strip() for s in status.split(",") if s.strip()])
+        qs = qs.order_by("-created_at")
         page = self.paginate_queryset(qs)
         if page is not None:
             return self.get_paginated_response(InventoryUnitSerializer(page, many=True).data)
         return Response(InventoryUnitSerializer(qs, many=True).data)
+
+
+# Statuses that mean the unit is no longer on the shelf. Each one is a way of
+# leaving: handed over, written off, or turned into an asset in its own right.
+GONE_FROM_STORE = ("issued", "scrapped", "converted")
 
 
 class InventoryUnitViewSet(viewsets.ModelViewSet):
