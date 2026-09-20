@@ -554,6 +554,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "hardware_revision",
             "status", "status_display", "source", "source_display", "allowed_transitions", "image", "images",
             "purchase_date", "purchase_price", "supplier", "supplier_name",
+            "planned_installation_cost", "actual_installation_cost",
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
             "clients", "client_names",

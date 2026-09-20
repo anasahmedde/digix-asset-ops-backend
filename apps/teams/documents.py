@@ -191,8 +191,9 @@ def render_cost_plan_pdf(project, plan: dict) -> bytes:
 
     # ── Totals ──
     totals = [
-        ("Materials", plan["materials_total"]),
+        ("Components", plan["materials_total"]),
         ("Production", plan["production_total"]),
+        ("Installation & activation", plan.get("installation_total")),
         ("Overheads", plan["overheads_total"]),
         (f"Contingency ({float(plan['contingency_percent']):g}% on materials)", plan["contingency_amount"]),
     ]
@@ -380,8 +381,9 @@ def render_actuals_pdf(project, actuals: dict) -> bytes:
 
     # ── Position ──
     totals = [
-        ("Materials used", actuals["materials_actual"]),
+        ("Components used", actuals["materials_actual"]),
         ("Production", actuals.get("production_actual")),
+        ("Installation & activation", actuals.get("installation_actual")),
         ("Vendor work orders", actuals.get("work_orders_actual")),
         ("Overheads (actual)", actuals["overheads_actual_total"]),
     ]

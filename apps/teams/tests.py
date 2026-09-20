@@ -900,3 +900,92 @@ def test_projects_are_searched_by_client_and_site_too():
 
     names = [p["name"] for p in _client(ops).get("/api/teams/projects/", {"search": "acme"}).json()["results"]]
     assert names == ["Window displays"]
+
+
+@pytest.mark.django_db
+def test_a_bought_asset_costs_what_its_order_charged_plus_installing_it():
+    """An asset bought whole is not built here: its cost is the purchase
+    order's, and the only other head is putting it in and switching it on."""
+    from decimal import Decimal
+
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.suppliers.models import Supplier
+
+    brand = Brand.objects.create(name="Bought Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="BG-1")
+    project = Project.objects.create(name="Bought Rollout")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-BUY-1", serial_number="BUY-1",
+        source="vendor_supplied", project=project, status="in_stock",
+    )
+    supplier = Supplier.objects.create(name="Screen Co")
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.RECEIVED)
+    item = PurchaseOrderItem.objects.create(
+        purchase_order=po, description="Screen", quantity=1, unit_price=Decimal("4800"),
+    )
+    device.procurement_item = item
+    # A stale price on the asset must not win over what the order charged.
+    device.purchase_price = Decimal("1000")
+    device.planned_installation_cost = Decimal("500")
+    device.actual_installation_cost = Decimal("615")
+    device.save(update_fields=[
+        "procurement_item", "purchase_price", "planned_installation_cost", "actual_installation_cost",
+    ])
+
+    ops = _U.objects.create_user(username="buy-ops", password="x", role="ops_manager")
+    c = _C()
+    c.force_authenticate(ops)
+
+    plan = c.get(f"/api/teams/projects/{project.id}/plan/").json()
+    assert Decimal(str(plan["installation_total"])) == Decimal("500")
+    asset = plan["assets"][0]
+    assert Decimal(str(asset["installation_cost"])) == Decimal("500")
+    assert asset["steps"] == [] and asset["lines"] == 0, "nothing is built here"
+
+    actuals = c.get(f"/api/teams/projects/{project.id}/actuals/").json()
+    asset = actuals["assets"][0]
+    assert Decimal(str(asset["asset_price"])) == Decimal("4800"), "the order, not the asset's own price"
+    assert asset["asset_priced_from"] == f"Purchase order · {po.po_number}"
+    assert asset["asset_arrived"] is True
+    assert Decimal(str(asset["installation_actual"])) == Decimal("615")
+    assert Decimal(str(asset["actual_total"])) == Decimal("5415")
+    # Two heads only: nothing was produced here.
+    assert Decimal(str(actuals["production_actual"])) == Decimal("0")
+    assert Decimal(str(actuals["work_orders_actual"])) == Decimal("0")
+    assert Decimal(str(actuals["installation_actual"])) == Decimal("615")
+    assert Decimal(str(actuals["actual_total"])) == Decimal("5415")
+
+
+@pytest.mark.django_db
+def test_a_bought_asset_that_has_not_arrived_costs_nothing_yet():
+    from decimal import Decimal
+
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.suppliers.models import Supplier
+
+    brand = Brand.objects.create(name="Waiting Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="WT-1")
+    project = Project.objects.create(name="Waiting Rollout")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-WAIT-1", serial_number="WAIT-1",
+        source="vendor_supplied", project=project, status="procured",
+    )
+    supplier = Supplier.objects.create(name="Slow Co")
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED)
+    device.procurement_item = PurchaseOrderItem.objects.create(
+        purchase_order=po, description="Screen", quantity=1, unit_price=Decimal("4800"),
+    )
+    device.save(update_fields=["procurement_item"])
+
+    ops = _U.objects.create_user(username="wait-ops", password="x", role="ops_manager")
+    c = _C()
+    c.force_authenticate(ops)
+    asset = c.get(f"/api/teams/projects/{project.id}/actuals/").json()["assets"][0]
+    assert asset["asset_arrived"] is False and asset["outstanding"] == 1
+    assert Decimal(str(asset["actual_total"])) == Decimal("0"), "nothing is spent until it arrives"

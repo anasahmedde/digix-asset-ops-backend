@@ -247,6 +247,17 @@ class Device(TimeStampedModel):
     assigned_vendor_contact = models.CharField(
         max_length=100, blank=True, help_text="Phone or contact person for the installing vendor",
     )
+    # Putting the asset in and switching it on: planned in the project's cost
+    # plan, recorded against it once the job is done. Kept on the asset because
+    # that is what is installed — a project's figure is the sum of its assets'.
+    planned_installation_cost = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+        help_text="What installing and activating this asset is expected to cost",
+    )
+    actual_installation_cost = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+        help_text="What installing and activating this asset actually cost",
+    )
     installation_date = models.DateField(null=True, blank=True)
     installed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
