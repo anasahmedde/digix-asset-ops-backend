@@ -241,6 +241,13 @@ class DeviceViewSet(viewsets.ModelViewSet):
                 device.current_site = site
                 update_fields.append("current_site")
 
+            # The date the job has to be done by, carried onto the tracker
+            # record that open_installation_for opens from this assignment.
+            due = ser.validated_data.get("installation_date")
+            if due is not None:
+                device.installation_date = due
+                update_fields.append("installation_date")
+
             reason = f"{reason} · Assigned to {assignee_label(technician, vendor, contact)}"
 
         if new_status == Device.Status.UNDER_MAINTENANCE:

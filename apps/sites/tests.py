@@ -1249,3 +1249,95 @@ def test_client_warranty_runs_from_the_installation_date(installation, ops):
     warranty.refresh_from_db()
     assert warranty.start_date == installation_date_for(installation) == timezone.localdate(installed)
     assert (warranty.end_date.year, warranty.end_date.month) == ((warranty.start_date.year + 1), warranty.start_date.month)
+
+
+@pytest.fixture
+def checklist(db):
+    """An installation with six steps, numbered 1 to 6."""
+    from django.utils import timezone
+
+    from apps.assets.models import AssetType, Device
+    from apps.sites.models import DeviceInstallation, InstallationStep, Site
+
+    site = Site.objects.create(name="Order Site", address="1 Road")
+    kind = AssetType.objects.create(name="Order Kind")
+    device = Device.objects.create(asset_type=kind, current_site=site)
+    job = DeviceInstallation(device=device, site=site, installed_at=timezone.now())
+    job._skip_default_steps = True
+    job.save()
+    job.steps.all().delete()
+    kinds = ["survey", "wiring", "structure", "programming", "testing", "handover"]
+    for n, kind_name in enumerate(kinds, start=1):
+        InstallationStep.objects.create(
+            installation=job, step_type=kind_name, step_number=n,
+        )
+    return job
+
+
+def _numbers(job):
+    return list(job.steps.order_by("step_number").values_list("step_number", flat=True))
+
+
+def _types(job):
+    return list(job.steps.order_by("step_number").values_list("step_type", flat=True))
+
+
+@pytest.mark.django_db
+def test_removing_a_step_closes_the_gap_it_leaves(ops, checklist):
+    """A checklist that reads 1, 2, 3, 5, 6 looks like it lost a step.
+
+    The numbers are the positions in the list, so deleting the fourth makes
+    the fifth the fourth rather than leaving a hole where it used to be.
+    """
+    fourth = checklist.steps.get(step_number=4)
+    r = _client(ops).delete(f"/api/sites/installation-steps/{fourth.id}/")
+    assert r.status_code == 204, r.content
+
+    assert _numbers(checklist) == [1, 2, 3, 4, 5]
+    assert _types(checklist) == ["survey", "wiring", "structure", "testing", "handover"]
+
+
+@pytest.mark.django_db
+def test_a_step_can_be_moved_to_any_position(ops, checklist):
+    """A step remembered late belongs where it happens, not at the end."""
+    ids = [str(s.id) for s in checklist.steps.order_by("step_number")]
+    # Take the last one and put it first.
+    r = _client(ops).post(
+        f"/api/sites/installations/{checklist.id}/reorder-steps/",
+        {"steps": [ids[-1], *ids[:-1]]}, format="json",
+    )
+    assert r.status_code == 200, r.content
+
+    assert _numbers(checklist) == [1, 2, 3, 4, 5, 6]
+    assert _types(checklist) == [
+        "handover", "survey", "wiring", "structure", "programming", "testing",
+    ]
+
+
+@pytest.mark.django_db
+def test_reordering_from_a_stale_list_keeps_every_step(ops, checklist):
+    """A screen that has not refreshed must not be able to drop a step.
+
+    Anything the caller leaves out keeps its place at the end rather than
+    being forgotten, so a slow browser cannot delete work by accident.
+    """
+    ids = [str(s.id) for s in checklist.steps.order_by("step_number")]
+    r = _client(ops).post(
+        f"/api/sites/installations/{checklist.id}/reorder-steps/",
+        {"steps": [ids[3]]}, format="json",
+    )
+    assert r.status_code == 200, r.content
+
+    assert checklist.steps.count() == 6
+    assert _numbers(checklist) == [1, 2, 3, 4, 5, 6]
+    assert _types(checklist)[0] == "programming"
+
+
+@pytest.mark.django_db
+def test_reordering_needs_the_order(ops, checklist):
+    r = _client(ops).post(
+        f"/api/sites/installations/{checklist.id}/reorder-steps/", {"steps": []},
+        format="json",
+    )
+    assert r.status_code == 400
+    assert "steps" in r.data

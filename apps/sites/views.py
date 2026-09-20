@@ -128,6 +128,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
     )
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["device", "site", "installed_by", "device__assigned_client", "device__project"]
+
     search_fields = [
         "device__asset_code", "device__display_name", "device__serial_number",
         "device__assigned_client__name", "device__clients__name",
@@ -135,6 +136,28 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         "site__name", "position_label",
     ]
     ordering_fields = ["installed_at", "due_date", "completed_at", "created_at"]
+
+    @action(detail=True, methods=["post"], url_path="reorder-steps")
+    def reorder_steps(self, request, pk=None):
+        """Put this installation's checklist in the order given.
+
+        Body: ``{"steps": [id, id, ...]}`` — the running order. A step left out
+        keeps its place at the end, so a list from a screen that has not
+        refreshed cannot quietly drop one.
+        """
+        from .ordering import apply_step_order
+
+        installation = self.get_object()
+        ids = request.data.get("steps")
+        if not isinstance(ids, list) or not ids:
+            return Response(
+                {"steps": ["Give the step ids in the order they should run."]},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        with transaction.atomic():
+            apply_step_order(installation.pk, ids)
+        installation.refresh_from_db()
+        return Response(self.get_serializer(installation).data)
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -539,6 +562,15 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
     serializer_class = InstallationStepSerializer
     filterset_fields = ["installation", "step_type", "status"]
     ordering_fields = ["step_number"]
+
+    def perform_destroy(self, instance):
+        """Remove the step, then close the gap it leaves in the numbering."""
+        from .ordering import renumber_steps
+
+        installation_id = instance.installation_id
+        with transaction.atomic():
+            instance.delete()
+            renumber_steps(installation_id)
 
     def get_permissions(self):
         # Only the assigned installer (mobile) or a super admin (desktop) may

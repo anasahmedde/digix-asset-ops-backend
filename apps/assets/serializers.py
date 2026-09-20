@@ -786,6 +786,9 @@ class DeviceTransitionSerializer(serializers.Serializer):
     current_site = serializers.PrimaryKeyRelatedField(
         queryset=Site.objects.all(), required=False, allow_null=True
     )
+    # When the installation has to be finished. Agreed with whoever is taking
+    # the job, at the moment they take it — not typed into the tracker later.
+    installation_date = serializers.DateField(required=False, allow_null=True)
     # Taking an asset out of service raises a corrective job, so the details
     # that job needs are asked for at the moment the asset goes down.
     maintenance_due = serializers.DateField(required=False, allow_null=True)

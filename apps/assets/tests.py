@@ -2738,3 +2738,42 @@ def test_an_unfinished_or_vendor_build_is_left_alone(db):
         source="inhouse", status=Device.Status.PROCURED,
     )
     assert build_is_complete(bare) is False, "nothing to build is not the same as built"
+
+
+@pytest.mark.django_db
+def test_the_due_date_agreed_at_assignment_lands_on_the_tracker(admin_client, in_stock_device):
+    """Handing the job out is when the date gets agreed.
+
+    The tracker used to open with an empty due date for somebody to fill in
+    afterwards, so nothing said when the work was actually wanted. The date
+    given as the technician takes it is the job's due date.
+    """
+    from datetime import date
+
+    from django.utils import timezone
+
+    from apps.sites.models import DeviceInstallation
+
+    tech = User.objects.create_user(
+        username="due-date-tech", password="x", role="technician", is_field_staff=True,
+        first_name="Bilal", last_name="Hussain",
+    )
+    due = date(2026, 10, 15)
+    r = admin_client.post(
+        f"/api/assets/devices/{in_stock_device.id}/transition/",
+        {
+            "status": "assigned", "reason": "Site ready",
+            "assigned_technician": str(tech.id), "installation_date": due.isoformat(),
+        },
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    in_stock_device.refresh_from_db()
+    assert in_stock_device.installation_date == due
+
+    job = DeviceInstallation.objects.get(device=in_stock_device)
+    assert job.due_date == due
+    # The three dates are distinct: it was assigned today, it is due later,
+    # and nothing has been installed yet.
+    assert job.installed_at.date() == timezone.localdate()
+    assert job.completed_at is None
