@@ -1094,8 +1094,9 @@ def test_each_phase_says_how_far_it_has_got():
     ProductionStep.objects.create(device=device, step_number=2, name="Fitting")
 
     bars = phase_progress(project)
-    assert bars["procurement"]["done"] == 0 and bars["procurement"]["total"] == 4
-    assert bars["production"]["total"] == 2 and bars["production"]["percent"] == 0
+    # Every phase is counted in assets: one asset here, none of it done.
+    assert bars["procurement"]["done"] == 0 and bars["procurement"]["total"] == 1
+    assert bars["production"]["total"] == 1 and bars["production"]["percent"] == 0
     assert bars["handover"]["total"] == 1 and bars["handover"]["percent"] == 0
     assert bars["planning"]["percent"] == 0, "no budget submitted yet"
 
@@ -1149,3 +1150,103 @@ def test_approving_the_budget_moves_the_project_off_planning():
     project.refresh_from_db()
     assert project.phase == Project.Phase.PROCUREMENT
     assert project.status == Project.Status.ON_TRACK
+
+
+@pytest.mark.django_db
+def test_a_phase_is_split_evenly_between_the_assets():
+    """One asset's long bill of materials cannot drown out the others.
+
+    A project of three assets moves a third at a time, however many parts or
+    operations each asset happens to carry — otherwise a big asset's screws
+    would read as more progress than a whole other asset being finished.
+    """
+    from apps.assets.models import ProductionStep
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    brand = Brand.objects.create(name="Split Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="SPL-1")
+    project = Project.objects.create(name="Even Split Rollout")
+    material = MaterialType.objects.create(name="Split Panel", unit="piece")
+    item = InventoryItem.objects.create(material_type=material, quantity=500)
+
+    # A big asset (40 parts) and two small ones (2 parts each).
+    sizes = [40, 2, 2]
+    devices = []
+    for n, size in enumerate(sizes, start=1):
+        d = Device.objects.create(device_model=dm, asset_code=f"AST-SPLIT-{n}", source="inhouse")
+        ProjectScopeItem.objects.create(project=project, device=d, quantity=1)
+        AssetComponent.objects.create(
+            device=d, name="Split Panel", quantity=size, inventory_item=item,
+        )
+        ProductionStep.objects.create(device=d, step_number=1, name="Assemble")
+        devices.append(d)
+
+    bars = phase_progress(project)
+    assert bars["procurement"]["total"] == 3 and bars["procurement"]["percent"] == 0
+
+    # Supply the big asset in full: one of three assets, so a third.
+    big = devices[0].components.get()
+    big.issued_quantity = 40
+    big.save(update_fields=["issued_quantity"])
+    bars = phase_progress(project)
+    assert bars["procurement"]["percent"] == 33, bars["procurement"]
+    assert bars["procurement"]["done"] == 1
+    assert bars["procurement"]["note"] == "1 of 3 assets supplied"
+
+    # Half of one small asset: half a share, so a sixth more.
+    small = devices[1].components.get()
+    small.issued_quantity = 1
+    small.save(update_fields=["issued_quantity"])
+    assert phase_progress(project)["procurement"]["percent"] == 50
+
+    # Production splits the same way: one of three routes finished.
+    step = devices[0].production_steps.get()
+    step.status = ProductionStep.Status.COMPLETED
+    step.save(update_fields=["status"])
+    bars = phase_progress(project)
+    assert bars["production"]["percent"] == 33 and bars["production"]["total"] == 3
+
+    # And handing over: one asset running out of three.
+    devices[2].status = Device.Status.ACTIVE
+    devices[2].save(update_fields=["status"])
+    bars = phase_progress(project)
+    assert bars["handover"]["percent"] == 33
+    assert bars["handover"]["note"] == "1 of 3 assets handed over"
+    # Nobody has opened an installation, so none of that phase is done.
+    assert bars["installation"]["percent"] == 0
+
+
+@pytest.mark.django_db
+def test_a_vendor_asset_clears_procurement_and_production_when_it_arrives():
+    """Nobody here builds it, so delivery is the whole of both phases.
+
+    A complete asset bought from a vendor has no bill of materials and no
+    route. Until it turns up neither phase has moved for it; once it is in
+    stock both are finished, and it waits on installation like anything else.
+    """
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    brand = Brand.objects.create(name="Vendor Share Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="VSH-1")
+    project = Project.objects.create(name="Vendor Share Rollout")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-VSHARE-1", source="vendor_supplied",
+        status=Device.Status.PROCURED,
+    )
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+
+    bars = phase_progress(project)
+    assert bars["procurement"]["percent"] == 0, "on order, not delivered"
+    assert bars["production"]["percent"] == 0, "the vendor has not delivered it"
+
+    # It arrives and goes into stock.
+    device.status = Device.Status.IN_STOCK
+    device.save(update_fields=["status"])
+
+    bars = phase_progress(project)
+    assert bars["procurement"]["percent"] == 100
+    assert bars["production"]["percent"] == 100, "nobody here builds it"
+    assert bars["installation"]["percent"] == 0, "still to be put in"
+    assert bars["handover"]["percent"] == 0

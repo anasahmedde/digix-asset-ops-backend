@@ -10,13 +10,36 @@ from __future__ import annotations
 from .costing import project_devices
 
 
-def _bar(done: int, total: int, note: str) -> dict:
+def _bar(done: int, total: int, note: str, percent: int | None = None) -> dict:
+    """done/total for the note, and the percent they imply.
+
+    ``percent`` is passed where the share is not the plain ratio — a phase
+    split evenly between assets, each of which is partly done.
+    """
     return {
         "done": done,
         "total": total,
-        "percent": round(done / total * 100) if total else 0,
+        "percent": percent if percent is not None else (
+            round(done / total * 100) if total else 0
+        ),
         "note": note,
     }
+
+
+def _even_split(shares: list[float], thing: str) -> dict:
+    """A phase divided equally between the assets, each part-filled.
+
+    ``shares`` is one fraction per asset, 0 to 1. Every asset counts the same
+    however much work it happens to carry, so a project of three assets moves
+    a third at a time and no further until the next one catches up.
+    """
+    if not shares:
+        return _bar(0, 0, "No assets yet")
+    done = sum(1 for share in shares if share >= 1)
+    return _bar(
+        done, len(shares), f"{done} of {len(shares)} assets {thing}",
+        percent=round(sum(shares) / len(shares) * 100),
+    )
 
 
 def phase_progress(project) -> dict:
@@ -46,35 +69,40 @@ def phase_progress(project) -> dict:
         else "Budget not submitted",
     )
 
-    # ── Procurement: every part in hand, every bought asset received ──
-    needed = 0
-    got = 0
+    # ── Procurement: every asset supplied, each worth the same ──
+    shares = []
     for device in devices:
         if device.source != Device.Source.INHOUSE:
-            # A whole asset bought from a vendor: one line, in or not.
-            needed += 1
-            got += 1 if device.status != Device.Status.PROCURED else 0
+            # A whole asset bought from a vendor: it has arrived or it has not.
+            shares.append(0.0 if device.status == Device.Status.PROCURED else 1.0)
             continue
-        for component in device.components.all():
-            needed += component.quantity
-            got += min(component.issued_quantity, component.quantity)
-    procurement = _bar(
-        got, needed,
-        f"{got} of {needed} issued or received" if needed else "Nothing to procure",
-    )
+        components = list(device.components.all())
+        wanted = sum(c.quantity for c in components)
+        if not wanted:
+            # Nothing to buy for it, so nothing is holding it up.
+            shares.append(1.0)
+            continue
+        shares.append(
+            sum(min(c.issued_quantity, c.quantity) for c in components) / wanted
+        )
+    procurement = _even_split(shares, "supplied")
 
-    # ── Production: every operation on every in-house route ──
-    ops_done = 0
-    ops_total = 0
+    # ── Production: every asset built, each worth the same ──
+    shares = []
     for device in devices:
-        for step in device.production_steps.all():
-            ops_total += 1
-            if step.status in ("completed", "skipped"):
-                ops_done += 1
-    production = _bar(
-        ops_done, ops_total,
-        f"{ops_done} of {ops_total} operations finished" if ops_total else "Nothing to build",
-    )
+        if device.source != Device.Source.INHOUSE:
+            # The vendor built it. It is finished the moment it turns up, so
+            # its share follows the delivery, exactly as procurement's does.
+            shares.append(0.0 if device.status == Device.Status.PROCURED else 1.0)
+            continue
+        steps = list(device.production_steps.all())
+        if not steps:
+            # Built here, but with no route on it: nothing to make.
+            shares.append(1.0)
+            continue
+        finished = sum(1 for s in steps if s.status in ("completed", "skipped"))
+        shares.append(finished / len(steps))
+    production = _even_split(shares, "built")
 
     # ── Installation: the checklist the technician works through on site ──
     jobs = (
@@ -82,33 +110,39 @@ def phase_progress(project) -> dict:
         .prefetch_related("steps")
         .order_by("device_id", "-installed_at")
     )
-    seen = set()
-    steps_done = 0
-    steps_total = 0
+    # The live job per asset — the most recent one, where a job was reopened.
+    latest = {}
     for job in jobs:
-        if job.device_id in seen:
+        latest.setdefault(job.device_id, job)
+    shares = []
+    for device in devices:
+        job = latest.get(device.pk)
+        if job is None:
+            # Nobody has opened a job for it, so none of it is installed.
+            shares.append(0.0)
             continue
-        seen.add(job.device_id)
-        for step in job.steps.all():
-            steps_total += 1
-            if step.status in (
+        steps = list(job.steps.all())
+        if not steps:
+            shares.append(0.0)
+            continue
+        done_here = sum(
+            1 for s in steps
+            if s.status in (
                 InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.SKIPPED,
-            ):
-                steps_done += 1
-    if steps_total:
-        note = f"{steps_done} of {steps_total} steps done across {len(seen)} installation(s)"
-    else:
-        note = "No installation opened yet" if device_ids else "No assets yet"
-    installation = _bar(steps_done, steps_total, note)
+            )
+        )
+        shares.append(done_here / len(steps))
+    installation = _even_split(shares, "installed")
+    if devices and not latest:
+        installation["note"] = "No installation opened yet"
 
     # ── Handing over: an asset is handed over when it is running ──
-    handed = sum(
-        1 for d in devices
-        if d.status in (Device.Status.ACTIVE, Device.Status.CLIENT_PROPERTY)
-    )
-    handover = _bar(
-        handed, len(devices),
-        f"{handed} of {len(devices)} assets active" if devices else "No assets yet",
+    handover = _even_split(
+        [
+            1.0 if d.status in (Device.Status.ACTIVE, Device.Status.CLIENT_PROPERTY) else 0.0
+            for d in devices
+        ],
+        "handed over",
     )
 
     return {
