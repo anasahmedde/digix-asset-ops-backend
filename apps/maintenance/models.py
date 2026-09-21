@@ -231,6 +231,14 @@ class MaintenancePartRequest(TimeStampedModel):
     decided_at = models.DateTimeField(null=True, blank=True)
     decision_note = models.CharField(max_length=300, blank=True)
 
+    # What the visit did with what it was given. The two add up to what the
+    # store issued: anything not used goes back, and is only back in stock
+    # once receiving has inspected it.
+    quantity_used = models.PositiveIntegerField(null=True, blank=True)
+    quantity_returned = models.PositiveIntegerField(default=0)
+    # The receipt the store inspects the returned material against.
+    return_reference = models.CharField(max_length=50, blank=True)
+
     # The store request this line became once it was approved. Nothing here
     # moves stock; the store still issues it.
     issuance_request = models.OneToOneField(

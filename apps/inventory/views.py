@@ -455,46 +455,20 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
         source (project_return | maintenance_return), inventory_item or
         unit_type, quantity, optional serial_numbers, reference, notes.
         """
-        source = request.data.get("source")
-        if source not in (GoodsReceipt.Source.PROJECT_RETURN, GoodsReceipt.Source.MAINTENANCE_RETURN):
-            return Response({"source": ["Say whether this is a project or a maintenance return."]}, status=400)
-        try:
-            quantity = int(request.data.get("quantity") or 0)
-        except (TypeError, ValueError):
-            quantity = 0
-        if quantity < 1:
-            return Response({"quantity": ["Return at least one."]}, status=400)
+        from .returns import record_return as book_in
 
-        item_id = request.data.get("inventory_item") or None
-        unit_type_id = request.data.get("unit_type") or None
-        if not item_id and not unit_type_id:
-            return Response({"inventory_item": ["Name the component coming back."]}, status=400)
-        serials = request.data.get("serial_numbers") or []
-        if unit_type_id and len(serials) != quantity:
-            return Response(
-                {"serial_numbers": [f"Give {quantity} serial number(s) for the units coming back."]},
-                status=400,
-            )
-
-        with transaction.atomic():
-            receipt = GoodsReceipt.objects.create(
-                source=source,
-                reference=(request.data.get("reference") or "").strip(),
-                notes=(request.data.get("notes") or "").strip(),
-                received_by=request.user,
-            )
-            line = GoodsReceiptLine.objects.create(
-                receipt=receipt,
-                inventory_item_id=item_id,
-                quantity=quantity,
-                serial_numbers=serials,
-                inspection_status=GoodsReceiptLine.Inspection.PENDING,
-            )
-            # A unique product is remembered on the line's notes for the
-            # inspector, who files the serials against it.
-            if unit_type_id:
-                line.inspection_notes = f"unit_type:{unit_type_id}"
-                line.save(update_fields=["inspection_notes", "updated_at"])
+        receipt = book_in(
+            source=request.data.get("source"),
+            rows=[{
+                "item": request.data.get("inventory_item") or None,
+                "unit_type": request.data.get("unit_type") or None,
+                "quantity": request.data.get("quantity"),
+                "serials": request.data.get("serial_numbers") or [],
+            }],
+            reference=request.data.get("reference") or "",
+            notes=request.data.get("notes") or "",
+            user=request.user,
+        )
         return Response(GoodsReceiptSerializer(receipt).data, status=201)
 
     def perform_create(self, serializer):

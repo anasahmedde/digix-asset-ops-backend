@@ -131,9 +131,18 @@ class MaintenanceRecordPhotoSerializer(serializers.ModelSerializer):
 
 class MaintenanceRecordSerializer(serializers.ModelSerializer):
     schedule_title = serializers.CharField(source="schedule.title", read_only=True, default=None)
-    performed_by_name = serializers.CharField(source="performed_by.get_full_name", read_only=True, default=None)
+    performed_by_name = serializers.SerializerMethodField()
     component_names = serializers.SerializerMethodField()
     photos = MaintenanceRecordPhotoSerializer(many=True, read_only=True)
+    # What the visit did with the parts the store issued it: rows of
+    # {part_request, used, serials}. It is sent when the visit is closed out,
+    # because that is the moment anybody knows.
+    parts_settlement = serializers.ListField(
+        child=serializers.DictField(), write_only=True, required=False
+    )
+    # The receipt the returned material waits on, so whoever closed the visit
+    # can be told where it went. Set while the visit is being recorded.
+    return_grn = serializers.SerializerMethodField()
 
     class Meta:
         model = MaintenanceRecord
@@ -143,9 +152,20 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
             "performed_at", "status", "notes", "cost",
             "is_billable", "charge_to",
             "components_used", "component_names", "photos",
+            "parts_settlement", "return_grn",
             "created_at",
         ]
         read_only_fields = ["id", "performed_by", "created_at"]
+
+    def get_performed_by_name(self, obj):
+        """Whoever attended, by whatever name the system knows them."""
+        user = obj.performed_by
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
+
+    def get_return_grn(self, obj):
+        return getattr(obj, "return_grn", None)
 
     def get_component_names(self, obj):
         return [c.name for c in obj.components_used.all()]
@@ -153,8 +173,13 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         # Warranty-aware billability defaults (MW-01/02) — explicit payload
         # values win over the derived ones.
+        from django.db import transaction
+
         from apps.warranties.services import derive_billability
 
+        from .parts import settle
+
+        settlement = validated_data.pop("parts_settlement", None)
         schedule = validated_data.get("schedule")
         device = schedule.device if schedule else None
         if device is not None:
@@ -163,7 +188,18 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
                 validated_data["is_billable"] = billable
             if not validated_data.get("charge_to"):
                 validated_data["charge_to"] = charge
-        return super().create(validated_data)
+        # One action: the visit is recorded and its leftovers are handed back
+        # together, so a rejected return cannot leave a closed-out visit whose
+        # parts are unaccounted for.
+        with transaction.atomic():
+            record = super().create(validated_data)
+            if settlement:
+                request = self.context.get("request")
+                receipt = settle(
+                    schedule, user=getattr(request, "user", None), rows=settlement
+                )
+                record.return_grn = receipt.grn_number if receipt else None
+        return record
 
     def validate(self, attrs):
         schedule = attrs.get("schedule") or getattr(self.instance, "schedule", None)
@@ -200,6 +236,10 @@ class MaintenancePartRequestSerializer(serializers.ModelSerializer):
     quantity_issued = serializers.IntegerField(
         source="issuance_request.quantity_issued", read_only=True, default=None,
     )
+    # Which units went out, so the ones coming back can be named.
+    issued_serials = serializers.JSONField(
+        source="issuance_request.issued_serials", read_only=True, default=list,
+    )
 
     class Meta:
         model = MaintenancePartRequest
@@ -210,6 +250,7 @@ class MaintenancePartRequestSerializer(serializers.ModelSerializer):
             "requested_by", "requested_by_name",
             "decided_by", "decided_by_name", "decided_at", "decision_note",
             "issuance_request", "issue_status", "issue_number", "quantity_issued",
+            "issued_serials", "quantity_used", "quantity_returned", "return_reference",
             "created_at", "updated_at",
         ]
         # The answer is given through the decide action, which is where the
@@ -218,6 +259,7 @@ class MaintenancePartRequestSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "status", "quantity_approved", "requested_by", "decided_by",
             "decided_at", "decision_note", "issuance_request",
+            "quantity_used", "quantity_returned", "return_reference",
             "created_at", "updated_at",
         ]
 

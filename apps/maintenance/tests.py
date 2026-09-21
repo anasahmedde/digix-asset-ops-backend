@@ -816,3 +816,146 @@ def test_an_unanswered_line_can_be_withdrawn_but_an_answered_one_cannot(parts_jo
         {"approve": True}, format="json",
     )
     assert tech.delete(f"/api/maintenance/part-requests/{r.data['id']}/").status_code == 400
+
+
+def _issue(job, line_id, quantity, serials=None):
+    """The store hands over what was approved, so there is something to settle."""
+    from apps.maintenance.models import MaintenancePartRequest
+
+    line = MaintenancePartRequest.objects.get(pk=line_id)
+    issuance = line.issuance_request
+    issuance.quantity_issued = quantity
+    issuance.issued_serials = serials or []
+    issuance.sync_status()
+    issuance.save()
+    return issuance
+
+
+def _approved_line(job, quantity=12):
+    r = _ask(_client(job["tech"]), job, quantity=quantity)
+    r = _client(job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True, "quantity": quantity}, format="json",
+    )
+    return r.data["id"]
+
+
+@pytest.mark.django_db
+def test_what_the_visit_did_not_use_goes_back_to_receiving(parts_job):
+    """A technician saying a part is spare does not put it back on the shelf.
+
+    The leftover is received the way a delivery is — a line waiting on
+    inspection — and the job records what it used and what it handed back.
+    """
+    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine
+    from apps.maintenance.models import MaintenancePartRequest
+
+    line_id = _approved_line(parts_job, quantity=12)
+    _issue(parts_job, line_id, 12)
+
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        "schedule": str(parts_job["schedule"].id),
+        "performed_at": timezone.now().isoformat(),
+        "status": "completed",
+        "parts_settlement": [{"part_request": line_id, "used": 9}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+
+    line = MaintenancePartRequest.objects.get(pk=line_id)
+    assert (line.quantity_used, line.quantity_returned) == (9, 3)
+
+    receipt = GoodsReceipt.objects.get(source=GoodsReceipt.Source.MAINTENANCE_RETURN)
+    assert line.return_reference == receipt.grn_number
+    assert r.data["return_grn"] == receipt.grn_number, "the visit says where the rest went"
+    back = receipt.lines.get()
+    assert back.quantity == 3
+    assert back.inspection_status == GoodsReceiptLine.Inspection.PENDING
+    parts_job["item"].refresh_from_db()
+    assert parts_job["item"].quantity == 100, "stock only moves when receiving passes the line"
+
+
+@pytest.mark.django_db
+def test_a_visit_that_used_everything_sends_nothing_back(parts_job):
+    from apps.inventory.models import GoodsReceipt
+    from apps.maintenance.models import MaintenancePartRequest
+
+    line_id = _approved_line(parts_job, quantity=5)
+    _issue(parts_job, line_id, 5)
+
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        "schedule": str(parts_job["schedule"].id),
+        "performed_at": timezone.now().isoformat(),
+        "status": "completed",
+        "parts_settlement": [{"part_request": line_id, "used": 5}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["return_grn"] is None
+    assert not GoodsReceipt.objects.filter(source=GoodsReceipt.Source.MAINTENANCE_RETURN).exists()
+    assert MaintenancePartRequest.objects.get(pk=line_id).quantity_returned == 0
+
+
+@pytest.mark.django_db
+def test_a_visit_cannot_use_more_than_the_store_issued(parts_job):
+    """And the visit is not recorded on a settlement that does not add up."""
+    from apps.maintenance.models import MaintenanceRecord
+
+    line_id = _approved_line(parts_job, quantity=4)
+    _issue(parts_job, line_id, 4)
+
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        "schedule": str(parts_job["schedule"].id),
+        "performed_at": timezone.now().isoformat(),
+        "status": "completed",
+        "parts_settlement": [{"part_request": line_id, "used": 6}],
+    }, format="json")
+    assert r.status_code == 400, r.content
+    assert not MaintenanceRecord.objects.exists(), "the visit rolls back with its settlement"
+
+
+@pytest.mark.django_db
+def test_unique_units_come_back_by_serial(parts_job):
+    """Which units are back matters: stock counts them one by one."""
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import GoodsReceipt, InventoryUnitType
+
+    kind = InventoryUnitType.objects.create(
+        material_type=MaterialType.objects.create(name="Parts Meter", unit="piece"),
+        name="Flow meter",
+    )
+    r = _client(parts_job["tech"]).post("/api/maintenance/part-requests/", {
+        "schedule": str(parts_job["schedule"].id), "unit_type": str(kind.id),
+        "quantity_requested": 2,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    line_id = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    ).data["id"]
+    _issue(parts_job, line_id, 2, serials=["FM-1", "FM-2"])
+
+    body = {
+        "schedule": str(parts_job["schedule"].id),
+        "performed_at": timezone.now().isoformat(),
+        "status": "completed",
+    }
+    # One is spare, but which one?
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        **body, "parts_settlement": [{"part_request": line_id, "used": 1}],
+    }, format="json")
+    assert r.status_code == 400, r.content
+
+    # And it has to be one that went out on this job.
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        **body,
+        "parts_settlement": [{"part_request": line_id, "used": 1, "serials": ["FM-9"]}],
+    }, format="json")
+    assert r.status_code == 400, r.content
+
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        **body,
+        "parts_settlement": [{"part_request": line_id, "used": 1, "serials": ["FM-2"]}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    back = GoodsReceipt.objects.get(source=GoodsReceipt.Source.MAINTENANCE_RETURN).lines.get()
+    assert back.serial_numbers == ["FM-2"]
+    assert back.inspection_notes == f"unit_type:{kind.id}", "receiving knows what it is"
