@@ -959,3 +959,42 @@ def test_unique_units_come_back_by_serial(parts_job):
     back = GoodsReceipt.objects.get(source=GoodsReceipt.Source.MAINTENANCE_RETURN).lines.get()
     assert back.serial_numbers == ["FM-2"]
     assert back.inspection_notes == f"unit_type:{kind.id}", "receiving knows what it is"
+
+
+@pytest.mark.django_db
+def test_a_request_sent_back_by_the_store_waits_on_the_supervisor_again(parts_job):
+    """The job does not sit reading "awaiting issue" for something the store
+    has handed back. The line returns to the supervisor, whose approval is
+    what puts it in front of the store in the first place.
+    """
+    from apps.accounts.models import User
+    from apps.inventory.models import IssuanceRequest
+    from apps.maintenance.models import MaintenancePartRequest
+
+    store = User.objects.create_user(username="parts-store", password="x", role="warehouse")
+    line_id = _approved_line(parts_job, quantity=6)
+    line = MaintenancePartRequest.objects.get(pk=line_id)
+    issuance = line.issuance_request
+
+    r = _client(store).post(
+        f"/api/inventory/issuance-requests/{issuance.id}/send-back/",
+        {"note": "Out of stock — decide again"}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["sent_back_to"] == parts_job["schedule"].title
+
+    line.refresh_from_db()
+    issuance.refresh_from_db()
+    assert issuance.status == IssuanceRequest.Status.CANCELLED
+    assert line.status == MaintenancePartRequest.Status.REQUESTED, "back with the supervisor"
+    assert line.quantity_approved is None and line.issuance_request_id is None
+    assert "Out of stock" in line.decision_note
+
+    # And the supervisor can answer it again, which asks the store afresh.
+    r = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{line_id}/decide/",
+        {"approve": True, "quantity": 4}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["quantity_approved"] == 4
+    assert r.data["issuance_request"] != str(issuance.id), "a fresh request, not the cancelled one"

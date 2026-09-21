@@ -453,6 +453,9 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
     # and inspection only has to show it.
     kind = serializers.SerializerMethodField()
     known_component = serializers.SerializerMethodField()
+    # The code of the component this line files into — the one the store will
+    # find it under once inspection passes it.
+    component_code = serializers.SerializerMethodField()
 
     def _product(self, obj):
         """The unique product a line is for, from whichever link it has: the
@@ -489,6 +492,18 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             return "unique"
         if self._item(obj) is not None or obj.routed_to == "generic":
             return "generic"
+        return None
+
+    def get_component_code(self, obj):
+        asset = self._asset(obj)
+        if asset is not None:
+            return asset.asset_code
+        product = self._product(obj)
+        if product is not None:
+            return product.type_code or None
+        item = self._item(obj)
+        if item is not None:
+            return item.sku or None
         return None
 
     def _legacy_label(self, obj):
@@ -572,7 +587,7 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             "quantity", "unit", "batch_number", "serial_numbers",
             "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
             "inspected_by", "inspected_by_name", "inspected_at", "inspection_notes",
-            "stocked_unit_count", "kind", "known_component", "created_at",
+            "stocked_unit_count", "kind", "known_component", "component_code", "created_at",
             "source", "source_display", "reference", "received_at", "received_by_name",
             "routed_to_display", "inspection_status_display", "stocked_item_sku", "storage_location", "stocked_units",
             "stocked_code", "stocked_name",

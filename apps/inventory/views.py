@@ -574,6 +574,89 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
             "reason": result.get("reason", ""),
         })
 
+    @action(detail=True, methods=["post"], url_path="send-back")
+    def send_back(self, request, pk=None):
+        """Hand a request back to whoever raised it.
+
+        The store is not the place to decide whether a job needs a part. A
+        request it cannot or should not fill goes back one step instead of
+        vanishing: to the supervisor who released it on a maintenance job, or
+        to the requirement on a project, for that decision to be made again.
+        Anything already issued stays issued; only the balance comes off the
+        queue.
+        """
+        from django.utils import timezone
+
+        denied = self._store_only(request)
+        if denied is not None:
+            return denied
+
+        issuance_request = self.get_object()
+        if issuance_request.status == IssuanceRequest.Status.CANCELLED:
+            return Response({"detail": "This request is already off the queue."}, status=400)
+        if issuance_request.outstanding_quantity == 0:
+            return Response(
+                {"detail": "Everything asked for has been issued — there is nothing to send back."},
+                status=400,
+            )
+
+        note = (request.data.get("note") or "").strip()
+        part = getattr(issuance_request, "maintenance_part_request", None)
+        component = issuance_request.asset_component
+
+        with transaction.atomic():
+            issuance_request.status = IssuanceRequest.Status.CANCELLED
+            who = request.user.get_full_name() or request.user.username
+            trail = f"Sent back by {who} on {timezone.localdate():%d %b %Y}"
+            if issuance_request.quantity_issued:
+                trail += f" — {issuance_request.quantity_issued} already issued stays issued"
+            if note:
+                trail += f": {note}"
+            issuance_request.notes = "\n".join(
+                x for x in [issuance_request.notes, trail] if x
+            )
+            issuance_request.save(update_fields=["status", "notes", "updated_at"])
+
+            where = "the store"
+            if part is not None:
+                # Back to awaiting an answer: the supervisor decides again, and
+                # approving raises a fresh request on the store's queue.
+                from apps.maintenance.models import MaintenancePartRequest
+
+                part.status = MaintenancePartRequest.Status.REQUESTED
+                part.quantity_approved = None
+                part.decided_by = None
+                part.decided_at = None
+                part.decision_note = note or f"Sent back by the store on {timezone.localdate():%d %b %Y}"
+                part.issuance_request = None
+                part.save(update_fields=[
+                    "status", "quantity_approved", "decided_by", "decided_at",
+                    "decision_note", "issuance_request", "updated_at",
+                ])
+                where = part.schedule.title
+            elif component is not None:
+                # A cancelled request stops counting against the requirement,
+                # so the quantity is undecided again; all that is left is to
+                # say so on the line itself.
+                from apps.assets.models import AssetComponent
+
+                component.refresh_from_db()
+                if component.outstanding_quantity == 0:
+                    component.fulfilment = AssetComponent.Fulfilment.FULFILLED
+                elif component.procure_quantity:
+                    component.fulfilment = AssetComponent.Fulfilment.PROCUREMENT
+                elif component.stock_requested_quantity:
+                    component.fulfilment = AssetComponent.Fulfilment.FROM_STOCK
+                else:
+                    component.fulfilment = AssetComponent.Fulfilment.PENDING
+                component.save(update_fields=["fulfilment", "updated_at"])
+                where = f"{component.device.asset_code} · {component.name}"
+
+        return Response({
+            "request": IssuanceRequestSerializer(issuance_request).data,
+            "sent_back_to": where,
+        })
+
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
         """Close a request that is no longer needed; issued stock is untouched."""

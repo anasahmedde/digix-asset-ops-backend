@@ -132,6 +132,7 @@ class MaintenanceRecordPhotoSerializer(serializers.ModelSerializer):
 class MaintenanceRecordSerializer(serializers.ModelSerializer):
     schedule_title = serializers.CharField(source="schedule.title", read_only=True, default=None)
     performed_by_name = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
     component_names = serializers.SerializerMethodField()
     photos = MaintenanceRecordPhotoSerializer(many=True, read_only=True)
     # What the visit did with the parts the store issued it: rows of
@@ -149,7 +150,7 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
         fields = [
             "id", "schedule", "schedule_title",
             "performed_by", "performed_by_name",
-            "performed_at", "status", "notes", "cost",
+            "performed_at", "status", "status_display", "notes", "cost",
             "is_billable", "charge_to",
             "components_used", "component_names", "photos",
             "parts_settlement", "return_grn",
