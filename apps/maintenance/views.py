@@ -1,16 +1,102 @@
+from rest_framework import serializers as drf_serializers
+from rest_framework import status as drf_status
 from rest_framework import viewsets
 from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
 from common.permissions import TechnicianCanCreate
 
-from .models import MaintenanceRecord, MaintenanceRecordPhoto, MaintenanceSchedule
+from .models import (
+    MaintenancePartRequest,
+    MaintenanceRecord,
+    MaintenanceRecordPhoto,
+    MaintenanceSchedule,
+)
 from .serializers import (
+    MaintenancePartDecisionSerializer,
+    MaintenancePartRequestSerializer,
     MaintenanceRecordPhotoSerializer,
     MaintenanceRecordSerializer,
     MaintenanceScheduleSerializer,
 )
+
+# Who may answer a technician's request for parts. Raising one is the
+# technician's job; releasing stock against it is not.
+DECIDING_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
+# Who may raise or withdraw one: the people who actually attend the job, and
+# the managers above them.
+ASKING_ROLES = DECIDING_ROLES + ("technician",)
+
+
+class CanAskOrAnswerForParts(BasePermission):
+    """Technicians ask, supervisors and managers answer; everyone else reads.
+
+    The shared technician permission is shaped for tickets and does not know
+    about deciding or withdrawing, so this viewset states its own rule rather
+    than widening one that other screens depend on.
+    """
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if request.method in SAFE_METHODS:
+            return True
+        role = getattr(user, "role", None)
+        if view.action == "decide":
+            return role in DECIDING_ROLES
+        return role in ASKING_ROLES
+
+
+class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
+    """Parts a technician has asked for on a job, and the answers given."""
+
+    queryset = MaintenancePartRequest.objects.select_related(
+        "schedule", "schedule__device", "item", "item__material_type",
+        "unit_type", "requested_by", "decided_by", "issuance_request",
+    ).all()
+    serializer_class = MaintenancePartRequestSerializer
+    permission_classes = [IsAuthenticated, CanAskOrAnswerForParts]
+    filterset_fields = ["schedule", "status", "requested_by"]
+    search_fields = ["name", "schedule__title"]
+    ordering_fields = ["created_at"]
+
+    def perform_create(self, serializer):
+        serializer.save(requested_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        """A line can be withdrawn while nobody has answered it yet."""
+        if instance.status != MaintenancePartRequest.Status.REQUESTED:
+            raise drf_serializers.ValidationError(
+                {"detail": "A line that has been answered stays on the record."}
+            )
+        instance.delete()
+
+    @action(detail=True, methods=["post"])
+    def decide(self, request, pk=None):
+        """Approve this line, for all or part of what was asked, or reject it.
+
+        Approving raises the request the store will issue against; it does not
+        move any stock itself.
+        """
+        from .parts import decide as decide_line
+
+        if getattr(request.user, "role", None) not in DECIDING_ROLES:
+            return Response(
+                {"detail": "Only a supervisor or above can answer a request for parts."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+        ser = MaintenancePartDecisionSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        line = decide_line(
+            self.get_object(),
+            user=request.user,
+            approve=ser.validated_data["approve"],
+            quantity=ser.validated_data.get("quantity"),
+            note=ser.validated_data.get("note", ""),
+        )
+        return Response(self.get_serializer(line).data)
 
 
 class MaintenanceScheduleViewSet(viewsets.ModelViewSet):

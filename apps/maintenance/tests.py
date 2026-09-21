@@ -691,3 +691,128 @@ def test_the_next_round_is_worked_out_from_the_start_and_the_frequency():
     # A date given without a start still anchors the schedule.
     from_due = MaintenanceSchedule.objects.create(title="From due", next_due=begins)
     assert from_due.start_date == begins
+
+
+@pytest.fixture
+def parts_job(db):
+    """A job with a technician on it and a drum of cable in the store."""
+    from apps.assets.models import AssetType, MaterialType
+    from apps.inventory.models import InventoryItem
+    from apps.maintenance.models import MaintenanceSchedule
+    from apps.sites.models import Site
+
+    site = Site.objects.create(name="Parts Site", address="1 Road")
+    kind = AssetType.objects.create(name="Parts Kind")
+    device = Device.objects.create(asset_type=kind, current_site=site)
+    tech = User.objects.create_user(
+        username="parts-tech", password="x", role="technician", is_field_staff=True,
+    )
+    boss = User.objects.create_user(username="parts-boss", password="x", role="supervisor")
+    material = MaterialType.objects.create(name="Parts Cable", unit="meter")
+    item = InventoryItem.objects.create(material_type=material, quantity=100)
+    schedule = MaintenanceSchedule.objects.create(
+        title="Cable round", device=device, assigned_to=tech,
+        start_date=timezone.localdate(),
+    )
+    return {"schedule": schedule, "item": item, "tech": tech, "boss": boss}
+
+
+def _ask(client, job, quantity=20):
+    return client.post("/api/maintenance/part-requests/", {
+        "schedule": str(job["schedule"].id), "item": str(job["item"].id),
+        "quantity_requested": quantity,
+    }, format="json")
+
+
+@pytest.mark.django_db
+def test_an_approved_line_becomes_a_request_on_the_stores_queue(parts_job):
+    """Approving does not issue anything — it asks the store to.
+
+    The store is the only place material leaves from, so the answer to a
+    technician queues there for the quantity that was agreed.
+    """
+    from apps.inventory.models import IssuanceRequest
+
+    r = _ask(_client(parts_job["tech"]), parts_job)
+    assert r.status_code == 201, r.content
+    assert r.data["status"] == "requested"
+    assert r.data["unit"] == "meter", "a line is counted the way its stock is"
+
+    r = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True, "quantity": 12, "note": "Half a drum is plenty"},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["quantity_approved"] == 12
+
+    issued = IssuanceRequest.objects.get(pk=r.data["issuance_request"])
+    assert issued.quantity_requested == 12, "the store is asked for what was agreed"
+    assert issued.source == IssuanceRequest.Source.MAINTENANCE
+    assert issued.maintenance_schedule_id == parts_job["schedule"].id
+    assert issued.status == IssuanceRequest.Status.PENDING, "nothing has left the store yet"
+
+
+@pytest.mark.django_db
+def test_a_line_cannot_be_approved_for_more_than_was_asked(parts_job):
+    """Cutting a line is the supervisor's call; adding to it is not."""
+    r = _ask(_client(parts_job["tech"]), parts_job, quantity=20)
+    r = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True, "quantity": 25}, format="json",
+    )
+    assert r.status_code == 400
+    assert "20 meter" in str(r.data["quantity"])
+
+
+@pytest.mark.django_db
+def test_a_rejected_line_asks_the_store_for_nothing(parts_job):
+    from apps.inventory.models import IssuanceRequest
+
+    before = IssuanceRequest.objects.count()
+    r = _ask(_client(parts_job["tech"]), parts_job)
+    r = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": False, "note": "Use what is on the van"}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["status"] == "rejected" and r.data["quantity_approved"] == 0
+    assert r.data["issuance_request"] is None
+    assert IssuanceRequest.objects.count() == before
+
+
+@pytest.mark.django_db
+def test_a_technician_cannot_answer_their_own_request(parts_job):
+    """Asking and approving are two people, or the approval means nothing."""
+    tech = _client(parts_job["tech"])
+    r = _ask(tech, parts_job)
+    r = tech.post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert r.status_code == 403, r.content
+
+
+@pytest.mark.django_db
+def test_a_line_is_answered_once(parts_job):
+    r = _ask(_client(parts_job["tech"]), parts_job)
+    boss = _client(parts_job["boss"])
+    line = f"/api/maintenance/part-requests/{r.data['id']}/decide/"
+    assert boss.post(line, {"approve": True}, format="json").status_code == 200
+    again = boss.post(line, {"approve": False}, format="json")
+    assert again.status_code == 400
+    assert "already approved" in str(again.data["status"])
+
+
+@pytest.mark.django_db
+def test_an_unanswered_line_can_be_withdrawn_but_an_answered_one_cannot(parts_job):
+    tech = _client(parts_job["tech"])
+    r = _ask(tech, parts_job)
+    assert tech.delete(f"/api/maintenance/part-requests/{r.data['id']}/").status_code == 204
+
+    r = _ask(tech, parts_job)
+    _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert tech.delete(f"/api/maintenance/part-requests/{r.data['id']}/").status_code == 400

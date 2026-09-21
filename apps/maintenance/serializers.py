@@ -1,6 +1,11 @@
 from rest_framework import serializers
 
-from .models import MaintenanceRecord, MaintenanceRecordPhoto, MaintenanceSchedule
+from .models import (
+    MaintenancePartRequest,
+    MaintenanceRecord,
+    MaintenanceRecordPhoto,
+    MaintenanceSchedule,
+)
 
 
 class MaintenanceScheduleSerializer(serializers.ModelSerializer):
@@ -8,6 +13,16 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
     device_name = serializers.CharField(source="device.display_name", read_only=True, default=None)
     device_status = serializers.CharField(source="device.status", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
+    # Which order the asset belongs to. It reaches a project by its own link or
+    # a Scope row, so the asset is asked rather than one field being read.
+    project_name = serializers.SerializerMethodField()
+
+    def get_project_name(self, obj):
+        if obj.device_id is None:
+            return None
+        project = obj.device.project_on
+        return project.name if project is not None else None
+
     assigned_to_name = serializers.CharField(source="assigned_to.get_full_name", read_only=True, default=None)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     effective_status = serializers.CharField(read_only=True)
@@ -21,6 +36,7 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
         fields = [
             "id", "title", "maintenance_type", "frequency", "priority",
             "device", "device_code", "device_name", "device_status", "site", "site_name",
+            "project_name",
             "assigned_to", "assigned_to_name", "vendors", "vendor_names",
             "start_date", "next_due", "instructions", "required_components",
             "status", "status_display",
@@ -163,3 +179,80 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
                 {"components_used": "This schedule has no asset — components cannot be attached."}
             )
         return attrs
+
+
+class MaintenancePartRequestSerializer(serializers.ModelSerializer):
+    """A part a technician has asked for on a job, and what was agreed."""
+
+    what = serializers.CharField(read_only=True)
+    unit = serializers.CharField(read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    schedule_title = serializers.CharField(source="schedule.title", read_only=True)
+    requested_by_name = serializers.SerializerMethodField()
+    decided_by_name = serializers.SerializerMethodField()
+    # Where the store has got to with it, once the line became a request.
+    issue_status = serializers.CharField(
+        source="issuance_request.status", read_only=True, default=None,
+    )
+    issue_number = serializers.CharField(
+        source="issuance_request.request_number", read_only=True, default=None,
+    )
+    quantity_issued = serializers.IntegerField(
+        source="issuance_request.quantity_issued", read_only=True, default=None,
+    )
+
+    class Meta:
+        model = MaintenancePartRequest
+        fields = [
+            "id", "schedule", "schedule_title", "item", "unit_type", "name",
+            "what", "unit", "quantity_requested", "quantity_approved",
+            "status", "status_display", "reason",
+            "requested_by", "requested_by_name",
+            "decided_by", "decided_by_name", "decided_at", "decision_note",
+            "issuance_request", "issue_status", "issue_number", "quantity_issued",
+            "created_at", "updated_at",
+        ]
+        # The answer is given through the decide action, which is where the
+        # store request gets raised — setting these directly would approve a
+        # line without anything reaching the store.
+        read_only_fields = [
+            "id", "status", "quantity_approved", "requested_by", "decided_by",
+            "decided_at", "decision_note", "issuance_request",
+            "created_at", "updated_at",
+        ]
+
+    def _name_of(self, user):
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
+
+    def get_requested_by_name(self, obj):
+        return self._name_of(obj.requested_by)
+
+    def get_decided_by_name(self, obj):
+        return self._name_of(obj.decided_by)
+
+    def validate(self, attrs):
+        item = attrs.get("item") or getattr(self.instance, "item", None)
+        unit_type = attrs.get("unit_type") or getattr(self.instance, "unit_type", None)
+        if item and unit_type:
+            raise serializers.ValidationError(
+                {"item": "A line names one thing: a stock item or a unique product, not both."}
+            )
+        if not item and not unit_type and not (attrs.get("name") or "").strip():
+            raise serializers.ValidationError(
+                {"item": "Say what is needed — pick it from stock, or name it."}
+            )
+        if attrs.get("quantity_requested", 1) < 1:
+            raise serializers.ValidationError({"quantity_requested": "Ask for at least one."})
+        return attrs
+
+
+class MaintenancePartDecisionSerializer(serializers.Serializer):
+    """A supervisor's answer to one line."""
+
+    approve = serializers.BooleanField()
+    # How much is actually being released. Left out on an approval, the whole
+    # amount asked for is agreed.
+    quantity = serializers.IntegerField(required=False, min_value=1)
+    note = serializers.CharField(required=False, allow_blank=True, default="")

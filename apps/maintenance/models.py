@@ -179,3 +179,86 @@ class MaintenanceRecordPhoto(TimeStampedModel):
 
     def __str__(self):
         return f"Photo for {self.record}"
+
+
+class MaintenancePartRequest(TimeStampedModel):
+    """One part a technician has asked for, and what was agreed.
+
+    Separate from the store's own queue: this is the asking and the answering,
+    and only once a line is approved does it become something the store is
+    expected to hand over.
+    """
+
+    class Status(models.TextChoices):
+        REQUESTED = "requested", "Awaiting Approval"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+        CANCELLED = "cancelled", "Withdrawn"
+
+    schedule = models.ForeignKey(
+        MaintenanceSchedule, on_delete=models.CASCADE, related_name="part_requests"
+    )
+    # Generic stock or an opened unique product — exactly one, the way every
+    # other requirement in the system names what it needs.
+    item = models.ForeignKey(
+        "inventory.InventoryItem", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="maintenance_part_requests",
+    )
+    unit_type = models.ForeignKey(
+        "inventory.InventoryUnitType", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="maintenance_part_requests",
+    )
+    # What the technician called it, kept for lines typed before a stock row
+    # existed and so a rejected line still reads sensibly.
+    name = models.CharField(max_length=200, blank=True)
+
+    quantity_requested = models.PositiveIntegerField()
+    # Null until decided. Approving for less than was asked is the common
+    # answer, so it is a quantity rather than a yes.
+    quantity_approved = models.PositiveIntegerField(null=True, blank=True)
+
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.REQUESTED)
+    reason = models.CharField(max_length=300, blank=True)
+
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="maintenance_parts_requested",
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="maintenance_parts_decided",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_note = models.CharField(max_length=300, blank=True)
+
+    # The store request this line became once it was approved. Nothing here
+    # moves stock; the store still issues it.
+    issuance_request = models.OneToOneField(
+        "inventory.IssuanceRequest", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="maintenance_part_request",
+    )
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.what} ×{self.quantity_requested} for {self.schedule.title}"
+
+    @property
+    def what(self):
+        """What was asked for, by the name the store would recognise."""
+        if self.item_id:
+            return self.item.material_type.name if self.item.material_type_id else self.item.sku
+        if self.unit_type_id:
+            return str(self.unit_type)
+        return self.name or "—"
+
+    @property
+    def unit(self):
+        """How this part is counted, from whichever stock row it names."""
+        if self.item_id:
+            mt = self.item.material_type
+            return (mt.unit if mt is not None else "") or "piece"
+        if self.unit_type_id:
+            return self.unit_type.unit or "piece"
+        return "piece"
