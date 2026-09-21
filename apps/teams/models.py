@@ -19,21 +19,23 @@ class Project(TimeStampedModel):
         RENTAL = "rental", "Rental"
 
     class Phase(models.TextChoices):
-        """Commercial lifecycle of a client order, from enquiry to retirement."""
+        """How far a client order has got, in the steps the work actually takes.
 
-        QUERY = "query", "Query"
-        ON_HOLD = "on_hold", "On Hold"
-        QUOTATION = "quotation", "Quotation"
-        NEGOTIATION = "negotiation", "Negotiation"
-        ORDER_CONFIRMATION = "order_confirmation", "Order Confirmation"
-        LOST = "lost", "Order Lost"
+        The commercial run-up is one phase to the delivery team; after it each
+        phase is a body of work that can be measured against what it needs to
+        finish.
+        """
+
+        PLANNING = "planning", "Planning"
+        PROCUREMENT = "procurement", "Procurement"
         PRODUCTION = "production", "Production"
-        DELIVERY = "delivery", "Delivery"
         INSTALLATION = "installation", "Installation"
         HANDOVER = "handover", "Handing Over"
+        ON_HOLD = "on_hold", "On Hold"
+        LOST = "lost", "Order Lost"
 
     name = models.CharField(max_length=300)
-    phase = models.CharField(max_length=25, choices=Phase.choices, default=Phase.QUERY)
+    phase = models.CharField(max_length=25, choices=Phase.choices, default=Phase.PLANNING)
     description = models.TextField(blank=True)
     location = models.CharField(max_length=300, blank=True)
     image = models.ImageField(upload_to=upload_to_path, blank=True)
@@ -78,25 +80,80 @@ class Project(TimeStampedModel):
 
     # The commercial ladder in delivery order (off-ramps excluded).
     MAIN_PHASE_ORDER = (
-        "query", "quotation", "negotiation", "order_confirmation", "production",
-        "delivery", "installation", "handover", "under_warranty",
-        "extended_warranty", "decommissioned",
+        Phase.PLANNING, Phase.PROCUREMENT, Phase.PRODUCTION,
+        Phase.INSTALLATION, Phase.HANDOVER,
     )
 
+    def phase_from_work(self):
+        """The first phase that is not finished — that is where the project is.
+
+        A phase is done when its bar reads 100%. When every one of them does,
+        the project sits on the last phase with nothing left in it. On Hold and
+        Order Lost are off-ramps somebody chooses, so the work does not
+        overrule them.
+        """
+        if self.phase in (self.Phase.ON_HOLD, self.Phase.LOST):
+            return self.phase
+        from .phases import phase_progress
+
+        bars = phase_progress(self)
+        for phase in self.MAIN_PHASE_ORDER:
+            if bars[phase]["percent"] < 100:
+                return phase
+        return self.MAIN_PHASE_ORDER[-1]
+
+    def sync_phase(self):
+        """Put the stored phase back in step with the work, and say what it is.
+
+        The phase is stored rather than worked out on demand because lists are
+        filtered by it. Storing it means it can fall behind, so reading it is
+        also when it gets corrected — which costs a write only on the read
+        where the work has actually moved on.
+        """
+        settled = self.phase_from_work()
+        changed = []
+        if settled != self.phase:
+            self.phase = settled
+            changed.append("phase")
+        # Everything finished is the one status the work can declare on its
+        # own; the rest are judgements somebody makes about how it is going.
+        if (
+            settled == self.MAIN_PHASE_ORDER[-1]
+            and self.status != self.Status.COMPLETED
+            and self.computed_progress() >= 100
+        ):
+            self.status = self.Status.COMPLETED
+            changed.append("status")
+        if changed:
+            self.save(update_fields=[*changed, "updated_at"])
+        return settled
+
     def computed_progress(self):
-        """Progress is derived, never hand-typed: % of completed milestones
-        when milestones exist, otherwise position along the phase ladder."""
+        """How far the order has got, derived rather than hand-typed.
+
+        Milestones win where a team keeps them. Otherwise it is the phases,
+        each worth an equal share of the project and each filled by its own
+        work. It deliberately does not consult the stored phase: that is a
+        label somebody sets by hand, and a project whose parts are all in and
+        whose assets are all built has made that progress whether or not
+        anybody remembered to move the marker.
+        """
         milestones = list(self.milestones.all())
         if milestones:
             done = sum(1 for m in milestones if m.completed_at)
             return round(done / len(milestones) * 100)
         if self.status == self.Status.COMPLETED:
             return 100
-        if self.phase in self.MAIN_PHASE_ORDER:
-            idx = self.MAIN_PHASE_ORDER.index(self.phase)
-            return round(idx / (len(self.MAIN_PHASE_ORDER) - 1) * 100)
-        # Off-ramp phases (on hold / lost): keep whatever was stored.
-        return self.progress or 0
+        if self.phase not in self.MAIN_PHASE_ORDER:
+            # Off-ramp phases (on hold / lost): keep whatever was stored.
+            return self.progress or 0
+        from .phases import phase_progress
+
+        bars = phase_progress(self)
+        return min(100, round(
+            sum(bars[phase]["percent"] for phase in self.MAIN_PHASE_ORDER)
+            / len(self.MAIN_PHASE_ORDER)
+        ))
 
 
 class ProjectScopeItem(TimeStampedModel):

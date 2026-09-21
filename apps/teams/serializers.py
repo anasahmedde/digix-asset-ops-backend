@@ -120,7 +120,21 @@ class ProjectMilestoneSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
-class ProjectListSerializer(serializers.ModelSerializer):
+class _PhaseFollowsTheWorkMixin:
+    """Brings the stored phase back in step before the project is rendered.
+
+    Done here rather than with a read-only field because the phase still has
+    to be writable: On Hold and Order Lost are set by hand, and a method field
+    would silently drop them. Syncing mutates the instance, so the ordinary
+    model fields then render the corrected value.
+    """
+
+    def to_representation(self, instance):
+        instance.sync_phase()
+        return super().to_representation(instance)
+
+
+class ProjectListSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
     assets_count = serializers.IntegerField(source="devices.count", read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
@@ -153,8 +167,15 @@ class ProjectListSerializer(serializers.ModelSerializer):
         return obj.computed_progress()
 
 
-class ProjectDetailSerializer(serializers.ModelSerializer):
+class ProjectDetailSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
+    # Who the work is for, with the contact the team will actually ring.
+    client_contact_person = serializers.CharField(
+        source="client.contact_person", read_only=True, default=None
+    )
+    client_contact_phone = serializers.CharField(
+        source="client.contact_phone", read_only=True, default=None
+    )
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     manager_name = serializers.CharField(source="manager.get_full_name", read_only=True, default=None)
     bottlenecks = ProjectBottleneckSerializer(many=True, read_only=True)
@@ -174,20 +195,29 @@ class ProjectDetailSerializer(serializers.ModelSerializer):
         model = Project
         fields = [
             "id", "name", "description", "location", "image",
-            "client", "client_name", "site", "site_name",
+            "client", "client_name", "client_contact_person", "client_contact_phone",
+            "site", "site_name",
             "status", "status_display", "phase", "phase_display",
             "contract_type", "contract_type_display", "rental_end_date",
             "progress", "start_date", "target_date", "completed_date",
             "manager", "manager_name", "budget", "notes", "sites", "site_names",
             "bottlenecks", "members", "scope_items", "milestones",
-            "created_at", "updated_at",
+            "phase_progress", "created_at", "updated_at",
         ]
         # The budget is what planning arrives at and approval freezes — not a
         # number typed when the project is opened.
         read_only_fields = ["id", "budget", "created_at", "updated_at"]
 
+    # How far each phase of the work has got, counted from the work itself.
+    phase_progress = serializers.SerializerMethodField()
+
     def get_progress(self, obj):
         return obj.computed_progress()
+
+    def get_phase_progress(self, obj):
+        from .phases import phase_progress
+
+        return phase_progress(obj)
 
 
 class ProjectCostLineSerializer(serializers.ModelSerializer):

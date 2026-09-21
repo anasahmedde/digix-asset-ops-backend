@@ -230,6 +230,13 @@ class HandoverRecord(TimeStampedModel):
     handover_date = models.DateField()
     accepted_by_name = models.CharField(max_length=200)
     acceptance_notes = models.TextField(blank=True)
+    # What the client actually signs. Kept as a file rather than an image so a
+    # scanned PDF is as acceptable as a photo taken on site.
+    signed_document = models.FileField(
+        upload_to=upload_to_path, blank=True,
+        help_text="The handover document, signed by the client.",
+    )
+    # Superseded by signed_document; kept so records made before it still show.
     signature = models.ImageField(upload_to=upload_to_path, blank=True)
     performed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="handovers_performed"

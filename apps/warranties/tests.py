@@ -189,7 +189,9 @@ def test_client_warranty_reanchors_on_handover(device):
     inst.refresh_from_db()
     assert inst.completed_at is not None
     w.refresh_from_db()
-    assert w.start_date == inst.completed_at.date()
+    # The cover runs from the installation date — the local day the job was
+    # finished, not the UTC date of the stamp.
+    assert w.start_date == timezone.localdate(inst.completed_at)
     assert (w.end_date - w.start_date).days >= 180
 
 

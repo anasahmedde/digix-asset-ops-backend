@@ -136,10 +136,24 @@ class _InstallationCommonMixin(serializers.Serializer):
     # Whichever vendor was assigned — registered supplier or hand-entered.
     vendor_display = serializers.SerializerMethodField()
     project_name = serializers.SerializerMethodField()
-    poc_name = serializers.CharField(source="device.assigned_client.contact_person", read_only=True, default=None)
-    poc_phone = serializers.CharField(source="device.assigned_client.contact_phone", read_only=True, default=None)
+    # The point of contact belongs to whoever the client turns out to be, which
+    # is not always recorded on the asset itself.
+    poc_name = serializers.SerializerMethodField()
+    poc_phone = serializers.SerializerMethodField()
+
+    def get_poc_name(self, obj):
+        client = obj.device.client_for
+        return client.contact_person if client is not None else None
+
+    def get_poc_phone(self, obj):
+        client = obj.device.client_for
+        return client.contact_phone if client is not None else None
     client_names = serializers.SerializerMethodField()
     progress = serializers.SerializerMethodField()
+    # The checklist in plain numbers, so a summary card can read "3 of 6 done"
+    # without fetching every step.
+    steps_done = serializers.SerializerMethodField()
+    steps_total = serializers.SerializerMethodField()
     client_delays = serializers.SerializerMethodField()
     on_hold_steps = serializers.SerializerMethodField()
     escalated = serializers.SerializerMethodField()
@@ -175,12 +189,25 @@ class _InstallationCommonMixin(serializers.Serializer):
             return f"{label} ({obj.external_vendor_contact})" if obj.external_vendor_contact else label
         return None
 
+    # Which client, by id, so a form can preselect it rather than ask again.
+    client_id = serializers.SerializerMethodField()
+
+    def get_client_id(self, obj):
+        client = obj.device.client_for
+        return str(client.pk) if client is not None else None
+
     def get_client_names(self, obj):
         names = []
         if obj.device.assigned_client:
             names.append(obj.device.assigned_client.name)
         for client in obj.device.clients.all():
             if client.name not in names:
+                names.append(client.name)
+        if not names:
+            # Nothing on the asset, so fall back to the project or the site —
+            # the client was named there when the work was set up.
+            client = obj.device.client_for
+            if client is not None:
                 names.append(client.name)
         return names
 
@@ -190,6 +217,12 @@ class _InstallationCommonMixin(serializers.Serializer):
             return 0
         completed = steps.filter(status="completed").count()
         return round((completed / steps.count()) * 100)
+
+    def get_steps_done(self, obj):
+        return sum(1 for s in obj.steps.all() if s.status == InstallationStep.StepStatus.COMPLETED)
+
+    def get_steps_total(self, obj):
+        return len(obj.steps.all())
 
     def get_client_delays(self, obj):
         return sum(1 for d in obj.delays.all() if d.cause == InstallationDelay.Cause.CLIENT)
@@ -281,13 +314,13 @@ class DeviceInstallationListSerializer(_InstallationCommonMixin, serializers.Mod
         model = DeviceInstallation
         fields = [
             "id", "device", "device_code", "device_name", "asset_name", "asset_type_name",
-            "client_names", "project_name", "poc_name", "poc_phone",
+            "client_names", "client_id", "project_name", "poc_name", "poc_phone",
             "site", "site_name", "installed_by", "installed_by_name", "installed_by_phone",
             "installed_by_employee_id", "installed_by_job_title", "installed_by_role",
             "vendor", "vendor_name", "external_vendor_name", "external_vendor_contact", "vendor_display",
             "installed_at", "removed_at", "due_date", "completed_at",
             "escalated", "escalation_state",
-            "progress", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
+            "progress", "steps_done", "steps_total", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
         ]
         read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
 
@@ -300,7 +333,8 @@ class HandoverRecordSerializer(serializers.ModelSerializer):
     class Meta:
         model = HandoverRecord
         fields = [
-            "id", "handover_date", "accepted_by_name", "acceptance_notes", "signature",
+            "id", "handover_date", "accepted_by_name", "acceptance_notes",
+            "signed_document", "signature",
             "client", "client_name", "site", "site_name", "performed_by_name", "created_at",
         ]
         read_only_fields = fields
@@ -318,7 +352,16 @@ class HandoverCreateSerializer(serializers.Serializer):
     client = serializers.PrimaryKeyRelatedField(
         queryset=Client.objects.filter(is_active=True), required=False, allow_null=True
     )
-    signature = serializers.ImageField(required=False, allow_null=True)
+    # The signed handover document. It is the handover: without the client's
+    # signature nothing has been accepted, so the record cannot be made
+    # without it. Any file the site can produce counts — a scanned PDF, a
+    # photograph of the signed sheet.
+    signed_document = serializers.FileField(
+        error_messages={
+            "required": "Upload the handover document the client signed — "
+                        "that signature is the handover.",
+        },
+    )
 
 
 class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.ModelSerializer):
@@ -335,16 +378,24 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
         required=False,
         allow_empty=False,
     )
-    device_image = serializers.ImageField(source="device.image", read_only=True)
+    # Not device.image: almost nothing writes that, and the asset's real
+    # photograph is the primary one in its gallery.
+    device_image = serializers.ImageField(source="device.display_image", read_only=True)
     device_status = serializers.CharField(source="device.status", read_only=True)
+    # How the asset is made decides who installs it, which is what the vendor
+    # field on this screen is really answering.
+    device_source = serializers.CharField(source="device.source", read_only=True)
+    device_source_display = serializers.CharField(
+        source="device.get_source_display", read_only=True
+    )
     site_city = serializers.CharField(source="site.city", read_only=True)
 
     class Meta:
         model = DeviceInstallation
         fields = [
             "id", "device", "device_code", "device_name", "asset_name", "asset_type_name",
-            "device_image", "device_status",
-            "client_names", "project_name", "poc_name", "poc_phone",
+            "device_image", "device_status", "device_source", "device_source_display",
+            "client_names", "client_id", "project_name", "poc_name", "poc_phone",
             "site", "site_name", "site_city", "zone",
             "installed_by", "installed_by_name", "installed_by_phone",
             "installed_by_employee_id", "installed_by_job_title", "installed_by_role",
@@ -353,7 +404,7 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
             "due_date", "completed_at",
             "escalated", "escalation_state",
             "position_label", "notes", "photos", "steps", "delays", "step_types",
-            "handover", "progress", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
+            "handover", "progress", "steps_done", "steps_total", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
         ]
         read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
 

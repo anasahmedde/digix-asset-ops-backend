@@ -26,7 +26,7 @@ def _spawn_project_if_needed(quotation: Quotation):
         client=quotation.client,
         site=quotation.site,
         source_quotation=quotation,
-        phase=Project.Phase.ORDER_CONFIRMATION,
+        phase=Project.Phase.PLANNING,
         status=Project.Status.PLANNING,
     )
     for item in quotation.items.all():

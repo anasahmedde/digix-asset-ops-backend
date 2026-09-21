@@ -5,7 +5,7 @@ import logging
 from django.db.models.signals import post_save, pre_save
 from django.dispatch import receiver
 
-from .models import Device, DeviceLifecycleEvent
+from .models import Device, DeviceLifecycleEvent, ProductionStep
 
 logger = logging.getLogger(__name__)
 
@@ -79,3 +79,25 @@ def log_device_status_change(sender, instance: Device, created: bool, **kwargs):
         resource_id=str(instance.pk),
         detail={"from": old_status, "to": instance.status, "reason": reason},
     )
+
+
+# ── A finished build puts itself into stock ──────────────────────────
+
+
+@receiver(post_save, sender=ProductionStep)
+def finish_build_when_route_is_done(sender, instance: ProductionStep, **kwargs):
+    """Closing the last operation on an asset whose parts are all issued
+    finishes the build, so the asset becomes stock without anyone editing it.
+
+    Hooked to the step rather than to the transition endpoint so every route
+    counts — a technician closing it, a work order inspected and accepted, a
+    step skipped.
+    """
+    from .services import finish_build_if_done
+
+    if instance.status not in (ProductionStep.Status.COMPLETED, ProductionStep.Status.SKIPPED):
+        return
+    try:
+        finish_build_if_done(instance.device)
+    except Exception:  # pragma: no cover - finishing a step must never 500
+        logger.exception("Failed to finish the build for %s", instance.device_id)

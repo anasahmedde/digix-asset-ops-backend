@@ -6,6 +6,7 @@ from .models import (
     NumberingScheme,
     PaymentTerms,
     TermsTemplate,
+    UnitOfMeasure,
     WarrantyPeriodPreset,
 )
 
@@ -44,6 +45,30 @@ class PaymentTermsSerializer(serializers.ModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class UnitOfMeasureSerializer(serializers.ModelSerializer):
+    # How many components count in this unit — shown so nobody deletes a live one.
+    in_use = serializers.SerializerMethodField()
+
+    class Meta:
+        model = UnitOfMeasure
+        fields = ["id", "name", "symbol", "description", "is_active", "in_use", "created_at", "updated_at"]
+        read_only_fields = ["id", "in_use", "created_at", "updated_at"]
+
+    def get_in_use(self, obj):
+        return obj.usage_count()
+
+    def validate_name(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Give the unit a name.")
+        clash = UnitOfMeasure.objects.filter(name__iexact=value)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError(f"'{value}' is already on the list.")
+        return value
 
 
 class TermsTemplateSerializer(serializers.ModelSerializer):

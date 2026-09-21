@@ -9,6 +9,8 @@ from .views import (
     InventoryUnitTypeViewSet,
     InventoryUnitViewSet,
     IssuanceRequestViewSet,
+    LowStockView,
+    ReorderRequestViewSet,
     IssuanceViewSet,
     StockMovementViewSet,
 )
@@ -23,7 +25,9 @@ router.register("receipts", GoodsReceiptViewSet, basename="goods-receipt")
 router.register("receipt-lines", GoodsReceiptLineViewSet, basename="goods-receipt-line")
 router.register("issuances", IssuanceViewSet, basename="issuance")
 router.register("issuance-requests", IssuanceRequestViewSet, basename="issuance-request")
+router.register("reorder-requests", ReorderRequestViewSet, basename="reorder-request")
 
 urlpatterns = [
+    path("low-stock/", LowStockView.as_view(), name="low-stock"),
     path("", include(router.urls)),
 ]

@@ -1185,3 +1185,128 @@ def test_approval_stamps_the_order_date_and_lines_say_what_they_buy(people, supp
     r = _client(people["group_head"]).post(f"/api/procurement/purchase-orders/{pid}/transition/", {"status": "approved"}, format="json")
     assert r.status_code == 200, r.content
     assert r.data["order_date"] == timezone.localdate().isoformat()
+
+
+@pytest.mark.django_db
+def test_procurement_can_send_a_line_back_to_the_project():
+    """A Procure decision handed back is undone with the reason on the asset;
+    a line already ordered stays until its order is cancelled."""
+    from rest_framework.test import APIClient
+
+    from apps.accounts.models import User
+    from apps.assets.models import AssetComponent, Brand, Device, DeviceLifecycleEvent, DeviceModel, MaterialType
+    from apps.inventory.models import InventoryItem, IssuanceRequest
+    from apps.suppliers.models import Supplier
+
+    ops = User.objects.create_user(username="sb-ops", password="x", role="ops_manager")
+    c = APIClient()
+    c.force_authenticate(ops)
+    brand = Brand.objects.create(name="SB Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="SB-1")
+    device = Device.objects.create(device_model=dm, asset_code="AST-SB-1", serial_number="SB-1", source="inhouse")
+    mt = MaterialType.objects.create(name="SB Bracket", unit="piece")
+    item = InventoryItem.objects.create(material_type=mt, quantity=0)
+    comp = AssetComponent.objects.create(device=device, name="SB Bracket", quantity=2, inventory_item=item)
+    # Execution decided to buy both.
+    r = c.post(f"/api/assets/components/{comp.id}/mark-for-procurement/", {"quantity": 2}, format="json")
+    assert r.status_code == 200, r.content
+    comp.refresh_from_db()
+    assert comp.procure_quantity == 2
+
+    r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"component": str(comp.id)}, format="json")
+    assert r.status_code == 400 and "why" in str(r.data["reason"]).lower()
+    r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"component": str(comp.id), "reason": "Use the spares in the yard"}, format="json")
+    assert r.status_code == 200, r.content
+    comp.refresh_from_db()
+    assert comp.procure_quantity == 0 and comp.undecided_quantity == 2 and comp.fulfilment == "pending"
+    assert IssuanceRequest.objects.filter(asset_component=comp, status="cancelled").count() == 1
+    note = DeviceLifecycleEvent.objects.get(device=device, metadata__sent_back=True)
+    assert "Use the spares in the yard" in note.description and note.performed_by == ops
+    listed = [row["component"] for row in c.get("/api/procurement/purchase-orders/requisitions/").json()["results"]]
+    assert str(comp.id) not in listed
+
+    # On an order already: stays until that order is cancelled.
+    c.post(f"/api/assets/components/{comp.id}/mark-for-procurement/", {"quantity": 2}, format="json")
+    supplier = Supplier.objects.create(name="SB Supplier")
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {"supplier": str(supplier.id), "components": [str(comp.id)], "devices": []}, format="json")
+    assert r.status_code == 201, r.content
+    r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"component": str(comp.id), "reason": "no"}, format="json")
+    assert r.status_code == 400 and "cancel that order first" in r.data["detail"]
+
+    # A vendor-supplied asset asked to be bought can go back too.
+    vendor_asset = Device.objects.create(device_model=dm, asset_code="AST-SB-V", serial_number="SB-V", source="vendor_supplied")
+    from django.utils import timezone
+    vendor_asset.procurement_requested_at = timezone.now()
+    vendor_asset.save(update_fields=["procurement_requested_at"])
+    r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"device": str(vendor_asset.id), "reason": "Client cancelled the unit"}, format="json")
+    assert r.status_code == 200, r.content
+    vendor_asset.refresh_from_db()
+    assert vendor_asset.procurement_requested_at is None
+
+
+@pytest.mark.django_db
+def test_receiving_a_complete_asset_asks_for_no_serial_number(people, supplier):
+    """An asset bought whole arrives under the code the registry gave it.
+
+    Nobody types a serial for it at the door: the asset already exists, the
+    line names it, and the receipt brings it into stock as it stands.
+    """
+    from apps.assets.models import AssetType, Device
+
+    kind = AssetType.objects.create(name="GRN Whole Standee")
+    device = Device.objects.create(
+        asset_type=kind, display_name="Foyer Standee",
+        source=Device.Source.VENDOR_SUPPLIED,
+    )
+    # Defining an asset invents no serial for it.
+    assert device.serial_number is None
+
+    ops = _client(people["ops"])
+    r = ops.post("/api/procurement/purchase-orders/raise-po/", {
+        "supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)],
+        "prices": {str(device.pk): "9000.00"},
+    }, format="json")
+    assert r.status_code == 201, r.content
+    po_id, item_id = r.data["id"], r.data["items"][0]["id"]
+
+    # The line names the asset by its code and prints no "S/N" beside it.
+    assert device.asset_code in r.data["items"][0]["line_detail"]
+    assert "S/N" not in r.data["items"][0]["line_detail"]
+    assert r.data["items"][0]["procured_asset_codes"] == [device.asset_code]
+
+    assert ops.post(f"/api/procurement/purchase-orders/{po_id}/transition/",
+                    {"status": "pending_approval"}, format="json").status_code == 200
+    gh = _client(people["group_head"])
+    assert gh.post(f"/api/procurement/purchase-orders/{po_id}/transition/",
+                   {"status": "approved"}, format="json").status_code == 200
+    store = _client(people["finance"])
+    assert store.post(f"/api/procurement/purchase-orders/{po_id}/transition/",
+                      {"status": "ordered"}, format="json").status_code == 200
+
+    # No serial_numbers key at all — the receipt is accepted.
+    r = _receive(store, po_id, [{"po_item": item_id, "quantity": 1}])
+    assert r.status_code == 201, r.content
+
+    device.refresh_from_db()
+    assert device.status == "in_stock"
+    # Still no serial: receiving did not invent one either.
+    assert device.serial_number is None
+
+
+@pytest.mark.django_db
+def test_two_assets_with_no_serial_can_both_exist(people, supplier):
+    """Most assets have no manufacturer serial, so "none" cannot be unique."""
+    from apps.assets.models import AssetType, Device
+
+    kind = AssetType.objects.create(name="GRN Plain Kind")
+    a = Device.objects.create(asset_type=kind, source=Device.Source.VENDOR_SUPPLIED)
+    b = Device.objects.create(asset_type=kind, source=Device.Source.VENDOR_SUPPLIED)
+    assert a.serial_number is None and b.serial_number is None
+    assert a.asset_code != b.asset_code
+
+    # A real manufacturer serial is still recorded, and still has to be unique.
+    a.serial_number = "MFR-REAL-1"
+    a.save(update_fields=["serial_number"])
+    b.serial_number = "MFR-REAL-1"
+    with pytest.raises(Exception):
+        b.save(update_fields=["serial_number"])

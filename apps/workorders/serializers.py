@@ -3,22 +3,82 @@ from rest_framework import serializers
 from .models import WorkOrder, WorkOrderItem
 
 
+LINE_STATE_LABELS = {
+    "with_vendor": "With the vendor",
+    "awaiting_inspection": "Delivered — awaiting inspection",
+    "accepted": "Accepted",
+    "rework": "Sent back for rework",
+}
+
+
 class WorkOrderItemSerializer(serializers.ModelSerializer):
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     device_model_name = serializers.StringRelatedField(source="device_model", read_only=True)
     line_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    # Where this line stands on its own, which is what Work Receiving works from.
+    line_state = serializers.CharField(read_only=True)
+    line_state_display = serializers.SerializerMethodField()
+    inspected_by_name = serializers.SerializerMethodField()
+    inspection_result_display = serializers.CharField(
+        source="get_inspection_result_display", read_only=True, default=None
+    )
+    operation = serializers.CharField(source="production_step.name", read_only=True, default=None)
+    asset_code = serializers.CharField(source="production_step.device.asset_code", read_only=True, default=None)
+
+    def get_line_state_display(self, obj):
+        return LINE_STATE_LABELS.get(obj.line_state, obj.line_state)
+
+    def get_inspected_by_name(self, obj):
+        user = obj.inspected_by
+        return (user.get_full_name() or user.username) if user else None
 
     class Meta:
         model = WorkOrderItem
         fields = [
             "id", "asset_type", "asset_type_name", "device_model", "device_model_name",
             "description", "quantity", "unit_price", "received_quantity", "line_total",
+            "operation", "asset_code",
+            "delivered_at", "inspected_at", "inspected_by_name",
+            "inspection_result", "inspection_result_display", "inspection_notes",
+            "line_state", "line_state_display",
         ]
-        read_only_fields = ["id", "line_total"]
+        read_only_fields = [
+            "id", "line_total", "delivered_at", "inspected_at", "inspected_by_name",
+            "inspection_result", "inspection_notes", "line_state",
+        ]
+
+
+def _assets_on(order):
+    """The assets an order is working on, named once each and in order.
+
+    An order carries them on its lines (one order, several operations for one
+    vendor); an older one named a single asset on the order itself.
+    """
+    codes = []
+    for item in order.items.all():
+        step = item.production_step
+        device = step.device if step is not None else None
+        if device is not None and device.asset_code not in codes:
+            codes.append(device.asset_code)
+    if not codes and order.device_id:
+        codes.append(order.device.asset_code)
+    return codes
 
 
 class WorkOrderListSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(source="supplier.name", read_only=True)
+    project_name = serializers.CharField(source="project.name", read_only=True, default=None)
+    # What the work is for: the project it belongs to and the assets worked on.
+    asset_codes = serializers.SerializerMethodField()
+
+    def get_asset_codes(self, obj):
+        return _assets_on(obj)
+    inspected_by_name = serializers.SerializerMethodField()
+    inspection_result_display = serializers.CharField(source="get_inspection_result_display", read_only=True, default=None)
+
+    def get_inspected_by_name(self, obj):
+        user = obj.inspected_by
+        return (user.get_full_name() or user.username) if user else None
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
@@ -28,10 +88,25 @@ class WorkOrderListSerializer(serializers.ModelSerializer):
         model = WorkOrder
         fields = [
             "id", "wo_number", "title", "order_type", "order_type_display",
-            "status", "status_display", "supplier", "supplier_name",
+            "status", "status_display", "supplier", "supplier_name", "project_name",
             "client_name", "site_name", "currency", "total_amount",
-            "expected_delivery", "created_at",
+            "expected_delivery", "delivered_at", "inspected_by_name", "inspected_at",
+            "inspection_result", "inspection_result_display", "inspection_notes",
+            "asset_codes", "line_count", "lines_awaiting_inspection", "lines_with_vendor", "created_at",
         ]
+
+    line_count = serializers.SerializerMethodField()
+    lines_awaiting_inspection = serializers.SerializerMethodField()
+    lines_with_vendor = serializers.SerializerMethodField()
+
+    def get_line_count(self, obj):
+        return len(obj.items.all())
+
+    def get_lines_awaiting_inspection(self, obj):
+        return sum(1 for i in obj.items.all() if i.awaiting_inspection)
+
+    def get_lines_with_vendor(self, obj):
+        return sum(1 for i in obj.items.all() if i.with_vendor)
 
 
 class WorkOrderSerializer(serializers.ModelSerializer):
@@ -42,12 +117,45 @@ class WorkOrderSerializer(serializers.ModelSerializer):
     payment_terms_name = serializers.CharField(source="payment_terms.name", read_only=True, default=None)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     order_type_display = serializers.CharField(source="get_order_type_display", read_only=True)
-    created_by_name = serializers.CharField(source="created_by.get_full_name", read_only=True, default=None)
-    approved_by_name = serializers.CharField(source="approved_by.get_full_name", read_only=True, default=None)
+    # Names fall back to the login when no full name is on file.
+    created_by_name = serializers.SerializerMethodField()
+    approved_by_name = serializers.SerializerMethodField()
+
+    def get_created_by_name(self, obj):
+        user = obj.created_by
+        return (user.get_full_name() or user.username) if user else None
+
+    def get_approved_by_name(self, obj):
+        user = obj.approved_by
+        return (user.get_full_name() or user.username) if user else None
 
     project_name = serializers.CharField(source="project.name", read_only=True, default=None)
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
     production_step_name = serializers.CharField(source="production_step.name", read_only=True, default=None)
+    inspected_by_name = serializers.SerializerMethodField()
+    inspection_result_display = serializers.CharField(source="get_inspection_result_display", read_only=True, default=None)
+    # How the order's jobs stand, so a screen can tell a whole delivery from a
+    # part of one without counting the lines itself.
+    line_count = serializers.SerializerMethodField()
+    lines_awaiting_inspection = serializers.SerializerMethodField()
+    lines_with_vendor = serializers.SerializerMethodField()
+    asset_codes = serializers.SerializerMethodField()
+
+    def get_inspected_by_name(self, obj):
+        user = obj.inspected_by
+        return (user.get_full_name() or user.username) if user else None
+
+    def get_asset_codes(self, obj):
+        return _assets_on(obj)
+
+    def get_line_count(self, obj):
+        return len(obj.items.all())
+
+    def get_lines_awaiting_inspection(self, obj):
+        return sum(1 for i in obj.items.all() if i.awaiting_inspection)
+
+    def get_lines_with_vendor(self, obj):
+        return sum(1 for i in obj.items.all() if i.with_vendor)
 
     class Meta:
         model = WorkOrder
@@ -60,10 +168,14 @@ class WorkOrderSerializer(serializers.ModelSerializer):
             "safety_instructions", "warranty_months",
             "currency", "order_date", "expected_delivery", "total_amount", "notes",
             "items", "created_by", "created_by_name", "approved_by", "approved_by_name",
+            "delivered_at", "inspected_by", "inspected_by_name", "inspected_at",
+            "inspection_result", "inspection_result_display", "inspection_notes",
+            "asset_codes", "line_count", "lines_awaiting_inspection", "lines_with_vendor",
             "approved_at", "issued_at", "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "wo_number", "total_amount", "created_by", "approved_by",
+            "delivered_at", "inspected_by", "inspected_at", "inspection_result", "inspection_notes",
             "approved_at", "issued_at", "created_at", "updated_at",
         ]
 

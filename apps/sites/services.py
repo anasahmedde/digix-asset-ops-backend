@@ -37,7 +37,11 @@ def open_installation_for(device, user=None):
         updates = {}
         if existing.installed_by_id != device.assigned_technician_id:
             updates["installed_by"] = device.assigned_technician
-        if existing.external_vendor_name != device.assigned_vendor_name:
+        if device.assigned_vendor_id and existing.vendor_id != device.assigned_vendor_id:
+            updates["vendor"] = device.assigned_vendor
+            updates["external_vendor_name"] = ""
+            updates["external_vendor_contact"] = ""
+        elif not device.assigned_vendor_id and existing.external_vendor_name != device.assigned_vendor_name:
             updates["external_vendor_name"] = device.assigned_vendor_name
             updates["external_vendor_contact"] = device.assigned_vendor_contact
         if updates:
@@ -51,8 +55,10 @@ def open_installation_for(device, user=None):
             device=device,
             site=device.current_site,
             installed_by=device.assigned_technician,
-            external_vendor_name=device.assigned_vendor_name,
-            external_vendor_contact=device.assigned_vendor_contact,
+            # A vendor on the register is linked; one that is not is named.
+            vendor=device.assigned_vendor,
+            external_vendor_name="" if device.assigned_vendor_id else device.assigned_vendor_name,
+            external_vendor_contact="" if device.assigned_vendor_id else device.assigned_vendor_contact,
             # The job starts now; the steps carry their own timestamps.
             installed_at=timezone.now(),
             due_date=device.installation_date,

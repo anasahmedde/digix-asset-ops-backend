@@ -111,9 +111,13 @@ def build_plan(project):
     # Each asset's own material cost, so the estimate reads asset by asset —
     # including assets with nothing listed yet.
     assets = []
+    installation_total = Decimal("0")
     for device in devices:
         asset_total = Decimal("0")
         asset_unpriced = 0
+        install = None if device.planned_installation_cost is None else money(device.planned_installation_cost)
+        if install is not None:
+            installation_total += install
         if device.source != device.Source.INHOUSE:
             # Bought complete from a vendor: one price, no parts list, no route.
             price = None if device.purchase_price is None else money(device.purchase_price)
@@ -128,13 +132,23 @@ def build_plan(project):
                 "vendor_asset": True,
                 "source": device.source,
                 "asset_price": price,
-                "supply_vendor_name": device.supply_vendor_name,
+                # Nobody supplies it until the purchase order says so.
+                "supply_vendor_name": (
+                    device.procurement_item.purchase_order.supplier.name
+                    if device.procurement_item_id and device.procurement_item.purchase_order.supplier_id
+                    else None
+                ),
+                "po_number": (
+                    device.procurement_item.purchase_order.po_number
+                    if device.procurement_item_id else None
+                ),
                 "lines": 0,
                 "materials_total": money(price or 0),
                 "unpriced_lines": 0 if price is not None else 1,
                 "steps": [],
                 "production_total": money(0),
-                "asset_total": money(price or 0),
+                "installation_cost": install,
+                "asset_total": money((price or 0) + (install or 0)),
             })
             continue
         components = list(device.components.all())
@@ -187,7 +201,8 @@ def build_plan(project):
             "unpriced_lines": asset_unpriced,
             "steps": steps,
             "production_total": money(asset_production),
-            "asset_total": money(asset_total + asset_production),
+            "installation_cost": install,
+            "asset_total": money(asset_total + asset_production + (install or 0)),
         })
 
     overheads = []
@@ -204,7 +219,7 @@ def build_plan(project):
             "amount": amount,
         })
 
-    subtotal = money(materials_total + production_total + overheads_total)
+    subtotal = money(materials_total + production_total + installation_total + overheads_total)
     # Contingency covers materials only: it is there for what the parts turn
     # out to cost, not for priced work or the team's own overheads.
     contingency = money(materials_total * (plan.contingency_percent or 0) / 100)
@@ -222,6 +237,7 @@ def build_plan(project):
         "overheads": overheads,
         "materials_total": money(materials_total),
         "production_total": money(production_total),
+        "installation_total": money(installation_total),
         "overheads_total": money(overheads_total),
         "subtotal": subtotal,
         "contingency_amount": contingency,
@@ -267,6 +283,38 @@ def _name(user):
     return user.get_full_name() or user.username
 
 
+def step_work_order_charges(steps):
+    """What the vendor charges for each operation given out, by step id.
+
+    An operation sits on a work order either as one of its lines (a services
+    order raised from Requests) or, on older single-operation orders, as the
+    order itself — then the order's amount is the charge. Cancelled orders do
+    not count; if more than one is live, the most recent one is taken.
+    """
+    from apps.workorders.models import WorkOrder, WorkOrderItem
+
+    if not steps:
+        return {}
+    ids = [s.pk for s in steps]
+    charges = {}
+    for line in (
+        WorkOrderItem.objects.filter(production_step_id__in=ids)
+        .exclude(work_order__status=WorkOrder.Status.CANCELLED)
+        .select_related("work_order__supplier")
+        .order_by("work_order__created_at", "created_at")
+    ):
+        charges[line.production_step_id] = (line.work_order, money(line.line_total))
+    for order in (
+        WorkOrder.objects.filter(production_step_id__in=ids)
+        .exclude(status=WorkOrder.Status.CANCELLED)
+        .select_related("supplier")
+        .order_by("created_at")
+    ):
+        if order.production_step_id not in charges:
+            charges[order.production_step_id] = (order, money(order.total_amount))
+    return charges
+
+
 def component_actual(component):
     """(unit price, where it came from) for what a requirement actually cost.
 
@@ -289,6 +337,7 @@ def build_actuals(project):
     materials_actual = Decimal("0")
     production_actual = Decimal("0")
     work_orders_actual = Decimal("0")
+    installation_actual = Decimal("0")
     devices = project_devices(project).prefetch_related(
         "components__inventory_item__material_type",
         "components__inventory_unit_type",
@@ -300,12 +349,28 @@ def build_actuals(project):
         asset_total = Decimal("0")
         outstanding = 0
         vendor_asset = device.source != device.Source.INHOUSE
+        asset_priced_from = None
         if vendor_asset:
-            # The complete asset costs what we paid once it has arrived.
-            if device.status != device.Status.PROCURED and device.purchase_price is not None:
-                asset_total = money(device.purchase_price)
-            else:
+            # The complete asset costs what the purchase order charged for it,
+            # once it has arrived. The order is the record of what was paid;
+            # the price on the asset stands in only where no order names it.
+            po_item = device.procurement_item
+            paid = (
+                po_item.unit_price if po_item is not None and po_item.unit_price
+                else device.purchase_price
+            )
+            arrived = device.status != device.Status.PROCURED
+            if arrived and paid is not None:
+                asset_total = money(paid)
+            if not arrived:
+                # Still to come. An asset that has arrived but carries no price
+                # is a gap in the record, not an outstanding delivery.
                 outstanding = 1
+            asset_priced_from = (
+                f"Purchase order · {po_item.purchase_order.po_number}"
+                if po_item is not None and po_item.unit_price else
+                "Price on the asset" if paid is not None else "No price on record"
+            )
         for component in ([] if vendor_asset else device.components.all()):
             price, source = component_actual(component)
             issued = component.issued_quantity
@@ -325,12 +390,31 @@ def build_actuals(project):
             })
         materials_actual += asset_total
 
-        # The build itself: each operation as it actually cost. A step with
-        # no actual yet is not free — it is simply not known.
+        # The build itself: each operation as it actually cost. One given to
+        # a vendor costs what its work order charges — the way a bought part
+        # costs what its purchase order charged — and is not typed in. One
+        # done on our own floor is recorded by hand once it is known; until
+        # then it is not free, simply not known.
         steps = []
         asset_production = Decimal("0")
-        for step in ([] if vendor_asset else sorted(device.production_steps.all(), key=lambda x: x.step_number)):
-            actual = None if step.actual_cost is None else money(step.actual_cost)
+        device_steps = [] if vendor_asset else sorted(device.production_steps.all(), key=lambda x: x.step_number)
+        charges = step_work_order_charges(device_steps)
+        for step in device_steps:
+            charge = charges.get(step.pk)
+            if charge is not None:
+                order, actual = charge
+                source = f"Work order · {order.wo_number}"
+                on_order = {
+                    "id": str(order.pk),
+                    "wo_number": order.wo_number,
+                    "status": order.status,
+                    "status_display": order.get_status_display(),
+                    "supplier": order.supplier.name if order.supplier_id else "",
+                }
+            else:
+                actual = None if step.actual_cost is None else money(step.actual_cost)
+                source = "Recorded by hand" if actual is not None else ""
+                on_order = None
             if actual is not None:
                 asset_production += actual
             steps.append({
@@ -338,16 +422,23 @@ def build_actuals(project):
                 "step_number": step.step_number,
                 "name": step.name,
                 "status": step.status,
+                "location": step.location,
                 "planned_cost": None if step.planned_cost is None else money(step.planned_cost),
                 "actual_cost": actual,
+                "actual_source": source,
+                "actual_editable": on_order is None,
+                "work_order": on_order,
             })
         production_actual += asset_production
 
-        # A vendor-built asset costs what its work orders come to.
+        # A vendor-built asset costs what its work orders come to. An order
+        # whose lines are this asset's operations is already counted above,
+        # operation by operation, so it is not added again here.
+        counted = {order.pk for order, _ in charges.values()}
         work_orders = []
         asset_work_orders = Decimal("0")
         for order in device.work_orders.all():
-            if order.status == "cancelled":
+            if order.status == "cancelled" or order.pk in counted:
                 continue
             amount = money(order.total_amount)
             asset_work_orders += amount
@@ -360,20 +451,30 @@ def build_actuals(project):
             })
         work_orders_actual += asset_work_orders
 
+        install = None if device.actual_installation_cost is None else money(device.actual_installation_cost)
+        if install is not None:
+            installation_actual += install
+
         assets.append({
             "id": str(device.pk),
             "asset_code": device.asset_code,
             "asset_name": device.display_name or "",
             "source": device.source,
             "vendor_asset": vendor_asset,
-            "asset_price": None if not vendor_asset else (None if device.purchase_price is None else money(device.purchase_price)),
+            "installation_actual": install,
+            "installation_planned": (
+                None if device.planned_installation_cost is None else money(device.planned_installation_cost)
+            ),
+            "asset_price": money(asset_total) if vendor_asset and asset_total else None,
+            "asset_priced_from": asset_priced_from if vendor_asset else None,
+            "asset_arrived": (device.status != device.Status.PROCURED) if vendor_asset else None,
             "lines": lines,
             "steps": steps,
             "work_orders": work_orders,
             "materials_actual": money(asset_total),
             "production_actual": money(asset_production),
             "work_orders_actual": money(asset_work_orders),
-            "actual_total": money(asset_total + asset_production + asset_work_orders),
+            "actual_total": money(asset_total + asset_production + asset_work_orders + (install or 0)),
             "outstanding": outstanding,
         })
 
@@ -397,7 +498,9 @@ def build_actuals(project):
             "unplanned": planned == 0,
         })
 
-    total = money(materials_actual + production_actual + work_orders_actual + actual_total)
+    total = money(
+        materials_actual + production_actual + work_orders_actual + installation_actual + actual_total
+    )
     approved = plan.approved_total if plan else None
     return {
         "project": str(project.pk),
@@ -408,6 +511,7 @@ def build_actuals(project):
         "materials_actual": money(materials_actual),
         "production_actual": money(production_actual),
         "work_orders_actual": money(work_orders_actual),
+        "installation_actual": money(installation_actual),
         "overheads": overheads,
         "overheads_planned_total": money(planned_total),
         "overheads_actual_total": money(actual_total),

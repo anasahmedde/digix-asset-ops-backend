@@ -125,3 +125,16 @@ class PurchaseOrderItem(TimeStampedModel):
     @property
     def line_total(self):
         return self.quantity * self.unit_price
+
+    @property
+    def stocked_quantity(self) -> int:
+        """How much of this line has passed inspection into stock.
+
+        Receiving only queues goods; inspection is what puts them on the shelf,
+        so this — not ``received_quantity`` — says whether the store can issue.
+        """
+        return sum(
+            (line.accepted_quantity or 0)
+            for line in self.receipt_lines.all()
+            if line.inspection_status == "passed"
+        )

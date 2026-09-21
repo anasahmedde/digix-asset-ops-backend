@@ -57,15 +57,18 @@ def test_project_scope_and_milestones():
     assert r.status_code == 201, r.content
 
     detail = c.get(f"/api/teams/projects/{project.pk}/")
-    assert detail.data["phase"] == "production"
-    assert detail.data["phase_display"] == "Production"
+    # The phase follows the work, not the value the project was created with:
+    # nothing has been budgeted or built, so it reads as still being planned
+    # however it was set by hand.
+    assert detail.data["phase"] == "planning"
+    assert detail.data["phase_display"] == "Planning"
     assert len(detail.data["scope_items"]) == 1
     assert len(detail.data["milestones"]) == 1
 
-    # phase is writable through the normal update flow
-    r = c.patch(f"/api/teams/projects/{project.pk}/", {"phase": "delivery"}, format="json")
+    # The off-ramps are the ones somebody still chooses.
+    r = c.patch(f"/api/teams/projects/{project.pk}/", {"phase": "on_hold"}, format="json")
     assert r.status_code == 200, r.content
-    assert r.data["phase"] == "delivery"
+    assert r.data["phase"] == "on_hold"
 
 
 @pytest.mark.django_db
@@ -110,11 +113,13 @@ def test_progress_is_computed():
     from apps.teams.models import ProjectMilestone
 
     c = _client(ops)
-    # no milestones -> phase position along the 11-step ladder
-    p = Project.objects.create(name="Ladder", phase="production")  # index 4 of 10
-    assert c.get(f"/api/teams/projects/{p.pk}/").data["progress"] == 40
+    # No milestones: progress is the five phase bars averaged, and a project
+    # with nothing on it has done none of the work — whatever phase somebody
+    # has set it to by hand.
+    p = Project.objects.create(name="Ladder", phase="production")
+    assert c.get(f"/api/teams/projects/{p.pk}/").data["progress"] == 0
 
-    # milestones override the ladder: 2 of 4 done -> 50
+    # milestones override the phases: 2 of 4 done -> 50
     for i in range(4):
         ProjectMilestone.objects.create(project=p, title=f"M{i}", order=i)
     for m in list(p.milestones.all())[:2]:
@@ -356,7 +361,7 @@ def test_project_and_bom_line_link_back_to_quotation():
     )
 
     project = Project.objects.create(
-        name="Project: Facade refresh", phase="order_confirmation",
+        name="Project: Facade refresh", phase="planning",
         client=customer, source_quotation=quotation,
     )
     line = ProjectBOMLine.objects.create(
@@ -820,3 +825,630 @@ def test_actuals_document_prints_the_complete_table(db):
     for needle in ("ACTUAL COST", built.asset_code, bought.asset_code, "Complete asset from the vendor",
                    "Doc cutting", "Travelling", "ACTUAL TO DATE", "120,000.00", "650.00"):
         assert needle in text, needle
+
+
+# ---------------------------------------------------------------------------
+# Deleting a project
+# ---------------------------------------------------------------------------
+@pytest.mark.django_db
+def test_a_project_with_no_activity_can_be_deleted():
+    """Scope, milestones and requirements go with it; assets are only unlinked."""
+    from apps.teams.models import ProjectMilestone, ProjectScopeItem
+
+    ops = User.objects.create_user(username="del-ops", password="x", role="ops_manager")
+    brand = Brand.objects.create(name="DelBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="D-1")
+    device = Device.objects.create(device_model=dm, asset_code="AST-DEL-1", serial_number="DEL-1")
+    project = Project.objects.create(name="Mistaken entry", phase="query")
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    ProjectMilestone.objects.create(project=project, title="Kick-off", due_date="2026-10-01", order=1)
+
+    r = _client(ops).delete(f"/api/teams/projects/{project.pk}/")
+    assert r.status_code == 204, r.content
+    assert not Project.objects.filter(pk=project.pk).exists()
+    assert not ProjectScopeItem.objects.filter(device=device).exists()
+    device.refresh_from_db()
+    assert device.project_id is None
+
+
+@pytest.mark.django_db
+def test_a_project_with_activity_is_kept():
+    """Stock issued or a work order placed: the project stays for the record."""
+    from apps.suppliers.models import Supplier
+    from apps.workorders.models import WorkOrder
+
+    ops = User.objects.create_user(username="keep-ops", password="x", role="ops_manager")
+    project = Project.objects.create(name="Live rollout", phase="production")
+    shop = Supplier.objects.create(name="Keep Works")
+    WorkOrder.objects.create(title="Frames", supplier=shop, project=project)
+
+    r = _client(ops).delete(f"/api/teams/projects/{project.pk}/")
+    assert r.status_code == 400, r.content
+    assert "1 work order(s)" in r.data["detail"] and "On Hold" in r.data["detail"]
+    assert Project.objects.filter(pk=project.pk).exists()
+
+    # A purchase order raised for a component of an asset on its scope counts too.
+    from decimal import Decimal
+
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.teams.models import ProjectScopeItem
+
+    ordered = Project.objects.create(name="Ordered rollout", phase="production")
+    brand = Brand.objects.create(name="KeepBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="K-1")
+    device = Device.objects.create(device_model=dm, asset_code="AST-KEEP-1", serial_number="KEEP-1")
+    ProjectScopeItem.objects.create(project=ordered, device=device, quantity=1)
+    po = PurchaseOrder.objects.create(supplier=shop, ordered_by=ops, status=PurchaseOrder.Status.DRAFT)
+    line = PurchaseOrderItem.objects.create(purchase_order=po, description="Frame steel", quantity=2, unit_price=Decimal("10"))
+    AssetComponent.objects.create(device=device, name="Frame steel", quantity=2, purchase_order_item=line)
+    r = _client(ops).delete(f"/api/teams/projects/{ordered.pk}/")
+    assert r.status_code == 400 and "1 purchase order line(s)" in r.data["detail"], r.data
+    # Cancelled orders do not hold a project back.
+    po.status = PurchaseOrder.Status.CANCELLED
+    po.save(update_fields=["status"])
+    assert _client(ops).delete(f"/api/teams/projects/{ordered.pk}/").status_code == 204
+
+    # Only managers delete at all.
+    tech = User.objects.create_user(username="keep-tech", password="x", role="technician")
+    empty = Project.objects.create(name="Nothing yet", phase="query")
+    assert _client(tech).delete(f"/api/teams/projects/{empty.pk}/").status_code == 403
+
+
+@pytest.mark.django_db
+def test_projects_are_searched_by_client_and_site_too():
+    from apps.clients.models import Client
+
+    ops = User.objects.create_user(username="search-ops", password="x", role="ops_manager")
+    acme = Client.objects.create(name="Acme Retail")
+    Project.objects.create(name="Window displays", client=acme, phase="query")
+    Project.objects.create(name="Kiosks", phase="query")
+
+    names = [p["name"] for p in _client(ops).get("/api/teams/projects/", {"search": "acme"}).json()["results"]]
+    assert names == ["Window displays"]
+
+
+@pytest.mark.django_db
+def test_a_bought_asset_costs_what_its_order_charged_plus_installing_it():
+    """An asset bought whole is not built here: its cost is the purchase
+    order's, and the only other head is putting it in and switching it on."""
+    from decimal import Decimal
+
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.suppliers.models import Supplier
+
+    brand = Brand.objects.create(name="Bought Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="BG-1")
+    project = Project.objects.create(name="Bought Rollout")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-BUY-1", serial_number="BUY-1",
+        source="vendor_supplied", project=project, status="in_stock",
+    )
+    supplier = Supplier.objects.create(name="Screen Co")
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.RECEIVED)
+    item = PurchaseOrderItem.objects.create(
+        purchase_order=po, description="Screen", quantity=1, unit_price=Decimal("4800"),
+    )
+    device.procurement_item = item
+    # A stale price on the asset must not win over what the order charged.
+    device.purchase_price = Decimal("1000")
+    device.planned_installation_cost = Decimal("500")
+    device.actual_installation_cost = Decimal("615")
+    device.save(update_fields=[
+        "procurement_item", "purchase_price", "planned_installation_cost", "actual_installation_cost",
+    ])
+
+    ops = _U.objects.create_user(username="buy-ops", password="x", role="ops_manager")
+    c = _C()
+    c.force_authenticate(ops)
+
+    plan = c.get(f"/api/teams/projects/{project.id}/plan/").json()
+    assert Decimal(str(plan["installation_total"])) == Decimal("500")
+    asset = plan["assets"][0]
+    assert Decimal(str(asset["installation_cost"])) == Decimal("500")
+    assert asset["steps"] == [] and asset["lines"] == 0, "nothing is built here"
+
+    actuals = c.get(f"/api/teams/projects/{project.id}/actuals/").json()
+    asset = actuals["assets"][0]
+    assert Decimal(str(asset["asset_price"])) == Decimal("4800"), "the order, not the asset's own price"
+    assert asset["asset_priced_from"] == f"Purchase order · {po.po_number}"
+    assert asset["asset_arrived"] is True
+    assert Decimal(str(asset["installation_actual"])) == Decimal("615")
+    assert Decimal(str(asset["actual_total"])) == Decimal("5415")
+    # Two heads only: nothing was produced here.
+    assert Decimal(str(actuals["production_actual"])) == Decimal("0")
+    assert Decimal(str(actuals["work_orders_actual"])) == Decimal("0")
+    assert Decimal(str(actuals["installation_actual"])) == Decimal("615")
+    assert Decimal(str(actuals["actual_total"])) == Decimal("5415")
+
+
+@pytest.mark.django_db
+def test_a_bought_asset_that_has_not_arrived_costs_nothing_yet():
+    from decimal import Decimal
+
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.suppliers.models import Supplier
+
+    brand = Brand.objects.create(name="Waiting Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="WT-1")
+    project = Project.objects.create(name="Waiting Rollout")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-WAIT-1", serial_number="WAIT-1",
+        source="vendor_supplied", project=project, status="procured",
+    )
+    supplier = Supplier.objects.create(name="Slow Co")
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED)
+    device.procurement_item = PurchaseOrderItem.objects.create(
+        purchase_order=po, description="Screen", quantity=1, unit_price=Decimal("4800"),
+    )
+    device.save(update_fields=["procurement_item"])
+
+    ops = _U.objects.create_user(username="wait-ops", password="x", role="ops_manager")
+    c = _C()
+    c.force_authenticate(ops)
+    asset = c.get(f"/api/teams/projects/{project.id}/actuals/").json()["assets"][0]
+    assert asset["asset_arrived"] is False and asset["outstanding"] == 1
+    assert Decimal(str(asset["actual_total"])) == Decimal("0"), "nothing is spent until it arrives"
+
+
+@pytest.mark.django_db
+def test_the_scope_line_says_where_the_asset_goes():
+    """The registry does not ask where an asset is — the project's Scope line
+    does, and the asset follows it."""
+    from apps.sites.models import Site
+    from apps.teams.models import ProjectScopeItem
+
+    brand = Brand.objects.create(name="Scope Site Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="SS-1")
+    device = Device.objects.create(device_model=dm, asset_code="AST-SITE-1", serial_number="SITE-1")
+    project = Project.objects.create(name="Scope Site Rollout")
+    mall = Site.objects.create(name="Mall One", address="1 Road")
+    tower = Site.objects.create(name="Tower Two", address="2 Road")
+    assert device.current_site_id is None
+
+    item = ProjectScopeItem.objects.create(project=project, device=device, quantity=1, site=mall)
+    device.refresh_from_db()
+    assert device.current_site_id == mall.pk, "scoping it to a site puts it there"
+
+    # Moving the line moves the asset with it.
+    item.site = tower
+    item.save(update_fields=["site"])
+    device.refresh_from_db()
+    assert device.current_site_id == tower.pk
+
+    # Clearing the line leaves the asset where it is: paperwork does not move
+    # something that is already standing somewhere.
+    item.site = None
+    item.save(update_fields=["site"])
+    device.refresh_from_db()
+    assert device.current_site_id == tower.pk
+
+
+@pytest.mark.django_db
+def test_a_bought_asset_names_its_vendor_only_once_an_order_does():
+    """Nobody supplies an asset until the purchase order says so, so the plan
+    names no vendor before one exists and reads it off the order after."""
+    from decimal import Decimal
+
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.suppliers.models import Supplier
+
+    brand = Brand.objects.create(name="Vendor Name Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="VN-1")
+    project = Project.objects.create(name="Vendor Name Rollout")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-VEND-1", serial_number="VEND-1",
+        source="vendor_supplied", project=project,
+    )
+    ops = _U.objects.create_user(username="vend-ops", password="x", role="ops_manager")
+    c = _C()
+    c.force_authenticate(ops)
+
+    asset = c.get(f"/api/teams/projects/{project.id}/plan/").json()["assets"][0]
+    assert asset["supply_vendor_name"] is None and asset["po_number"] is None
+
+    # A name typed onto the asset is not a vendor either — only an order is.
+    device.supply_vendor_name = "Somebody Somebody"
+    device.save(update_fields=["supply_vendor_name"])
+    asset = c.get(f"/api/teams/projects/{project.id}/plan/").json()["assets"][0]
+    assert asset["supply_vendor_name"] is None, "a typed name is not a purchase"
+
+    supplier = Supplier.objects.create(name="Screens Limited")
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED)
+    device.procurement_item = PurchaseOrderItem.objects.create(
+        purchase_order=po, description="Screen", quantity=1, unit_price=Decimal("4800"),
+    )
+    device.save(update_fields=["procurement_item"])
+
+    asset = c.get(f"/api/teams/projects/{project.id}/plan/").json()["assets"][0]
+    assert asset["supply_vendor_name"] == "Screens Limited"
+    assert asset["po_number"] == po.po_number
+
+
+@pytest.mark.django_db
+def test_each_phase_says_how_far_it_has_got():
+    """A phase is work, so its bar is counted from the work: parts issued,
+    operations finished, installation steps done, assets handed over."""
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.assets.models import ProductionStep
+    from apps.sites.models import DeviceInstallation, InstallationStep, Site
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    brand = Brand.objects.create(name="Phase Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="PH-1")
+    project = Project.objects.create(name="Phase Rollout")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-PHASE-1", serial_number="PHASE-1", source="inhouse",
+    )
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    material = MaterialType.objects.create(name="Phase Panel", unit="piece")
+    item = InventoryItem.objects.create(material_type=material, quantity=10)
+    AssetComponent.objects.create(device=device, name="Phase Panel", quantity=4, inventory_item=item)
+    cut = ProductionStep.objects.create(device=device, step_number=1, name="Cutting")
+    ProductionStep.objects.create(device=device, step_number=2, name="Fitting")
+
+    bars = phase_progress(project)
+    # Every phase is counted in assets: one asset here, none of it done.
+    assert bars["procurement"]["done"] == 0 and bars["procurement"]["total"] == 1
+    assert bars["production"]["total"] == 1 and bars["production"]["percent"] == 0
+    assert bars["handover"]["total"] == 1 and bars["handover"]["percent"] == 0
+    assert bars["planning"]["percent"] == 0, "no budget submitted yet"
+
+    # Half the parts in, one operation done.
+    component = device.components.get()
+    component.issued_quantity = 2
+    component.save(update_fields=["issued_quantity"])
+    cut.status = ProductionStep.Status.COMPLETED
+    cut.save(update_fields=["status"])
+    bars = phase_progress(project)
+    assert bars["procurement"]["percent"] == 50
+    assert bars["production"]["percent"] == 50
+
+    # An installation opened, half its checklist worked through.
+    site = Site.objects.create(name="Phase Site", address="1 Road")
+    job = DeviceInstallation(device=device, site=site, installed_at=timezone.now())
+    job._skip_default_steps = True
+    job.save()
+    for n, status in enumerate((InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.NOT_STARTED), start=1):
+        InstallationStep.objects.create(
+            installation=job, step_type=InstallationStep.StepType.SURVEY, step_number=n, status=status,
+        )
+    bars = phase_progress(project)
+    assert bars["installation"]["percent"] == 50, bars["installation"]
+
+    # Handed over once the client has it. Running is not the same thing — see
+    # test_handing_over_needs_the_client_to_have_accepted_it — so this uses the
+    # state that means the client owns it outright.
+    device.status = Device.Status.CLIENT_PROPERTY
+    device.save(update_fields=["status"])
+    assert phase_progress(project)["handover"]["percent"] == 100
+
+
+@pytest.mark.django_db
+def test_approving_the_budget_moves_the_project_off_planning():
+    """Planning ends when the figure is agreed; the order stops reading as
+    still being planned."""
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+
+    project, device, cable, po = _planned_project()
+    assert project.phase == Project.Phase.PLANNING and project.status == Project.Status.PLANNING
+
+    ops = _U.objects.create_user(username="phase-ops", password="x", role="ops_manager")
+    head = _U.objects.create_user(username="phase-head", password="x", role="group_head")
+    c, h = _C(), _C()
+    c.force_authenticate(ops)
+    h.force_authenticate(head)
+    assert c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json").status_code == 200
+    assert h.post(f"/api/teams/projects/{project.id}/approve-budget/", {}, format="json").status_code == 200
+
+    project.refresh_from_db()
+    assert project.phase == Project.Phase.PROCUREMENT
+    assert project.status == Project.Status.ON_TRACK
+
+
+@pytest.mark.django_db
+def test_a_phase_is_split_evenly_between_the_assets():
+    """One asset's long bill of materials cannot drown out the others.
+
+    A project of three assets moves a third at a time, however many parts or
+    operations each asset happens to carry — otherwise a big asset's screws
+    would read as more progress than a whole other asset being finished.
+    """
+    from apps.assets.models import ProductionStep
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    brand = Brand.objects.create(name="Split Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="SPL-1")
+    project = Project.objects.create(name="Even Split Rollout")
+    material = MaterialType.objects.create(name="Split Panel", unit="piece")
+    item = InventoryItem.objects.create(material_type=material, quantity=500)
+
+    # A big asset (40 parts) and two small ones (2 parts each).
+    sizes = [40, 2, 2]
+    devices = []
+    for n, size in enumerate(sizes, start=1):
+        d = Device.objects.create(device_model=dm, asset_code=f"AST-SPLIT-{n}", source="inhouse")
+        ProjectScopeItem.objects.create(project=project, device=d, quantity=1)
+        AssetComponent.objects.create(
+            device=d, name="Split Panel", quantity=size, inventory_item=item,
+        )
+        ProductionStep.objects.create(device=d, step_number=1, name="Assemble")
+        devices.append(d)
+
+    bars = phase_progress(project)
+    assert bars["procurement"]["total"] == 3 and bars["procurement"]["percent"] == 0
+
+    # Supply the big asset in full: one of three assets, so a third.
+    big = devices[0].components.get()
+    big.issued_quantity = 40
+    big.save(update_fields=["issued_quantity"])
+    bars = phase_progress(project)
+    assert bars["procurement"]["percent"] == 33, bars["procurement"]
+    assert bars["procurement"]["done"] == 1
+    assert bars["procurement"]["note"] == "1 of 3 assets supplied"
+
+    # Half of one small asset: half a share, so a sixth more.
+    small = devices[1].components.get()
+    small.issued_quantity = 1
+    small.save(update_fields=["issued_quantity"])
+    assert phase_progress(project)["procurement"]["percent"] == 50
+
+    # Production splits the same way: one of three routes finished.
+    step = devices[0].production_steps.get()
+    step.status = ProductionStep.Status.COMPLETED
+    step.save(update_fields=["status"])
+    bars = phase_progress(project)
+    assert bars["production"]["percent"] == 33 and bars["production"]["total"] == 3
+
+    # And handing over: one of three now belongs to the client.
+    devices[2].status = Device.Status.CLIENT_PROPERTY
+    devices[2].save(update_fields=["status"])
+    bars = phase_progress(project)
+    assert bars["handover"]["percent"] == 33
+    assert bars["handover"]["note"] == "1 of 3 assets handed over"
+    # Nobody has opened an installation, so none of that phase is done.
+    assert bars["installation"]["percent"] == 0
+
+
+@pytest.mark.django_db
+def test_a_vendor_asset_clears_procurement_and_production_when_it_arrives():
+    """Nobody here builds it, so delivery is the whole of both phases.
+
+    A complete asset bought from a vendor has no bill of materials and no
+    route. Until it turns up neither phase has moved for it; once it is in
+    stock both are finished, and it waits on installation like anything else.
+    """
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    brand = Brand.objects.create(name="Vendor Share Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="VSH-1")
+    project = Project.objects.create(name="Vendor Share Rollout")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-VSHARE-1", source="vendor_supplied",
+        status=Device.Status.PROCURED,
+    )
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+
+    bars = phase_progress(project)
+    assert bars["procurement"]["percent"] == 0, "on order, not delivered"
+    assert bars["production"]["percent"] == 0, "the vendor has not delivered it"
+
+    # It arrives and goes into stock.
+    device.status = Device.Status.IN_STOCK
+    device.save(update_fields=["status"])
+
+    bars = phase_progress(project)
+    assert bars["procurement"]["percent"] == 100
+    assert bars["production"]["percent"] == 100, "nobody here builds it"
+    assert bars["installation"]["percent"] == 0, "still to be put in"
+    assert bars["handover"]["percent"] == 0
+
+
+@pytest.mark.django_db
+def test_handing_over_needs_the_client_to_have_accepted_it():
+    """An asset the crew switched on has not been handed over.
+
+    Handing over is the client accepting it on the Installation Tracker. Until
+    that record exists the phase has not moved for that asset, however live it
+    is — otherwise the bar would say a project was delivered while the client
+    had signed nothing.
+    """
+    from apps.clients.models import Client
+    from apps.sites.models import DeviceInstallation, HandoverRecord, Site
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    brand = Brand.objects.create(name="Handover Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="HO-1")
+    project = Project.objects.create(name="Handover Rollout")
+    site = Site.objects.create(name="Handover Site", address="1 Road")
+    client = Client.objects.create(name="Handover Client")
+
+    devices = []
+    for n in range(2):
+        d = Device.objects.create(
+            device_model=dm, asset_code=f"AST-HO-{n}", source="vendor_supplied",
+            current_site=site, status=Device.Status.ACTIVE,
+        )
+        ProjectScopeItem.objects.create(project=project, device=d, quantity=1)
+        devices.append(d)
+
+    # Both are live, neither has been accepted by anybody.
+    assert phase_progress(project)["handover"]["percent"] == 0
+
+    job = DeviceInstallation(device=devices[0], site=site, installed_at=timezone.now())
+    job._skip_default_steps = True
+    job.save()
+    HandoverRecord.objects.create(
+        installation=job, device=devices[0], client=client, site=site,
+        handover_date=timezone.localdate(), accepted_by_name="Site Manager",
+    )
+    bars = phase_progress(project)
+    assert bars["handover"]["percent"] == 50
+    assert bars["handover"]["note"] == "1 of 2 assets handed over"
+
+    # An asset that became the client's own property is past handing over.
+    devices[1].status = Device.Status.CLIENT_PROPERTY
+    devices[1].save(update_fields=["status"])
+    assert phase_progress(project)["handover"]["percent"] == 100
+
+
+@pytest.mark.django_db
+def test_progress_ignores_the_phase_label_and_counts_the_work():
+    """A project can be finished while the marker still says Planning.
+
+    The phase is set by hand and gets forgotten. Every parts issued, every
+    asset built and installed is recorded as it happens, so the overall figure
+    reads those instead — otherwise a project with all its work done reported
+    a fifth of it because nobody moved the label.
+    """
+    from apps.assets.models import ProductionStep
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    brand = Brand.objects.create(name="Progress Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="PRG-1")
+    # The label is left where it started, deliberately.
+    project = Project.objects.create(name="Progress Rollout", phase=Project.Phase.PLANNING)
+    material = MaterialType.objects.create(name="Progress Panel", unit="piece")
+    item = InventoryItem.objects.create(material_type=material, quantity=50)
+
+    device = Device.objects.create(device_model=dm, asset_code="AST-PRG-1", source="inhouse")
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    component = AssetComponent.objects.create(
+        device=device, name="Progress Panel", quantity=4, inventory_item=item,
+    )
+    step = ProductionStep.objects.create(device=device, step_number=1, name="Assemble")
+
+    # Nothing done yet, and no budget: none of the five phases has moved.
+    assert project.computed_progress() == 0
+
+    # Parts in and the route finished: two of five phases done, so two fifths.
+    component.issued_quantity = 4
+    component.save(update_fields=["issued_quantity"])
+    step.status = ProductionStep.Status.COMPLETED
+    step.save(update_fields=["status"])
+    bars = phase_progress(project)
+    assert bars["procurement"]["percent"] == 100 and bars["production"]["percent"] == 100
+    assert project.computed_progress() == 40
+
+    # The label never moved, and that is the point.
+    project.refresh_from_db()
+    assert project.phase == Project.Phase.PLANNING
+
+
+@pytest.mark.django_db
+def test_the_phase_is_the_first_one_not_finished():
+    """The label used to be moved by hand and got left behind.
+
+    A phase is done when its bar reads 100%, so the project is in the first
+    one that is not. Reading the project is when the stored label catches up,
+    which is what keeps list filters honest.
+    """
+    from apps.assets.models import ProductionStep
+    from apps.teams.models import ProjectBudget, ProjectScopeItem
+
+    brand = Brand.objects.create(name="Phase Sync Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="PSY-1")
+    project = Project.objects.create(name="Phase Sync Rollout", phase=Project.Phase.PLANNING)
+    material = MaterialType.objects.create(name="Sync Panel", unit="piece")
+    item = InventoryItem.objects.create(material_type=material, quantity=50)
+    device = Device.objects.create(device_model=dm, asset_code="AST-PSY-1", source="inhouse")
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    component = AssetComponent.objects.create(
+        device=device, name="Sync Panel", quantity=2, inventory_item=item,
+    )
+    step = ProductionStep.objects.create(device=device, step_number=1, name="Assemble")
+
+    # No budget: planning is the first unfinished phase.
+    assert project.sync_phase() == Project.Phase.PLANNING
+
+    plan = ProjectBudget.objects.create(project=project, status=ProjectBudget.Status.APPROVED)
+    assert plan.status == ProjectBudget.Status.APPROVED
+    assert project.sync_phase() == Project.Phase.PROCUREMENT
+
+    component.issued_quantity = 2
+    component.save(update_fields=["issued_quantity"])
+    assert project.sync_phase() == Project.Phase.PRODUCTION
+
+    step.status = ProductionStep.Status.COMPLETED
+    step.save(update_fields=["status"])
+    assert project.sync_phase() == Project.Phase.INSTALLATION
+
+    # The stored field really moved, so a filter on it finds the project.
+    project.refresh_from_db()
+    assert project.phase == Project.Phase.INSTALLATION
+    assert Project.objects.filter(phase=Project.Phase.INSTALLATION, pk=project.pk).exists()
+
+
+@pytest.mark.django_db
+def test_an_off_ramp_is_not_overruled_by_the_work():
+    """On Hold and Order Lost are somebody's decision, not the work's."""
+    from apps.teams.models import ProjectScopeItem
+
+    brand = Brand.objects.create(name="Off Ramp Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="OFR-1")
+    project = Project.objects.create(name="Off Ramp Rollout", phase=Project.Phase.ON_HOLD)
+    device = Device.objects.create(device_model=dm, asset_code="AST-OFR-1", source="inhouse")
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+
+    assert project.sync_phase() == Project.Phase.ON_HOLD
+    project.refresh_from_db()
+    assert project.phase == Project.Phase.ON_HOLD
+
+
+@pytest.mark.django_db
+def test_a_project_completes_itself_when_every_phase_is_done():
+    """Nothing left in any phase is the one status the work can declare."""
+    from apps.clients.models import Client
+    from apps.sites.models import DeviceInstallation, HandoverRecord, InstallationStep, Site
+    from apps.teams.models import ProjectBudget, ProjectScopeItem
+
+    brand = Brand.objects.create(name="Complete Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="CMP-1")
+    site = Site.objects.create(name="Complete Site", address="1 Road")
+    client = Client.objects.create(name="Complete Client")
+    project = Project.objects.create(
+        name="Complete Rollout", phase=Project.Phase.PLANNING, client=client,
+    )
+    ProjectBudget.objects.create(project=project, status=ProjectBudget.Status.APPROVED)
+
+    # Bought whole, so procurement and production are done when it arrives.
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-CMP-1", source="vendor_supplied",
+        current_site=site, status=Device.Status.ACTIVE,
+    )
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+
+    job = DeviceInstallation(device=device, site=site, installed_at=timezone.now())
+    job._skip_default_steps = True
+    job.save()
+    job.steps.all().delete()
+    InstallationStep.objects.create(
+        installation=job, step_type=InstallationStep.StepType.SURVEY, step_number=1,
+        status=InstallationStep.StepStatus.COMPLETED,
+    )
+    HandoverRecord.objects.create(
+        installation=job, device=device, client=client, site=site,
+        handover_date=timezone.localdate(), accepted_by_name="Site Manager",
+    )
+
+    assert project.computed_progress() == 100
+    assert project.sync_phase() == Project.Phase.HANDOVER
+    project.refresh_from_db()
+    assert project.status == Project.Status.COMPLETED

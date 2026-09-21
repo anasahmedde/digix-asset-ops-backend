@@ -7,6 +7,7 @@ from .views import (
     NumberingSchemeViewSet,
     PaymentTermsViewSet,
     TermsTemplateViewSet,
+    UnitOfMeasureViewSet,
     WarrantyPeriodPresetViewSet,
 )
 
@@ -15,6 +16,7 @@ router.register("company", CompanyViewSet, basename="company")
 router.register("numbering-schemes", NumberingSchemeViewSet, basename="numbering-scheme")
 router.register("payment-terms", PaymentTermsViewSet, basename="payment-terms")
 router.register("terms-templates", TermsTemplateViewSet, basename="terms-template")
+router.register("units", UnitOfMeasureViewSet, basename="unit-of-measure")
 router.register("warranty-periods", WarrantyPeriodPresetViewSet, basename="warranty-period")
 router.register("escalation-policies", EscalationPolicyViewSet, basename="escalation-policy")
 

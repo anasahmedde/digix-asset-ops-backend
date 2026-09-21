@@ -3,6 +3,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from apps.sites.models import Site
+from apps.suppliers.models import Supplier
 
 from .models import (
     AssetCode,
@@ -31,7 +32,8 @@ def validate_assignee(attrs, *, allow_both=False):
     action and the edit form, so all three enforce the same rule and wording.
     """
     technician = attrs.get("assigned_technician")
-    vendor = (attrs.get("assigned_vendor_name") or "").strip()
+    picked = attrs.get("assigned_vendor")
+    vendor = picked.name if picked is not None else (attrs.get("assigned_vendor_name") or "").strip()
     if not technician and not vendor:
         raise serializers.ValidationError({
             "assigned_technician": "Say who this asset is assigned to — a technician or a vendor."
@@ -264,6 +266,10 @@ class AssetComponentSerializer(serializers.ModelSerializer):
     po_number = serializers.CharField(
         source="purchase_order_item.purchase_order.po_number", read_only=True, default=None
     )
+    # How much of what was bought for this line has passed inspection into
+    # stock, and the material requests the store issues it against.
+    po_stocked_quantity = serializers.SerializerMethodField()
+    procure_requests = serializers.SerializerMethodField()
     source_label = serializers.SerializerMethodField()
     increase_requested_by_name = serializers.CharField(
         source="increase_requested_by.get_full_name", read_only=True, default=None
@@ -277,7 +283,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "inventory_item", "inventory_item_name", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name", "available_quantity",
             "fulfilment", "issued_quantity", "outstanding_quantity", "stock_requested_quantity", "procure_quantity", "undecided_quantity",
-            "purchase_order_item", "po_number", "planned_unit_price",
+            "purchase_order_item", "po_number", "po_stocked_quantity", "procure_requests", "planned_unit_price",
             "pending_increase", "increase_reason", "increase_notes",
             "increase_requested_by_name", "increase_requested_at",
             "inventory_unit", "inventory_unit_code", "source_label",
@@ -296,6 +302,14 @@ class AssetComponentSerializer(serializers.ModelSerializer):
         if obj.inventory_item_id:
             return obj.inventory_item.quantity
         return None
+
+    def get_po_stocked_quantity(self, obj):
+        if obj.purchase_order_item_id is None:
+            return 0
+        return obj.purchase_order_item.stocked_quantity
+
+    def get_procure_requests(self, obj):
+        return [r.request_number for r in obj._open_requests() if r.awaiting_procurement]
 
     def get_source_label(self, obj):
         if obj.inventory_unit_type_id:
@@ -400,6 +414,12 @@ def _client_names(device):
     for client in device.clients.all():
         if client.name not in names:
             names.append(client.name)
+    if not names:
+        # Nothing on the asset, so read where the work was set up: the project
+        # it is scoped to, else the client whose site it stands on.
+        client = device.client_for
+        if client is not None:
+            names.append(client.name)
     return names
 
 
@@ -418,7 +438,17 @@ class DeviceListSerializer(serializers.ModelSerializer):
     device_model_name = serializers.StringRelatedField(source="device_model", read_only=True)
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
-    client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+    # The picture to show: the asset's own where one was set, else the primary
+    # photo in its gallery. Declared, not inferred — a bare property name in
+    # `fields` serialises the file object itself and breaks the response.
+    display_image = serializers.ImageField(read_only=True)
+    # Not assigned_client.name: an asset scoped to a project belongs to that
+    # project's client without anybody naming it twice.
+    client_name = serializers.SerializerMethodField()
+
+    def get_client_name(self, obj):
+        client = obj.client_for
+        return client.name if client is not None else None
     client_names = serializers.SerializerMethodField()
     project_name = serializers.SerializerMethodField()
     warranty_status = serializers.SerializerMethodField()
@@ -430,7 +460,7 @@ class DeviceListSerializer(serializers.ModelSerializer):
             "id", "asset_code", "serial_number", "display_name", "project", "project_name",
             "asset_type", "asset_type_name",
             "device_model", "device_model_name",
-            "status", "status_display", "source", "image", "current_site", "site_name",
+            "status", "status_display", "source", "image", "display_image", "current_site", "site_name",
             "assigned_client", "client_name", "client_names",
             "installation_date", "warranty_status", "created_at",
         ]
@@ -450,7 +480,17 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     brand_name = serializers.CharField(source="device_model.brand.name", read_only=True, default=None)
     site_name = serializers.CharField(source="current_site.name", read_only=True, default=None)
-    client_name = serializers.CharField(source="assigned_client.name", read_only=True, default=None)
+    # The picture to show: the asset's own where one was set, else the primary
+    # photo in its gallery. Declared, not inferred — a bare property name in
+    # `fields` serialises the file object itself and breaks the response.
+    display_image = serializers.ImageField(read_only=True)
+    # Not assigned_client.name: an asset scoped to a project belongs to that
+    # project's client without anybody naming it twice.
+    client_name = serializers.SerializerMethodField()
+
+    def get_client_name(self, obj):
+        client = obj.client_for
+        return client.name if client is not None else None
     client_names = serializers.SerializerMethodField()
     project_name = serializers.SerializerMethodField()
     # Contract chip (PR-01): rental/sold context from the parent project.
@@ -538,8 +578,10 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "device_model", "device_model_name", "brand_name",
             "length_in", "width_in", "depth_in", "diagonal_inches",
             "hardware_revision",
-            "status", "status_display", "source", "source_display", "allowed_transitions", "image", "images",
+            "status", "status_display", "source", "source_display", "allowed_transitions",
+            "image", "display_image", "images",
             "purchase_date", "purchase_price", "supplier", "supplier_name",
+            "planned_installation_cost", "actual_installation_cost",
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
             "clients", "client_names",
@@ -547,7 +589,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             "components",
             "assigned_technician", "technician_name", "technician_employee_id",
             "technician_job_title", "technician_phone",
-            "assigned_vendor_name", "assigned_vendor_contact", "assigned_to_display",
+            "assigned_vendor", "assigned_vendor_name", "assigned_vendor_contact", "assigned_to_display",
             "supply_vendor_name", "supply_vendor_contact",
             "is_locked", "route_complete", "procurement_item", "procurement_po_number",
             "procurement_requested_at", "copy_from",
@@ -756,9 +798,12 @@ class DeviceTransitionSerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=Device.Status.choices)
     reason = serializers.CharField()
     # Moving to `assigned` must say who it went to: an internal technician
-    # (picked from the manpower records) or an external vendor typed by hand.
+    # (picked from the manpower records) or a vendor from the register.
     assigned_technician = serializers.PrimaryKeyRelatedField(
         queryset=get_user_model().objects.all(), required=False, allow_null=True
+    )
+    assigned_vendor = serializers.PrimaryKeyRelatedField(
+        queryset=Supplier.objects.all(), required=False, allow_null=True
     )
     assigned_vendor_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
     assigned_vendor_contact = serializers.CharField(required=False, allow_blank=True, max_length=100)
@@ -768,6 +813,9 @@ class DeviceTransitionSerializer(serializers.Serializer):
     current_site = serializers.PrimaryKeyRelatedField(
         queryset=Site.objects.all(), required=False, allow_null=True
     )
+    # When the installation has to be finished. Agreed with whoever is taking
+    # the job, at the moment they take it — not typed into the tracker later.
+    installation_date = serializers.DateField(required=False, allow_null=True)
     # Taking an asset out of service raises a corrective job, so the details
     # that job needs are asked for at the moment the asset goes down.
     maintenance_due = serializers.DateField(required=False, allow_null=True)
@@ -888,6 +936,9 @@ class DeviceAssignmentSerializer(serializers.Serializer):
     assigned_technician = serializers.PrimaryKeyRelatedField(
         queryset=get_user_model().objects.all(), required=False, allow_null=True
     )
+    assigned_vendor = serializers.PrimaryKeyRelatedField(
+        queryset=Supplier.objects.all(), required=False, allow_null=True
+    )
     assigned_vendor_name = serializers.CharField(required=False, allow_blank=True, max_length=200)
     assigned_vendor_contact = serializers.CharField(required=False, allow_blank=True, max_length=100)
     reason = serializers.CharField()
@@ -914,14 +965,23 @@ class ProductionStepSerializer(serializers.ModelSerializer):
     work_order = serializers.SerializerMethodField()
 
     def get_work_order(self, obj):
-        orders = getattr(obj, "_prefetched_objects_cache", {}).get("work_orders")
-        orders = list(orders) if orders is not None else list(obj.work_orders.all())
-        live = [o for o in orders if o.status != "cancelled"]
-        if not live:
+        o = obj.live_work_order
+        if o is None:
             return None
-        o = sorted(live, key=lambda x: x.created_at)[-1]
-        return {"id": str(o.pk), "wo_number": o.wo_number, "status": o.status,
-                "status_display": o.get_status_display(), "amount": o.total_amount}
+        inspector = o.inspected_by
+        return {
+            "id": str(o.pk), "wo_number": o.wo_number, "status": o.status,
+            "status_display": o.get_status_display(), "amount": o.total_amount,
+            "supplier_name": o.supplier.name if o.supplier_id else None,
+            "delivered_at": o.delivered_at,
+            "inspected_by_name": (inspector.get_full_name() or inspector.username) if inspector else None,
+            "inspected_at": o.inspected_at,
+            "inspection_result": o.inspection_result or None,
+            "inspection_notes": o.inspection_notes or "",
+        }
+
+    # Execution asked for a work order; Work Orders › Requests has it.
+    work_order_requested = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = ProductionStep
@@ -929,6 +989,7 @@ class ProductionStepSerializer(serializers.ModelSerializer):
             "id", "device", "step_number", "name",
             "location", "location_display", "workshop", "workshop_name", "workshop_display",
             "status", "status_display", "allowed_transitions", "hold_reason", "decision_pending", "work_order",
+            "work_order_requested", "work_order_requested_at",
             "assigned_to", "assigned_to_name", "expected_days", "planned_cost", "actual_cost",
             "started_at", "sent_at", "returned_at", "completed_at",
             "notes", "created_at",
