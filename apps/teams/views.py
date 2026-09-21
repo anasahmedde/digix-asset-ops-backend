@@ -36,11 +36,113 @@ from .serializers import (
 )
 
 
+def _installations_for(devices):
+    """What the Installation Tracker knows about these assets, by device id.
+
+    Execution should not have to send people hunting: the job on the tracker,
+    who it went to, the stage it has reached and when it is due all read here.
+    """
+    from apps.sites.models import DeviceInstallation, InstallationStep
+
+    jobs = (
+        DeviceInstallation.objects
+        .filter(device__in=devices)
+        .select_related("site", "installed_by", "vendor")
+        .prefetch_related("steps")
+        .order_by("device_id", "-installed_at")
+    )
+    out = {}
+    for job in jobs:
+        # The live job wins; a finished one stands until a new one opens.
+        if job.device_id in out and out[job.device_id]["completed_at"] is None:
+            continue
+        steps = sorted(job.steps.all(), key=lambda s: s.step_number)
+        done = [s for s in steps if s.status == InstallationStep.StepStatus.COMPLETED]
+        current = next(
+            (s for s in steps if s.status not in (
+                InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.SKIPPED,
+            )),
+            None,
+        )
+        crew = job.installed_by
+        out[job.device_id] = {
+            "id": str(job.pk),
+            "site_name": job.site.name if job.site_id else None,
+            "installed_by_name": (crew.get_full_name() or crew.username) if crew else None,
+            "vendor_name": job.vendor.name if job.vendor_id else (job.external_vendor_name or None),
+            "due_date": job.due_date,
+            "installed_at": job.installed_at,
+            "completed_at": job.completed_at,
+            "steps_done": len(done),
+            "steps_total": len(steps),
+            "progress": round(len(done) / len(steps) * 100) if steps else 0,
+            "stage": (
+                "Complete" if job.completed_at is not None
+                else (current.custom_label or current.get_step_type_display()) if current is not None
+                else "Not started"
+            ),
+            "stage_status": current.get_status_display() if current is not None else None,
+        }
+    return out
+
+
 class ProjectViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["status", "phase", "contract_type", "client", "site", "manager"]
-    search_fields = ["name", "location", "description"]
+    search_fields = ["name", "location", "description", "client__name", "site__name", "sites__name"]
     ordering_fields = ["created_at", "start_date", "target_date", "progress"]
+
+    @staticmethod
+    def _activity(project):
+        """What has already happened on a project, in the words a user reads.
+
+        Stock issued, purchase orders raised or work orders placed are records
+        other people rely on; a project carrying any of them is not deleted.
+        """
+        from apps.procurement.models import PurchaseOrderItem
+        from apps.workorders.models import WorkOrder
+
+        found = []
+        issued = (
+            project.inventory_issuances.exists()
+            or project.issuance_requests.filter(quantity_issued__gt=0).exists()
+        )
+        if issued:
+            found.append("stock issued to it")
+        # Lines raised for its requirements, for its vendor-built assets, or
+        # for the components of assets on its scope.
+        orders = (
+            PurchaseOrderItem.objects.filter(
+                Q(bom_line__project=project)
+                | Q(procured_devices__project_scope_items__project=project)
+                | Q(asset_components__device__project_scope_items__project=project)
+            )
+            .exclude(purchase_order__status="cancelled")
+            .distinct()
+            .count()
+        )
+        if orders:
+            found.append(f"{orders} purchase order line(s) raised for it")
+        wos = project.work_orders.exclude(status=WorkOrder.Status.CANCELLED).count()
+        if wos:
+            found.append(f"{wos} work order(s)")
+        return found
+
+    def destroy(self, request, *args, **kwargs):
+        """A project with no activity can go; one with activity is kept."""
+        project = self.get_object()
+        activity = self._activity(project)
+        if activity:
+            return Response(
+                {
+                    "detail": (
+                        f"'{project.name}' has {', '.join(activity)}. Projects with activity are kept "
+                        "for the record — move it to On Hold or Order Lost instead."
+                    )
+                },
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
 
     def get_queryset(self):
         return (
@@ -125,6 +227,8 @@ class ProjectViewSet(viewsets.ModelViewSet):
         assets = []
         totals = {"required": 0, "issued": 0, "outstanding": 0,
                   "awaiting_decision": 0, "to_procure": 0}
+        installs = _installations_for(devices)
+        from apps.assets.serializers import assignee_label
 
         for device in devices:
             if device.source != Device.Source.INHOUSE:
@@ -155,6 +259,11 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     "components": [],
                     "steps": [],
                     "route_complete": False,
+                    "installation": installs.get(device.pk),
+                    "assigned_to_display": assignee_label(
+                        device.assigned_technician, device.assigned_vendor_name,
+                        device.assigned_vendor_contact,
+                    ),
                 })
                 continue
             components = list(device.components.all())
@@ -186,6 +295,11 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 # The route's own decisions: each operation in-house or on a work order.
                 "steps": ProductionStepSerializer(steps, many=True).data,
                 "route_complete": bool(steps) and all(x.status in ("completed", "skipped") for x in steps),
+                "installation": installs.get(device.pk),
+                "assigned_to_display": assignee_label(
+                    device.assigned_technician, device.assigned_vendor_name,
+                    device.assigned_vendor_contact,
+                ),
             })
 
         return Response({"project": str(project.pk), "assets": assets, "totals": totals})
@@ -327,7 +441,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             step = ProductionStep.objects.filter(pk=request.data.get("production_step"), device=device).first()
             if step is None:
                 return Response({"production_step": ["That operation is not on this asset's route."]}, status=400)
-            if step.work_orders.exclude(status="cancelled").exists():
+            if step.live_work_orders().exists():
                 return Response({"production_step": [f"'{step.name}' already has a work order."]}, status=400)
             if step.status in ("completed", "skipped"):
                 return Response({"production_step": [f"'{step.name}' is already finished."]}, status=400)
@@ -343,7 +457,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             amount = Decimal("0")
 
         if step is not None:
-            order_type = WorkOrder.OrderType.PRODUCTION
+            order_type = WorkOrder.OrderType.SERVICES
         else:
             order_type = (
                 WorkOrder.OrderType.SUPPLY_INSTALL
@@ -375,6 +489,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     f"{step.name} on {device.display_name or device.asset_code}" if step is not None
                     else f"{device.display_name or device.asset_code} ({device.get_source_display()})"
                 ),
+                production_step=step,
                 quantity=1,
                 unit_price=amount,
             )
@@ -460,7 +575,16 @@ class ProjectViewSet(viewsets.ModelViewSet):
             plan.approved_total = summary["total"]
             update.append("approved_total")
             project.budget = summary["total"]
-            project.save(update_fields=["budget", "updated_at"])
+            moved = ["budget", "updated_at"]
+            # Planning is over once the figure is agreed: the order moves on to
+            # getting the parts in, and stops reading as still being planned.
+            if project.phase == Project.Phase.PLANNING:
+                project.phase = Project.Phase.PROCUREMENT
+                moved.append("phase")
+            if project.status == Project.Status.PLANNING:
+                project.status = Project.Status.ON_TRACK
+                moved.append("status")
+            project.save(update_fields=moved)
         plan.save(update_fields=update)
         return Response(build_plan(project))
 

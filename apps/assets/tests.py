@@ -1595,16 +1595,21 @@ def test_cannot_issue_more_than_the_requirement(admin_client, project_build):
 
 
 @pytest.mark.django_db
-def test_issuing_more_than_stock_is_refused_with_a_hint(admin_client, project_build, stock_refs):
+def test_asking_for_more_than_stock_is_refused_with_a_hint(admin_client, project_build, stock_refs):
+    """The shelf sets the limit at decision time: the store is asked for what
+    it holds and the rest goes to procurement — it never queues a shortfall."""
     stock_refs["item"].quantity = 1
     stock_refs["item"].save(update_fields=["quantity"])
     component = project_build["generic"]
-    # Asking is always allowed — the shortfall is the store's problem to report.
-    assert _ask_store(admin_client, component).status_code == 200
-
-    r = _store_issues(admin_client, component)
+    r = _ask_store(admin_client, component)          # defaults to the whole requirement (4)
     assert r.status_code == 400, r.content
-    assert "procure the shortfall" in str(r.data["quantity"])
+    assert "Only 1 in stock" in str(r.data["quantity"]) and "procure the rest" in str(r.data["quantity"])
+
+    assert _ask_store(admin_client, component, 1).status_code == 200
+    r = _store_issues(admin_client, component)
+    assert r.status_code == 200, r.content
+    stock_refs["item"].refresh_from_db()
+    assert stock_refs["item"].quantity == 0
 
 
 @pytest.mark.django_db
@@ -1660,8 +1665,8 @@ def test_register_an_asset_without_a_serial(admin_client, db):
     )
     assert r.status_code == 201, r.content
     assert r.data["asset_code"].startswith("DGX-")
-    # Serial falls back to the generated code so the unique index is safe.
-    assert r.data["serial_number"] == r.data["asset_code"]
+    # The asset code identifies it. No serial is invented to fill the field.
+    assert r.data["serial_number"] is None
 
 
 @pytest.mark.django_db
@@ -1674,7 +1679,9 @@ def test_two_assets_without_serials_do_not_collide(admin_client, db):
             "/api/assets/devices/", {"device_model": str(model.id)}, format="json",
         )
         assert r.status_code == 201, r.content
-        codes.add(r.data["serial_number"])
+        # None of them has a serial, and the unique index tolerates that.
+        assert r.data["serial_number"] is None
+        codes.add(r.data["asset_code"])
     assert len(codes) == 3
 
 
@@ -1717,18 +1724,21 @@ def test_issuing_parts_journals_and_starts_the_build(admin_client, project_build
         assert r.status_code == 200, r.content
 
     device.refresh_from_db()
-    # Everything is in hand now, so the floor starts.
-    assert device.status == Device.Status.IN_PRODUCTION
+    # Everything is in hand, so the floor starts — and this asset has no
+    # operations to do, so the same moment finishes the build: it is stock.
+    assert device.status == Device.Status.IN_STOCK
 
     note = DeviceLifecycleEvent.objects.filter(
         device=device, event_type=DeviceLifecycleEvent.EventType.NOTE
     ).latest("created_at")
     assert "Comp Media Player" in note.description
 
-    moved = DeviceLifecycleEvent.objects.filter(
-        device=device, event_type=DeviceLifecycleEvent.EventType.STATUS_CHANGE
-    ).latest("created_at")
-    assert moved.to_value == "in_production"
+    moves = list(
+        DeviceLifecycleEvent.objects.filter(
+            device=device, event_type=DeviceLifecycleEvent.EventType.STATUS_CHANGE
+        ).order_by("created_at").values_list("to_value", flat=True)
+    )
+    assert moves[-2:] == ["in_production", "in_stock"]
 
 
 @pytest.mark.django_db
@@ -2589,3 +2599,183 @@ def test_a_copied_route_leaves_the_decision_to_the_project(admin_client, inhouse
     assert [s.name for s in copied] == ["Cutting", "Painting"]
     assert {s.location for s in copied} == {"undecided"}
     assert all(s.workshop_id is None for s in copied)
+
+
+@pytest.mark.django_db
+def test_the_store_is_only_asked_for_what_the_shelf_holds(admin_client, project_build):
+    """No stock, no inventory decision; part stock, the request stops at the
+    shelf and the rest is for procurement; stock already queued counts."""
+    from apps.inventory.models import InventoryItem
+
+    generic = project_build["generic"]
+    item = InventoryItem.objects.get(pk=generic.inventory_item_id)
+
+    item.quantity = 0
+    item.save(update_fields=["quantity"])
+    r = _ask_store(admin_client, generic, 1)
+    assert r.status_code == 400 and "Nothing in stock" in str(r.data["quantity"]), r.content
+
+    item.quantity = 1
+    item.save(update_fields=["quantity"])
+    r = _ask_store(admin_client, generic, 2)
+    assert r.status_code == 400 and "Only 1 in stock" in str(r.data["quantity"]), r.content
+    r = _ask_store(admin_client, generic, 1)
+    assert r.status_code in (200, 201), r.content
+
+    # That one is now promised to the queue: the shelf has nothing free.
+    r = _ask_store(admin_client, generic, 1)
+    assert r.status_code == 400 and "Only 0 in stock" in str(r.data["quantity"]), r.content
+
+
+@pytest.mark.django_db
+def test_prices_follow_the_budget_not_the_build_lock(admin_client, project_build, stock_refs):
+    """Once parts move the build is fixed, but a planner can still type
+    prices — until the budget is approved, when prices are fixed too."""
+    from apps.teams.costing import get_or_create_plan
+
+    generic = project_build["generic"]
+    step = _step(admin_client, project_build["device"], 1, "Cutting").data["id"]
+    # Parts issued: the asset is in execution and its structure is locked.
+    assert _ask_store(admin_client, generic, 1).status_code == 200
+    assert _store_issues(admin_client, generic).status_code == 200
+    project_build["device"].refresh_from_db()
+    assert project_build["device"].is_locked
+
+    r = admin_client.patch(f"/api/assets/components/{generic.id}/", {"quantity": 9}, format="json")
+    assert r.status_code == 403 and "in execution" in r.data["detail"]
+    r = admin_client.patch(f"/api/assets/components/{generic.id}/", {"planned_unit_price": "162.00"}, format="json")
+    assert r.status_code == 200, r.content
+    r = admin_client.patch(f"/api/assets/production-steps/{step}/", {"planned_cost": "900"}, format="json")
+    assert r.status_code == 200, r.content
+    r = admin_client.patch(f"/api/assets/production-steps/{step}/", {"name": "Laser cutting"}, format="json")
+    assert r.status_code == 403 and "in execution" in r.data["detail"]
+
+    # Approved budget: prices are fixed too, and the message says which budget.
+    plan = get_or_create_plan(project_build["project"])
+    plan.status = "approved"
+    plan.save(update_fields=["status"])
+    r = admin_client.patch(f"/api/assets/components/{generic.id}/", {"planned_unit_price": "170.00"}, format="json")
+    assert r.status_code == 403 and "approved budget" in r.data["detail"] and project_build["project"].name in r.data["detail"]
+
+
+@pytest.mark.django_db
+def test_a_finished_build_puts_itself_into_stock(db):
+    """Parts all issued and every operation closed: the asset is stock. Nobody
+    edits a status — the last piece of work is what moves it."""
+    from django.db import transaction
+
+    from apps.assets.models import AssetComponent, MaterialType, ProductionStep
+    from apps.assets.services import build_is_complete
+    from apps.inventory.models import InventoryItem
+    from apps.inventory.services import issue_stock_for_component
+
+    brand = Brand.objects.create(name="Done Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="DN-1")
+    device = Device.objects.create(
+        device_model=dm, asset_code="AST-DONE-1", serial_number="DONE-1", source="inhouse",
+    )
+    material = MaterialType.objects.create(name="Done Panel", unit="piece")
+    stock = InventoryItem.objects.create(material_type=material, quantity=10)
+    component = AssetComponent.objects.create(device=device, name="Done Panel", quantity=2, inventory_item=stock)
+    cut = ProductionStep.objects.create(device=device, step_number=1, name="Cutting")
+    fit = ProductionStep.objects.create(device=device, step_number=2, name="Fitting")
+    user = User.objects.create_user(username="done-ops", password="x", role="ops_manager")
+
+    # Parts in hand: the build starts, but the route is still open.
+    with transaction.atomic():
+        issue_stock_for_component(component, user, 2)
+    device.refresh_from_db()
+    assert device.status == Device.Status.IN_PRODUCTION and not build_is_complete(device)
+
+    # One operation left: still on the floor.
+    cut.status = ProductionStep.Status.COMPLETED
+    cut.save(update_fields=["status"])
+    device.refresh_from_db()
+    assert device.status == Device.Status.IN_PRODUCTION
+
+    # The last one closes and the asset becomes stock, with the reason on record.
+    fit.status = ProductionStep.Status.SKIPPED
+    fit.save(update_fields=["status"])
+    device.refresh_from_db()
+    assert device.status == Device.Status.IN_STOCK
+    note = device.lifecycle_events.filter(to_value=Device.Status.IN_STOCK).first()
+    assert note is not None and "Build complete" in note.description
+
+
+@pytest.mark.django_db
+def test_an_unfinished_or_vendor_build_is_left_alone(db):
+    """A part still owed keeps the asset on the floor; a vendor asset has no
+    build of ours to finish, and a bare record is not 'built' either."""
+    from apps.assets.models import AssetComponent, MaterialType, ProductionStep
+    from apps.assets.services import build_is_complete, finish_build_if_done
+    from apps.inventory.models import InventoryItem
+
+    brand = Brand.objects.create(name="Open Brand")
+    dm = DeviceModel.objects.create(brand=brand, name="OP-1")
+    material = MaterialType.objects.create(name="Open Panel", unit="piece")
+    stock = InventoryItem.objects.create(material_type=material, quantity=10)
+
+    short = Device.objects.create(
+        device_model=dm, asset_code="AST-OPEN-1", serial_number="OPEN-1",
+        source="inhouse", status=Device.Status.IN_PRODUCTION,
+    )
+    AssetComponent.objects.create(device=short, name="Open Panel", quantity=2, inventory_item=stock, issued_quantity=1)
+    step = ProductionStep.objects.create(device=short, step_number=1, name="Cutting")
+    step.status = ProductionStep.Status.COMPLETED
+    step.save(update_fields=["status"])
+    short.refresh_from_db()
+    assert short.status == Device.Status.IN_PRODUCTION, "a part is still owed"
+
+    vendor_asset = Device.objects.create(
+        device_model=dm, asset_code="AST-OPEN-2", serial_number="OPEN-2",
+        source="vendor_supplied", status=Device.Status.PROCURED,
+    )
+    assert build_is_complete(vendor_asset) is False
+    assert finish_build_if_done(vendor_asset) is False
+
+    bare = Device.objects.create(
+        device_model=dm, asset_code="AST-OPEN-3", serial_number="OPEN-3",
+        source="inhouse", status=Device.Status.PROCURED,
+    )
+    assert build_is_complete(bare) is False, "nothing to build is not the same as built"
+
+
+@pytest.mark.django_db
+def test_the_due_date_agreed_at_assignment_lands_on_the_tracker(admin_client, in_stock_device):
+    """Handing the job out is when the date gets agreed.
+
+    The tracker used to open with an empty due date for somebody to fill in
+    afterwards, so nothing said when the work was actually wanted. The date
+    given as the technician takes it is the job's due date.
+    """
+    from datetime import date
+
+    from django.utils import timezone
+
+    from apps.sites.models import DeviceInstallation
+
+    tech = User.objects.create_user(
+        username="due-date-tech", password="x", role="technician", is_field_staff=True,
+        first_name="Bilal", last_name="Hussain",
+    )
+    due = date(2026, 10, 15)
+    r = admin_client.post(
+        f"/api/assets/devices/{in_stock_device.id}/transition/",
+        {
+            "status": "assigned", "reason": "Site ready",
+            "assigned_technician": str(tech.id), "installation_date": due.isoformat(),
+        },
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    in_stock_device.refresh_from_db()
+    assert in_stock_device.installation_date == due
+
+    job = DeviceInstallation.objects.get(device=in_stock_device)
+    assert job.due_date == due
+    # The three dates are distinct: it was assigned today, it is due later,
+    # and nothing has been installed yet.
+    # localdate() of the stamp, not .date(): the stamp is UTC and the day
+    # rolls over five hours earlier there than it does here.
+    assert timezone.localdate(job.installed_at) == timezone.localdate()
+    assert job.completed_at is None

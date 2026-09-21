@@ -7,6 +7,7 @@ from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from common.permissions import (
@@ -17,6 +18,7 @@ from common.permissions import (
 )
 
 from .models import (
+    ReorderRequest,
     GoodsReceipt,
     GoodsReceiptLine,
     InventoryCategory,
@@ -28,6 +30,7 @@ from .models import (
     StockMovement,
 )
 from .serializers import (
+    ReorderRequestSerializer,
     GoodsReceiptLineInspectSerializer,
     GoodsReceiptLineSerializer,
     GoodsReceiptSerializer,
@@ -73,6 +76,26 @@ class InventoryItemViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
     filterset_fields = ["location", "category", "material_type", "watch_on_dashboard"]
     search_fields = ["sku", "material_type__name", "category__name"]
+
+    def perform_create(self, serializer):
+        """A component opened with stock starts its ledger with that balance.
+
+        The quantity typed on 'Add Component' is the opening stock; from then
+        on stock only moves through receipts, issues and returns, so the
+        opening entry is what makes the first number traceable.
+        """
+        item = serializer.save()
+        if item.quantity > 0:
+            unit = item.material_type.unit if item.material_type_id else "piece"
+            rate = f" at {item.unit_cost} per {unit}" if item.unit_cost is not None else ""
+            StockMovement.objects.create(
+                item=item,
+                movement_type=StockMovement.MovementType.OPENING,
+                quantity=item.quantity,
+                reference="Opening stock",
+                notes=f"Opening balance of {item.quantity} {unit}{rate}.",
+                performed_by=self.request.user,
+            )
     ordering_fields = ["quantity", "total_value", "material_type__name", "created_at"]
 
     def get_queryset(self):
@@ -159,13 +182,30 @@ class InventoryUnitTypeViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"])
     def units(self, request, pk=None):
-        """The physical units registered against this product."""
+        """The physical units registered against this product.
+
+        ``?in_store=1`` narrows it to the ones the store still holds. A unit
+        that was issued, scrapped or registered as an asset has left, and
+        listing it as stock overstates the shelf; where it went is the
+        issuance log's business, not this list's.
+        """
         product = self.get_object()
         qs = product.units.select_related("supplier", "goods_receipt_line__receipt").all()
+        if request.query_params.get("in_store") in ("1", "true", "True"):
+            qs = qs.exclude(status__in=GONE_FROM_STORE)
+        status = request.query_params.get("status")
+        if status:
+            qs = qs.filter(status__in=[s.strip() for s in status.split(",") if s.strip()])
+        qs = qs.order_by("-created_at")
         page = self.paginate_queryset(qs)
         if page is not None:
             return self.get_paginated_response(InventoryUnitSerializer(page, many=True).data)
         return Response(InventoryUnitSerializer(qs, many=True).data)
+
+
+# Statuses that mean the unit is no longer on the shelf. Each one is a way of
+# leaving: handed over, written off, or turned into an asset in its own right.
+GONE_FROM_STORE = ("issued", "scrapped", "converted")
 
 
 class InventoryUnitViewSet(viewsets.ModelViewSet):
@@ -307,6 +347,38 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
     ]
     ordering_fields = ["created_at", "inspected_at"]
 
+    @action(detail=False, methods=["get"], url_path="export")
+    def export_receiving(self, request):
+        """The receiving log as Excel — one row per inspected delivery line."""
+        from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
+
+        qs = (
+            self.filter_queryset(self.get_queryset())
+            .exclude(inspection_status=GoodsReceiptLine.Inspection.PENDING)
+            .order_by("-inspected_at", "-created_at")
+        )
+        ser = GoodsReceiptLineSerializer(qs[:EXPORT_MAX_ROWS], many=True)
+        columns = [
+            "GRN", "Received", "Inspected", "Source", "PO", "Supplier", "Reference", "Component", "Code", "Kind",
+            "UOM", "Received Qty", "Accepted", "Rejected", "Batch", "Filed Into", "Serial Numbers",
+            "Placed At", "Inspected By", "Result", "Notes",
+        ]
+        rows = []
+        for line in ser.data:
+            rows.append([
+                line["grn_number"], (line.get("received_at") or "")[:10], (line.get("inspected_at") or "")[:10],
+                line.get("source_display"), line.get("po_number"), line.get("supplier_name"), line.get("reference"),
+                line.get("known_component") or line.get("po_item_description") or line.get("material_name"),
+                line.get("stocked_item_sku") or "", {"generic": "Generic stock", "unique": "Unique item", "asset": "Whole asset"}.get(line.get("kind") or "", ""),
+                line.get("unit"), line["quantity"], line.get("accepted_quantity"), line.get("rejected_quantity"),
+                line.get("batch_number"), line.get("routed_to_display"),
+                ", ".join(u["serial_number"] for u in line.get("stocked_units") or []) or ", ".join(line.get("serial_numbers") or []),
+                line.get("storage_location"), line.get("inspected_by_name"), line.get("inspection_status_display"),
+                line.get("inspection_notes"),
+            ])
+        log_export(request.user, "goods_receipt_line", len(rows), export_params(request))
+        return xlsx_response("receiving-log", "Receiving Log", columns, rows)
+
     @action(detail=False, methods=["get"], url_path="pending")
     def pending(self, request):
         """The technician's inspection queue."""
@@ -348,6 +420,8 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
                 if result["inventory_item"] else None
             ),
             "stocked_units": InventoryUnitSerializer(result["units"], many=True).data,
+            # Material requests waiting on this line: the store issues against them.
+            "ready_requests": result.get("ready_requests", []),
         })
 
 
@@ -522,6 +596,8 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
             "request": IssuanceRequestSerializer(issuance_request).data,
             "issued": result["quantity"],
             "serials": result["serials"],
+            "closed": result.get("closed", False),
+            "reason": result.get("reason", ""),
         })
 
     @action(detail=True, methods=["post"])
@@ -536,6 +612,46 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         issuance_request.save(update_fields=["status", "updated_at"])
         return Response(IssuanceRequestSerializer(issuance_request).data)
 
+    @action(detail=False, methods=["get"], url_path="export")
+    def export_log(self, request):
+        """The issuance log as Excel — one row per hand-over."""
+        from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
+
+        qs = self.filter_queryset(self.get_queryset()).filter(quantity_issued__gt=0).order_by("-last_issued_at", "-updated_at")
+        columns = [
+            "Request No.", "Date", "Component", "Code", "Kind", "UOM", "Qty Issued", "Received By", "Issued By",
+            "Serial Numbers", "Requested", "Issued Total", "Balance", "Status", "Raised For", "Project", "Asset",
+            "Component Line", "Purpose", "Requested By",
+        ]
+        rows = []
+
+        def name_of(user):
+            return (user.get_full_name() or user.username) if user else ""
+
+        for r in qs[:EXPORT_MAX_ROWS]:
+            if r.unit_type_id:
+                name, code, kind, unit = r.unit_type.name, r.unit_type.type_code, "Unique item", r.unit_type.unit or "piece"
+            elif r.item_id:
+                mt = r.item.material_type if r.item.material_type_id else None
+                name, code, kind, unit = (mt.name if mt else r.item.sku), r.item.sku, "Generic stock", (mt.unit if mt else None) or "piece"
+            else:
+                name, code, kind, unit = r.what, "", "", "piece"
+            handovers = r.handovers or [{
+                "at": (r.last_issued_at or r.updated_at).isoformat(), "quantity": r.quantity_issued,
+                "received_by": r.received_by, "issued_by": name_of(r.issued_by), "serials": r.issued_serials or [],
+            }]
+            for h in handovers:
+                rows.append([
+                    r.request_number, (h.get("at") or "")[:10], name, code, kind, unit, h.get("quantity"),
+                    h.get("received_by") or "", h.get("issued_by") or "", ", ".join(h.get("serials") or []),
+                    r.quantity_requested, r.quantity_issued, r.outstanding_quantity, r.get_status_display(),
+                    r.get_source_display(), r.project.name if r.project_id else "",
+                    r.asset_component.device.asset_code if r.asset_component_id else "",
+                    r.asset_component.name if r.asset_component_id else "", r.purpose, name_of(r.requested_by),
+                ])
+        log_export(request.user, "issuance_request", len(rows), export_params(request))
+        return xlsx_response("issuance-log", "Issuance Log", columns, rows)
+
     @action(detail=True, methods=["get"])
     def slip(self, request, pk=None):
         """The issue slip: what went out, what for, and who handled it."""
@@ -547,3 +663,90 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         name = issuance_request.request_number or "issue-slip"
         response["Content-Disposition"] = f'attachment; filename="{name}.pdf"'
         return response
+
+
+class LowStockView(APIView):
+    """Everything at or below its reorder level: stock items and unique
+    products alike, with the open reorder request on each, if any."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        live = {
+            ("item", r.item_id): r for r in
+            ReorderRequest.objects.filter(status__in=("open", "ordered"), item__isnull=False)
+            .select_related("purchase_order_item__purchase_order")
+        }
+        live.update({
+            ("unit_type", r.unit_type_id): r for r in
+            ReorderRequest.objects.filter(status__in=("open", "ordered"), unit_type__isnull=False)
+            .select_related("purchase_order_item__purchase_order")
+        })
+
+        def open_request(kind, pk):
+            r = live.get((kind, pk))
+            if r is None:
+                return None
+            return {
+                "id": str(r.pk), "request_number": r.request_number, "status": r.status, "status_display": r.get_status_display(),
+                "quantity": r.quantity,
+                "po_number": r.purchase_order_item.purchase_order.po_number if r.purchase_order_item_id else None,
+            }
+
+        rows = []
+        items = (
+            InventoryItem.objects.select_related("material_type")
+            .filter(min_stock_level__gt=0, quantity__lte=F("min_stock_level"))
+            .order_by("material_type__name")
+        )
+        for it in items:
+            rows.append({
+                "kind": "generic", "id": str(it.pk),
+                "name": it.material_type.name if it.material_type_id else it.sku, "code": it.sku,
+                "unit": (it.material_type.unit if it.material_type_id else None) or "piece",
+                "on_hand": it.quantity, "reorder_level": it.min_stock_level,
+                "shortfall": max(it.min_stock_level - it.quantity, 0),
+                "unit_cost": it.unit_cost,
+                "open_request": open_request("item", it.pk),
+            })
+        products = InventoryUnitType.objects.filter(min_stock_level__gt=0, is_active=True).order_by("name")
+        for p in products:
+            on_hand = p.in_stock_count
+            if on_hand > p.min_stock_level:
+                continue
+            rows.append({
+                "kind": "unique", "id": str(p.pk), "name": p.name, "code": p.type_code,
+                "unit": p.unit or "piece", "on_hand": on_hand, "reorder_level": p.min_stock_level,
+                "shortfall": max(p.min_stock_level - on_hand, 0),
+                "unit_cost": p.unit_cost,
+                "open_request": open_request("unit_type", p.pk),
+            })
+        return Response({"results": rows, "count": len(rows), "unrequested": sum(1 for r in rows if not r["open_request"])})
+
+
+class ReorderRequestViewSet(viewsets.ModelViewSet):
+    """Reorder requests: raised from Low Stock, bought under To Procure."""
+
+    queryset = ReorderRequest.objects.select_related(
+        "item__material_type", "unit_type", "purchase_order_item__purchase_order", "requested_by",
+    ).all()
+    serializer_class = ReorderRequestSerializer
+    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    filterset_fields = ["status", "item", "unit_type"]
+    http_method_names = ["get", "post", "head", "options"]
+
+    def perform_create(self, serializer):
+        serializer.save(requested_by=self.request.user)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        """Withdraw a request that has not been ordered yet."""
+        req = self.get_object()
+        if req.status == ReorderRequest.Status.ORDERED:
+            return Response({"detail": f"Already on {req.purchase_order_item.purchase_order.po_number} — cancel that order instead."}, status=400)
+        if req.status != ReorderRequest.Status.OPEN:
+            return Response({"detail": f"This request is {req.get_status_display().lower()}."}, status=400)
+        req.status = ReorderRequest.Status.CANCELLED
+        req.notes = (req.notes + "\n" if req.notes else "") + (request.data.get("reason") or "Withdrawn.").strip()
+        req.save(update_fields=["status", "notes", "updated_at"])
+        return Response(ReorderRequestSerializer(req).data)

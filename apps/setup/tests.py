@@ -102,3 +102,60 @@ class EscalationPolicyStageTests(TestCase):
             "hours": 30, "escalate_to_role": "group_head", "also_notify_role": "",
         })
         self.assertFalse(ser.is_valid())
+
+
+# ---------------------------------------------------------------------------
+# Units of measure are master data under Setup
+# ---------------------------------------------------------------------------
+import pytest
+from rest_framework.test import APIClient
+
+from apps.accounts.models import User
+
+
+def _ops_client():
+    user = User.objects.create_user(username="uom-ops", password="x", role="ops_manager")
+    c = APIClient()
+    c.force_authenticate(user)
+    return c
+
+
+@pytest.mark.django_db
+def test_units_of_measure_are_master_data():
+    """The business opens the units it counts in; the seeded list is there
+    from the start, a duplicate is refused whatever its case, and inactive
+    units drop out of the dropdown filter."""
+    from .models import UnitOfMeasure
+
+    c = _ops_client()
+    seeded = {u["name"] for u in c.get("/api/setup/units/", {"page_size": 100}).json().get("results", [])}
+    assert {"piece", "meter", "kg"} <= seeded
+
+    r = c.post("/api/setup/units/", {"name": "Running Foot", "symbol": "rft"}, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["in_use"] == 0
+    r = c.post("/api/setup/units/", {"name": "running foot"}, format="json")
+    assert r.status_code == 400 and "already" in str(r.data["name"])
+
+    rft = UnitOfMeasure.objects.get(name="Running Foot")
+    c.patch(f"/api/setup/units/{rft.id}/", {"is_active": False}, format="json")
+    active = {u["name"] for u in c.get("/api/setup/units/", {"is_active": "true", "page_size": 100}).json().get("results", [])}
+    assert "Running Foot" not in active and "piece" in active
+
+
+@pytest.mark.django_db
+def test_a_unit_in_use_cannot_be_deleted():
+    """Components store the unit's name, so a unit still counted in stays
+    on the list — it can only be made inactive."""
+    from apps.assets.models import MaterialType
+    from .models import UnitOfMeasure
+
+    c = _ops_client()
+    sheet = UnitOfMeasure.objects.create(name="Sheet")
+    MaterialType.objects.create(name="MS Sheet 18g", unit="sheet")
+    r = c.delete(f"/api/setup/units/{sheet.id}/")
+    assert r.status_code == 400 and "1 component" in r.data["detail"]
+    assert c.get(f"/api/setup/units/{sheet.id}/").json()["in_use"] == 1
+
+    spare = UnitOfMeasure.objects.create(name="Bundle")
+    assert c.delete(f"/api/setup/units/{spare.id}/").status_code == 204

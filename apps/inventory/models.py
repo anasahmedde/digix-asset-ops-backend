@@ -303,6 +303,8 @@ class StockMovement(TimeStampedModel):
         OUT = "out", "Stock Out"
         TRANSFER = "transfer", "Transfer"
         ADJUSTMENT = "adjustment", "Adjustment"
+        # The balance a component is opened with, before any receipt or issue.
+        OPENING = "opening", "Opening Stock"
 
     item = models.ForeignKey(InventoryItem, on_delete=models.CASCADE, related_name="movements")
     movement_type = models.CharField(max_length=15, choices=MovementType.choices)
@@ -536,6 +538,11 @@ class IssuanceRequest(TimeStampedModel):
     )
     # Serials handed over, in the order they went out — the issue slip lists them.
     issued_serials = models.JSONField(default=list, blank=True)
+    # The most recent hand-over against this request — the date the log shows.
+    last_issued_at = models.DateTimeField(null=True, blank=True)
+    # Every hand-over, one by one: when, how much, to whom, by whom, which
+    # serials. `received_by` keeps the latest name for the list; this is the record.
+    handovers = models.JSONField(default=list, blank=True)
 
     status = models.CharField(
         max_length=12, choices=Status.choices, default=Status.PENDING, db_index=True
@@ -587,3 +594,87 @@ class IssuanceRequest(TimeStampedModel):
                 "material_request", model=type(self), field="request_number"
             )
         super().save(*args, **kwargs)
+
+
+class ReorderRequest(TimeStampedModel):
+    """Stock that fell to its reorder level, asked to be bought.
+
+    Raised from Inventory › Low Stock, listed under Procurement › To Procure,
+    put on a purchase order like any other line, and closed when that line is
+    received into stock. One open request per item at a time.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Requested"
+        ORDERED = "ordered", "On purchase order"
+        RECEIVED = "received", "Received"
+        CANCELLED = "cancelled", "Cancelled"
+
+    # Purchase requisition number — PR-YYYY-00001 — from the numbering scheme.
+    request_number = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
+    item = models.ForeignKey(
+        InventoryItem, on_delete=models.SET_NULL, null=True, blank=True, related_name="reorder_requests"
+    )
+    unit_type = models.ForeignKey(
+        InventoryUnitType, on_delete=models.SET_NULL, null=True, blank=True, related_name="reorder_requests"
+    )
+    quantity = models.PositiveIntegerField(help_text="Reorder quantity")
+    reason = models.CharField(max_length=300, blank=True)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.OPEN, db_index=True)
+    purchase_order_item = models.ForeignKey(
+        "procurement.PurchaseOrderItem", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="reorder_requests",
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="reorder_requests"
+    )
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.request_number} · {self.quantity} × {self.name}"
+
+    def save(self, *args, **kwargs):
+        if not self.request_number:
+            self.request_number = generate_code(
+                "purchase_requisition", model=type(self), field="request_number"
+            )
+        super().save(*args, **kwargs)
+
+    @property
+    def kind(self) -> str:
+        return "unique" if self.unit_type_id else "generic"
+
+    @property
+    def name(self) -> str:
+        if self.unit_type_id:
+            return self.unit_type.name
+        if self.item_id:
+            return self.item.material_type.name if self.item.material_type_id else self.item.sku
+        return "—"
+
+    @property
+    def code(self) -> str:
+        return self.unit_type.type_code if self.unit_type_id else (self.item.sku if self.item_id else "")
+
+    @property
+    def unit(self) -> str:
+        if self.unit_type_id:
+            return self.unit_type.unit or "piece"
+        if self.item_id and self.item.material_type_id:
+            return self.item.material_type.unit or "piece"
+        return "piece"
+
+    @property
+    def on_hand(self) -> int:
+        if self.unit_type_id:
+            return self.unit_type.in_stock_count
+        return self.item.quantity if self.item_id else 0
+
+    @property
+    def reorder_level(self) -> int:
+        if self.unit_type_id:
+            return self.unit_type.min_stock_level
+        return self.item.min_stock_level if self.item_id else 0

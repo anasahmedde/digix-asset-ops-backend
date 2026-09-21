@@ -219,24 +219,34 @@ class DeviceViewSet(viewsets.ModelViewSet):
         # or an external vendor — and names them in the journalled reason.
         if new_status == Device.Status.ASSIGNED:
             technician = ser.validated_data.get("assigned_technician")
-            vendor = (ser.validated_data.get("assigned_vendor_name") or "").strip()
-            contact = (ser.validated_data.get("assigned_vendor_contact") or "").strip()
+            supplier = ser.validated_data.get("assigned_vendor")
+            vendor, contact = _vendor_details(ser.validated_data)
 
             # Only a turnkey job has an installing vendor, and there our
             # technician oversees them; every other route is one or the
             # other, so naming a technician clears the vendor.
             vendor_route = device.source == Device.Source.VENDOR_TURNKEY
+            keeps_vendor = vendor_route or not technician
             device.assigned_technician = technician
-            device.assigned_vendor_name = vendor if (vendor_route or not technician) else ""
-            device.assigned_vendor_contact = contact if (vendor_route or not technician) else ""
+            device.assigned_vendor = supplier if keeps_vendor else None
+            device.assigned_vendor_name = vendor if keeps_vendor else ""
+            device.assigned_vendor_contact = contact if keeps_vendor else ""
             update_fields += [
-                "assigned_technician", "assigned_vendor_name", "assigned_vendor_contact",
+                "assigned_technician", "assigned_vendor", "assigned_vendor_name",
+                "assigned_vendor_contact",
             ]
 
             site = ser.validated_data.get("current_site") or device.current_site
             if site != device.current_site:
                 device.current_site = site
                 update_fields.append("current_site")
+
+            # The date the job has to be done by, carried onto the tracker
+            # record that open_installation_for opens from this assignment.
+            due = ser.validated_data.get("installation_date")
+            if due is not None:
+                device.installation_date = due
+                update_fields.append("installation_date")
 
             reason = f"{reason} · Assigned to {assignee_label(technician, vendor, contact)}"
 
@@ -287,15 +297,17 @@ class DeviceViewSet(viewsets.ModelViewSet):
 
         previous = DeviceDetailSerializer(device, context={"request": request}).data["assigned_to_display"]
         technician = ser.validated_data.get("assigned_technician")
-        vendor = (ser.validated_data.get("assigned_vendor_name") or "").strip()
-        contact = (ser.validated_data.get("assigned_vendor_contact") or "").strip()
+        supplier = ser.validated_data.get("assigned_vendor")
+        vendor, contact = _vendor_details(ser.validated_data)
 
-        vendor_route = device.source == Device.Source.VENDOR_TURNKEY
+        keeps_vendor = device.source == Device.Source.VENDOR_TURNKEY or not technician
         device.assigned_technician = technician
-        device.assigned_vendor_name = vendor if (vendor_route or not technician) else ""
-        device.assigned_vendor_contact = contact if (vendor_route or not technician) else ""
+        device.assigned_vendor = supplier if keeps_vendor else None
+        device.assigned_vendor_name = vendor if keeps_vendor else ""
+        device.assigned_vendor_contact = contact if keeps_vendor else ""
         device.save(update_fields=[
-            "assigned_technician", "assigned_vendor_name", "assigned_vendor_contact", "updated_at",
+            "assigned_technician", "assigned_vendor", "assigned_vendor_name",
+            "assigned_vendor_contact", "updated_at",
         ])
 
         new_label = assignee_label(technician, vendor, contact)
@@ -577,7 +589,7 @@ class DeviceViewSet(viewsets.ModelViewSet):
         for d in qs:
             rows.append([
                 d.asset_code,
-                d.serial_number,
+                d.serial_number or "",
                 d.display_name,
                 str(d.device_model) if d.device_model_id else "",
                 d.asset_type.name if d.asset_type_id else "",
@@ -593,6 +605,17 @@ class DeviceViewSet(viewsets.ModelViewSet):
             ])
         log_export(request.user, "device", len(rows), export_params(request))
         return xlsx_response("assets", "Assets", columns, rows)
+
+    @action(detail=True, methods=["get"], url_path="bom")
+    def bom_document(self, request, pk=None):
+        """The asset's bill of materials as a PDF, for the floor."""
+        from .documents import render_bom_pdf
+
+        device = self.get_object()
+        pdf = render_bom_pdf(device)
+        response = HttpResponse(pdf, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="bom-{device.asset_code}.pdf"'
+        return response
 
     @action(detail=True, methods=["post"], url_path="ready-for-installation")
     def ready_for_installation(self, request, pk=None):
@@ -705,6 +728,46 @@ class DeviceViewSet(viewsets.ModelViewSet):
         return response
 
 
+def _approved_budget_project(device):
+    """The project whose approved budget priced this asset, if any."""
+    from apps.teams.models import ProjectScopeItem
+
+    plan = getattr(device.project, "cost_plan", None) if device.project_id else None
+    if plan is not None and plan.status == "approved":
+        return device.project
+    row = (
+        ProjectScopeItem.objects.filter(device=device, project__cost_plan__status="approved")
+        .select_related("project").first()
+    )
+    return row.project if row else None
+
+
+def _refuse_if_priced_in_approved_budget(device):
+    """Prices are not structure: they may change while the budget is open,
+    and are fixed once it is approved — revise the budget to change them."""
+    project = _approved_budget_project(device) if device is not None else None
+    if project is not None:
+        raise PermissionDenied(
+            f"{device.asset_code} is priced in the approved budget of {project.name} — "
+            "revise that budget to change prices."
+        )
+
+
+def _vendor_details(data):
+    """(name, contact) of the installing vendor.
+
+    A vendor picked from the register names itself and brings its own contact;
+    one that is not on the register is described by hand.
+    """
+    supplier = data.get("assigned_vendor")
+    contact = (data.get("assigned_vendor_contact") or "").strip()
+    if supplier is None:
+        return (data.get("assigned_vendor_name") or "").strip(), contact
+    if not contact:
+        contact = " · ".join(x for x in (supplier.contact_person, supplier.contact_phone) if x)
+    return supplier.name, contact
+
+
 def _budget_block_response(component):
     """A 400 when the asset's project has a budget that is not approved yet.
 
@@ -775,8 +838,16 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         _refuse_if_vendor_asset(serializer.validated_data.get("device"), "components" if isinstance(self, AssetComponentViewSet) else "production route")
         super().perform_create(serializer)
 
+    # Cost fields a planner may type while the budget is open; everything
+    # else on a component is structure and freezes with execution.
+    PRICE_FIELDS = {"planned_unit_price"}
+
     def perform_update(self, serializer):
-        self._refuse_if_locked(serializer.instance.device)
+        touched = set(serializer.validated_data)
+        if touched and touched <= self.PRICE_FIELDS:
+            _refuse_if_priced_in_approved_budget(serializer.instance.device)
+        else:
+            self._refuse_if_locked(serializer.instance.device)
         super().perform_update(serializer)
 
     def perform_destroy(self, instance):
@@ -821,6 +892,17 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             return Response({"quantity": [
                 f"Only {component.undecided_quantity} of this line is still to be decided "
                 f"({already_open} already asked for)."
+            ]}, status=400)
+
+        # The store can only give what is on the shelf and not already promised.
+        on_shelf = component.available_quantity
+        free = max(on_shelf - already_open, 0)
+        if on_shelf <= 0:
+            return Response({"quantity": ["Nothing in stock — procure this line instead."]}, status=400)
+        if quantity > free:
+            return Response({"quantity": [
+                f"Only {free} in stock" + (f" not already asked for" if already_open else "")
+                + f" — ask the store for {free} and procure the rest."
             ]}, status=400)
 
         with transaction.atomic():
@@ -1112,8 +1194,31 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
         _refuse_if_vendor_asset(serializer.validated_data.get("device"), "components" if isinstance(self, AssetComponentViewSet) else "production route")
         super().perform_create(serializer)
 
+    # The planned cost may be typed while the budget is open and freezes with
+    # approval; the route itself (names, order, where) freezes with execution.
+    PRICE_FIELDS = {"planned_cost"}
+    # What the work really cost is recorded while it happens — after approval,
+    # while execution is locked — so these fields are never frozen.
+    EXECUTION_FIELDS = {"actual_cost", "notes"}
+
     def perform_update(self, serializer):
-        self._refuse_if_locked(serializer.instance.device)
+        touched = set(serializer.validated_data)
+        step = serializer.instance
+        if "actual_cost" in touched:
+            # An operation given to a vendor costs what its work order charges,
+            # the way a bought part costs what its PO charged — not typed in.
+            order = step.live_work_order
+            if order is not None:
+                raise ValidationError({"actual_cost": [
+                    f"'{step.name}' is on work order {order.wo_number} — its cost is what that order "
+                    "charges, not typed in."
+                ]})
+        if touched and touched <= self.EXECUTION_FIELDS:
+            pass
+        elif touched and touched <= self.PRICE_FIELDS | self.EXECUTION_FIELDS:
+            _refuse_if_priced_in_approved_budget(step.device)
+        else:
+            self._refuse_if_locked(step.device)
         super().perform_update(serializer)
 
     def perform_destroy(self, instance):
@@ -1181,18 +1286,29 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="decide")
     def decide(self, request, pk=None):
-        """Execution decision for one operation: done in-house. (Giving it to a
-        workshop is a work order, raised from the project.)"""
+        """Execution decision for one operation: done in-house, or given to a
+        vendor. 'external' asks for a work order — the request lands under
+        Work Orders › Requests, where the vendor is chosen and the order raised."""
         step = self.get_object()
-        if step.work_orders.exclude(status="cancelled").exists():
+        if step.live_work_orders().exists():
             return Response(
-                {"detail": f"'{step.name}' is on a work order — cancel that first to bring it in-house."},
+                {"detail": f"'{step.name}' is on a work order — cancel that first to change the decision."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        step.location = ProductionStep.Location.IN_HOUSE
+        if step.status in (ProductionStep.Status.COMPLETED, ProductionStep.Status.SKIPPED):
+            return Response({"detail": f"'{step.name}' is already finished."}, status=400)
+        where = request.data.get("location", ProductionStep.Location.IN_HOUSE)
+        if where == ProductionStep.Location.EXTERNAL:
+            step.location = ProductionStep.Location.EXTERNAL
+            step.work_order_requested_at = timezone.now()
+        elif where == ProductionStep.Location.IN_HOUSE:
+            step.location = ProductionStep.Location.IN_HOUSE
+            step.work_order_requested_at = None
+        else:
+            return Response({"location": ["Choose 'in_house' or 'external'."]}, status=400)
         step.workshop = None
         step.workshop_name = ""
-        step.save(update_fields=["location", "workshop", "workshop_name", "updated_at"])
+        step.save(update_fields=["location", "workshop", "workshop_name", "work_order_requested_at", "updated_at"])
         return Response(ProductionStepSerializer(step).data)
 
     @action(detail=True, methods=["post"])

@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from .models import (
+    ReorderRequest,
     GoodsReceipt,
     GoodsReceiptLine,
     InventoryCategory,
@@ -72,10 +73,14 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
     # Uses the list queryset's annotation when present, else the model property.
     in_stock_count = serializers.SerializerMethodField()
     # Stock already on the shelf when the product is first opened. Serialized
-    # items need a serial each, so provisional ones are generated from the type
-    # code for the storekeeper to correct as the units are found.
+    # items need a serial each, typed here — one per unit, all different, none
+    # already in inventory. Opening at zero needs none.
     opening_quantity = serializers.IntegerField(
         write_only=True, required=False, min_value=0, max_value=500, default=0
+    )
+    opening_serials = serializers.ListField(
+        child=serializers.CharField(max_length=200, allow_blank=True),
+        write_only=True, required=False, default=list,
     )
 
     class Meta:
@@ -87,15 +92,50 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
             "unit_cost", "min_stock_level", "is_high_value",
             "default_has_warranty", "default_warranty_type", "default_warranty_months",
             "supplier", "supplier_name",
-            "in_stock_count", "opening_quantity", "notes", "is_active", "created_at", "updated_at",
+            "in_stock_count", "opening_quantity", "opening_serials", "notes", "is_active",
+            "created_at", "updated_at",
         ]
         read_only_fields = ["id", "type_code", "created_at", "updated_at"]
 
     def get_in_stock_count(self, obj):
         return getattr(obj, "stock_count", None) or obj.in_stock_count
 
+    def _validate_opening_stock(self, attrs):
+        """Stock on the shelf needs a serial per unit; opened empty, none."""
+        if self.instance is not None:
+            return attrs
+        opening = attrs.get("opening_quantity") or 0
+        serials = [(sn or "").strip() for sn in attrs.get("opening_serials") or []]
+        if opening == 0:
+            attrs["opening_serials"] = []
+            return attrs
+        if len(serials) != opening or any(not sn for sn in serials):
+            raise serializers.ValidationError({
+                "opening_serials": [f"Type a serial number for each of the {opening} unit(s) on the shelf."],
+            })
+        seen, repeated = set(), []
+        for sn in serials:
+            key = sn.lower()
+            if key in seen and sn not in repeated:
+                repeated.append(sn)
+            seen.add(key)
+        if repeated:
+            raise serializers.ValidationError({
+                "opening_serials": [f"Each unit needs its own serial — repeated: {', '.join(repeated)}."],
+            })
+        from .models import InventoryUnit
+
+        taken = list(InventoryUnit.objects.filter(serial_number__in=serials).values_list("serial_number", flat=True))
+        if taken:
+            raise serializers.ValidationError({
+                "opening_serials": [f"Already in inventory: {', '.join(sorted(taken))}."],
+            })
+        attrs["opening_serials"] = serials
+        return attrs
+
     def create(self, validated_data):
         opening = validated_data.pop("opening_quantity", 0) or 0
+        serials = validated_data.pop("opening_serials", []) or []
         unit_type = super().create(validated_data)
         if opening:
             from .models import InventoryUnit
@@ -103,17 +143,17 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
             # Saved one at a time, not bulk_create: each unit's unit_code is
             # generated in save(), and bulk_create would leave them all blank
             # against a unique column.
-            for n in range(1, opening + 1):
+            for serial in serials:
                 InventoryUnit.objects.create(
                     unit_type=unit_type,
-                    serial_number=f"{unit_type.type_code}-{n:04d}",
+                    serial_number=serial,
                     material_type=unit_type.material_type,
                     category=unit_type.category,
                     brand=unit_type.brand,
                     model_name=unit_type.model_name,
                     supplier=unit_type.supplier,
                     purchase_price=unit_type.unit_cost,
-                    notes="Opening stock — provisional serial, replace it with the real one.",
+                    notes="Opening stock.",
                 )
         return unit_type
 
@@ -121,6 +161,7 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
         # Opening stock is a fact about the moment the product was opened; it
         # is not something an edit can replay.
         validated_data.pop("opening_quantity", None)
+        validated_data.pop("opening_serials", None)
         return super().update(instance, validated_data)
 
     def validate_name(self, value):
@@ -137,7 +178,7 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 "default_warranty_months": "Set the warranty term in months, or clear the warranty default."
             })
-        return attrs
+        return self._validate_opening_stock(attrs)
 
 
 class InventoryUnitSerializer(serializers.ModelSerializer):
@@ -319,7 +360,8 @@ class InventoryUnitBulkSerializer(InventoryUnitSerializer):
 
 class StockMovementSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.material_type.name", read_only=True, default=None)
-    performed_by_name = serializers.CharField(source="performed_by.get_full_name", read_only=True, default=None)
+    # Who moved it: their name, or their login when no name is on file.
+    performed_by_name = serializers.SerializerMethodField()
     # Where this stock came from: the delivery, the order behind it, and who
     # supplied it. Without these a movement says a number changed but not why.
     grn_number = serializers.CharField(
@@ -331,6 +373,12 @@ class StockMovementSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(
         source="goods_receipt_line.receipt.purchase_order.supplier.name", read_only=True, default=None
     )
+
+    def get_performed_by_name(self, obj):
+        user = obj.performed_by
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
 
     class Meta:
         model = StockMovement
@@ -365,12 +413,143 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
     device_model_name = serializers.CharField(
         source="po_item.device_model.name", read_only=True, default=None
     )
-    inspected_by_name = serializers.CharField(
-        source="inspected_by.get_full_name", read_only=True, default=None
-    )
+    inspected_by_name = serializers.SerializerMethodField()
+
+    def get_inspected_by_name(self, obj):
+        user = obj.inspected_by
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
     stocked_unit_count = serializers.SerializerMethodField()
+    # The receipt this line arrived on: where from, when, who booked it in.
+    source = serializers.CharField(source="receipt.source", read_only=True, default=None)
+    source_display = serializers.CharField(source="receipt.get_source_display", read_only=True, default=None)
+    reference = serializers.CharField(source="receipt.reference", read_only=True, default=None)
+    received_at = serializers.DateTimeField(source="receipt.created_at", read_only=True, default=None)
+    received_by_name = serializers.SerializerMethodField()
+    routed_to_display = serializers.CharField(source="get_routed_to_display", read_only=True, default=None)
+    inspection_status_display = serializers.CharField(source="get_inspection_status_display", read_only=True, default=None)
+    # What the line became in the warehouse.
+    stocked_item_sku = serializers.CharField(source="inventory_item.sku", read_only=True, default=None)
+    storage_location = serializers.CharField(source="inventory_item.storage_location", read_only=True, default=None)
+    stocked_units = serializers.SerializerMethodField()
+
+    def get_received_by_name(self, obj):
+        user = obj.receipt.received_by if obj.receipt_id else None
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
+
+    def get_stocked_units(self, obj):
+        return [
+            {"serial_number": u.serial_number, "unit_code": u.unit_code, "status": u.status, "status_display": u.get_status_display()}
+            for u in obj.units.all()
+        ]
+
     # The unit the delivered quantity is counted in.
     unit = serializers.SerializerMethodField()
+    # What the order line was bought for. A component is opened in inventory
+    # before it is ever ordered, so by the time goods arrive the kind is known
+    # and inspection only has to show it.
+    kind = serializers.SerializerMethodField()
+    known_component = serializers.SerializerMethodField()
+
+    def _product(self, obj):
+        """The unique product a line is for, from whichever link it has: the
+        order line, the units it became, or the return's note naming it."""
+        po = obj.po_item
+        if po is not None and po.inventory_unit_type_id:
+            return po.inventory_unit_type
+        units = list(obj.units.all()[:1])
+        if units and units[0].unit_type_id:
+            return units[0].unit_type
+        stash = obj.inspection_notes or ""
+        if "unit_type:" in stash:
+            pk = stash.split("unit_type:", 1)[1].split()[0]
+            return InventoryUnitType.objects.filter(pk=pk).first()
+        return None
+
+    def _item(self, obj):
+        po = obj.po_item
+        if po is not None and po.inventory_item_id:
+            return po.inventory_item
+        return obj.inventory_item if obj.inventory_item_id else None
+
+    def _asset(self, obj):
+        """The complete asset a line delivers, when the order line bought one."""
+        po = obj.po_item
+        if po is None:
+            return None
+        return po.procured_devices.first()
+
+    def get_kind(self, obj):
+        if self._asset(obj) is not None:
+            return "asset"
+        if self._product(obj) is not None or obj.routed_to == "unique":
+            return "unique"
+        if self._item(obj) is not None or obj.routed_to == "generic":
+            return "generic"
+        return None
+
+    def _legacy_label(self, obj):
+        """Units filed before products existed: read make and model off the
+        unit itself, else what the order line said."""
+        units = list(obj.units.all()[:1])
+        if units:
+            u = units[0]
+            label = u.model_name or (u.material_type.name if u.material_type_id else "")
+            if label and u.brand_id:
+                label = f"{u.brand.name} {label}"
+            if label:
+                return label
+        po = obj.po_item
+        if po is not None:
+            if po.device_model_id:
+                return str(po.device_model)
+            if po.material_type_id:
+                return po.material_type.name
+            return po.description or None
+        return None
+
+    def get_known_component(self, obj):
+        asset = self._asset(obj)
+        if asset is not None:
+            label = asset.display_name or (asset.asset_type.name if asset.asset_type_id else "Asset")
+            return f"{label} · {asset.asset_code}"
+        product = self._product(obj)
+        if product is not None:
+            return f"{product.name} · {product.type_code}" if product.type_code else product.name
+        item = self._item(obj)
+        if item is not None:
+            name = item.material_type.name if item.material_type_id else item.sku
+            return f"{name} · {item.sku}" if item.sku and name != item.sku else name
+        return self._legacy_label(obj)
+
+    # What the line became: the stock row or the product its units belong to.
+    stocked_code = serializers.SerializerMethodField()
+    stocked_name = serializers.SerializerMethodField()
+
+    def get_stocked_code(self, obj):
+        asset = self._asset(obj)
+        if asset is not None:
+            return asset.asset_code
+        product = self._product(obj)
+        if product is not None:
+            return product.type_code
+        item = self._item(obj)
+        return item.sku if item is not None else None
+
+    def get_stocked_name(self, obj):
+        asset = self._asset(obj)
+        if asset is not None:
+            return asset.display_name or asset.asset_code
+        product = self._product(obj)
+        if product is not None:
+            return product.name
+        item = self._item(obj)
+        if item is not None:
+            return item.material_type.name if item.material_type_id else item.sku
+        return self._legacy_label(obj)
 
     def get_unit(self, obj):
         po = obj.po_item
@@ -393,7 +572,10 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             "quantity", "unit", "batch_number", "serial_numbers",
             "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
             "inspected_by", "inspected_by_name", "inspected_at", "inspection_notes",
-            "stocked_unit_count", "created_at",
+            "stocked_unit_count", "kind", "known_component", "created_at",
+            "source", "source_display", "reference", "received_at", "received_by_name",
+            "routed_to_display", "inspection_status_display", "stocked_item_sku", "storage_location", "stocked_units",
+            "stocked_code", "stocked_name",
         ]
         read_only_fields = fields
 
@@ -541,6 +723,60 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         source="item.material_type.name", read_only=True, default=None
     )
     unit_type_name = serializers.StringRelatedField(source="unit_type", read_only=True)
+    # The code the store knows the component by — the one down the Unique
+    # Components list, which is what anybody looks it up by.
+    unit_type_code = serializers.SerializerMethodField()
+    # The units this request will draw, in the order the store will draw them.
+    # Issuing picks oldest-first, so naming them here is the same list, before
+    # the fact rather than after it.
+    next_units = serializers.SerializerMethodField()
+
+    def _unique_product_id(self, obj):
+        """The unique product behind this request, named either way it can be.
+
+        A request either names the product outright or reaches it through the
+        asset requirement it was raised to cover.
+        """
+        if obj.unit_type_id:
+            return obj.unit_type_id
+        if obj.asset_component_id:
+            return obj.asset_component.inventory_unit_type_id
+        return None
+
+    # What the material is going into, by the name people call it.
+    asset_name = serializers.CharField(
+        source="asset_component.device.display_name", read_only=True, default=None,
+    )
+    maintenance_title = serializers.CharField(
+        source="maintenance_schedule.title", read_only=True, default=None,
+    )
+
+    def get_unit_type_code(self, obj):
+        from .models import InventoryUnitType
+
+        type_id = self._unique_product_id(obj)
+        if type_id is None:
+            return None
+        return (
+            InventoryUnitType.objects.filter(pk=type_id)
+            .values_list("type_code", flat=True).first()
+        )
+
+    def get_next_units(self, obj):
+        from .models import InventoryUnit
+
+        type_id = self._unique_product_id(obj)
+        if type_id is None:
+            return []
+        units = (
+            InventoryUnit.objects
+            .filter(unit_type_id=type_id, status=InventoryUnit.Status.IN_STOCK)
+            .order_by("created_at")[:25]
+        )
+        return [
+            {"serial_number": u.serial_number, "unit_code": u.unit_code}
+            for u in units
+        ]
     # Quantities read with their unit of measure (piece, meter, box…).
     unit = serializers.SerializerMethodField()
 
@@ -550,7 +786,21 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         if obj.item_id and obj.item.material_type_id:
             return obj.item.material_type.unit or "piece"
         return "piece"
-    project_name = serializers.CharField(source="project.name", read_only=True, default=None)
+    # The project the material is for. A request raised against an asset's
+    # component belongs to that asset's project, whether or not the request
+    # itself names one, so the store can always see who is waiting.
+    project_name = serializers.SerializerMethodField()
+
+    def get_project_name(self, obj):
+        if obj.project_id:
+            return obj.project.name
+        component = obj.asset_component
+        if component is not None:
+            project = component.device.project_on
+            if project is not None:
+                return project.name
+        return None
+
     asset_code = serializers.CharField(
         source="asset_component.device.asset_code", read_only=True, default=None
     )
@@ -569,15 +819,49 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
     # True while the goods are still being bought: the store cannot issue
     # until the PO is received and inspected into stock.
     awaiting_procurement = serializers.SerializerMethodField()
+    # Raised by a Procure decision: the goods come in on a PO and are issued from here.
+    procured = serializers.BooleanField(source="awaiting_procurement", read_only=True)
     po_number = serializers.SerializerMethodField()
+    po_received_quantity = serializers.SerializerMethodField()
+    # For a unique item: every serial handed over, with where each unit stands now.
+    issued_units = serializers.SerializerMethodField()
+
+    def get_issued_units(self, obj):
+        serials = obj.issued_serials or []
+        if not serials:
+            return []
+        units = {
+            u.serial_number: u
+            for u in InventoryUnit.objects.filter(serial_number__in=serials).only(
+                "serial_number", "unit_code", "status"
+            )
+        }
+        out = []
+        for sn in serials:
+            unit = units.get(sn)
+            out.append({
+                "serial_number": sn,
+                "unit_code": unit.unit_code if unit else None,
+                "status": unit.status if unit else None,
+                "status_display": unit.get_status_display() if unit else None,
+            })
+        return out
+
+    def _po_line(self, obj):
+        component = obj.asset_component
+        return component.purchase_order_item if component is not None else None
 
     def get_awaiting_procurement(self, obj):
-        if not obj.awaiting_procurement:
+        """True while the store cannot issue: the goods are still being bought."""
+        if not obj.awaiting_procurement or obj.status in ("fulfilled", "cancelled"):
             return False
-        component = obj.asset_component
-        line = component.purchase_order_item if component is not None else None
-        # Still being bought until the order line has been received.
-        return line is None or line.received_quantity < line.quantity
+        line = self._po_line(obj)
+        # On order until something has passed inspection into stock.
+        return line is None or line.stocked_quantity <= 0
+
+    def get_po_received_quantity(self, obj):
+        line = self._po_line(obj)
+        return line.stocked_quantity if line is not None else 0
 
     def get_po_number(self, obj):
         component = obj.asset_component
@@ -593,14 +877,16 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "quantity_requested", "quantity_issued", "outstanding_quantity", "available_quantity",
             "source", "source_display", "purpose",
             "project", "project_name", "asset_component", "asset_code", "component_name",
+            "next_units", "unit_type_code", "asset_name",
             "maintenance_schedule", "maintenance_title",
             "requested_by", "requested_by_name", "issued_by", "issued_by_name",
-            "received_by", "issued_serials", "awaiting_procurement", "po_number",
+            "received_by", "issued_serials", "issued_units", "handovers", "last_issued_at", "awaiting_procurement", "po_number",
+            "procured", "po_received_quantity",
             "status", "status_display", "notes", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "request_number", "quantity_issued", "issued_by", "issued_serials",
-            "received_by", "status", "requested_by", "created_at", "updated_at",
+            "id", "request_number", "quantity_issued", "issued_by", "issued_serials", "issued_units", "handovers",
+            "last_issued_at", "received_by", "status", "requested_by", "created_at", "updated_at",
         ]
 
     def _name(self, user):
@@ -637,3 +923,48 @@ class IssuanceRequestIssueSerializer(serializers.Serializer):
     quantity = serializers.IntegerField(min_value=1)
     received_by = serializers.CharField(required=False, allow_blank=True, default="")
     notes = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class ReorderRequestSerializer(serializers.ModelSerializer):
+    """A request to buy stock that fell to its reorder level."""
+
+    item_sku = serializers.CharField(source="item.sku", read_only=True, default=None)
+    unit_type_name = serializers.CharField(source="unit_type.name", read_only=True, default=None)
+    name = serializers.CharField(read_only=True)
+    code = serializers.CharField(read_only=True)
+    kind = serializers.CharField(read_only=True)
+    unit = serializers.CharField(read_only=True)
+    on_hand = serializers.IntegerField(read_only=True)
+    reorder_level = serializers.IntegerField(read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    po_number = serializers.CharField(source="purchase_order_item.purchase_order.po_number", read_only=True, default=None)
+    requested_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReorderRequest
+        fields = [
+            "id", "request_number", "item", "item_sku", "unit_type", "unit_type_name", "name", "code", "kind", "unit",
+            "quantity", "reason", "status", "status_display", "purchase_order_item", "po_number",
+            "on_hand", "reorder_level", "requested_by", "requested_by_name", "notes", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "request_number", "status", "purchase_order_item", "requested_by", "created_at", "updated_at"]
+
+    def get_requested_by_name(self, obj):
+        user = obj.requested_by
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
+
+    def validate(self, attrs):
+        item = attrs.get("item")
+        unit_type = attrs.get("unit_type")
+        if bool(item) == bool(unit_type):
+            raise serializers.ValidationError({"item": ["Name one stock item or one unique product."]})
+        if (attrs.get("quantity") or 0) < 1:
+            raise serializers.ValidationError({"quantity": ["Ask for at least one."]})
+        if self.instance is None:
+            live = ReorderRequest.objects.filter(status__in=(ReorderRequest.Status.OPEN, ReorderRequest.Status.ORDERED))
+            live = live.filter(item=item) if item else live.filter(unit_type=unit_type)
+            if live.exists():
+                raise serializers.ValidationError({"detail": "A reorder request for this component is already open."})
+        return attrs

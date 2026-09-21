@@ -61,3 +61,21 @@ def release_project_field(sender, instance: ProjectScopeItem, **kwargs):
     ).exists():
         return
     Device.objects.filter(pk=instance.device_id, project_id=instance.project_id).update(project=None)
+
+
+@receiver(post_save, sender=ProjectScopeItem)
+def carry_the_scope_site_onto_the_asset(sender, instance: ProjectScopeItem, **kwargs):
+    """Where an asset goes is settled on the project, and the asset follows.
+
+    The Scope line names the site the work happens at, so the registry does not
+    ask for it separately — it reads it from here. Clearing the line's site
+    leaves the asset where it is: an asset already installed somewhere is not
+    moved by tidying a project's paperwork.
+    """
+    if instance.site_id is None or instance.device_id is None:
+        return
+    # Updated through the queryset: this is not a lifecycle change, and the
+    # Device signals above would only rewrite the scope line it came from.
+    Device.objects.filter(pk=instance.device_id).exclude(
+        current_site_id=instance.site_id
+    ).update(current_site_id=instance.site_id)

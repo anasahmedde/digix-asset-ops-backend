@@ -146,9 +146,13 @@ class Device(TimeStampedModel):
 
     asset_code = models.CharField(max_length=50, unique=True, db_index=True)
     # Not entered by hand: every asset gets a generated asset_code with a
-    # QR/barcode label, and the serial defaults to it. Kept as its own
-    # field so a manufacturer serial can still be recorded when there is one.
-    serial_number = models.CharField(max_length=200, unique=True, blank=True)
+    # QR/barcode label, and that is what identifies it here. The serial is the
+    # manufacturer's own, recorded only where the thing actually carries one —
+    # most assets do not, so the field is empty far more often than not.
+    serial_number = models.CharField(
+        max_length=200, unique=True, blank=True, null=True, default=None,
+        help_text="The manufacturer's serial, where there is one. Assets are identified by their asset code.",
+    )
     mobile_id = models.CharField(max_length=200, blank=True, help_text="Linked CMS device ID")
     mac_address = models.CharField(max_length=17, blank=True)
     imei = models.CharField(max_length=20, blank=True)
@@ -234,11 +238,29 @@ class Device(TimeStampedModel):
     assigned_technician = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="assigned_devices"
     )
+    # Picked from the vendors on the register. The name is kept alongside so a
+    # vendor recorded before the register existed still reads correctly, and so
+    # removing a vendor does not erase who did the work.
+    assigned_vendor = models.ForeignKey(
+        "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installing_devices", help_text="Vendor installing this asset",
+    )
     assigned_vendor_name = models.CharField(
         max_length=200, blank=True, help_text="External vendor installing this asset",
     )
     assigned_vendor_contact = models.CharField(
         max_length=100, blank=True, help_text="Phone or contact person for the installing vendor",
+    )
+    # Putting the asset in and switching it on: planned in the project's cost
+    # plan, recorded against it once the job is done. Kept on the asset because
+    # that is what is installed — a project's figure is the sum of its assets'.
+    planned_installation_cost = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+        help_text="What installing and activating this asset is expected to cost",
+    )
+    actual_installation_cost = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+        help_text="What installing and activating this asset actually cost",
     )
     installation_date = models.DateField(null=True, blank=True)
     installed_by = models.ForeignKey(
@@ -266,11 +288,65 @@ class Device(TimeStampedModel):
     def save(self, *args, **kwargs):
         if not self.asset_code:
             self.asset_code = generate_code("asset", model=type(self), field="asset_code")
-        # Fall back to the generated code so the unique constraint never sees
-        # two blanks.
+        # No serial is NULL, never "" — the unique index tolerates any number
+        # of assets that have none, but only one empty string.
         if not self.serial_number:
-            self.serial_number = self.asset_code
+            self.serial_number = None
         super().save(*args, **kwargs)
+
+    @property
+    def client_for(self):
+        """Whose asset this is, from wherever the answer was recorded.
+
+        Its own client where somebody set one. Otherwise the client the
+        project was raised for, and failing that the client whose site it
+        stands on — both of which were entered once already.
+        """
+        if self.assigned_client_id:
+            return self.assigned_client
+        # Additional clients are exactly that — extras who also see the asset,
+        # not the party it was sold to. The project answers that.
+        project = self.project_on
+        if project is not None and project.client_id:
+            return project.client
+        if self.current_site_id and self.current_site.client_id:
+            return self.current_site.client
+        return None
+
+    @property
+    def display_image(self):
+        """The picture to show for this asset, wherever one exists.
+
+        The asset's own image field is the one somebody set deliberately. Where
+        none was set, the gallery stands in — which is where the photograph the
+        technician takes on completion ends up, so an installed asset stops
+        showing a placeholder.
+        """
+        if self.image:
+            return self.image
+        photo = (
+            self.images.filter(is_primary=True).first()
+            or self.images.order_by("sort_order", "created_at").first()
+        )
+        return photo.image if photo is not None else None
+
+    @property
+    def project_on(self):
+        """The project this asset belongs to.
+
+        An asset reaches a project one of two ways: its own link, or a Scope
+        row added from the project. Callers that check only the field miss
+        every asset scoped from the project screen, which is most of them.
+        """
+        if self.project_id:
+            return self.project
+        from apps.teams.models import ProjectScopeItem
+
+        row = (
+            ProjectScopeItem.objects.filter(device=self)
+            .select_related("project").first()
+        )
+        return row.project if row is not None else None
 
     def can_transition_to(self, new_status: str) -> bool:
         allowed = self.VALID_TRANSITIONS.get(self.status, ())
@@ -468,6 +544,9 @@ class ProductionStep(TimeStampedModel):
     sent_at = models.DateTimeField(null=True, blank=True)
     returned_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+    # When Execution asked for a work order. Cleared once one is raised, or
+    # when the decision changes.
+    work_order_requested_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True)
 
     class Meta:
@@ -481,6 +560,44 @@ class ProductionStep(TimeStampedModel):
     def can_transition_to(self, new_status) -> bool:
         return new_status in self.VALID_TRANSITIONS.get(self.status, ())
 
+    def live_work_orders(self):
+        """Work orders covering this operation — named on the order itself
+        (older single-step orders) or on one of its lines — not cancelled."""
+        from apps.workorders.models import WorkOrder
+
+        return (
+            WorkOrder.objects.filter(
+                models.Q(production_step=self) | models.Q(items__production_step=self)
+            )
+            .exclude(status=WorkOrder.Status.CANCELLED)
+            .distinct()
+            .order_by("created_at")
+        )
+
+    @property
+    def live_work_order(self):
+        return self.live_work_orders().last()
+
+    @property
+    def on_a_work_order(self) -> bool:
+        """The operation is genuinely in a vendor's hands, or queued to be.
+
+        An operation marked external with no live order and no request behind
+        it is external in name only — nothing is going to move it, so it stays
+        the floor's to run rather than waiting forever on an order that does
+        not exist.
+        """
+        return self.work_order_requested or self.live_work_orders().exists()
+
+    @property
+    def work_order_requested(self) -> bool:
+        """Execution asked for a work order that nobody has raised yet."""
+        return (
+            self.location == self.Location.EXTERNAL
+            and self.work_order_requested_at is not None
+            and not self.live_work_orders().exists()
+        )
+
     @property
     def on_project(self) -> bool:
         device = self.device
@@ -489,7 +606,7 @@ class ProductionStep(TimeStampedModel):
     @property
     def manual_moves(self) -> tuple:
         """What a person may move this step to right now."""
-        if self.location == self.Location.EXTERNAL:
+        if self.location == self.Location.EXTERNAL and self.on_a_work_order:
             return ()  # follows its work order
         if self.location == self.Location.UNDECIDED and self.on_project:
             return ()  # the project decides first
@@ -499,7 +616,9 @@ class ProductionStep(TimeStampedModel):
     def hold_reason(self) -> str:
         if self.status in (self.Status.COMPLETED, self.Status.SKIPPED):
             return ""
-        if self.location == self.Location.EXTERNAL:
+        if self.location == self.Location.EXTERNAL and self.on_a_work_order:
+            if self.work_order_requested:
+                return "Work order requested — raise it under Work Orders › Requests; the status then follows the order."
             return "On a work order — its status follows the work order."
         if self.location == self.Location.UNDECIDED and self.on_project:
             return "Decide in the project's Execution tab whether this is done in-house or on a work order."
@@ -511,6 +630,8 @@ class ProductionStep(TimeStampedModel):
             return None
         if self.workshop_id:
             return self.workshop.name
+        if self.work_order_requested:
+            return "Work order requested"
         return self.workshop_name or "Unnamed workshop"
 
 

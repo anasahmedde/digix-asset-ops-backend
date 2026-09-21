@@ -177,7 +177,9 @@ def test_accept_spawns_project_with_bom_lines(people, customer, site):
 
     project = Project.objects.get(pk=r.data["spawned_project"])
     assert project.name == "Project: LED wall for atrium"
-    assert project.phase == "order_confirmation"
+    # An accepted quotation lands the project in Planning: the commercial
+    # run-up is over and the estimate is what comes next.
+    assert project.phase == "planning"
     assert project.client_id == customer.id
     assert project.site_id == site.id
     assert project.source_quotation_id == Quotation.objects.get(pk=body["id"]).id

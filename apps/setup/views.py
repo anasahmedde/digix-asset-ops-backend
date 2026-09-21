@@ -1,4 +1,5 @@
-from rest_framework import viewsets
+from rest_framework import status, viewsets
+from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 
 from common.permissions import CommercialWriteElseRead, IsAdminOrManager
@@ -9,6 +10,7 @@ from .models import (
     NumberingScheme,
     PaymentTerms,
     TermsTemplate,
+    UnitOfMeasure,
     WarrantyPeriodPreset,
 )
 from .serializers import (
@@ -17,6 +19,7 @@ from .serializers import (
     NumberingSchemeSerializer,
     PaymentTermsSerializer,
     TermsTemplateSerializer,
+    UnitOfMeasureSerializer,
     WarrantyPeriodPresetSerializer,
 )
 
@@ -44,6 +47,29 @@ class PaymentTermsViewSet(viewsets.ModelViewSet):
     filterset_fields = ["is_active"]
     search_fields = ["name", "code"]
     ordering_fields = ["days", "name", "created_at"]
+
+
+class UnitOfMeasureViewSet(viewsets.ModelViewSet):
+    """Units components are counted in. Deleting one that is in use would
+    leave components counting in a unit nobody can pick again, so those are
+    deactivated instead."""
+
+    queryset = UnitOfMeasure.objects.all()
+    serializer_class = UnitOfMeasureSerializer
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    filterset_fields = ["is_active"]
+    search_fields = ["name", "symbol"]
+    ordering_fields = ["name", "created_at"]
+
+    def destroy(self, request, *args, **kwargs):
+        unit = self.get_object()
+        used = unit.usage_count()
+        if used:
+            return Response(
+                {"detail": f"'{unit.name}' is used by {used} component definition(s). Mark it inactive instead of deleting it."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
 
 
 class TermsTemplateViewSet(viewsets.ModelViewSet):

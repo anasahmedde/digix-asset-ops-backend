@@ -21,6 +21,10 @@ from common.models import TimeStampedModel
 
 class WorkOrder(TimeStampedModel):
     class OrderType(models.TextChoices):
+        # What a work order is: services a vendor performs for us — an
+        # operation of a build given to a workshop, installation labour, a
+        # repair. Goods are bought on purchase orders, not here.
+        SERVICES = "services", "Services"
         SUPPLY = "supply", "Supply / Purchase"
         INSTALLATION = "installation", "Installation"
         SUPPLY_INSTALL = "supply_install", "Supply & Installation"
@@ -33,8 +37,8 @@ class WorkOrder(TimeStampedModel):
         ISSUED = "issued", "Issued to Supplier"
         IN_PROGRESS = "in_progress", "In Progress"
         PARTIALLY_DELIVERED = "partially_delivered", "Partially Delivered"
-        DELIVERED = "delivered", "Delivered"
-        COMPLETED = "completed", "Completed"
+        DELIVERED = "delivered", "Delivered — awaiting inspection"
+        COMPLETED = "completed", "Completed — inspected"
         CANCELLED = "cancelled", "Cancelled"
 
     class Currency(models.TextChoices):
@@ -49,7 +53,7 @@ class WorkOrder(TimeStampedModel):
     wo_number = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
     title = models.CharField(max_length=300)
     description = models.TextField(blank=True)
-    order_type = models.CharField(max_length=20, choices=OrderType.choices, default=OrderType.SUPPLY_INSTALL)
+    order_type = models.CharField(max_length=20, choices=OrderType.choices, default=OrderType.SERVICES)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
 
     supplier = models.ForeignKey(
@@ -98,6 +102,19 @@ class WorkOrder(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="approved_work_orders"
     )
     approved_at = models.DateTimeField(null=True, blank=True)
+    # Work receiving: the vendor delivers, we inspect. Accepted work completes
+    # the order; work sent back for rework goes to the vendor again.
+    class InspectionResult(models.TextChoices):
+        ACCEPTED = "accepted", "Accepted"
+        REWORK = "rework", "Sent back for rework"
+
+    inspected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="inspected_work_orders"
+    )
+    inspected_at = models.DateTimeField(null=True, blank=True)
+    inspection_result = models.CharField(max_length=10, choices=InspectionResult.choices, blank=True)
+    inspection_notes = models.TextField(blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
     issued_at = models.DateTimeField(null=True, blank=True)
 
     VALID_TRANSITIONS = {
@@ -106,7 +123,9 @@ class WorkOrder(TimeStampedModel):
         Status.APPROVED: (Status.ISSUED, Status.CANCELLED),
         Status.ISSUED: (Status.IN_PROGRESS, Status.CANCELLED),
         Status.IN_PROGRESS: (Status.PARTIALLY_DELIVERED, Status.DELIVERED, Status.CANCELLED),
-        Status.PARTIALLY_DELIVERED: (Status.DELIVERED, Status.CANCELLED),
+        # A vendor can keep sending jobs in one at a time, so a part delivery
+        # can follow a part delivery until the last job is in.
+        Status.PARTIALLY_DELIVERED: (Status.PARTIALLY_DELIVERED, Status.DELIVERED, Status.CANCELLED),
         Status.DELIVERED: (Status.COMPLETED,),
         Status.COMPLETED: (),
         Status.CANCELLED: (),
@@ -146,10 +165,30 @@ class WorkOrderItem(TimeStampedModel):
     device_model = models.ForeignKey(
         "assets.DeviceModel", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_order_items"
     )
+    # The operation of a build this line pays for, when the order came from a
+    # production route. One order can carry several operations for one vendor.
+    production_step = models.ForeignKey(
+        "assets.ProductionStep", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="work_order_items",
+    )
     description = models.CharField(max_length=300)
     quantity = models.PositiveIntegerField(default=1)
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     received_quantity = models.PositiveIntegerField(default=0)
+
+    # A vendor with three jobs on one order can finish one and send it in while
+    # the others are still on his bench, so each line carries its own delivery
+    # and its own verdict. The order follows its lines.
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    inspected_at = models.DateTimeField(null=True, blank=True)
+    inspected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="work_order_lines_inspected",
+    )
+    inspection_result = models.CharField(
+        max_length=10, choices=WorkOrder.InspectionResult.choices, blank=True
+    )
+    inspection_notes = models.TextField(blank=True)
 
     class Meta:
         ordering = ["id"]
@@ -160,3 +199,26 @@ class WorkOrderItem(TimeStampedModel):
     @property
     def line_total(self) -> Decimal:
         return (self.unit_price or Decimal("0")) * self.quantity
+
+    @property
+    def accepted(self) -> bool:
+        """The work on this line was inspected and passed — it is finished."""
+        return self.inspection_result == WorkOrder.InspectionResult.ACCEPTED
+
+    @property
+    def awaiting_inspection(self) -> bool:
+        """It has come in and nobody has looked at it yet."""
+        return self.delivered_at is not None and not self.accepted
+
+    @property
+    def with_vendor(self) -> bool:
+        """Still out: never delivered, or sent back to be redone."""
+        return self.delivered_at is None and not self.accepted
+
+    @property
+    def line_state(self) -> str:
+        if self.accepted:
+            return "accepted"
+        if self.delivered_at is not None:
+            return "awaiting_inspection"
+        return "rework" if self.inspection_result else "with_vendor"
