@@ -54,6 +54,10 @@ class MaintenanceSchedule(TimeStampedModel):
     vendors = models.ManyToManyField(
         "suppliers.Supplier", blank=True, related_name="maintenance_schedules"
     )
+    # The day the arrangement comes into effect. next_due moves on with every
+    # round completed; this stays put, so a schedule can still say when it
+    # began after a year of visits.
+    start_date = models.DateField(null=True, blank=True)
     next_due = models.DateField()
     instructions = models.TextField(blank=True)
     # What this maintenance needs on-site, entered freely at scheduling time:
@@ -69,7 +73,32 @@ class MaintenanceSchedule(TimeStampedModel):
     def __str__(self):
         return f"{self.title} ({self.frequency})"
 
+    def due_after(self, start):
+        """When the round after ``start`` falls, given this frequency.
+
+        A one-time job has no round after: it happens once, on the day it was
+        arranged for.
+        """
+        from dateutil.relativedelta import relativedelta
+
+        cycles = {
+            self.Frequency.DAILY: relativedelta(days=1),
+            self.Frequency.WEEKLY: relativedelta(weeks=1),
+            self.Frequency.MONTHLY: relativedelta(months=1),
+            self.Frequency.QUARTERLY: relativedelta(months=3),
+            self.Frequency.YEARLY: relativedelta(years=1),
+        }
+        step = cycles.get(self.frequency)
+        return start + step if step else start
+
     def save(self, *args, **kwargs):
+        # The start date and the frequency say when the next visit falls, so
+        # it is worked out rather than asked for — a third date entered by
+        # hand could only disagree with the two it is derived from.
+        if self.start_date:
+            self.next_due = self.due_after(self.start_date)
+        elif self.next_due:
+            self.start_date = self.next_due
         # Maintenance happens where the asset stands. The site is recorded on
         # the asset when it is installed, so asking for it again here would
         # only create a second answer that could disagree with the first.
@@ -81,22 +110,13 @@ class MaintenanceSchedule(TimeStampedModel):
 
     def advance_after_completion(self, performed_date):
         """Roll the schedule to its next cycle once a completed record lands."""
-        from dateutil.relativedelta import relativedelta
-
         if self.frequency == self.Frequency.ONE_TIME:
             self.status = self.Status.COMPLETED
             self.is_active = False
             self.save(update_fields=["status", "is_active", "updated_at"])
             return
-        deltas = {
-            self.Frequency.DAILY: relativedelta(days=1),
-            self.Frequency.WEEKLY: relativedelta(weeks=1),
-            self.Frequency.MONTHLY: relativedelta(months=1),
-            self.Frequency.QUARTERLY: relativedelta(months=3),
-            self.Frequency.YEARLY: relativedelta(years=1),
-        }
         base = max(self.next_due, performed_date) if self.next_due else performed_date
-        self.next_due = base + deltas[self.frequency]
+        self.next_due = self.due_after(base)
         self.status = self.Status.ACTIVE
         self.save(update_fields=["next_due", "status", "updated_at"])
 

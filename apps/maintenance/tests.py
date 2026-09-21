@@ -137,7 +137,7 @@ def test_schedule_supports_multiple_vendors(ops):
     v2 = Supplier.objects.create(name="Vendor B")
     r = _client(ops).post("/api/maintenance/schedules/", {
         "title": "Deep clean",
-        "next_due": str(timezone.now().date()),
+        "start_date": str(timezone.now().date()),
         "vendors": [str(v1.pk), str(v2.pk)],
     }, format="json")
     assert r.status_code == 201, r.content
@@ -148,7 +148,7 @@ def test_schedule_supports_multiple_vendors(ops):
 def test_required_components_roundtrip(ops):
     r = _client(ops).post("/api/maintenance/schedules/", {
         "title": "Panel swap",
-        "next_due": str(timezone.now().date()),
+        "start_date": str(timezone.now().date()),
         "required_components": [
             {"name": "SMD Module P3.9", "quantity": 6},
             {"name": "Silicone sealant", "quantity": 2},
@@ -161,7 +161,7 @@ def test_required_components_roundtrip(ops):
     ]
     # malformed rows rejected
     bad = _client(ops).post("/api/maintenance/schedules/", {
-        "title": "Bad", "next_due": str(timezone.now().date()),
+        "title": "Bad", "start_date": str(timezone.now().date()),
         "required_components": [{"quantity": 3}],
     }, format="json")
     assert bad.status_code == 400
@@ -500,7 +500,7 @@ def test_schedule_materials_are_picked_from_inventory(corrective_client):
     item = InventoryItem.objects.create(material_type=MaterialType.objects.create(name="PM Sealant"), quantity=9)
     r = c.post("/api/maintenance/schedules/", {
         "title": "Quarterly visit", "maintenance_type": "preventive", "frequency": "quarterly",
-        "next_due": "2030-01-01",
+        "start_date": "2030-01-01",
         "required_components": [{"inventory_item": str(item.id), "quantity": 2}],
     }, format="json")
     assert r.status_code == 201, r.content
@@ -633,3 +633,61 @@ def test_an_asset_with_no_site_does_not_erase_the_one_given():
         title="Bench check", device=device, site=site, next_due=timezone.localdate(),
     )
     assert schedule.site == site
+
+
+@pytest.mark.django_db
+def test_a_schedule_records_when_its_rounds_begin():
+    """The start date stays put while the next due date moves on.
+
+    Only the next round was recorded, so after a year of visits nothing could
+    say when the arrangement began.
+    """
+    from datetime import date
+
+    from apps.maintenance.models import MaintenanceSchedule
+
+    begins = date(2026, 10, 5)
+    schedule = MaintenanceSchedule.objects.create(
+        title="Quarterly round", frequency=MaintenanceSchedule.Frequency.MONTHLY,
+        start_date=begins, next_due=begins,
+    )
+    schedule.advance_after_completion(begins)
+    schedule.refresh_from_db()
+
+    assert schedule.start_date == begins, "the start date is not a moving target"
+    assert schedule.next_due > begins
+
+
+@pytest.mark.django_db
+def test_the_next_round_is_worked_out_from_the_start_and_the_frequency():
+    """Two facts decide the third, so the third is never asked for.
+
+    A monthly round starting on the first falls due a month later. A one-time
+    job has no round after it: it happens on the day it was arranged for.
+    """
+    from datetime import date
+
+    from apps.maintenance.models import MaintenanceSchedule
+
+    begins = date(2026, 11, 1)
+    monthly = MaintenanceSchedule.objects.create(
+        title="Monthly", start_date=begins,
+        frequency=MaintenanceSchedule.Frequency.MONTHLY,
+    )
+    assert monthly.next_due == date(2026, 12, 1)
+
+    weekly = MaintenanceSchedule.objects.create(
+        title="Weekly", start_date=begins,
+        frequency=MaintenanceSchedule.Frequency.WEEKLY,
+    )
+    assert weekly.next_due == date(2026, 11, 8)
+
+    once = MaintenanceSchedule.objects.create(
+        title="Once", start_date=begins,
+        frequency=MaintenanceSchedule.Frequency.ONE_TIME,
+    )
+    assert once.next_due == begins, "a one-time job happens on its start date"
+
+    # A date given without a start still anchors the schedule.
+    from_due = MaintenanceSchedule.objects.create(title="From due", next_due=begins)
+    assert from_due.start_date == begins

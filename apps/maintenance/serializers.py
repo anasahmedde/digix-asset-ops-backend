@@ -12,6 +12,9 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     effective_status = serializers.CharField(read_only=True)
     vendor_names = serializers.SerializerMethodField()
+    # A schedule has to say when its rounds begin: the next one due is worked
+    # out from it, so without it there is nothing to work out.
+    start_date = serializers.DateField(required=True)
 
     class Meta:
         model = MaintenanceSchedule
@@ -19,12 +22,16 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
             "id", "title", "maintenance_type", "frequency", "priority",
             "device", "device_code", "device_name", "device_status", "site", "site_name",
             "assigned_to", "assigned_to_name", "vendors", "vendor_names",
-            "next_due", "instructions", "required_components",
+            "start_date", "next_due", "instructions", "required_components",
             "status", "status_display",
             "effective_status", "is_active",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "created_at", "updated_at"]
+        # next_due is worked out from the start date and the frequency, and
+        # moves on by itself as rounds are completed. Accepting it would let a
+        # caller set a date that disagrees with the two it comes from, and the
+        # model would overwrite it on save anyway.
+        read_only_fields = ["id", "next_due", "created_at", "updated_at"]
 
     def get_vendor_names(self, obj):
         return [v.name for v in obj.vendors.all()]
