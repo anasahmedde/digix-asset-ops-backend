@@ -563,3 +563,73 @@ def test_an_open_job_cannot_be_deleted_while_the_asset_is_out_of_service(correct
 
     r = c.delete(f"/api/maintenance/schedules/{job.id}/")
     assert r.status_code == 204, r.content
+
+
+@pytest.mark.django_db
+def test_a_schedule_takes_its_site_from_the_asset():
+    """Where the work happens is where the asset stands.
+
+    Asking for the site separately let a schedule claim an asset was being
+    serviced somewhere it does not stand, so the asset answers instead — and
+    keeps answering when the asset is moved.
+    """
+    from apps.assets.models import AssetType, Device
+    from apps.maintenance.models import MaintenanceSchedule
+    from apps.sites.models import Site
+
+    here = Site.objects.create(name="Where It Stands", address="1 Road")
+    there = Site.objects.create(name="Somewhere Else", address="2 Road")
+    kind = AssetType.objects.create(name="Site Follow Kind")
+    device = Device.objects.create(asset_type=kind, current_site=here)
+
+    # The site given is ignored: the asset's own is the answer.
+    schedule = MaintenanceSchedule.objects.create(
+        title="Quarterly clean", device=device, site=there,
+        next_due=timezone.localdate(),
+    )
+    assert schedule.site == here
+
+    device.current_site = there
+    device.save(update_fields=["current_site"])
+    schedule.save()
+    assert schedule.site == there
+
+
+@pytest.mark.django_db
+def test_maintenance_comes_in_two_kinds():
+    """Planned ahead, or a response to a fault. There is no third."""
+    from apps.maintenance.models import MaintenanceSchedule
+
+    kinds = dict(MaintenanceSchedule.MaintenanceType.choices)
+    assert set(kinds) == {"preventive", "corrective"}
+    assert kinds["preventive"] == "Preventive"
+    assert kinds["corrective"] == "Corrective"
+
+
+@pytest.mark.django_db
+def test_a_schedule_without_an_asset_keeps_the_site_it_was_given():
+    """Not all maintenance is on one asset — a site round has no device."""
+    from apps.maintenance.models import MaintenanceSchedule
+    from apps.sites.models import Site
+
+    site = Site.objects.create(name="Round Site", address="3 Road")
+    schedule = MaintenanceSchedule.objects.create(
+        title="Site walk-round", site=site, next_due=timezone.localdate(),
+    )
+    assert schedule.site == site
+
+
+@pytest.mark.django_db
+def test_an_asset_with_no_site_does_not_erase_the_one_given():
+    """Deriving a site should never leave a schedule with less than it had."""
+    from apps.assets.models import AssetType
+    from apps.maintenance.models import MaintenanceSchedule
+
+    kind = AssetType.objects.create(name="Homeless Kind")
+    device = Device.objects.create(asset_type=kind)
+    site = Site.objects.create(name="Told Site", address="4 Road")
+
+    schedule = MaintenanceSchedule.objects.create(
+        title="Bench check", device=device, site=site, next_due=timezone.localdate(),
+    )
+    assert schedule.site == site

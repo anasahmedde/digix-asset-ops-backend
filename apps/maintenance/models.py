@@ -6,9 +6,15 @@ from common.models import TimeStampedModel
 
 class MaintenanceSchedule(TimeStampedModel):
     class MaintenanceType(models.TextChoices):
+        """Work is either planned ahead of a fault or a response to one.
+
+        Preventive is scheduled — the rounds somebody sets up in advance.
+        Corrective is raised when an asset goes down, from a ticket or from
+        the asset itself. There is no third kind.
+        """
+
         PREVENTIVE = "preventive", "Preventive"
         CORRECTIVE = "corrective", "Corrective"
-        PREDICTIVE = "predictive", "Predictive"
 
     class Frequency(models.TextChoices):
         DAILY = "daily", "Daily"
@@ -62,6 +68,16 @@ class MaintenanceSchedule(TimeStampedModel):
 
     def __str__(self):
         return f"{self.title} ({self.frequency})"
+
+    def save(self, *args, **kwargs):
+        # Maintenance happens where the asset stands. The site is recorded on
+        # the asset when it is installed, so asking for it again here would
+        # only create a second answer that could disagree with the first.
+        # An asset with nowhere recorded overrides nothing: erasing a site
+        # somebody set would be worse than the disagreement this avoids.
+        if self.device_id is not None and self.device.current_site_id:
+            self.site_id = self.device.current_site_id
+        super().save(*args, **kwargs)
 
     def advance_after_completion(self, performed_date):
         """Roll the schedule to its next cycle once a completed record lands."""
