@@ -59,6 +59,13 @@ class MaintenanceSchedule(TimeStampedModel):
     # began after a year of visits.
     start_date = models.DateField(null=True, blank=True)
     next_due = models.DateField()
+    # The fault this job answers, when it came in as a ticket. A ticket is a
+    # complaint; the job is the work it causes, and one points at the other so
+    # neither screen has to be told about the fault twice.
+    ticket = models.ForeignKey(
+        "tickets.Ticket", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="maintenance_jobs",
+    )
     instructions = models.TextField(blank=True)
     # What this maintenance needs on-site, entered freely at scheduling time:
     # a list of {"name": str, "quantity": int} rows (not tied to the asset's

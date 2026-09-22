@@ -109,7 +109,7 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
 
 class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
     queryset = MaintenanceSchedule.objects.select_related(
-        "device", "site", "assigned_to"
+        "device", "site", "assigned_to", "ticket"
     ).prefetch_related("vendors", "visits__assigned_to").all()
     serializer_class = MaintenanceScheduleSerializer
     permission_classes = [IsAuthenticated, TechnicianCanCreate]

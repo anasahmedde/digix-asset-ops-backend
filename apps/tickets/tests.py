@@ -723,7 +723,7 @@ def test_multi_asset_ticket(people, warranty_device):
     second = Device.objects.create(device_model=dm, asset_code="AST-MA-2", serial_number="MA-2")
     c = _client(people["ops"])
     r = c.post("/api/tickets/", {
-        "title": "Preventive: adapters batch", "category": "preventive_maintenance",
+        "title": "Predictive: adapters batch", "category": "predictive_maintenance",
         "devices": [str(warranty_device.pk), str(second.pk)],
     }, format="json")
     assert r.status_code == 201, r.content

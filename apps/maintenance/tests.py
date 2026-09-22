@@ -1107,3 +1107,58 @@ def test_a_part_is_asked_for_on_the_round_it_is_needed_for(parts_job):
     r = _ask(_client(parts_job["tech"]), parts_job, quantity=2)
     assert r.status_code == 201, r.content
     assert str(r.data["visit"]) == str(schedule.open_visit().id)
+
+
+@pytest.mark.django_db
+def test_a_ticket_raised_against_an_asset_shows_up_as_a_corrective_job():
+    """A fault reported is work to be done, and work lives in the register.
+
+    Tickets take the complaint; the repair is planned, parted and recorded in
+    maintenance, so raising one opens the job there and closing it files the
+    job's completion record.
+    """
+    from apps.assets.models import AssetType
+    from apps.maintenance.models import MaintenanceSchedule
+    from apps.tickets.models import Ticket
+
+    boss = User.objects.create_user(username="ticket-boss", password="x", role="ops_manager")
+    site = Site.objects.create(name="Ticket Site", address="2 Road")
+    device = Device.objects.create(
+        asset_type=AssetType.objects.create(name="Ticket Kind"), current_site=site,
+        status=Device.Status.ACTIVE,
+    )
+
+    r = _client(boss).post("/api/tickets/", {
+        "title": "Screen flickering", "description": "Flickers on the hour.",
+        "device": str(device.id), "priority": "high", "category": "repair",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    ticket = Ticket.objects.get(pk=r.data["id"])
+
+    job = MaintenanceSchedule.objects.get(ticket=ticket)
+    assert job.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE
+    assert job.device_id == device.id and job.site_id == site.id
+    assert job.title == "Screen flickering"
+    assert job.frequency == MaintenanceSchedule.Frequency.ONE_TIME
+    assert job.visits.count() == 1, "and it has a round to plan, like any other job"
+
+    # A second ticket on the same asset joins the outage rather than doubling it.
+    r2 = _client(boss).post("/api/tickets/", {
+        "title": "Screen still flickering", "device": str(device.id), "category": "repair",
+    }, format="json")
+    assert r2.status_code == 201, r2.content
+    assert MaintenanceSchedule.objects.filter(device=device).count() == 1
+
+    device.refresh_from_db()
+    assert device.status == Device.Status.UNDER_MAINTENANCE, (
+        "an asset with a fault open against it is not in service"
+    )
+
+    # Closing the ticket closes the job it raised, and the asset comes back.
+    ticket.status = Ticket.Status.CLOSED
+    ticket.save(update_fields=["status"])
+    job.refresh_from_db()
+    device.refresh_from_db()
+    assert job.status == MaintenanceSchedule.Status.COMPLETED
+    assert job.records.count() == 1
+    assert device.status == Device.Status.ACTIVE

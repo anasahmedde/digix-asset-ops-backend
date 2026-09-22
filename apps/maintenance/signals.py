@@ -63,3 +63,27 @@ def keep_a_round_open(sender, instance, **kwargs):
         instance.open_visit()
     except Exception:  # pragma: no cover - never block saving a schedule
         logger.exception("Could not open the next round for schedule %s", instance.pk)
+
+
+@receiver(post_save, sender="tickets.Ticket")
+def raise_the_job_a_ticket_causes(sender, instance, created, **kwargs):
+    """A fault reported against an asset is work, and work lives here.
+
+    Tickets are where a complaint is taken; the maintenance register is where
+    the repair is planned, parted and recorded. Raising one opens a corrective
+    job so the register knows about every fault, and closing it files the job's
+    completion record rather than leaving it open for ever.
+    """
+    from apps.tickets.models import Ticket
+
+    from .services import close_job_for_ticket, job_for_ticket
+
+    if instance.device_id is None:
+        return
+    try:
+        if created:
+            job_for_ticket(instance, getattr(instance, "_transition_user", None))
+        elif instance.status in (Ticket.Status.CLOSED, Ticket.Status.APPROVED):
+            close_job_for_ticket(instance, getattr(instance, "_transition_user", None))
+    except Exception:  # pragma: no cover - a ticket is never blocked by this
+        logger.exception("Could not keep the maintenance register in step with ticket %s", instance.pk)

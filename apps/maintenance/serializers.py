@@ -29,6 +29,8 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
     effective_status = serializers.CharField(read_only=True)
     # Who is going next, which is rarely the same person every month.
     next_visit_assignee = serializers.SerializerMethodField()
+    # The fault that raised this job, when it came in as a ticket.
+    ticket_number = serializers.CharField(source="ticket.ticket_number", read_only=True, default=None)
     vendor_names = serializers.SerializerMethodField()
     # A schedule has to say when its rounds begin: the next one due is worked
     # out from it, so without it there is nothing to work out.
@@ -44,6 +46,7 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
             "start_date", "next_due", "instructions", "required_components",
             "status", "status_display",
             "effective_status", "is_active", "next_visit_assignee",
+            "ticket", "ticket_number",
             "created_at", "updated_at",
         ]
         # next_due is worked out from the start date and the frequency, and

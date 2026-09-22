@@ -63,7 +63,10 @@ class Ticket(TimeStampedModel):
         INSPECTION = "inspection", "Inspection"
         RELOCATION = "relocation", "Relocation"
         WARRANTY_CLAIM = "warranty_claim", "Warranty Claim"
-        PREVENTIVE_MAINTENANCE = "preventive_maintenance", "Preventive Maintenance"
+        # A ticket is raised against a fault or a warning sign, never against
+        # a planned round: preventive work is a maintenance schedule, which
+        # has its own rounds and its own screen.
+        PREDICTIVE_MAINTENANCE = "predictive_maintenance", "Predictive Maintenance"
         OTHER = "other", "Other"
 
     class ChargeTo(models.TextChoices):
