@@ -91,13 +91,24 @@ class MaintenanceSchedule(TimeStampedModel):
         step = cycles.get(self.frequency)
         return start + step if step else start
 
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        row = super().from_db(db, field_names, values)
+        row._loaded_start_date = row.start_date
+        return row
+
     def save(self, *args, **kwargs):
-        # The start date and the frequency say when the next visit falls, so
-        # it is worked out rather than asked for — a third date entered by
-        # hand could only disagree with the two it is derived from.
-        if self.start_date:
+        # The start date and the frequency say when the first visit falls, so
+        # it is worked out rather than asked for. After that the date moves on
+        # its own — a round completed, or one moved to a day that suits the
+        # site — and recomputing it from the start would undo that.
+        start_moved = (
+            self.start_date is not None
+            and self.start_date != getattr(self, "_loaded_start_date", None)
+        )
+        if self.start_date and (self._state.adding or start_moved or not self.next_due):
             self.next_due = self.due_after(self.start_date)
-        elif self.next_due:
+        elif not self.start_date and self.next_due:
             self.start_date = self.next_due
         # Maintenance happens where the asset stands. The site is recorded on
         # the asset when it is installed, so asking for it again here would
@@ -107,6 +118,7 @@ class MaintenanceSchedule(TimeStampedModel):
         if self.device_id is not None and self.device.current_site_id:
             self.site_id = self.device.current_site_id
         super().save(*args, **kwargs)
+        self._loaded_start_date = self.start_date
 
     def advance_after_completion(self, performed_date):
         """Roll the schedule to its next cycle once a completed record lands."""
@@ -120,6 +132,31 @@ class MaintenanceSchedule(TimeStampedModel):
         self.status = self.Status.ACTIVE
         self.save(update_fields=["next_due", "status", "updated_at"])
 
+    def open_visit(self):
+        """The round being planned, opened if there is not one yet.
+
+        A live schedule always has exactly one: the next date it falls due,
+        with whoever is going. Completing a round rolls the schedule and opens
+        the round after it.
+        """
+        visit = (
+            self.visits.filter(
+                status__in=(MaintenanceVisit.Status.PLANNED, MaintenanceVisit.Status.IN_PROGRESS)
+            )
+            .order_by("due_date", "created_at")
+            .first()
+        )
+        if visit is None:
+            return MaintenanceVisit.objects.create(
+                schedule=self, due_date=self.next_due, assigned_to=self.assigned_to,
+            )
+        # The open round is the next one due, so it follows the schedule when
+        # the schedule is what moved.
+        if visit.due_date != self.next_due:
+            visit.due_date = self.next_due
+            visit.save(update_fields=["due_date", "updated_at"])
+        return visit
+
     @property
     def effective_status(self):
         """Auto-flag overdue schedules that aren't completed or on hold."""
@@ -130,6 +167,52 @@ class MaintenanceSchedule(TimeStampedModel):
         if self.next_due and self.next_due < timezone.now().date():
             return self.Status.OVERDUE
         return self.status
+
+
+class MaintenanceVisit(TimeStampedModel):
+    """One round of a schedule: the visit itself, planned or done.
+
+    A preventive schedule is an arrangement, not a job — it comes round every
+    month and whoever is free attends. So each round is its own row: when it
+    is due, who is going, what it needs from the store, and what came back.
+    The open round is always there to be planned against; completing it writes
+    the record and opens the next.
+    """
+
+    class Status(models.TextChoices):
+        PLANNED = "planned", "Planned"
+        IN_PROGRESS = "in_progress", "In Progress"
+        COMPLETED = "completed", "Completed"
+        SKIPPED = "skipped", "Skipped"
+
+    schedule = models.ForeignKey(
+        MaintenanceSchedule, on_delete=models.CASCADE, related_name="visits"
+    )
+    due_date = models.DateField()
+    # Who attends this round. A schedule names a default; every round can go
+    # to somebody else, which is the whole point of planning one at a time.
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="maintenance_visits",
+    )
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PLANNED)
+    started_at = models.DateTimeField(null=True, blank=True)
+    # What was recorded when the round was closed out.
+    record = models.OneToOneField(
+        "maintenance.MaintenanceRecord", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="visit",
+    )
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["due_date", "created_at"]
+
+    def __str__(self):
+        return f"{self.schedule.title} — {self.due_date}"
+
+    @property
+    def is_open(self) -> bool:
+        return self.status in (self.Status.PLANNED, self.Status.IN_PROGRESS)
 
 
 class MaintenanceRecord(TimeStampedModel):
@@ -231,6 +314,13 @@ class MaintenancePartRequest(TimeStampedModel):
     decided_at = models.DateTimeField(null=True, blank=True)
     decision_note = models.CharField(max_length=300, blank=True)
 
+    # The round this line belongs to. A schedule runs every month and asks for
+    # parts every time, so without it a job's parts are one long list with no
+    # way to tell which visit each was for.
+    visit = models.ForeignKey(
+        "maintenance.MaintenanceVisit", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="part_requests",
+    )
     # What the visit did with what it was given. The two add up to what the
     # store issued: anything not used goes back, and is only back in stock
     # once receiving has inspected it.

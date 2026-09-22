@@ -558,6 +558,18 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
             )
         })
 
+    # Material for a job goes to whoever is on that job. Handing it to anybody
+    # else leaves the parts with one person and the work with another, and the
+    # job's own record of who holds what says something untrue.
+    job = request_row.maintenance_schedule
+    if job is not None and job.assigned_to_id:
+        on_the_job = job.assigned_to.get_full_name() or job.assigned_to.username
+        if received_by and received_by.strip() != on_the_job:
+            raise serializers.ValidationError({"received_by": (
+                f"{job.title} is {on_the_job}'s job — the parts for it are collected by them."
+            )})
+        received_by = on_the_job
+
     serials = []
 
     # A request raised against a build moves that requirement along, so it goes

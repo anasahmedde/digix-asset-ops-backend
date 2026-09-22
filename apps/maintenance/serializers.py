@@ -5,6 +5,7 @@ from .models import (
     MaintenanceRecord,
     MaintenanceRecordPhoto,
     MaintenanceSchedule,
+    MaintenanceVisit,
 )
 
 
@@ -26,6 +27,8 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
     assigned_to_name = serializers.CharField(source="assigned_to.get_full_name", read_only=True, default=None)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     effective_status = serializers.CharField(read_only=True)
+    # Who is going next, which is rarely the same person every month.
+    next_visit_assignee = serializers.SerializerMethodField()
     vendor_names = serializers.SerializerMethodField()
     # A schedule has to say when its rounds begin: the next one due is worked
     # out from it, so without it there is nothing to work out.
@@ -40,7 +43,7 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
             "assigned_to", "assigned_to_name", "vendors", "vendor_names",
             "start_date", "next_due", "instructions", "required_components",
             "status", "status_display",
-            "effective_status", "is_active",
+            "effective_status", "is_active", "next_visit_assignee",
             "created_at", "updated_at",
         ]
         # next_due is worked out from the start date and the frequency, and
@@ -48,6 +51,15 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
         # caller set a date that disagrees with the two it comes from, and the
         # model would overwrite it on save anyway.
         read_only_fields = ["id", "next_due", "created_at", "updated_at"]
+
+    def get_next_visit_assignee(self, obj):
+        visit = next(
+            (v for v in obj.visits.all() if v.status in ("planned", "in_progress")), None
+        )
+        person = visit.assigned_to if visit else None
+        if person is None:
+            return None
+        return person.get_full_name() or person.username
 
     def get_vendor_names(self, obj):
         return [v.name for v in obj.vendors.all()]
@@ -129,6 +141,66 @@ class MaintenanceRecordPhotoSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "taken_by", "created_at"]
 
 
+class MaintenanceVisitSerializer(serializers.ModelSerializer):
+    """One round of a schedule — when it is due and who is going."""
+
+    assigned_to_name = serializers.SerializerMethodField()
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    schedule_title = serializers.CharField(source="schedule.title", read_only=True)
+    # What the round came to, once it was closed out.
+    performed_at = serializers.DateTimeField(source="record.performed_at", read_only=True, default=None)
+    performed_by_name = serializers.SerializerMethodField()
+    cost = serializers.DecimalField(
+        source="record.cost", max_digits=10, decimal_places=2, read_only=True, default=None,
+    )
+    is_billable = serializers.BooleanField(source="record.is_billable", read_only=True, default=None)
+    charge_to = serializers.CharField(source="record.charge_to", read_only=True, default="")
+    record_notes = serializers.CharField(source="record.notes", read_only=True, default="")
+    component_names = serializers.SerializerMethodField()
+    photos = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MaintenanceVisit
+        fields = [
+            "id", "schedule", "schedule_title", "due_date", "assigned_to", "assigned_to_name",
+            "status", "status_display", "started_at", "record", "notes",
+            "performed_at", "performed_by_name", "cost", "is_billable", "charge_to",
+            "record_notes", "component_names", "photos",
+            "created_at", "updated_at",
+        ]
+        # A round is closed out by recording the visit, not by editing it here.
+        read_only_fields = ["id", "schedule", "status", "started_at", "record", "created_at", "updated_at"]
+
+    def _name(self, user):
+        if user is None:
+            return None
+        return user.get_full_name() or user.username
+
+    def get_assigned_to_name(self, obj):
+        return self._name(obj.assigned_to)
+
+    def get_performed_by_name(self, obj):
+        return self._name(obj.record.performed_by) if obj.record_id else None
+
+    def get_component_names(self, obj):
+        return [c.name for c in obj.record.components_used.all()] if obj.record_id else []
+
+    def get_photos(self, obj):
+        if not obj.record_id:
+            return []
+        return MaintenanceRecordPhotoSerializer(obj.record.photos.all(), many=True).data
+
+    def update(self, instance, validated_data):
+        # The open round is the next one due, so moving its date moves the
+        # schedule with it — two answers to "when is it next?" is one too many.
+        visit = super().update(instance, validated_data)
+        schedule = visit.schedule
+        if visit.is_open and schedule.next_due != visit.due_date:
+            schedule.next_due = visit.due_date
+            schedule.save(update_fields=["next_due", "updated_at"])
+        return visit
+
+
 class MaintenanceRecordSerializer(serializers.ModelSerializer):
     schedule_title = serializers.CharField(source="schedule.title", read_only=True, default=None)
     performed_by_name = serializers.SerializerMethodField()
@@ -140,6 +212,10 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
     # because that is the moment anybody knows.
     parts_settlement = serializers.ListField(
         child=serializers.DictField(), write_only=True, required=False
+    )
+    # The round being closed out. Left out, it is the open one on the schedule.
+    visit = serializers.PrimaryKeyRelatedField(
+        queryset=MaintenanceVisit.objects.all(), write_only=True, required=False,
     )
     # The receipt the returned material waits on, so whoever closed the visit
     # can be told where it went. Set while the visit is being recorded.
@@ -153,7 +229,7 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
             "performed_at", "status", "status_display", "notes", "cost",
             "is_billable", "charge_to",
             "components_used", "component_names", "photos",
-            "parts_settlement", "return_grn",
+            "parts_settlement", "return_grn", "visit",
             "created_at",
         ]
         read_only_fields = ["id", "performed_by", "created_at"]
@@ -181,6 +257,7 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
         from .parts import settle
 
         settlement = validated_data.pop("parts_settlement", None)
+        visit = validated_data.pop("visit", None)
         schedule = validated_data.get("schedule")
         device = schedule.device if schedule else None
         if device is not None:
@@ -194,10 +271,19 @@ class MaintenanceRecordSerializer(serializers.ModelSerializer):
         # parts are unaccounted for.
         with transaction.atomic():
             record = super().create(validated_data)
+            # A visit is a round of the schedule: closing it out is what this
+            # record is, so the two are tied together here.
+            if visit is None and schedule is not None:
+                visit = schedule.open_visit()
+            if visit is not None:
+                visit.record = record
+                visit.status = MaintenanceVisit.Status.COMPLETED
+                visit.save(update_fields=["record", "status", "updated_at"])
             if settlement:
                 request = self.context.get("request")
                 receipt = settle(
-                    schedule, user=getattr(request, "user", None), rows=settlement
+                    schedule, user=getattr(request, "user", None), rows=settlement,
+                    visit=visit,
                 )
                 record.return_grn = receipt.grn_number if receipt else None
         return record
@@ -251,7 +337,7 @@ class MaintenancePartRequestSerializer(serializers.ModelSerializer):
             "requested_by", "requested_by_name",
             "decided_by", "decided_by_name", "decided_at", "decision_note",
             "issuance_request", "issue_status", "issue_number", "quantity_issued",
-            "issued_serials", "quantity_used", "quantity_returned", "return_reference",
+            "issued_serials", "visit", "quantity_used", "quantity_returned", "return_reference",
             "created_at", "updated_at",
         ]
         # The answer is given through the decide action, which is where the

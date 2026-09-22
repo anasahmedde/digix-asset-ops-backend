@@ -12,6 +12,7 @@ from .models import (
     MaintenanceRecord,
     MaintenanceRecordPhoto,
     MaintenanceSchedule,
+    MaintenanceVisit,
 )
 from .serializers import (
     MaintenancePartDecisionSerializer,
@@ -19,6 +20,7 @@ from .serializers import (
     MaintenanceRecordPhotoSerializer,
     MaintenanceRecordSerializer,
     MaintenanceScheduleSerializer,
+    MaintenanceVisitSerializer,
 )
 
 # Who may answer a technician's request for parts. Raising one is the
@@ -63,7 +65,13 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
     ordering_fields = ["created_at"]
 
     def perform_create(self, serializer):
-        serializer.save(requested_by=self.request.user)
+        # A line is asked for on a round, and the round being planned is the
+        # one it is for.
+        schedule = serializer.validated_data.get("schedule")
+        serializer.save(
+            requested_by=self.request.user,
+            visit=schedule.open_visit() if schedule is not None else None,
+        )
 
     def perform_destroy(self, instance):
         """A line can be withdrawn while nobody has answered it yet."""
@@ -102,7 +110,7 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
 class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
     queryset = MaintenanceSchedule.objects.select_related(
         "device", "site", "assigned_to"
-    ).prefetch_related("vendors").all()
+    ).prefetch_related("vendors", "visits__assigned_to").all()
     serializer_class = MaintenanceScheduleSerializer
     permission_classes = [IsAuthenticated, TechnicianCanCreate]
     filterset_fields = [
@@ -155,6 +163,67 @@ class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
                 "which puts the asset back into service."
             )
         instance.delete()
+
+
+class CanPlanOrStartARound(BasePermission):
+    """Planning a round is a supervisor's call; attending one is not.
+
+    Rounds are opened by the schedule itself, so nobody creates or deletes one
+    from outside: they are planned, started and closed out.
+    """
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        if request.method in SAFE_METHODS:
+            return True
+        if view.action == "start":
+            return getattr(request.user, "role", None) in ASKING_ROLES
+        if view.action in ("update", "partial_update"):
+            return getattr(request.user, "role", None) in DECIDING_ROLES
+        return False
+
+
+class MaintenanceVisitViewSet(viewsets.ModelViewSet):
+    """The rounds of a schedule: when each is due and who is going.
+
+    A schedule is an arrangement that comes round again and again, so who
+    attends is decided one round at a time rather than once for all of them.
+    """
+
+    queryset = MaintenanceVisit.objects.select_related(
+        "schedule", "schedule__device", "schedule__site", "assigned_to",
+        "record", "record__performed_by",
+    ).prefetch_related("record__components_used", "record__photos").all()
+    serializer_class = MaintenanceVisitSerializer
+    permission_classes = [IsAuthenticated, CanPlanOrStartARound]
+    filterset_fields = ["schedule", "status", "assigned_to"]
+    ordering_fields = ["due_date", "created_at"]
+
+    def perform_destroy(self, instance):
+        raise drf_serializers.ValidationError(
+            {"detail": "A round is completed or skipped, not deleted."}
+        )
+
+    @action(detail=True, methods=["post"])
+    def start(self, request, pk=None):
+        """Somebody is on site: the round is under way, and so is the job."""
+        from django.utils import timezone
+
+        visit = self.get_object()
+        if visit.status != MaintenanceVisit.Status.PLANNED:
+            return Response(
+                {"detail": f"This round is already {visit.get_status_display().lower()}."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        visit.status = MaintenanceVisit.Status.IN_PROGRESS
+        visit.started_at = timezone.now()
+        visit.save(update_fields=["status", "started_at", "updated_at"])
+        schedule = visit.schedule
+        if schedule.status != MaintenanceSchedule.Status.IN_PROCESS:
+            schedule.status = MaintenanceSchedule.Status.IN_PROCESS
+            schedule.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(visit).data)
 
 
 class MaintenanceRecordViewSet(viewsets.ModelViewSet):

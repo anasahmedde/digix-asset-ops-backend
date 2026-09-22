@@ -766,6 +766,13 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         source="maintenance_schedule.title", read_only=True, default=None,
     )
 
+    def get_maintenance_assignee(self, obj):
+        job = obj.maintenance_schedule
+        person = job.assigned_to if job is not None else None
+        if person is None:
+            return None
+        return person.get_full_name() or person.username
+
     def get_unit_type_code(self, obj):
         from .models import InventoryUnitType
 
@@ -825,6 +832,9 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
     maintenance_title = serializers.CharField(
         source="maintenance_schedule.title", read_only=True, default=None
     )
+    # Parts for a job are collected by whoever is on that job, so the store is
+    # told who that is rather than asked who took them.
+    maintenance_assignee = serializers.SerializerMethodField()
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     source_display = serializers.CharField(source="get_source_display", read_only=True)
     outstanding_quantity = serializers.IntegerField(read_only=True)
@@ -893,7 +903,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "source", "source_display", "purpose",
             "project", "project_name", "asset_component", "asset_code", "component_name",
             "next_units", "unit_type_code", "asset_name",
-            "maintenance_schedule", "maintenance_title",
+            "maintenance_schedule", "maintenance_title", "maintenance_assignee",
             "requested_by", "requested_by_name", "issued_by", "issued_by_name",
             "received_by", "issued_serials", "issued_units", "handovers", "last_issued_at", "awaiting_procurement", "po_number",
             "procured", "po_received_quantity",

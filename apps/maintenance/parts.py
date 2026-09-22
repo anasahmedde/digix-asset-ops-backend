@@ -73,10 +73,12 @@ def decide(part_request, *, user, approve, quantity=None, note=""):
     return part_request
 
 
-def settle(schedule, *, user, rows):
+def settle(schedule, *, user, rows, visit=None):
     """Say what the visit did with the parts the store issued for it.
 
-    Each row is ``{"part_request": id, "used": int, "serials": [...]}``.
+    Each row is ``{"part_request": id, "used": int, "serials": [...]}``, and
+    ``visit`` is the round being closed out, which the lines are stamped with
+    so a schedule running every month can say which round used what.
     Whatever was issued and not used goes back to the store in one return
     receipt, which waits in receiving to be inspected like any delivery —
     a technician saying a part is unused does not put it back on the shelf.
@@ -133,6 +135,7 @@ def settle(schedule, *, user, rows):
 
         line.quantity_used = used
         line.quantity_returned = returning
+        line.visit = visit or line.visit
         settled.append(line)
         if returning:
             coming_back.append({
@@ -155,6 +158,6 @@ def settle(schedule, *, user, rows):
     for line in settled:
         line.return_reference = receipt.grn_number if receipt and line.quantity_returned else ""
         line.save(update_fields=[
-            "quantity_used", "quantity_returned", "return_reference", "updated_at",
+            "visit", "quantity_used", "quantity_returned", "return_reference", "updated_at",
         ])
     return receipt

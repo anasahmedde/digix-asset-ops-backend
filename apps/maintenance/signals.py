@@ -45,3 +45,21 @@ def keep_maintenance_register_in_step(sender, instance: Device, created: bool, *
             )
     except Exception:  # pragma: no cover - a status change must never 500
         logger.exception("Failed to sync the maintenance register for %s", instance.pk)
+
+
+@receiver(post_save, sender="maintenance.MaintenanceSchedule")
+def keep_a_round_open(sender, instance, **kwargs):
+    """A live schedule always has a round to plan against.
+
+    Whoever attends is decided round by round, so the row has to exist before
+    anybody can be put on it — from the moment the schedule is written down,
+    and again the moment a completed round rolls it to the next cycle.
+    """
+    from .models import MaintenanceSchedule
+
+    if not instance.is_active or instance.status == MaintenanceSchedule.Status.COMPLETED:
+        return
+    try:
+        instance.open_visit()
+    except Exception:  # pragma: no cover - never block saving a schedule
+        logger.exception("Could not open the next round for schedule %s", instance.pk)

@@ -863,6 +863,9 @@ def test_what_the_visit_did_not_use_goes_back_to_receiving(parts_job):
 
     line = MaintenancePartRequest.objects.get(pk=line_id)
     assert (line.quantity_used, line.quantity_returned) == (9, 3)
+    assert line.visit_id == parts_job["schedule"].visits.get(status="completed").id, (
+        "the line belongs to the round that used it"
+    )
 
     receipt = GoodsReceipt.objects.get(source=GoodsReceipt.Source.MAINTENANCE_RETURN)
     assert line.return_reference == receipt.grn_number
@@ -998,3 +1001,109 @@ def test_a_request_sent_back_by_the_store_waits_on_the_supervisor_again(parts_jo
     assert r.status_code == 200, r.content
     assert r.data["quantity_approved"] == 4
     assert r.data["issuance_request"] != str(issuance.id), "a fresh request, not the cancelled one"
+
+
+@pytest.mark.django_db
+def test_a_jobs_parts_are_collected_by_whoever_is_on_the_job(parts_job):
+    """Parts and the work they are for stay with the same person.
+
+    Handing them to anyone else leaves the job's record saying something
+    untrue about who holds what.
+    """
+    from apps.accounts.models import User
+    from apps.inventory.models import IssuanceRequest
+
+    store = User.objects.create_user(username="collect-store", password="x", role="warehouse")
+    line_id = _approved_line(parts_job, quantity=3)
+    issuance = IssuanceRequest.objects.get(maintenance_part_request=line_id)
+    tech = parts_job["tech"].get_full_name() or parts_job["tech"].username
+
+    r = _client(store).post(f"/api/inventory/issuance-requests/{issuance.id}/issue/",
+                            {"quantity": 1, "received_by": "Someone off the street"}, format="json")
+    assert r.status_code == 400, r.content
+    assert tech in str(r.data["received_by"])
+
+    r = _client(store).post(f"/api/inventory/issuance-requests/{issuance.id}/issue/",
+                            {"quantity": 1, "received_by": tech}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["request"]["received_by"] == tech
+
+    # Left blank, the store does not have to type it: the job already says.
+    r = _client(store).post(f"/api/inventory/issuance-requests/{issuance.id}/issue/",
+                            {"quantity": 1}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["request"]["received_by"] == tech
+    assert r.data["request"]["maintenance_assignee"] == tech
+
+
+@pytest.mark.django_db
+def test_every_round_is_planned_on_its_own(parts_job):
+    """A recurring schedule is an arrangement, not one person's job.
+
+    Each round is its own row: due on its own date, attended by whoever is
+    free, and closing one opens the next.
+    """
+    from apps.accounts.models import User
+    from apps.maintenance.models import MaintenanceVisit
+
+    schedule = parts_job["schedule"]
+    visit = schedule.visits.get()
+    assert visit.status == MaintenanceVisit.Status.PLANNED
+    assert visit.due_date == schedule.next_due
+    assert visit.assigned_to_id == schedule.assigned_to_id, "the standing technician, to start with"
+
+    # This round goes to somebody else, and the schedule's default is untouched.
+    stand_in = User.objects.create_user(
+        username="stand-in", password="x", role="technician", is_field_staff=True,
+    )
+    r = _client(parts_job["boss"]).patch(
+        f"/api/maintenance/visits/{visit.id}/",
+        {"assigned_to": str(stand_in.id), "due_date": str(schedule.next_due + timedelta(days=2))},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    visit.refresh_from_db()
+    schedule.refresh_from_db()
+    assert visit.assigned_to_id == stand_in.id
+    assert schedule.assigned_to_id == parts_job["tech"].id, "the arrangement keeps its own technician"
+    assert schedule.next_due == visit.due_date, "the open round is when it is next due"
+
+    # A technician cannot hand their own round to somebody else.
+    r = _client(parts_job["tech"]).patch(
+        f"/api/maintenance/visits/{visit.id}/", {"assigned_to": str(parts_job["tech"].id)}, format="json",
+    )
+    assert r.status_code == 403, r.content
+
+    # Starting says so on the round and on the schedule.
+    r = _client(parts_job["tech"]).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
+    assert r.status_code == 200, r.content
+    visit.refresh_from_db(); schedule.refresh_from_db()
+    assert visit.status == MaintenanceVisit.Status.IN_PROGRESS and visit.started_at is not None
+    assert schedule.status == MaintenanceSchedule.Status.IN_PROCESS
+    r = _client(parts_job["tech"]).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
+    assert r.status_code == 400, "a round already under way cannot start again"
+
+    # Closing it out records the round and opens the next one.
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        "schedule": str(schedule.id),
+        "performed_at": timezone.now().isoformat(),
+        "status": "completed",
+        "notes": "Round one done.",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    visit.refresh_from_db(); schedule.refresh_from_db()
+    assert visit.status == MaintenanceVisit.Status.COMPLETED
+    assert str(visit.record_id) == r.data["id"]
+
+    nxt = schedule.visits.exclude(pk=visit.pk).get()
+    assert nxt.status == MaintenanceVisit.Status.PLANNED
+    assert nxt.due_date == schedule.next_due > visit.due_date
+    assert nxt.assigned_to_id == schedule.assigned_to_id, "back to the standing technician"
+
+
+@pytest.mark.django_db
+def test_a_part_is_asked_for_on_the_round_it_is_needed_for(parts_job):
+    schedule = parts_job["schedule"]
+    r = _ask(_client(parts_job["tech"]), parts_job, quantity=2)
+    assert r.status_code == 201, r.content
+    assert str(r.data["visit"]) == str(schedule.open_visit().id)
