@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import (
     ReorderRequest,
     GoodsReceipt,
@@ -21,7 +23,7 @@ class InventoryCategorySerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
-class InventoryItemSerializer(serializers.ModelSerializer):
+class InventoryItemSerializer(HidesMoney, serializers.ModelSerializer):
     material_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
     category_name = serializers.CharField(source="category.name", read_only=True, default=None)
     unit = serializers.CharField(source="material_type.unit", read_only=True, default=None)
@@ -62,7 +64,7 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         return value
 
 
-class InventoryUnitTypeSerializer(serializers.ModelSerializer):
+class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
     """A unique product as opened in inventory — details now, serials later."""
 
     material_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
@@ -181,7 +183,7 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
         return self._validate_opening_stock(attrs)
 
 
-class InventoryUnitSerializer(serializers.ModelSerializer):
+class InventoryUnitSerializer(HidesMoney, serializers.ModelSerializer):
     # Where the unit ended up, once it was fitted into an asset's build.
     fitted_to_asset = serializers.SerializerMethodField()
 

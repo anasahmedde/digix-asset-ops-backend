@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import WorkOrder, WorkOrderItem
 
 
@@ -11,7 +13,7 @@ LINE_STATE_LABELS = {
 }
 
 
-class WorkOrderItemSerializer(serializers.ModelSerializer):
+class WorkOrderItemSerializer(HidesMoney, serializers.ModelSerializer):
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     device_model_name = serializers.StringRelatedField(source="device_model", read_only=True)
     line_total = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
@@ -65,7 +67,7 @@ def _assets_on(order):
     return codes
 
 
-class WorkOrderListSerializer(serializers.ModelSerializer):
+class WorkOrderListSerializer(HidesMoney, serializers.ModelSerializer):
     supplier_name = serializers.CharField(source="supplier.name", read_only=True)
     project_name = serializers.CharField(source="project.name", read_only=True, default=None)
     # What the work is for: the project it belongs to and the assets worked on.
@@ -109,7 +111,7 @@ class WorkOrderListSerializer(serializers.ModelSerializer):
         return sum(1 for i in obj.items.all() if i.with_vendor)
 
 
-class WorkOrderSerializer(serializers.ModelSerializer):
+class WorkOrderSerializer(HidesMoney, serializers.ModelSerializer):
     items = WorkOrderItemSerializer(many=True, required=False)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)

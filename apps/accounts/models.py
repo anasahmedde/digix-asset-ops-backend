@@ -1,5 +1,6 @@
 import uuid
 
+from django.conf import settings
 from django.contrib.auth.models import AbstractUser
 from django.core.validators import RegexValidator
 from django.db import models
@@ -59,6 +60,71 @@ class User(AbstractUser):
 
     def __str__(self):
         return f"{self.get_full_name()} ({self.role})"
+
+    # ---- What this person may do ----------------------------------------
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """Everything this person may do: the role's defaults, adjusted.
+
+        An override is absolute — granted means granted even if the role
+        would not, withdrawn means withdrawn even if it would.
+        """
+        from .capabilities import defaults_for
+
+        allowed = set(defaults_for(self.role))
+        for row in self.capability_overrides.all():
+            if row.allowed:
+                allowed.add(row.capability)
+            else:
+                allowed.discard(row.capability)
+        return frozenset(allowed)
+
+    def can(self, capability: str) -> bool:
+        return capability in self.capabilities
+
+    def manages(self, other) -> bool:
+        """Is this person somewhere up the other's reporting line?
+
+        A team lead may adjust their own team, however deep it runs, which
+        is what makes the delegation useful rather than decorative.
+        """
+        seen = set()
+        boss = other.reports_to
+        while boss is not None and boss.pk not in seen:
+            if boss.pk == self.pk:
+                return True
+            seen.add(boss.pk)
+            boss = boss.reports_to
+        return False
+
+
+class UserCapability(TimeStampedModel):
+    """One capability granted to, or withdrawn from, one person.
+
+    Rows exist only where somebody differs from their role, so the table
+    stays small and every row is a decision a person made and can explain.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="capability_overrides",
+    )
+    capability = models.CharField(max_length=50)
+    allowed = models.BooleanField()
+    granted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="capabilities_granted",
+    )
+    reason = models.CharField(max_length=300, blank=True)
+
+    class Meta:
+        unique_together = [("user", "capability")]
+        ordering = ["capability"]
+        verbose_name_plural = "user capabilities"
+
+    def __str__(self):
+        verb = "granted" if self.allowed else "withdrawn"
+        return f"{self.capability} {verb} for {self.user}"
 
 
 class AuditLog(TimeStampedModel):

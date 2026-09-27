@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from apps.suppliers.models import Supplier
 from apps.teams.models import Project
 
@@ -33,7 +35,7 @@ def _buy_asset_on(item, device_id):
     device.save(update_fields=["procurement_item", "updated_at"])
 
 
-class PurchaseOrderItemSerializer(serializers.ModelSerializer):
+class PurchaseOrderItemSerializer(HidesMoney, serializers.ModelSerializer):
     """Nested under PurchaseOrderSerializer (mirrors WorkOrderItemSerializer).
 
     ``id`` is writable so nested updates can upsert: rows carrying an existing
@@ -139,7 +141,7 @@ def _can_see_prices(context) -> bool:
     return getattr(user, "role", "") in PRICE_VIEW_ROLES
 
 
-class PurchaseOrderSerializer(serializers.ModelSerializer):
+class PurchaseOrderSerializer(HidesMoney, serializers.ModelSerializer):
     items = PurchaseOrderItemSerializer(many=True, required=False)
 
     def to_representation(self, instance):

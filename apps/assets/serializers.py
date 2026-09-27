@@ -2,6 +2,8 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from apps.sites.models import Site
 from apps.suppliers.models import Supplier
 
@@ -484,7 +486,7 @@ class DeviceListSerializer(serializers.ModelSerializer):
         return _warranty_status(obj)
 
 
-class DeviceDetailSerializer(serializers.ModelSerializer):
+class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
     device_model_name = serializers.StringRelatedField(source="device_model", read_only=True)
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     brand_name = serializers.CharField(source="device_model.brand.name", read_only=True, default=None)
@@ -960,7 +962,7 @@ class DeviceAssignmentSerializer(serializers.Serializer):
         )
 
 
-class ProductionStepSerializer(serializers.ModelSerializer):
+class ProductionStepSerializer(HidesMoney, serializers.ModelSerializer):
     """One operation in an in-house build route."""
 
     workshop_display = serializers.CharField(read_only=True)

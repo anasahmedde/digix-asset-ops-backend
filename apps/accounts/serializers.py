@@ -31,6 +31,14 @@ class UserSerializer(serializers.ModelSerializer):
     def get_direct_report_count(self, obj):
         return obj.direct_reports.count()
 
+    # Everything this person may do, after their role's defaults are
+    # adjusted. The screen hides what it must from this, and the server
+    # still checks on every call.
+    capabilities = serializers.SerializerMethodField()
+
+    def get_capabilities(self, obj):
+        return sorted(obj.capabilities)
+
     # The only fields a non-super_admin may write (on their own record).
     # `supplier` is deliberately NOT here: linking a login to a vendor is a
     # super_admin decision (it grants that supplier's portal scope).
@@ -42,7 +50,7 @@ class UserSerializer(serializers.ModelSerializer):
             "id", "username", "email", "first_name", "last_name",
             "full_name", "role", "job_title", "phone", "avatar", "is_field_staff",
             "employee_id", "cnic", "join_date", "leaving_date",
-            "reports_to", "reports_to_name", "direct_report_count",
+            "reports_to", "reports_to_name", "direct_report_count", "capabilities",
             "supplier", "supplier_name",
             "is_active", "date_joined",
         ]
@@ -107,3 +115,24 @@ class AuditLogSerializer(serializers.ModelSerializer):
             "resource_id", "detail", "ip_address", "created_at",
         ]
         read_only_fields = fields
+
+
+class CapabilityOverrideSerializer(serializers.Serializer):
+    """One adjustment: this capability, granted or withdrawn, and why."""
+
+    capability = serializers.CharField()
+    allowed = serializers.BooleanField()
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=300)
+
+    def validate_capability(self, value):
+        from .capabilities import ALL_KEYS
+
+        if value not in ALL_KEYS:
+            raise serializers.ValidationError(f"There is no capability called '{value}'.")
+        return value
+
+
+class CapabilitySetSerializer(serializers.Serializer):
+    """The whole set of adjustments for one person, replacing what was there."""
+
+    overrides = CapabilityOverrideSerializer(many=True)

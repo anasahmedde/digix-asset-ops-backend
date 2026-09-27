@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import (
     ProjectCostLine,
     BOMAllocation,
@@ -28,7 +30,7 @@ class BOMAllocationSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "status", "allocated_by", "created_at"]
 
 
-class ProjectBOMLineSerializer(serializers.ModelSerializer):
+class ProjectBOMLineSerializer(HidesMoney, serializers.ModelSerializer):
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     device_model_name = serializers.CharField(source="device_model.name", read_only=True, default=None)
     material_type_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
@@ -233,7 +235,7 @@ class ProjectDetailSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerial
         return phase_progress(obj)
 
 
-class ProjectCostLineSerializer(serializers.ModelSerializer):
+class ProjectCostLineSerializer(HidesMoney, serializers.ModelSerializer):
     """An overhead line on a project's cost plan."""
 
     amount = serializers.SerializerMethodField()
