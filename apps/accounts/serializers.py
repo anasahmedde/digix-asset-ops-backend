@@ -3,7 +3,7 @@ from rest_framework import serializers
 
 from common.permissions import ADMIN_ROLES
 
-from .models import AuditLog
+from .models import AuditLog, RoleDefinition
 
 User = get_user_model()
 
@@ -59,7 +59,12 @@ class UserSerializer(serializers.ModelSerializer):
     def get_fields(self):
         fields = super().get_fields()
         request = self.context.get("request")
-        if not _is_super_admin(getattr(request, "user", None)):
+        actor = getattr(request, "user", None)
+        # Managing people is a capability; whoever holds it writes the whole
+        # record, not just their own profile fields.
+        can = getattr(actor, "can", None)
+        may_manage = _is_super_admin(actor) or (callable(can) and can("manage_team"))
+        if not may_manage:
             # Non-admins can only edit safe profile fields; everything else
             # (role, is_active, HR fields, username, ...) becomes read-only.
             for name, field in fields.items():
@@ -136,3 +141,50 @@ class CapabilitySetSerializer(serializers.Serializer):
     """The whole set of adjustments for one person, replacing what was there."""
 
     overrides = CapabilityOverrideSerializer(many=True)
+
+
+class RoleDefinitionSerializer(serializers.ModelSerializer):
+    """A role and the capabilities it grants."""
+
+    holders = serializers.IntegerField(read_only=True)
+    created_by_name = serializers.SerializerMethodField()
+    # Derived from the label when a role is written; fixed thereafter,
+    # because every account stores it.
+    key = serializers.SlugField(max_length=50, required=False)
+
+    def get_created_by_name(self, obj):
+        who = obj.created_by
+        return (who.get_full_name() or who.username) if who else None
+
+    class Meta:
+        model = RoleDefinition
+        fields = [
+            "id", "key", "label", "description", "capabilities",
+            "is_builtin", "is_active", "holders", "created_by_name",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "is_builtin", "created_at", "updated_at"]
+
+    def validate_capabilities(self, value):
+        from .capabilities import ALL_KEYS
+
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Send a list of capability keys.")
+        unknown = sorted(set(value) - ALL_KEYS)
+        if unknown:
+            raise serializers.ValidationError(f"No such capability: {', '.join(unknown)}.")
+        return sorted(set(value))
+
+    def validate_key(self, value):
+        # The key is what every account stores, so it is fixed once set.
+        if self.instance and value != self.instance.key:
+            raise serializers.ValidationError(
+                "A role's key cannot change — accounts are stored against it. "
+                "Rename the label instead."
+            )
+        return value
+
+    def validate_label(self, value):
+        if not value.strip():
+            raise serializers.ValidationError("Give the role a name.")
+        return value.strip()

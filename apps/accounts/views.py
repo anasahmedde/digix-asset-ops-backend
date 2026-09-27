@@ -3,6 +3,7 @@ from django.db import transaction
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
@@ -10,10 +11,11 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 
 from common.permissions import ADMIN_ROLES, IsSuperAdmin
 
-from .models import AuditLog, UserCapability
+from .models import AuditLog, RoleDefinition, UserCapability
 from .serializers import (
     AuditLogSerializer,
     CapabilitySetSerializer,
+    RoleDefinitionSerializer,
     UserCreateSerializer,
     UserSerializer,
 )
@@ -75,6 +77,11 @@ class IsSelfOrSuperAdmin(BasePermission):
         user = request.user
         if user.is_superuser or getattr(user, "role", None) in ADMIN_ROLES:
             return True
+        # Managing people is a capability now, so whoever holds it may do
+        # it — not only the one role that used to be hardcoded here.
+        can = getattr(user, "can", None)
+        if callable(can) and can("manage_team"):
+            return True
         # Setting somebody's capabilities has its own, finer gate: a team
         # lead may do it for their own team, which this rule cannot express.
         if getattr(view, "action", None) == "capabilities":
@@ -105,7 +112,7 @@ class UserViewSet(viewsets.ModelViewSet):
         subject = self.get_object()
 
         if request.method == "GET":
-            from .capabilities import defaults_for
+            from .roles import defaults_for
 
             allowed, why = may_set_capabilities(request.user, subject)
             return Response({
@@ -148,7 +155,7 @@ class UserViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
-        from .capabilities import defaults_for
+        from .roles import defaults_for
 
         defaults = defaults_for(subject.role)
         with transaction.atomic():
@@ -227,12 +234,14 @@ class CapabilityCatalogueView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        from .capabilities import MODULES, ROLE_DEFAULTS, catalogue
+        from .capabilities import MODULES, catalogue
+        from .roles import capability_map, ensure_seeded
 
+        ensure_seeded()
         return Response({
             "capabilities": catalogue(),
             "modules": list(MODULES),
-            "role_defaults": {role: sorted(keys) for role, keys in ROLE_DEFAULTS.items()},
+            "role_defaults": {role: sorted(keys) for role, keys in capability_map().items()},
         })
 
 
@@ -254,3 +263,70 @@ def may_set_capabilities(actor, subject) -> tuple[bool, str]:
     if actor.manages(subject):
         return True, ""
     return False, "You can only change permissions for people who report to you."
+
+
+class ManagesPermissions(BasePermission):
+    """Reading roles is open; changing them needs the capability."""
+
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
+            return True
+        can = getattr(request.user, "can", None)
+        return bool(callable(can) and can("manage_permissions"))
+
+
+class RoleDefinitionViewSet(viewsets.ModelViewSet):
+    """The roles themselves: what each one allows, and new ones.
+
+    Everyone may read them — knowing what a role means is how you pick the
+    right one — and ``manage_permissions`` is needed to change them.
+    """
+
+    serializer_class = RoleDefinitionSerializer
+    permission_classes = [IsAuthenticated, ManagesPermissions]
+
+    def get_queryset(self):
+        from .roles import ensure_seeded
+
+        ensure_seeded()
+        return RoleDefinition.objects.all()
+
+    def perform_create(self, serializer):
+        from django.utils.text import slugify
+
+        label = serializer.validated_data["label"]
+        key = serializer.validated_data.get("key") or slugify(label).replace("-", "_")[:50]
+        if RoleDefinition.objects.filter(key=key).exists():
+            raise ValidationError({"key": [f"A role keyed '{key}' already exists."]})
+        serializer.save(key=key, is_builtin=False, created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        role = serializer.instance
+        # Nobody hands out through a role what they could not hand out
+        # directly — the same rule as setting one person's capabilities.
+        actor = self.request.user
+        if actor.role not in ("super_admin", "group_head"):
+            wanted = set(serializer.validated_data.get("capabilities", role.capabilities))
+            overreach = sorted(wanted - set(role.capabilities) - actor.capabilities)
+            if overreach:
+                raise PermissionDenied(
+                    f"You cannot grant what you do not have yourself: {', '.join(overreach)}."
+                )
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if instance.is_builtin:
+            raise ValidationError({
+                "detail": [
+                    "A built-in role cannot be deleted — accounts are stored against it. "
+                    "Switch it off instead, or empty its capabilities."
+                ]
+            })
+        holders = instance.holders
+        if holders:
+            raise ValidationError({
+                "detail": [
+                    f"{holders} person(s) still hold this role. Move them to another one first."
+                ]
+            })
+        instance.delete()
