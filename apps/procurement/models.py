@@ -53,7 +53,10 @@ class PurchaseOrder(TimeStampedModel):
     VALID_TRANSITIONS = {
         Status.DRAFT: (Status.PENDING_APPROVAL, Status.CANCELLED),
         Status.PENDING_APPROVAL: (Status.APPROVED, Status.DRAFT, Status.CANCELLED),
-        Status.APPROVED: (Status.ORDERED, Status.CANCELLED),
+        # Approval places the order — the Group Head's signature is what
+        # commits the company — so an approved order is received against
+        # directly. "Ordered" remains only for rows that reached it before.
+        Status.APPROVED: (Status.PARTIALLY_RECEIVED, Status.RECEIVED, Status.CANCELLED),
         Status.ORDERED: (Status.PARTIALLY_RECEIVED, Status.RECEIVED, Status.CANCELLED),
         Status.PARTIALLY_RECEIVED: (Status.RECEIVED, Status.CANCELLED),
         Status.RECEIVED: (),

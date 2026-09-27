@@ -556,6 +556,12 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         new_status = ser.validated_data["status"]
         notes = ser.validated_data.get("notes", "").strip()
 
+        # The date can arrive with the move: an order written without one
+        # is given it here, at the moment it matters.
+        given_delivery = ser.validated_data.get("expected_delivery")
+        if given_delivery and not purchase_order.expected_delivery:
+            purchase_order.expected_delivery = given_delivery
+
         # A supplier cannot promise what nobody asked for: an order leaving
         # draft says when the goods are needed by. A draft is still being
         # written, so it is free to be incomplete.
@@ -579,6 +585,8 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             )
 
         update_fields = ["status", "updated_at"]
+        if given_delivery and "expected_delivery" not in update_fields:
+            update_fields.append("expected_delivery")
         old_status_display = purchase_order.get_status_display()
         purchase_order.status = new_status
         if new_status == PurchaseOrder.Status.CANCELLED:

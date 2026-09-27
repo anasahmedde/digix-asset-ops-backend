@@ -22,6 +22,7 @@ from apps.inventory.models import GoodsReceipt, GoodsReceiptLine
 from .models import PurchaseOrder
 
 RECEIVABLE_STATUSES = (
+    PurchaseOrder.Status.APPROVED,
     PurchaseOrder.Status.ORDERED,
     PurchaseOrder.Status.PARTIALLY_RECEIVED,
 )

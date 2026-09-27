@@ -254,7 +254,8 @@ def test_full_transition_flow_and_approved_by_stamp(people, supplier):
     assert po.status == "approved"
     assert po.approved_by == people["group_head"]  # the signature is the Group Head's
 
-    assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "ordered"}, format="json").status_code == 200
+    # Approval placed the order: goods are received against it directly.
+    assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "ordered"}, format="json").status_code == 400
     assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "partially_received"}, format="json").status_code == 200
     assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "received"}, format="json").status_code == 200
     # received is terminal
@@ -855,7 +856,9 @@ def test_receive_over_receive_400(people, receivable_po):
 @pytest.mark.django_db
 def test_receive_rejected_for_wrong_po_status(people, supplier, receivable_po):
     c = _client(people["finance"])
-    for bad_status in ("draft", "pending_approval", "approved", "received", "cancelled"):
+    # Approved is receivable now — approval is what places the order — so the
+    # statuses that still refuse goods are the ones either side of it.
+    for bad_status in ("draft", "pending_approval", "received", "cancelled"):
         po = PurchaseOrder.objects.create(supplier=supplier, status=bad_status, expected_delivery=timezone.localdate())
         item = PurchaseOrderItem.objects.create(
             purchase_order=po, description="Line", quantity=1, unit_price=Decimal("1.00"),
@@ -1061,7 +1064,7 @@ def test_receiving_a_product_line_only_needs_serials(people, requisitions, suppl
     po_id = po_resp.data["id"]
     item_id = po_resp.data["items"][0]["id"]
 
-    for st in ("pending_approval", "approved", "ordered"):
+    for st in ("pending_approval", "approved"):
         # Approval is the Group Head's step; the rest is Operations/Finance.
         mover = _client(people["group_head"]) if st == "approved" else c
         r_st = mover.post(f"/api/procurement/purchase-orders/{po_id}/transition/", {"status": st}, format="json")
@@ -1289,8 +1292,6 @@ def test_receiving_a_complete_asset_asks_for_no_serial_number(people, supplier):
     assert gh.post(f"/api/procurement/purchase-orders/{po_id}/transition/",
                    {"status": "approved"}, format="json").status_code == 200
     store = _client(people["finance"])
-    assert store.post(f"/api/procurement/purchase-orders/{po_id}/transition/",
-                      {"status": "ordered"}, format="json").status_code == 200
 
     # No serial_numbers key at all — the receipt is accepted.
     r = _receive(store, po_id, [{"po_item": item_id, "quantity": 1}])
@@ -1368,7 +1369,7 @@ def test_a_charge_on_an_order_is_not_goods_to_receive():
     charge_row = next(i for i in r.data["items"] if i["is_charge"])
     assert charge_row["line_detail"] == "charge, not goods"
 
-    for who, status in ((c, "pending_approval"), (head, "approved"), (c, "ordered")):
+    for who, status in ((c, "pending_approval"), (head, "approved")):
         r = who.post(f"/api/procurement/purchase-orders/{po.id}/transition/", {"status": status}, format="json")
         assert r.status_code == 200, (status, r.content)
 

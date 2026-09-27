@@ -137,7 +137,11 @@ class Device(TimeStampedModel):
             Status.UNDER_MAINTENANCE, Status.RMA, Status.CLIENT_PROPERTY,
             Status.IN_TRANSIT, Status.DECOMMISSIONED, Status.LOST_STOLEN,
         ),
-        Status.UNDER_MAINTENANCE: (Status.ACTIVE, Status.RMA, Status.DECOMMISSIONED),
+        # Servicing can end in a handover as readily as in a return to
+        # service: the asset is put right and given to the client.
+        Status.UNDER_MAINTENANCE: (
+            Status.ACTIVE, Status.RMA, Status.CLIENT_PROPERTY, Status.DECOMMISSIONED,
+        ),
         Status.RMA: (Status.IN_STOCK, Status.DECOMMISSIONED),
         Status.CLIENT_PROPERTY: (Status.DECOMMISSIONED,),
         Status.LOST_STOLEN: (Status.IN_STOCK,),

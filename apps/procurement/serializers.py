@@ -313,6 +313,9 @@ class PurchaseOrderReceiveSerializer(serializers.Serializer):
 class PurchaseOrderTransitionSerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=PurchaseOrder.Status.choices)
     notes = serializers.CharField(required=False, allow_blank=True)
+    # A draft may be given its delivery date on the way out, rather than
+    # bounced for not having one.
+    expected_delivery = serializers.DateField(required=False, allow_null=True)
 
     def validate_status(self, value):
         purchase_order = self.context["purchase_order"]
