@@ -234,6 +234,14 @@ class InventoryUnit(TimeStampedModel):
     converted_device = models.OneToOneField(
         "assets.Device", on_delete=models.SET_NULL, null=True, blank=True, related_name="source_inventory_unit"
     )
+    # The requirement this unit was issued against, once it has been fitted
+    # into an asset's build. A requirement takes as many units as it needs, so
+    # this is the record of which ones — the asset names its serials, and the
+    # unit says where it went.
+    fitted_to = models.ForeignKey(
+        "assets.AssetComponent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="fitted_units",
+    )
     notes = models.TextField(blank=True)
 
     class Meta:

@@ -251,6 +251,15 @@ class AssetComponentSerializer(serializers.ModelSerializer):
     )
     inventory_item_sku = serializers.CharField(source="inventory_item.sku", read_only=True, default=None)
     inventory_unit_code = serializers.CharField(source="inventory_unit.unit_code", read_only=True, default=None)
+    # Every unit fitted against this requirement, by serial — a line for three
+    # players is built from three particular players.
+    fitted_serials = serializers.SerializerMethodField()
+
+    def get_fitted_serials(self, obj):
+        serials = [u.serial_number for u in obj.fitted_units.all() if u.serial_number]
+        if not serials and obj.inventory_unit_id and obj.inventory_unit.serial_number:
+            serials = [obj.inventory_unit.serial_number]
+        return serials
     # StringRelatedField, not source="…__str__": with no related row DRF walks
     # to a bound method-wrapper on None and renders it verbatim.
     inventory_unit_type_name = serializers.StringRelatedField(
@@ -278,7 +287,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
     class Meta:
         model = AssetComponent
         fields = [
-            "id", "device", "name", "component_type", "serial_number",
+            "id", "device", "name", "component_type", "serial_number", "fitted_serials",
             "quantity", "supplier", "supplier_name",
             "inventory_item", "inventory_item_name", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name", "available_quantity",

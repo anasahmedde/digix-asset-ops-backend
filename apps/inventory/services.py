@@ -145,7 +145,9 @@ def issue_stock_for_component(component, user, quantity, *, via_request=None):
             })
         for unit in units:
             unit.status = InventoryUnit.Status.ISSUED
-            unit.save(update_fields=["status", "updated_at"])
+            # Which asset it went into: the requirement knows its device.
+            unit.fitted_to = component
+            unit.save(update_fields=["status", "fitted_to", "updated_at"])
             issued_units.append(unit)
         # Record the first serial on the requirement when it covers one unit.
         if component.inventory_unit_id is None and len(units) == 1:

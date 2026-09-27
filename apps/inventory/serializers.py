@@ -182,6 +182,20 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
 
 
 class InventoryUnitSerializer(serializers.ModelSerializer):
+    # Where the unit ended up, once it was fitted into an asset's build.
+    fitted_to_asset = serializers.SerializerMethodField()
+
+    def get_fitted_to_asset(self, obj):
+        component = obj.fitted_to
+        if component is None:
+            return None
+        device = component.device
+        return {
+            "device": str(device.pk),
+            "asset_code": device.asset_code,
+            "asset_name": device.display_name or (device.asset_type.name if device.asset_type_id else ""),
+            "component": component.name,
+        }
     """Serialized ("unique") inventory items — one row per physical unit."""
 
     material_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
@@ -220,7 +234,7 @@ class InventoryUnitSerializer(serializers.ModelSerializer):
             "goods_receipt_line", "grn_number", "po_number",
             "has_warranty", "warranty_type", "warranty_start", "warranty_months", "warranty_end",
             "warranty_state", "is_under_warranty",
-            "converted_device", "converted_device_code",
+            "converted_device", "converted_device_code", "fitted_to", "fitted_to_asset",
             "notes", "created_at", "updated_at",
         ]
         read_only_fields = [
