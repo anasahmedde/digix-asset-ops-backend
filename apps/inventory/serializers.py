@@ -830,16 +830,36 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
     def get_project_name(self, obj):
         if obj.project_id:
             return obj.project.name
-        component = obj.asset_component
-        if component is not None:
-            project = component.device.project_on
+        device = self._device(obj)
+        if device is not None:
+            project = device.project_on
             if project is not None:
                 return project.name
         return None
 
-    asset_code = serializers.CharField(
-        source="asset_component.device.asset_code", read_only=True, default=None
+    def _device(self, obj):
+        """The asset the material is for, whichever way it was asked for."""
+        if obj.asset_component_id:
+            return obj.asset_component.device
+        if obj.maintenance_schedule_id:
+            return obj.maintenance_schedule.device
+        return None
+
+    # A maintenance job names its asset too: the store is handing parts over
+    # for a particular standee, not for a job title.
+    asset_code = serializers.SerializerMethodField()
+    asset_name = serializers.SerializerMethodField()
+    maintenance_type = serializers.CharField(
+        source="maintenance_schedule.get_maintenance_type_display", read_only=True, default=None,
     )
+
+    def get_asset_code(self, obj):
+        device = self._device(obj)
+        return device.asset_code if device is not None else None
+
+    def get_asset_name(self, obj):
+        device = self._device(obj)
+        return (device.display_name or "") if device is not None else None
     component_name = serializers.CharField(
         source="asset_component.name", read_only=True, default=None
     )
@@ -917,7 +937,8 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "source", "source_display", "purpose",
             "project", "project_name", "asset_component", "asset_code", "component_name",
             "next_units", "unit_type_code", "asset_name",
-            "maintenance_schedule", "maintenance_title", "maintenance_assignee",
+            "maintenance_schedule", "maintenance_title", "maintenance_type", "maintenance_assignee",
+            "asset_name",
             "requested_by", "requested_by_name", "issued_by", "issued_by_name",
             "received_by", "issued_serials", "issued_units", "handovers", "last_issued_at", "awaiting_procurement", "po_number",
             "procured", "po_received_quantity",

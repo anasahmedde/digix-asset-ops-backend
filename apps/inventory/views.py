@@ -740,6 +740,22 @@ class LowStockView(APIView):
             .select_related("purchase_order_item__purchase_order")
         })
 
+        declines = {}
+        for r in (
+            ReorderRequest.objects.filter(status=ReorderRequest.Status.CANCELLED)
+            .exclude(declined_at=None).select_related("declined_by").order_by("declined_at")
+        ):
+            key = ("item", r.item_id) if r.item_id else ("unit_type", r.unit_type_id)
+            who = r.declined_by
+            declines[key] = {
+                "reason": r.declined_reason,
+                "at": r.declined_at,
+                "by": (who.get_full_name() or who.username) if who else None,
+            }
+
+        def last_decline(kind, pk):
+            return declines.get((kind, pk))
+
         def open_request(kind, pk):
             r = live.get((kind, pk))
             if r is None:
@@ -765,6 +781,7 @@ class LowStockView(APIView):
                 "shortfall": max(it.min_stock_level - it.quantity, 0),
                 "unit_cost": it.unit_cost,
                 "open_request": open_request("item", it.pk),
+                "last_decline": last_decline("item", it.pk),
             })
         products = InventoryUnitType.objects.filter(min_stock_level__gt=0, is_active=True).order_by("name")
         for p in products:
@@ -777,6 +794,7 @@ class LowStockView(APIView):
                 "shortfall": max(p.min_stock_level - on_hand, 0),
                 "unit_cost": p.unit_cost,
                 "open_request": open_request("unit_type", p.pk),
+                "last_decline": last_decline("unit_type", p.pk),
             })
         return Response({"results": rows, "count": len(rows), "unrequested": sum(1 for r in rows if not r["open_request"])})
 

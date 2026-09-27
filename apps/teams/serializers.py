@@ -190,6 +190,12 @@ class ProjectDetailSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerial
     phase_display = serializers.CharField(source="get_phase_display", read_only=True)
     contract_type_display = serializers.CharField(source="get_contract_type_display", read_only=True)
     progress = serializers.SerializerMethodField()
+    # Where the work stands regardless of an off-ramp: what a project comes
+    # back to when On Hold or Order Lost is lifted.
+    resume_phase = serializers.SerializerMethodField()
+
+    def get_resume_phase(self, obj):
+        return obj.phase_from_work(ignore_off_ramp=True)
 
     class Meta:
         model = Project
@@ -197,7 +203,7 @@ class ProjectDetailSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerial
             "id", "name", "description", "location", "image",
             "client", "client_name", "client_contact_person", "client_contact_phone",
             "site", "site_name",
-            "status", "status_display", "phase", "phase_display",
+            "status", "status_display", "phase", "phase_display", "resume_phase",
             "contract_type", "contract_type_display", "rental_end_date",
             "progress", "start_date", "target_date", "completed_date",
             "manager", "manager_name", "budget", "notes", "sites", "site_names",

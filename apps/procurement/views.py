@@ -133,10 +133,22 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             # A stock reorder has no project; it is simply withdrawn, reason on record.
             if reorder.status == ReorderRequest.Status.ORDERED:
                 return Response({"detail": f"'{reorder.name}' is already on {reorder.purchase_order_item.purchase_order.po_number} — cancel that order first."}, status=400)
+            from django.utils import timezone as _tz
+
             reorder.status = ReorderRequest.Status.CANCELLED
             reorder.notes = (reorder.notes + "\n" if reorder.notes else "") + f"Sent back by Procurement: {reason}"
-            reorder.save(update_fields=["status", "notes", "updated_at"])
-            return Response({"detail": f"The reorder of {reorder.name} is withdrawn; Inventory can raise it again."})
+            reorder.declined_reason = reason
+            reorder.declined_at = _tz.now()
+            reorder.declined_by = request.user
+            reorder.save(update_fields=[
+                "status", "notes", "declined_reason", "declined_at", "declined_by", "updated_at",
+            ])
+            return Response({
+                "detail": (
+                    f"The reorder of {reorder.name} goes back to the store — it is off the buying "
+                    f"list, and Inventory sees why under Low Stock."
+                )
+            })
 
         component = AssetComponent.objects.filter(pk=request.data.get("component")).select_related("device").first()
         device = Device.objects.filter(pk=request.data.get("device")).first() if not component else None
