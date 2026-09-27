@@ -870,7 +870,7 @@ def test_receive_line_without_type_400(people, supplier):
     )
     r = _receive(_client(people["finance"]), po.pk, [{"po_item": str(untyped.pk), "quantity": 2}])
     assert r.status_code == 400, r.content
-    assert "no unique product, device model or material type" in str(r.json())
+    assert "names no component or asset" in str(r.json())
 
 
 @pytest.mark.django_db
@@ -1310,3 +1310,112 @@ def test_two_assets_with_no_serial_can_both_exist(people, supplier):
     b.serial_number = "MFR-REAL-1"
     with pytest.raises(Exception):
         b.save(update_fields=["serial_number"])
+
+
+
+@pytest.mark.django_db
+def test_a_charge_on_an_order_is_not_goods_to_receive():
+    """Delivery charges are money owed, not something that arrives at the door.
+
+    An order carrying a cable and a delivery charge is complete once the cable
+    is in, and receiving cannot be asked to take delivery of the charge.
+    """
+    from apps.accounts.models import User
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem
+    from apps.procurement.models import PurchaseOrder
+    from apps.suppliers.models import Supplier
+    from rest_framework.test import APIClient
+
+    # Operations raise the order, the Group Head signs it off, the store
+    # receives against it — three hands, as on a real order.
+    c = APIClient()
+    c.force_authenticate(User.objects.create_user(username="charge-ops", password="x", role="ops_manager"))
+    head = APIClient()
+    head.force_authenticate(User.objects.create_user(username="charge-head", password="x", role="group_head"))
+    store = APIClient()
+    store.force_authenticate(User.objects.create_user(username="charge-fin", password="x", role="finance"))
+    supplier = Supplier.objects.create(name="Charge Supplies")
+    cable = InventoryItem.objects.create(
+        material_type=MaterialType.objects.create(name="Charge Cable", unit="meter"), quantity=0,
+    )
+
+    r = c.post("/api/procurement/purchase-orders/", {
+        "supplier": str(supplier.id), "currency": "PKR",
+        "supplier_details": "Quote Q-118 · deliver to the Multan store",
+        "items": [
+            {"description": "Charge Cable", "quantity": 10, "unit_price": "50.00",
+             "inventory_item": str(cable.id)},
+            {"description": "Delivery charges", "quantity": 1, "unit_price": "1500.00", "is_charge": True},
+        ],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    po = PurchaseOrder.objects.get(pk=r.data["id"])
+    assert po.supplier_details.startswith("Quote Q-118")
+    assert str(po.total_amount) == "2000.00", "the charge still counts in the total"
+    charge = po.items.get(is_charge=True)
+    goods = po.items.get(is_charge=False)
+    charge_row = next(i for i in r.data["items"] if i["is_charge"])
+    assert charge_row["line_detail"] == "charge, not goods"
+
+    for who, status in ((c, "pending_approval"), (head, "approved"), (c, "ordered")):
+        r = who.post(f"/api/procurement/purchase-orders/{po.id}/transition/", {"status": status}, format="json")
+        assert r.status_code == 200, (status, r.content)
+
+    # Nothing arrives for a charge.
+    r = store.post(f"/api/procurement/purchase-orders/{po.id}/receive/", {
+        "lines": [{"po_item": str(charge.id), "quantity": 1}],
+    }, format="json")
+    assert r.status_code == 400, r.content
+    assert "charge" in str(r.data).lower()
+
+    # The goods arriving is the whole delivery.
+    r = store.post(f"/api/procurement/purchase-orders/{po.id}/receive/", {
+        "lines": [{"po_item": str(goods.id), "quantity": 10}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    po.refresh_from_db()
+    assert po.status == PurchaseOrder.Status.RECEIVED, "the charge does not hold the order open"
+
+    # And the printed order carries the supplier's particulars.
+    r = c.get(f"/api/procurement/purchase-orders/{po.id}/document/")
+    assert r.status_code == 200
+    assert r["Content-Type"].startswith("application/pdf")
+
+
+@pytest.mark.django_db
+def test_an_order_can_buy_an_asset_already_registered():
+    """An asset bought complete is registered first, then ordered by name."""
+    from apps.accounts.models import User
+    from apps.assets.models import AssetType, Device
+    from apps.procurement.models import PurchaseOrder
+    from apps.suppliers.models import Supplier
+    from rest_framework.test import APIClient
+
+    boss = User.objects.create_user(username="asset-boss", password="x", role="ops_manager")
+    c = APIClient()
+    c.force_authenticate(boss)
+    supplier = Supplier.objects.create(name="Standee Makers")
+    kind = AssetType.objects.create(name="Bought Standee")
+    device = Device.objects.create(asset_type=kind, status=Device.Status.PROCURED)
+
+    r = c.post("/api/procurement/purchase-orders/", {
+        "supplier": str(supplier.id), "currency": "PKR",
+        "items": [{"description": "Standee, complete", "quantity": 1, "unit_price": "90000.00",
+                   "device": str(device.id)}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    device.refresh_from_db()
+    po = PurchaseOrder.objects.get(pk=r.data["id"])
+    assert device.procurement_item.purchase_order_id == po.id
+    assert r.data["items"][0]["procured_device"] == str(device.id)
+    assert r.data["items"][0]["procured_asset_codes"] == [device.asset_code]
+
+    # One asset is bought once.
+    r = c.post("/api/procurement/purchase-orders/", {
+        "supplier": str(supplier.id), "currency": "PKR",
+        "items": [{"description": "Standee again", "quantity": 1, "unit_price": "1.00",
+                   "device": str(device.id)}],
+    }, format="json")
+    assert r.status_code == 400, r.content
+    assert po.po_number in str(r.data)

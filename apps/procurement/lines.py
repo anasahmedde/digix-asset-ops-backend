@@ -69,6 +69,8 @@ def line_text(title: str, detail: str) -> str:
 def describe_item(item) -> tuple[str, str]:
     """(title, detail) for an existing PO line, from what it points at; falls
     back to the stored text so older orders still read sensibly."""
+    if getattr(item, "is_charge", False):
+        return item.description or "Charge", "charge, not goods"
     # A component on an asset's build that this line was raised to cover.
     components = list(item.asset_components.all()) if hasattr(item, "asset_components") else []
     if components:

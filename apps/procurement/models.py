@@ -36,6 +36,10 @@ class PurchaseOrder(TimeStampedModel):
     expected_delivery = models.DateField(null=True, blank=True)
     total_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     notes = models.TextField(blank=True)
+    # The supplier's particulars for this order — a contact, a quote
+    # reference, a delivery address — where they differ from the supplier's
+    # standing record. Printed on the order under the supplier.
+    supplier_details = models.TextField(blank=True)
     # Printed on the order the supplier receives. Seeded from the house
     # standard, then edited per order when a deal says something different.
     terms = models.TextField(blank=True)
@@ -115,6 +119,10 @@ class PurchaseOrderItem(TimeStampedModel):
     quantity = models.IntegerField(default=1)
     unit_price = models.DecimalField(max_digits=10, decimal_places=2)
     received_quantity = models.IntegerField(default=0)
+    # Delivery, installation, a service fee: money on the order that is not
+    # goods. Nothing arrives at the door for it, so receiving skips it and the
+    # order can complete without it.
+    is_charge = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["id"]

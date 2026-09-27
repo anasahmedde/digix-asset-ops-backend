@@ -42,6 +42,12 @@ def _validate_lines(purchase_order, lines):
             )
         line["_po_item"] = po_item
 
+        # Money on the order is not goods at the door.
+        if po_item.is_charge:
+            raise serializers.ValidationError({
+                label: f"'{po_item.description}' is a charge, not goods — there is nothing to receive."
+            })
+
         remaining = po_item.quantity - po_item.received_quantity
         if line["quantity"] > remaining:
             raise serializers.ValidationError({
@@ -71,10 +77,15 @@ def _validate_lines(purchase_order, lines):
                 })
             if any(not s for s in serials):
                 raise serializers.ValidationError({label: "Serial numbers cannot be blank."})
-        elif not po_item.material_type_id:
-            raise serializers.ValidationError(
-                {label: "line has no unique product, device model or material type"}
-            )
+        # Generic stock is counted, not serialised: the line names the stock
+        # row (or its material) and the quantity is all the door needs.
+        elif not (po_item.inventory_item_id or po_item.material_type_id):
+            raise serializers.ValidationError({
+                label: (
+                    f"'{po_item.description}' names no component or asset — receiving cannot "
+                    f"tell what it is. Name one on the order, or mark the line as a charge."
+                )
+            })
         all_serials.extend(serials)
 
     # Serial uniqueness — within the payload and globally against Device.
@@ -185,7 +196,8 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
         # status directly (bypassing the role-gated endpoint) and journal it
         # with the Wave-1 notes-append pattern tagged by GRN.
         fully_received = all(
-            item.received_quantity >= item.quantity for item in po_items.values()
+            item.received_quantity >= item.quantity
+            for item in po_items.values() if not item.is_charge
         )
         new_status = (
             PurchaseOrder.Status.RECEIVED if fully_received
