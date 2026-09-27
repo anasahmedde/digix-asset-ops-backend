@@ -109,33 +109,47 @@ def close_corrective_jobs(device, user=None, reason: str = "", *, returned_to_se
     return records
 
 
-def job_for_ticket(ticket, user=None):
-    """The corrective job a ticket causes, opened the first time it is asked for.
+def jobs_for_ticket(ticket, user=None, devices=None):
+    """The corrective jobs a ticket causes — one per asset it names.
 
-    A ticket is a complaint about an asset; the work it causes belongs in the
-    maintenance register with every other repair, so raising one opens the job
-    there instead of leaving the register ignorant of it.
+    A ticket is a complaint; the work it causes belongs in the maintenance
+    register with every other repair. One ticket can cover several assets,
+    but each is its own repair — attended, parted and closed out on its own —
+    so each gets its own job. Opened the first time they are asked for.
     """
-    device = ticket.device
-    if device is None:
-        return None
-    existing = MaintenanceSchedule.objects.filter(ticket=ticket).first()
-    if existing is not None:
-        return existing
-    job = open_corrective_job(
-        device,
-        user=user,
-        reason=ticket.title,
-        details={
-            "priority": _job_priority(ticket.priority),
-            "next_due": ticket.due_date,
-            "instructions": ticket.description,
-            "assigned_to": ticket.assigned_to,
-        },
-        ticket=ticket,
-    )
-    take_out_of_service(device, user, ticket)
-    return job
+    named = list(devices) if devices is not None else [
+        d for d in [ticket.device, *ticket.devices.all()] if d is not None
+    ]
+    jobs = []
+    seen = set()
+    for device in named:
+        if device.pk in seen:
+            continue
+        seen.add(device.pk)
+        existing = MaintenanceSchedule.objects.filter(ticket=ticket, device=device).first()
+        if existing is not None:
+            jobs.append(existing)
+            continue
+        jobs.append(open_corrective_job(
+            device,
+            user=user,
+            reason=ticket.title,
+            details={
+                "priority": _job_priority(ticket.priority),
+                "next_due": ticket.due_date,
+                "instructions": ticket.description,
+                "assigned_to": ticket.assigned_to,
+            },
+            ticket=ticket,
+        ))
+        take_out_of_service(device, user, ticket)
+    return jobs
+
+
+def job_for_ticket(ticket, user=None):
+    """The job for the ticket's primary asset, for callers that want one."""
+    jobs = jobs_for_ticket(ticket, user)
+    return jobs[0] if jobs else None
 
 
 def take_out_of_service(device, user=None, ticket=None):
@@ -170,39 +184,40 @@ def _job_priority(ticket_priority):
 
 
 def close_job_for_ticket(ticket, user=None):
-    """A ticket that is done closes the job it raised.
+    """A ticket that is done closes every job it raised.
 
     The repair is over whichever screen it was finished on, so the register
-    files its completion record rather than leaving the job open for ever.
+    files each job's completion record rather than leaving it open for ever.
     """
-    job = MaintenanceSchedule.objects.filter(ticket=ticket).exclude(
-        status=MaintenanceSchedule.Status.COMPLETED
-    ).first()
-    if job is None or job.device_id is None:
-        return []
     from apps.warranties.services import derive_billability
 
-    _, billable, charge = derive_billability(job.device)
-    now = timezone.now()
-    record = MaintenanceRecord.objects.create(
-        schedule=job,
-        performed_by=user,
-        performed_at=now,
-        status=MaintenanceRecord.Status.COMPLETED,
-        notes=f"Closed with {ticket.ticket_number}",
-        is_billable=billable,
-        charge_to=charge,
+    jobs = MaintenanceSchedule.objects.filter(ticket=ticket, device__isnull=False).exclude(
+        status=MaintenanceSchedule.Status.COMPLETED
     )
-    visit = job.visits.filter(status__in=("planned", "in_progress")).first()
-    if visit is not None:
-        visit.record = record
-        visit.status = "completed"
-        visit.save(update_fields=["record", "status", "updated_at"])
-    job.advance_after_completion(now.date())
-    # The repair is over, so the asset goes back into service — unless
-    # something else is still open against it.
-    return_to_service_if_done(record, user)
-    return [record]
+    now = timezone.now()
+    records = []
+    for job in jobs:
+        _, billable, charge = derive_billability(job.device)
+        record = MaintenanceRecord.objects.create(
+            schedule=job,
+            performed_by=user,
+            performed_at=now,
+            status=MaintenanceRecord.Status.COMPLETED,
+            notes=f"Closed with {ticket.ticket_number}",
+            is_billable=billable,
+            charge_to=charge,
+        )
+        visit = job.visits.filter(status__in=("planned", "in_progress")).first()
+        if visit is not None:
+            visit.record = record
+            visit.status = "completed"
+            visit.save(update_fields=["record", "status", "updated_at"])
+        job.advance_after_completion(now.date())
+        # The repair is over, so the asset goes back into service — unless
+        # something else is still open against it.
+        return_to_service_if_done(record, user)
+        records.append(record)
+    return records
 
 
 def return_to_service_if_done(record, user=None):

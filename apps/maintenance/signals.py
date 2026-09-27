@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from django.db.models.signals import post_save
+from django.db.models.signals import m2m_changed, post_save
 from django.dispatch import receiver
 
 from apps.assets.models import Device
@@ -76,14 +76,39 @@ def raise_the_job_a_ticket_causes(sender, instance, created, **kwargs):
     """
     from apps.tickets.models import Ticket
 
-    from .services import close_job_for_ticket, job_for_ticket
+    from .services import close_job_for_ticket, jobs_for_ticket
 
-    if instance.device_id is None:
-        return
     try:
         if created:
-            job_for_ticket(instance, getattr(instance, "_transition_user", None))
+            jobs_for_ticket(instance, getattr(instance, "_transition_user", None))
         elif instance.status in (Ticket.Status.CLOSED, Ticket.Status.APPROVED):
             close_job_for_ticket(instance, getattr(instance, "_transition_user", None))
     except Exception:  # pragma: no cover - a ticket is never blocked by this
         logger.exception("Could not keep the maintenance register in step with ticket %s", instance.pk)
+
+
+@receiver(m2m_changed, sender="tickets.Ticket_devices")
+def raise_a_job_for_each_asset_added(sender, instance, action, pk_set, **kwargs):
+    """The other assets on a ticket are attached after the ticket is saved.
+
+    Each is its own repair, so each gets its own job the moment it joins the
+    ticket — while the ticket is open, that is; an asset added to a closed one
+    is a correction of the record, not new work.
+    """
+    from apps.assets.models import Device
+    from apps.tickets.models import Ticket
+
+    from .services import jobs_for_ticket
+
+    if action != "post_add" or not pk_set:
+        return
+    if instance.status in (Ticket.Status.CLOSED, Ticket.Status.APPROVED, Ticket.Status.REJECTED):
+        return
+    try:
+        jobs_for_ticket(
+            instance,
+            getattr(instance, "_transition_user", None),
+            devices=Device.objects.filter(pk__in=pk_set),
+        )
+    except Exception:  # pragma: no cover - a ticket is never blocked by this
+        logger.exception("Could not raise jobs for the assets added to ticket %s", instance.pk)

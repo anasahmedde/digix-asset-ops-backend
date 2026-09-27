@@ -62,7 +62,6 @@ class Ticket(TimeStampedModel):
         REPLACEMENT = "replacement", "Replacement"
         INSPECTION = "inspection", "Inspection"
         RELOCATION = "relocation", "Relocation"
-        WARRANTY_CLAIM = "warranty_claim", "Warranty Claim"
         # A ticket is raised against a fault or a warning sign, never against
         # a planned round: preventive work is a maintenance schedule, which
         # has its own rounds and its own screen.
@@ -76,7 +75,11 @@ class Ticket(TimeStampedModel):
 
     # Service categories whose cost liability is derived from the device's
     # warranty state at creation (WF-14/15).
-    WARRANTY_AWARE_CATEGORIES = ("repair", "replacement", "warranty_claim")
+    # A category says what work is needed. Who pays is worked out from the
+    # asset's cover, so "warranty claim" was a second answer to a question
+    # already answered: cover-backed work is a repair or a replacement whose
+    # cost lands on the vendor.
+    WARRANTY_AWARE_CATEGORIES = ("repair", "replacement")
 
     # Response SLA per priority — a ticket still "open" past this window is
     # auto-escalated (see tasks.escalate_overdue_tickets).

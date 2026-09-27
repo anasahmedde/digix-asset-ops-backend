@@ -115,6 +115,7 @@ class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, TechnicianCanCreate]
     filterset_fields = [
         "maintenance_type", "frequency", "status", "is_active", "assigned_to", "device", "priority",
+        "ticket",
     ]
     search_fields = ["title", "device__asset_code", "device__display_name"]
     ordering_fields = ["next_due", "created_at", "priority"]

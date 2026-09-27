@@ -1162,3 +1162,51 @@ def test_a_ticket_raised_against_an_asset_shows_up_as_a_corrective_job():
     assert job.status == MaintenanceSchedule.Status.COMPLETED
     assert job.records.count() == 1
     assert device.status == Device.Status.ACTIVE
+
+
+
+@pytest.mark.django_db
+def test_a_ticket_over_several_assets_opens_a_job_for_each():
+    """Each asset on a ticket is its own repair.
+
+    One complaint can cover two standees, but they are attended, parted and
+    closed out separately — so each gets its own job, and closing the ticket
+    closes them all.
+    """
+    from apps.assets.models import AssetType
+    from apps.maintenance.models import MaintenanceSchedule
+    from apps.tickets.models import Ticket
+
+    boss = User.objects.create_user(username="multi-boss", password="x", role="ops_manager")
+    site = Site.objects.create(name="Multi Site", address="3 Road")
+    kind = AssetType.objects.create(name="Multi Kind")
+    first = Device.objects.create(asset_type=kind, current_site=site, status=Device.Status.ACTIVE)
+    second = Device.objects.create(asset_type=kind, current_site=site, status=Device.Status.ACTIVE)
+
+    r = _client(boss).post("/api/tickets/", {
+        "title": "Both standees dark", "device": str(first.id),
+        "devices": [str(first.id), str(second.id)], "category": "repair",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    ticket = Ticket.objects.get(pk=r.data["id"])
+
+    jobs = MaintenanceSchedule.objects.filter(ticket=ticket)
+    assert jobs.count() == 2
+    assert {j.device_id for j in jobs} == {first.id, second.id}
+    assert all(j.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE for j in jobs)
+    first.refresh_from_db(); second.refresh_from_db()
+    assert first.status == second.status == Device.Status.UNDER_MAINTENANCE
+
+    # An asset added later joins with its own job too.
+    third = Device.objects.create(asset_type=kind, current_site=site, status=Device.Status.ACTIVE)
+    ticket.devices.add(third)
+    assert MaintenanceSchedule.objects.filter(ticket=ticket, device=third).exists()
+
+    ticket.status = Ticket.Status.CLOSED
+    ticket.save(update_fields=["status"])
+    assert not MaintenanceSchedule.objects.filter(ticket=ticket).exclude(
+        status=MaintenanceSchedule.Status.COMPLETED
+    ).exists(), "every job the ticket raised is closed with it"
+    for d in (first, second, third):
+        d.refresh_from_db()
+        assert d.status == Device.Status.ACTIVE

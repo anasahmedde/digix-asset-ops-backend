@@ -193,13 +193,22 @@ class TicketListSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(
         source="inventory_unit.supplier.name", read_only=True, default=None
     )
+    # Every asset the ticket is raised for, not only the primary: one ticket
+    # can cover several, and the list is where they are told apart.
+    devices_info = serializers.SerializerMethodField()
+
+    def get_devices_info(self, obj):
+        return [
+            {"id": str(d.pk), "asset_code": d.asset_code, "display_name": d.display_name}
+            for d in obj.devices.all()
+        ]
 
     class Meta:
         model = Ticket
         fields = [
             "id", "ticket_number", "occurrence", "complaint_by", "title", "description", "priority", "status", "category",
             "issue_type", "issue_type_name",
-            "device", "device_code", "site", "site_name",
+            "device", "device_code", "devices_info", "site", "site_name",
             "is_billable", "charge_to", "warranty", "repair_cost",
             "inventory_unit", "inventory_unit_serial", "supplier_name",
             "assigned_to", "assigned_to_name", "assigned_vendor", "assigned_vendor_name",
