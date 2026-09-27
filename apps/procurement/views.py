@@ -17,6 +17,7 @@ from .models import PurchaseOrder, PurchaseOrderItem
 from .serializers import (
     PurchaseOrderFromShortageSerializer,
     PurchaseOrderItemDetailSerializer,
+    PurchaseOrderItemSerializer,
     PurchaseOrderReceiveSerializer,
     PurchaseOrderSerializer,
     PurchaseOrderTransitionSerializer,
@@ -383,11 +384,14 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         """Create one purchase order covering the given requirements.
 
         Body: supplier, components [ids], devices [ids], prices {id: amount},
-        and optionally currency, expected_delivery, terms, notes.
+        and optionally extra_items, currency, supplier_details, expected_delivery,
+        terms, notes.
         Each requirement becomes a PO line for its outstanding quantity and is
         linked back, so receiving the goods closes the loop. A vendor-built
         asset is bought as one line. Prices default to the last known figure;
-        the buyer changes them before the order is placed.
+        the buyer changes them before the order is placed. ``extra_items`` are
+        lines the requests never asked for — freight, a spare, a charge —
+        written exactly as the new-order screen writes them.
         """
         from apps.assets.models import AssetComponent, Device
         from apps.suppliers.models import Supplier
@@ -397,6 +401,9 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         device_ids = request.data.get("devices") or []
         reorder_ids = request.data.get("reorders") or []
         prices = request.data.get("prices") or {}
+        extra_items = request.data.get("extra_items") or []
+        if not isinstance(extra_items, list):
+            return Response({"extra_items": ["Send a list of extra lines."]}, status=400)
         if not supplier_id:
             return Response({"supplier": ["Choose the supplier to buy from."]}, status=400)
         if not isinstance(component_ids, list) or not isinstance(device_ids, list) or not isinstance(reorder_ids, list):
@@ -450,12 +457,18 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             except (InvalidOperation, ValueError):
                 return fallback or 0
 
+        # The added lines answer to the same rules as a hand-written order's.
+        extra = PurchaseOrderItemSerializer(data=extra_items, many=True)
+        extra.is_valid(raise_exception=True)
+
         from .documents import DEFAULT_TERMS
+        from .serializers import _buy_asset_on
 
         with transaction.atomic():
             purchase_order = PurchaseOrder.objects.create(
                 supplier_id=supplier_id,
-                currency=request.data.get("currency", PurchaseOrder.Currency.PKR),
+                currency=request.data.get("currency") or PurchaseOrder.Currency.PKR,
+                supplier_details=(request.data.get("supplier_details") or "").strip(),
                 expected_delivery=request.data.get("expected_delivery") or None,
                 terms=(request.data.get("terms") or "").strip() or DEFAULT_TERMS,
                 notes=(request.data.get("notes") or "").strip(),
@@ -512,6 +525,11 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
                 rr.purchase_order_item = item
                 rr.status = ReorderRequest.Status.ORDERED
                 rr.save(update_fields=["purchase_order_item", "status", "updated_at"])
+            for row in extra.validated_data:
+                row.pop("id", None)
+                device_id = row.pop("device", None)
+                line = PurchaseOrderItem.objects.create(purchase_order=purchase_order, **row)
+                _buy_asset_on(line, device_id)
             purchase_order.recalc_total()
 
         return Response(

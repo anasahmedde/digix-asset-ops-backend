@@ -10,10 +10,13 @@ from rest_framework.response import Response
 from apps.tickets.models import Ticket
 from common.permissions import IsSuperAdmin
 
-from .models import Notification, PushToken, WebhookEndpoint
+from rest_framework.exceptions import PermissionDenied
+
+from .models import Notification, PushToken, StickyNote, WebhookEndpoint
 from .serializers import (
     NotificationSerializer,
     PushTokenSerializer,
+    StickyNoteSerializer,
     WebhookEndpointSerializer,
 )
 from .tasks import send_webhook_delivery
@@ -122,3 +125,55 @@ class WebhookEndpointViewSet(viewsets.ModelViewSet):
         }
         send_webhook_delivery.delay(str(webhook.id), "webhook.test", payload)
         return Response({"status": "Test webhook queued for delivery."})
+
+
+class StickyNoteViewSet(viewsets.ModelViewSet):
+    """The dashboard's two boards.
+
+    A person sees the team board and their own private notes, never anybody
+    else's private notes. Only the author edits or removes a note.
+    """
+
+    serializer_class = StickyNoteSerializer
+    permission_classes = [IsAuthenticated]
+    filterset_fields = ["scope"]
+
+    def get_queryset(self):
+        user = self.request.user
+        return (
+            StickyNote.objects.filter(
+                Q(scope=StickyNote.Scope.TEAM) | Q(author=user)
+            )
+            .select_related("author")
+            .prefetch_related("mentions")
+        )
+
+    def perform_create(self, serializer):
+        note = serializer.save(author=self.request.user)
+        self._tell_the_tagged(note)
+
+    def perform_update(self, serializer):
+        self._author_only(serializer.instance)
+        note = serializer.save()
+        self._tell_the_tagged(note)
+
+    def perform_destroy(self, instance):
+        self._author_only(instance)
+        instance.delete()
+
+    def _author_only(self, note):
+        if note.author_id != self.request.user.id:
+            raise PermissionDenied("A note belongs to whoever wrote it.")
+
+    def _tell_the_tagged(self, note):
+        """A tag is only useful if it reaches the person tagged."""
+        if note.scope != StickyNote.Scope.TEAM:
+            return
+        who = note.author.get_full_name() or note.author.username
+        for user in note.mentions.exclude(pk=note.author_id):
+            Notification.objects.create(
+                recipient=user,
+                notification_type=Notification.Type.SYSTEM,
+                title=f"{who} tagged you on a team note",
+                message=note.body[:300],
+            )

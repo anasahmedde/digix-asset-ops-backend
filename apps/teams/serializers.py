@@ -151,12 +151,19 @@ class ProjectListSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerializ
     def get_site_names(self, obj):
         return [site.name for site in obj.sites.all()]
 
+    # Where the work stands regardless of an off-ramp. The list draws the
+    # button that lifts On Hold, so the list has to know what it lifts to.
+    resume_phase = serializers.SerializerMethodField()
+
+    def get_resume_phase(self, obj):
+        return obj.phase_from_work(ignore_off_ramp=True)
+
     class Meta:
         model = Project
         fields = [
             "id", "name", "location", "image", "client", "client_name",
             "site", "site_name", "status", "status_display",
-            "phase", "phase_display", "progress",
+            "phase", "phase_display", "resume_phase", "progress",
             "contract_type", "contract_type_display", "rental_end_date",
             "start_date", "target_date", "completed_date",
             "manager", "manager_name", "bottleneck_count", "created_at",

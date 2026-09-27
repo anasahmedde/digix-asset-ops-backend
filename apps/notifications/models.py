@@ -125,3 +125,33 @@ class PushToken(TimeStampedModel):
 
     def __str__(self):
         return f"{self.user} · {self.token[:24]}…"
+
+
+class StickyNote(TimeStampedModel):
+    """A short note on the dashboard, kept to self or posted to the team.
+
+    Self is private to the person who wrote it. Team is a shared board:
+    everybody reads it and every note is signed. Tagging somebody on a team
+    note notifies them, so a note meant for a person reaches that person.
+    """
+
+    class Scope(models.TextChoices):
+        SELF = "self", "Only me"
+        TEAM = "team", "Team"
+
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="sticky_notes"
+    )
+    scope = models.CharField(max_length=5, choices=Scope.choices, default=Scope.SELF)
+    body = models.TextField()
+    # Who the note is addressed to. Read back so the board can mark them.
+    mentions = models.ManyToManyField(
+        settings.AUTH_USER_MODEL, blank=True, related_name="sticky_note_mentions"
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["scope", "-created_at"])]
+
+    def __str__(self):
+        return f"{self.get_scope_display()} · {self.body[:40]}"
