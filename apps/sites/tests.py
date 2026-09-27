@@ -1456,3 +1456,47 @@ def test_the_signed_document_is_kept_on_the_record(ops, handover_ready):
     assert record.signed_document.name.endswith(".pdf")
     with record.signed_document.open("rb") as fh:
         assert fh.read().startswith(b"%PDF")
+
+
+
+@pytest.mark.django_db
+def test_a_live_assets_installation_steps_are_a_record():
+    """Once the asset has gone live, its checklist is how it came to be in
+    service — read, not edited."""
+    from apps.accounts.models import User
+    from apps.assets.models import AssetType, Device
+    from apps.sites.models import DeviceInstallation, InstallationStep, Site
+    from rest_framework.test import APIClient
+
+    admin = User.objects.create_user(username="lock-admin", password="x", role="super_admin")
+    c = APIClient()
+    c.force_authenticate(admin)
+    site = Site.objects.create(name="Lock Site", address="9 Road")
+    device = Device.objects.create(asset_type=AssetType.objects.create(name="Lock Kind"), status=Device.Status.INSTALLED)
+    installation = DeviceInstallation.objects.create(
+        device=device, site=site, installed_at=timezone.now(),
+    )
+    # An installation is created with its default checklist; take the first.
+    step = installation.steps.order_by("step_number").first()
+    assert step is not None
+
+    # While the asset is merely installed, the checklist can still be touched.
+    r = c.patch(f"/api/sites/installation-steps/{step.id}/", {"status": "not_started"}, format="json")
+    assert r.status_code == 200, r.content
+
+    # Live: nothing on the checklist moves any more.
+    device.status = Device.Status.ACTIVE
+    device.save(update_fields=["status"])
+    for call in (
+        lambda: c.patch(f"/api/sites/installation-steps/{step.id}/", {"status": "completed"}, format="json"),
+        lambda: c.post("/api/sites/installation-steps/", {
+            "installation": str(installation.id), "step_type": "wiring",
+            "step_number": installation.steps.count() + 1,
+        }, format="json"),
+        lambda: c.delete(f"/api/sites/installation-steps/{step.id}/"),
+        lambda: c.post(f"/api/sites/installations/{installation.id}/reorder-steps/", {"steps": [str(step.id)]}, format="json"),
+    ):
+        r = call()
+        assert r.status_code == 400, r.content
+        assert "record" in str(r.data).lower()
+    assert InstallationStep.objects.filter(pk=step.pk).exists()
