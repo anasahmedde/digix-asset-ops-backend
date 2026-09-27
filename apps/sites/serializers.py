@@ -382,6 +382,17 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
     # photograph is the primary one in its gallery.
     device_image = serializers.ImageField(source="device.display_image", read_only=True)
     device_status = serializers.CharField(source="device.status", read_only=True)
+    # When the asset went live: the Active step at the end of the checklist
+    # is dated from the registry, which is where going live is recorded.
+    device_activated_at = serializers.SerializerMethodField()
+
+    def get_device_activated_at(self, obj):
+        event = (
+            obj.device.lifecycle_events.filter(event_type="status_change", to_value="active")
+            .order_by("-created_at")
+            .first()
+        )
+        return event.created_at if event else None
     # How the asset is made decides who installs it, which is what the vendor
     # field on this screen is really answering.
     device_source = serializers.CharField(source="device.source", read_only=True)
@@ -394,7 +405,7 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
         model = DeviceInstallation
         fields = [
             "id", "device", "device_code", "device_name", "asset_name", "asset_type_name",
-            "device_image", "device_status", "device_source", "device_source_display",
+            "device_image", "device_status", "device_activated_at", "device_source", "device_source_display",
             "client_names", "client_id", "project_name", "poc_name", "poc_phone",
             "site", "site_name", "site_city", "zone",
             "installed_by", "installed_by_name", "installed_by_phone",
