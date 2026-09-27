@@ -11,11 +11,12 @@ import re
 
 
 def _dims(device) -> str:
+    unit = getattr(device, "dimension_unit", "in") or "in"
     if device.diagonal_inches:
-        return f'{float(device.diagonal_inches):g}" diagonal'
+        return f"{float(device.diagonal_inches):g} {unit} diagonal"
     parts = [device.length_in, device.width_in, device.depth_in]
     if any(parts):
-        return " × ".join(f"{float(p):g}" for p in parts if p) + " in"
+        return " × ".join(f"{float(p):g}" for p in parts if p) + f" {unit}"
     return ""
 
 

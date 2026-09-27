@@ -526,6 +526,18 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         new_status = ser.validated_data["status"]
         notes = ser.validated_data.get("notes", "").strip()
 
+        # A supplier cannot promise what nobody asked for: an order leaving
+        # draft says when the goods are needed by. A draft is still being
+        # written, so it is free to be incomplete.
+        if (
+            new_status not in (PurchaseOrder.Status.DRAFT, PurchaseOrder.Status.CANCELLED)
+            and not purchase_order.expected_delivery
+        ):
+            return Response(
+                {"expected_delivery": ["Say when the goods are needed by before sending this order on."]},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+
         # Placing an order commits money: Operations raise it, the Group Head
         # signs it off (or the Super Admin).
         if new_status == PurchaseOrder.Status.APPROVED and getattr(

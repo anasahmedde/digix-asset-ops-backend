@@ -35,6 +35,8 @@ def supplier(db):
 def _create_po(client, supplier, **extra):
     payload = {
         "supplier": str(supplier.id),
+        # An order says when the goods are wanted, as a real one would.
+        "expected_delivery": str(timezone.localdate()),
         "items": [
             {"description": "P6 LED module", "quantity": 2, "unit_price": "100.00"},
             {"description": "Cat6 cable", "quantity": 3, "unit_price": "10.50"},
@@ -547,6 +549,7 @@ def receivable_po(db, people, supplier):
     material = MaterialType.objects.create(name="GRN Cable", unit="meter")
 
     po = PurchaseOrder.objects.create(
+        expected_delivery=timezone.localdate(),
         supplier=supplier, ordered_by=people["finance"], status=PurchaseOrder.Status.ORDERED
     )
     serialized = PurchaseOrderItem.objects.create(
@@ -853,7 +856,7 @@ def test_receive_over_receive_400(people, receivable_po):
 def test_receive_rejected_for_wrong_po_status(people, supplier, receivable_po):
     c = _client(people["finance"])
     for bad_status in ("draft", "pending_approval", "approved", "received", "cancelled"):
-        po = PurchaseOrder.objects.create(supplier=supplier, status=bad_status)
+        po = PurchaseOrder.objects.create(supplier=supplier, status=bad_status, expected_delivery=timezone.localdate())
         item = PurchaseOrderItem.objects.create(
             purchase_order=po, description="Line", quantity=1, unit_price=Decimal("1.00"),
             material_type=receivable_po["material"],
@@ -864,7 +867,7 @@ def test_receive_rejected_for_wrong_po_status(people, supplier, receivable_po):
 
 @pytest.mark.django_db
 def test_receive_line_without_type_400(people, supplier):
-    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED)
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED, expected_delivery=timezone.localdate())
     untyped = PurchaseOrderItem.objects.create(
         purchase_order=po, description="Untyped line", quantity=2, unit_price=Decimal("9.00"),
     )
@@ -875,7 +878,7 @@ def test_receive_line_without_type_400(people, supplier):
 
 @pytest.mark.django_db
 def test_receive_foreign_po_item_400(people, supplier, receivable_po):
-    other = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED)
+    other = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED, expected_delivery=timezone.localdate())
     foreign = PurchaseOrderItem.objects.create(
         purchase_order=other, description="Foreign", quantity=1, unit_price=Decimal("2.00"),
         material_type=receivable_po["material"],
@@ -990,6 +993,7 @@ def test_flagged_requirements_appear_as_requisitions(people, requisitions):
 def test_raise_a_po_from_requisitions(people, requisitions, supplier):
     c = _client(people["finance"])
     r = c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),
         "supplier": str(supplier.pk),
         "components": [str(requisitions["generic"].pk), str(requisitions["unique"].pk)],
     }, format="json")
@@ -1015,6 +1019,7 @@ def test_raise_a_po_from_requisitions(people, requisitions, supplier):
 def test_requisitions_can_be_filtered_to_unordered(people, requisitions, supplier):
     c = _client(people["finance"])
     c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),
         "supplier": str(supplier.pk), "components": [str(requisitions["generic"].pk)],
     }, format="json")
 
@@ -1049,6 +1054,7 @@ def test_receiving_a_product_line_only_needs_serials(people, requisitions, suppl
 
     c = _client(people["finance"])
     po_resp = c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),
         "supplier": str(supplier.pk), "components": [str(requisitions["unique"].pk)],
     }, format="json")
     assert po_resp.status_code == 201, po_resp.content
@@ -1114,6 +1120,7 @@ def test_clearing_a_decision_lets_it_be_procured_again(people, requisitions, sup
     component = requisitions["generic"]
     c = _client(people["finance"])
     assert c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),
         "supplier": str(supplier.pk), "components": [str(component.pk)],
     }, format="json").status_code == 201
     component.refresh_from_db()
@@ -1172,7 +1179,8 @@ def test_approval_stamps_the_order_date_and_lines_say_what_they_buy(people, supp
     device = Device.objects.create(asset_type=kind, display_name="Lobby Wall", source=Device.Source.VENDOR_SUPPLIED,
                                    serial_number="PO-LINE-1", diagonal_inches="55.0")
     c = _client(people["ops"])
-    r = c.post("/api/procurement/purchase-orders/raise-po/", {"supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)], "prices": {}}, format="json")
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),"supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)], "prices": {}}, format="json")
     assert r.status_code == 201, r.content
     line = r.data["items"][0]
     assert line["description"].startswith("Lobby Wall (PO Line Display")
@@ -1228,14 +1236,14 @@ def test_procurement_can_send_a_line_back_to_the_project():
     # On an order already: stays until that order is cancelled.
     c.post(f"/api/assets/components/{comp.id}/mark-for-procurement/", {"quantity": 2}, format="json")
     supplier = Supplier.objects.create(name="SB Supplier")
-    r = c.post("/api/procurement/purchase-orders/raise-po/", {"supplier": str(supplier.id), "components": [str(comp.id)], "devices": []}, format="json")
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),"supplier": str(supplier.id), "components": [str(comp.id)], "devices": []}, format="json")
     assert r.status_code == 201, r.content
     r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"component": str(comp.id), "reason": "no"}, format="json")
     assert r.status_code == 400 and "cancel that order first" in r.data["detail"]
 
     # A vendor-supplied asset asked to be bought can go back too.
     vendor_asset = Device.objects.create(device_model=dm, asset_code="AST-SB-V", serial_number="SB-V", source="vendor_supplied")
-    from django.utils import timezone
     vendor_asset.procurement_requested_at = timezone.now()
     vendor_asset.save(update_fields=["procurement_requested_at"])
     r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"device": str(vendor_asset.id), "reason": "Client cancelled the unit"}, format="json")
@@ -1263,6 +1271,7 @@ def test_receiving_a_complete_asset_asks_for_no_serial_number(people, supplier):
 
     ops = _client(people["ops"])
     r = ops.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),
         "supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)],
         "prices": {str(device.pk): "9000.00"},
     }, format="json")
@@ -1342,6 +1351,7 @@ def test_a_charge_on_an_order_is_not_goods_to_receive():
 
     r = c.post("/api/procurement/purchase-orders/", {
         "supplier": str(supplier.id), "currency": "PKR",
+        "expected_delivery": str(timezone.localdate()),
         "supplier_details": "Quote Q-118 · deliver to the Multan store",
         "items": [
             {"description": "Charge Cable", "quantity": 10, "unit_price": "50.00",
@@ -1401,6 +1411,7 @@ def test_an_order_can_buy_an_asset_already_registered():
 
     r = c.post("/api/procurement/purchase-orders/", {
         "supplier": str(supplier.id), "currency": "PKR",
+        "expected_delivery": str(timezone.localdate()),
         "items": [{"description": "Standee, complete", "quantity": 1, "unit_price": "90000.00",
                    "device": str(device.id)}],
     }, format="json")
@@ -1414,6 +1425,7 @@ def test_an_order_can_buy_an_asset_already_registered():
     # One asset is bought once.
     r = c.post("/api/procurement/purchase-orders/", {
         "supplier": str(supplier.id), "currency": "PKR",
+        "expected_delivery": str(timezone.localdate()),
         "items": [{"description": "Standee again", "quantity": 1, "unit_price": "1.00",
                    "device": str(device.id)}],
     }, format="json")

@@ -585,7 +585,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             # device_model stays readable for historical assets but is no longer
             # part of registration; identity comes from type + name + components.
             "device_model", "device_model_name", "brand_name",
-            "length_in", "width_in", "depth_in", "diagonal_inches",
+            "length_in", "width_in", "depth_in", "diagonal_inches", "dimension_unit",
             "hardware_revision",
             "status", "status_display", "source", "source_display", "allowed_transitions",
             "image", "display_image", "images",
