@@ -19,6 +19,17 @@ def _is_super_admin(user):
 class UserSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
     supplier_name = serializers.CharField(source="supplier.name", read_only=True)
+    reports_to_name = serializers.SerializerMethodField()
+    direct_report_count = serializers.SerializerMethodField()
+
+    def get_reports_to_name(self, obj):
+        boss = obj.reports_to
+        if boss is None:
+            return None
+        return boss.get_full_name() or boss.username
+
+    def get_direct_report_count(self, obj):
+        return obj.direct_reports.count()
 
     # The only fields a non-super_admin may write (on their own record).
     # `supplier` is deliberately NOT here: linking a login to a vendor is a
@@ -31,6 +42,7 @@ class UserSerializer(serializers.ModelSerializer):
             "id", "username", "email", "first_name", "last_name",
             "full_name", "role", "job_title", "phone", "avatar", "is_field_staff",
             "employee_id", "cnic", "join_date", "leaving_date",
+            "reports_to", "reports_to_name", "direct_report_count",
             "supplier", "supplier_name",
             "is_active", "date_joined",
         ]

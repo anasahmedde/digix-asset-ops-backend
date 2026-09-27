@@ -38,6 +38,12 @@ class User(AbstractUser):
     )
     join_date = models.DateField(null=True, blank=True)
     leaving_date = models.DateField(null=True, blank=True)
+    # The reporting line, as the organogram draws it. Permissions come from
+    # `role`; this is who the person answers to, which is a different
+    # question and the one the org chart asks.
+    reports_to = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="direct_reports",
+    )
     # Vendor-portal accounts (XC-04): which supplier this login belongs to.
     # Everything a role=vendor user can see/do is scoped to this supplier.
     supplier = models.ForeignKey(
