@@ -27,7 +27,8 @@ def ensure_seeded():
     from .models import RoleDefinition, User
 
     labels = dict(User.Role.choices)
-    existing = set(RoleDefinition.objects.values_list("key", flat=True))
+    rows = list(RoleDefinition.objects.all())
+    existing = {r.key for r in rows}
     missing = [
         RoleDefinition(
             key=key,
@@ -40,6 +41,24 @@ def ensure_seeded():
     ]
     if missing:
         RoleDefinition.objects.bulk_create(missing)
+        forget()
+        rows += missing
+
+    # A capability added to the catalogue after the roles were seeded would
+    # otherwise reach nobody: the records hold the list as it was. Anything
+    # no role has heard of yet is new, so it is granted to the built-in
+    # roles the code says should have it. Only ever added, never removed,
+    # and a role somebody has edited keeps every choice they made.
+    known = set().union(*(set(r.capabilities or ()) for r in rows)) if rows else set()
+    fresh = {k for caps in ROLE_DEFAULTS.values() for k in caps} - known
+    if fresh:
+        for row in rows:
+            if not row.is_builtin:
+                continue
+            should = ROLE_DEFAULTS.get(row.key, frozenset()) & fresh
+            if should:
+                row.capabilities = sorted(set(row.capabilities or ()) | should)
+                row.save(update_fields=["capabilities", "updated_at"])
         forget()
 
 
