@@ -670,7 +670,7 @@ def test_billability_vendor_when_supplier_warranty_active(people, warranty_devic
     _make_warranty(warranty_device, wtype="supplier")
     c = _client(people["marketing"])
     r = c.post("/api/tickets/", {
-        "title": "Module burnt", "category": "warranty_claim",
+        "title": "Module burnt", "category": "repair",
         "device": str(warranty_device.pk),
     }, format="json")
     assert r.status_code == 201, r.content
@@ -690,7 +690,7 @@ def test_explicit_billability_overrides_defaults(people, warranty_device):
     assert r.json()["charge_to"] == "client"
 
 
-def test_warranty_claim_leaves_the_warranty_status_alone(people, warranty_device):
+def test_work_under_cover_leaves_the_warranty_status_alone(people, warranty_device):
     """A claim is tracked on the claim; the cover itself is not moved.
 
     The claim's progress is the ticket's status, so the warranty keeps saying
@@ -701,7 +701,7 @@ def test_warranty_claim_leaves_the_warranty_status_alone(people, warranty_device
     warranty = _make_warranty(warranty_device)
     c = _client(people["ops"])
     r = c.post("/api/tickets/", {
-        "title": "Claim: dead pixels", "category": "warranty_claim",
+        "title": "Claim: dead pixels", "category": "repair",
         "device": str(warranty_device.pk),
     }, format="json")
     assert r.status_code == 201, r.content
@@ -723,7 +723,7 @@ def test_multi_asset_ticket(people, warranty_device):
     second = Device.objects.create(device_model=dm, asset_code="AST-MA-2", serial_number="MA-2")
     c = _client(people["ops"])
     r = c.post("/api/tickets/", {
-        "title": "Preventive: adapters batch", "category": "preventive_maintenance",
+        "title": "Predictive: adapters batch", "category": "predictive_maintenance",
         "devices": [str(warranty_device.pk), str(second.pk)],
     }, format="json")
     assert r.status_code == 201, r.content
@@ -750,7 +750,7 @@ def test_warranty_must_belong_to_ticket_device(people, warranty_device):
     foreign_warranty = _make_warranty(foreign_device)
     c = _client(people["tech"])
     r = c.post("/api/tickets/", {
-        "title": "Hijack attempt", "category": "warranty_claim",
+        "title": "Hijack attempt", "category": "repair",
         "device": str(warranty_device.pk), "warranty": str(foreign_warranty.pk),
     }, format="json")
     assert r.status_code == 400
@@ -771,7 +771,7 @@ def test_reopening_a_claim_still_leaves_the_warranty_alone(people, warranty_devi
     warranty = _make_warranty(warranty_device)
     c = _client(people["ops"])
     ticket_id = c.post("/api/tickets/", {
-        "title": "Claim cycle", "category": "warranty_claim",
+        "title": "Claim cycle", "category": "repair",
         "device": str(warranty_device.pk),
     }, format="json").json()["id"]
     c.post(f"/api/tickets/{ticket_id}/transition/", {"status": "closed"}, format="json")

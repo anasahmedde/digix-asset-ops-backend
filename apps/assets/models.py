@@ -137,7 +137,11 @@ class Device(TimeStampedModel):
             Status.UNDER_MAINTENANCE, Status.RMA, Status.CLIENT_PROPERTY,
             Status.IN_TRANSIT, Status.DECOMMISSIONED, Status.LOST_STOLEN,
         ),
-        Status.UNDER_MAINTENANCE: (Status.ACTIVE, Status.RMA, Status.DECOMMISSIONED),
+        # Servicing can end in a handover as readily as in a return to
+        # service: the asset is put right and given to the client.
+        Status.UNDER_MAINTENANCE: (
+            Status.ACTIVE, Status.RMA, Status.CLIENT_PROPERTY, Status.DECOMMISSIONED,
+        ),
         Status.RMA: (Status.IN_STOCK, Status.DECOMMISSIONED),
         Status.CLIENT_PROPERTY: (Status.DECOMMISSIONED,),
         Status.LOST_STOLEN: (Status.IN_STOCK,),
@@ -174,6 +178,19 @@ class Device(TimeStampedModel):
 
     # Physical size in inches: length × width × depth (e.g. SMD screens)
     # and/or diagonal (displays).
+    # What the four sizes below are measured in. They are stored as entered:
+    # a joiner works in feet and a screen is quoted in inches, and converting
+    # either one by hand is how a wrong number gets typed.
+    class DimensionUnit(models.TextChoices):
+        INCH = "in", "Inches (in)"
+        CENTIMETRE = "cm", "Centimetres (cm)"
+        MILLIMETRE = "mm", "Millimetres (mm)"
+        FOOT = "ft", "Feet (ft)"
+        METRE = "m", "Metres (m)"
+
+    dimension_unit = models.CharField(
+        max_length=2, choices=DimensionUnit.choices, default=DimensionUnit.INCH
+    )
     length_in = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
     width_in = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
     depth_in = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)

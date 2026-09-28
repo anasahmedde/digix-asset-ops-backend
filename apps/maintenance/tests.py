@@ -137,7 +137,7 @@ def test_schedule_supports_multiple_vendors(ops):
     v2 = Supplier.objects.create(name="Vendor B")
     r = _client(ops).post("/api/maintenance/schedules/", {
         "title": "Deep clean",
-        "next_due": str(timezone.now().date()),
+        "start_date": str(timezone.now().date()),
         "vendors": [str(v1.pk), str(v2.pk)],
     }, format="json")
     assert r.status_code == 201, r.content
@@ -148,7 +148,7 @@ def test_schedule_supports_multiple_vendors(ops):
 def test_required_components_roundtrip(ops):
     r = _client(ops).post("/api/maintenance/schedules/", {
         "title": "Panel swap",
-        "next_due": str(timezone.now().date()),
+        "start_date": str(timezone.now().date()),
         "required_components": [
             {"name": "SMD Module P3.9", "quantity": 6},
             {"name": "Silicone sealant", "quantity": 2},
@@ -161,7 +161,7 @@ def test_required_components_roundtrip(ops):
     ]
     # malformed rows rejected
     bad = _client(ops).post("/api/maintenance/schedules/", {
-        "title": "Bad", "next_due": str(timezone.now().date()),
+        "title": "Bad", "start_date": str(timezone.now().date()),
         "required_components": [{"quantity": 3}],
     }, format="json")
     assert bad.status_code == 400
@@ -500,7 +500,7 @@ def test_schedule_materials_are_picked_from_inventory(corrective_client):
     item = InventoryItem.objects.create(material_type=MaterialType.objects.create(name="PM Sealant"), quantity=9)
     r = c.post("/api/maintenance/schedules/", {
         "title": "Quarterly visit", "maintenance_type": "preventive", "frequency": "quarterly",
-        "next_due": "2030-01-01",
+        "start_date": "2030-01-01",
         "required_components": [{"inventory_item": str(item.id), "quantity": 2}],
     }, format="json")
     assert r.status_code == 201, r.content
@@ -563,3 +563,650 @@ def test_an_open_job_cannot_be_deleted_while_the_asset_is_out_of_service(correct
 
     r = c.delete(f"/api/maintenance/schedules/{job.id}/")
     assert r.status_code == 204, r.content
+
+
+@pytest.mark.django_db
+def test_a_schedule_takes_its_site_from_the_asset():
+    """Where the work happens is where the asset stands.
+
+    Asking for the site separately let a schedule claim an asset was being
+    serviced somewhere it does not stand, so the asset answers instead — and
+    keeps answering when the asset is moved.
+    """
+    from apps.assets.models import AssetType, Device
+    from apps.maintenance.models import MaintenanceSchedule
+    from apps.sites.models import Site
+
+    here = Site.objects.create(name="Where It Stands", address="1 Road")
+    there = Site.objects.create(name="Somewhere Else", address="2 Road")
+    kind = AssetType.objects.create(name="Site Follow Kind")
+    device = Device.objects.create(asset_type=kind, current_site=here)
+
+    # The site given is ignored: the asset's own is the answer.
+    schedule = MaintenanceSchedule.objects.create(
+        title="Quarterly clean", device=device, site=there,
+        next_due=timezone.localdate(),
+    )
+    assert schedule.site == here
+
+    device.current_site = there
+    device.save(update_fields=["current_site"])
+    schedule.save()
+    assert schedule.site == there
+
+
+@pytest.mark.django_db
+def test_maintenance_comes_in_two_kinds():
+    """Planned ahead, or a response to a fault. There is no third."""
+    from apps.maintenance.models import MaintenanceSchedule
+
+    kinds = dict(MaintenanceSchedule.MaintenanceType.choices)
+    assert set(kinds) == {"preventive", "corrective"}
+    assert kinds["preventive"] == "Preventive"
+    assert kinds["corrective"] == "Corrective"
+
+
+@pytest.mark.django_db
+def test_a_schedule_without_an_asset_keeps_the_site_it_was_given():
+    """Not all maintenance is on one asset — a site round has no device."""
+    from apps.maintenance.models import MaintenanceSchedule
+    from apps.sites.models import Site
+
+    site = Site.objects.create(name="Round Site", address="3 Road")
+    schedule = MaintenanceSchedule.objects.create(
+        title="Site walk-round", site=site, next_due=timezone.localdate(),
+    )
+    assert schedule.site == site
+
+
+@pytest.mark.django_db
+def test_an_asset_with_no_site_does_not_erase_the_one_given():
+    """Deriving a site should never leave a schedule with less than it had."""
+    from apps.assets.models import AssetType
+    from apps.maintenance.models import MaintenanceSchedule
+
+    kind = AssetType.objects.create(name="Homeless Kind")
+    device = Device.objects.create(asset_type=kind)
+    site = Site.objects.create(name="Told Site", address="4 Road")
+
+    schedule = MaintenanceSchedule.objects.create(
+        title="Bench check", device=device, site=site, next_due=timezone.localdate(),
+    )
+    assert schedule.site == site
+
+
+@pytest.mark.django_db
+def test_a_schedule_records_when_its_rounds_begin():
+    """The start date stays put while the next due date moves on.
+
+    Only the next round was recorded, so after a year of visits nothing could
+    say when the arrangement began.
+    """
+    from datetime import date
+
+    from apps.maintenance.models import MaintenanceSchedule
+
+    begins = date(2026, 10, 5)
+    schedule = MaintenanceSchedule.objects.create(
+        title="Quarterly round", frequency=MaintenanceSchedule.Frequency.MONTHLY,
+        start_date=begins, next_due=begins,
+    )
+    schedule.advance_after_completion(begins)
+    schedule.refresh_from_db()
+
+    assert schedule.start_date == begins, "the start date is not a moving target"
+    assert schedule.next_due > begins
+
+
+@pytest.mark.django_db
+def test_the_next_round_is_worked_out_from_the_start_and_the_frequency():
+    """Two facts decide the third, so the third is never asked for.
+
+    A monthly round starting on the first falls due a month later. A one-time
+    job has no round after it: it happens on the day it was arranged for.
+    """
+    from datetime import date
+
+    from apps.maintenance.models import MaintenanceSchedule
+
+    begins = date(2026, 11, 1)
+    monthly = MaintenanceSchedule.objects.create(
+        title="Monthly", start_date=begins,
+        frequency=MaintenanceSchedule.Frequency.MONTHLY,
+    )
+    assert monthly.next_due == date(2026, 12, 1)
+
+    weekly = MaintenanceSchedule.objects.create(
+        title="Weekly", start_date=begins,
+        frequency=MaintenanceSchedule.Frequency.WEEKLY,
+    )
+    assert weekly.next_due == date(2026, 11, 8)
+
+    once = MaintenanceSchedule.objects.create(
+        title="Once", start_date=begins,
+        frequency=MaintenanceSchedule.Frequency.ONE_TIME,
+    )
+    assert once.next_due == begins, "a one-time job happens on its start date"
+
+    # A date given without a start still anchors the schedule.
+    from_due = MaintenanceSchedule.objects.create(title="From due", next_due=begins)
+    assert from_due.start_date == begins
+
+
+@pytest.fixture
+def parts_job(db):
+    """A job with a technician on it and a drum of cable in the store."""
+    from apps.assets.models import AssetType, MaterialType
+    from apps.inventory.models import InventoryItem
+    from apps.maintenance.models import MaintenanceSchedule
+    from apps.sites.models import Site
+
+    site = Site.objects.create(name="Parts Site", address="1 Road")
+    kind = AssetType.objects.create(name="Parts Kind")
+    device = Device.objects.create(asset_type=kind, current_site=site)
+    tech = User.objects.create_user(
+        username="parts-tech", password="x", role="technician", is_field_staff=True,
+    )
+    boss = User.objects.create_user(username="parts-boss", password="x", role="supervisor")
+    material = MaterialType.objects.create(name="Parts Cable", unit="meter")
+    item = InventoryItem.objects.create(material_type=material, quantity=100)
+    schedule = MaintenanceSchedule.objects.create(
+        title="Cable round", device=device, assigned_to=tech,
+        start_date=timezone.localdate(),
+    )
+    return {"schedule": schedule, "item": item, "tech": tech, "boss": boss}
+
+
+def _ask(client, job, quantity=20):
+    return client.post("/api/maintenance/part-requests/", {
+        "schedule": str(job["schedule"].id), "item": str(job["item"].id),
+        "quantity_requested": quantity,
+    }, format="json")
+
+
+@pytest.mark.django_db
+def test_an_approved_line_becomes_a_request_on_the_stores_queue(parts_job):
+    """Approving does not issue anything — it asks the store to.
+
+    The store is the only place material leaves from, so the answer to a
+    technician queues there for the quantity that was agreed.
+    """
+    from apps.inventory.models import IssuanceRequest
+
+    r = _ask(_client(parts_job["tech"]), parts_job)
+    assert r.status_code == 201, r.content
+    assert r.data["status"] == "requested"
+    assert r.data["unit"] == "meter", "a line is counted the way its stock is"
+
+    r = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True, "quantity": 12, "note": "Half a drum is plenty"},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["quantity_approved"] == 12
+
+    issued = IssuanceRequest.objects.get(pk=r.data["issuance_request"])
+    assert issued.quantity_requested == 12, "the store is asked for what was agreed"
+    assert issued.source == IssuanceRequest.Source.MAINTENANCE
+    assert issued.maintenance_schedule_id == parts_job["schedule"].id
+    assert issued.status == IssuanceRequest.Status.PENDING, "nothing has left the store yet"
+
+
+@pytest.mark.django_db
+def test_a_line_cannot_be_approved_for_more_than_was_asked(parts_job):
+    """Cutting a line is the supervisor's call; adding to it is not."""
+    r = _ask(_client(parts_job["tech"]), parts_job, quantity=20)
+    r = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True, "quantity": 25}, format="json",
+    )
+    assert r.status_code == 400
+    assert "20 meter" in str(r.data["quantity"])
+
+
+@pytest.mark.django_db
+def test_a_rejected_line_asks_the_store_for_nothing(parts_job):
+    from apps.inventory.models import IssuanceRequest
+
+    before = IssuanceRequest.objects.count()
+    r = _ask(_client(parts_job["tech"]), parts_job)
+    r = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": False, "note": "Use what is on the van"}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["status"] == "rejected" and r.data["quantity_approved"] == 0
+    assert r.data["issuance_request"] is None
+    assert IssuanceRequest.objects.count() == before
+
+
+@pytest.mark.django_db
+def test_a_technician_cannot_answer_their_own_request(parts_job):
+    """Asking and approving are two people, or the approval means nothing."""
+    tech = _client(parts_job["tech"])
+    r = _ask(tech, parts_job)
+    r = tech.post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert r.status_code == 403, r.content
+
+
+@pytest.mark.django_db
+def test_a_line_is_answered_once(parts_job):
+    r = _ask(_client(parts_job["tech"]), parts_job)
+    boss = _client(parts_job["boss"])
+    line = f"/api/maintenance/part-requests/{r.data['id']}/decide/"
+    assert boss.post(line, {"approve": True}, format="json").status_code == 200
+    again = boss.post(line, {"approve": False}, format="json")
+    assert again.status_code == 400
+    assert "already approved" in str(again.data["status"])
+
+
+@pytest.mark.django_db
+def test_an_unanswered_line_can_be_withdrawn_but_an_answered_one_cannot(parts_job):
+    tech = _client(parts_job["tech"])
+    r = _ask(tech, parts_job)
+    assert tech.delete(f"/api/maintenance/part-requests/{r.data['id']}/").status_code == 204
+
+    r = _ask(tech, parts_job)
+    _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert tech.delete(f"/api/maintenance/part-requests/{r.data['id']}/").status_code == 400
+
+
+def _issue(job, line_id, quantity, serials=None):
+    """The store hands over what was approved, so there is something to settle."""
+    from apps.maintenance.models import MaintenancePartRequest
+
+    line = MaintenancePartRequest.objects.get(pk=line_id)
+    issuance = line.issuance_request
+    issuance.quantity_issued = quantity
+    issuance.issued_serials = serials or []
+    issuance.sync_status()
+    issuance.save()
+    return issuance
+
+
+def _approved_line(job, quantity=12):
+    r = _ask(_client(job["tech"]), job, quantity=quantity)
+    r = _client(job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True, "quantity": quantity}, format="json",
+    )
+    return r.data["id"]
+
+
+@pytest.mark.django_db
+def test_what_the_visit_did_not_use_goes_back_to_receiving(parts_job):
+    """A technician saying a part is spare does not put it back on the shelf.
+
+    The leftover is received the way a delivery is — a line waiting on
+    inspection — and the job records what it used and what it handed back.
+    """
+    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine
+    from apps.maintenance.models import MaintenancePartRequest
+
+    line_id = _approved_line(parts_job, quantity=12)
+    _issue(parts_job, line_id, 12)
+
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        "schedule": str(parts_job["schedule"].id),
+        "performed_at": timezone.now().isoformat(),
+        "status": "completed",
+        "parts_settlement": [{"part_request": line_id, "used": 9}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+
+    line = MaintenancePartRequest.objects.get(pk=line_id)
+    assert (line.quantity_used, line.quantity_returned) == (9, 3)
+    assert line.visit_id == parts_job["schedule"].visits.get(status="completed").id, (
+        "the line belongs to the round that used it"
+    )
+
+    receipt = GoodsReceipt.objects.get(source=GoodsReceipt.Source.MAINTENANCE_RETURN)
+    assert line.return_reference == receipt.grn_number
+    assert r.data["return_grn"] == receipt.grn_number, "the visit says where the rest went"
+    back = receipt.lines.get()
+    assert back.quantity == 3
+    assert back.inspection_status == GoodsReceiptLine.Inspection.PENDING
+    parts_job["item"].refresh_from_db()
+    assert parts_job["item"].quantity == 100, "stock only moves when receiving passes the line"
+
+
+@pytest.mark.django_db
+def test_a_visit_that_used_everything_sends_nothing_back(parts_job):
+    from apps.inventory.models import GoodsReceipt
+    from apps.maintenance.models import MaintenancePartRequest
+
+    line_id = _approved_line(parts_job, quantity=5)
+    _issue(parts_job, line_id, 5)
+
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        "schedule": str(parts_job["schedule"].id),
+        "performed_at": timezone.now().isoformat(),
+        "status": "completed",
+        "parts_settlement": [{"part_request": line_id, "used": 5}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["return_grn"] is None
+    assert not GoodsReceipt.objects.filter(source=GoodsReceipt.Source.MAINTENANCE_RETURN).exists()
+    assert MaintenancePartRequest.objects.get(pk=line_id).quantity_returned == 0
+
+
+@pytest.mark.django_db
+def test_a_visit_cannot_use_more_than_the_store_issued(parts_job):
+    """And the visit is not recorded on a settlement that does not add up."""
+    from apps.maintenance.models import MaintenanceRecord
+
+    line_id = _approved_line(parts_job, quantity=4)
+    _issue(parts_job, line_id, 4)
+
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        "schedule": str(parts_job["schedule"].id),
+        "performed_at": timezone.now().isoformat(),
+        "status": "completed",
+        "parts_settlement": [{"part_request": line_id, "used": 6}],
+    }, format="json")
+    assert r.status_code == 400, r.content
+    assert not MaintenanceRecord.objects.exists(), "the visit rolls back with its settlement"
+
+
+@pytest.mark.django_db
+def test_unique_units_come_back_by_serial(parts_job):
+    """Which units are back matters: stock counts them one by one."""
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import GoodsReceipt, InventoryUnitType
+
+    kind = InventoryUnitType.objects.create(
+        material_type=MaterialType.objects.create(name="Parts Meter", unit="piece"),
+        name="Flow meter",
+    )
+    r = _client(parts_job["tech"]).post("/api/maintenance/part-requests/", {
+        "schedule": str(parts_job["schedule"].id), "unit_type": str(kind.id),
+        "quantity_requested": 2,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    line_id = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    ).data["id"]
+    _issue(parts_job, line_id, 2, serials=["FM-1", "FM-2"])
+
+    body = {
+        "schedule": str(parts_job["schedule"].id),
+        "performed_at": timezone.now().isoformat(),
+        "status": "completed",
+    }
+    # One is spare, but which one?
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        **body, "parts_settlement": [{"part_request": line_id, "used": 1}],
+    }, format="json")
+    assert r.status_code == 400, r.content
+
+    # And it has to be one that went out on this job.
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        **body,
+        "parts_settlement": [{"part_request": line_id, "used": 1, "serials": ["FM-9"]}],
+    }, format="json")
+    assert r.status_code == 400, r.content
+
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        **body,
+        "parts_settlement": [{"part_request": line_id, "used": 1, "serials": ["FM-2"]}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    back = GoodsReceipt.objects.get(source=GoodsReceipt.Source.MAINTENANCE_RETURN).lines.get()
+    assert back.serial_numbers == ["FM-2"]
+    assert back.inspection_notes == f"unit_type:{kind.id}", "receiving knows what it is"
+
+
+@pytest.mark.django_db
+def test_a_request_sent_back_by_the_store_waits_on_the_supervisor_again(parts_job):
+    """The job does not sit reading "awaiting issue" for something the store
+    has handed back. The line returns to the supervisor, whose approval is
+    what puts it in front of the store in the first place.
+    """
+    from apps.accounts.models import User
+    from apps.inventory.models import IssuanceRequest
+    from apps.maintenance.models import MaintenancePartRequest
+
+    store = User.objects.create_user(username="parts-store", password="x", role="warehouse")
+    line_id = _approved_line(parts_job, quantity=6)
+    line = MaintenancePartRequest.objects.get(pk=line_id)
+    issuance = line.issuance_request
+
+    r = _client(store).post(
+        f"/api/inventory/issuance-requests/{issuance.id}/send-back/",
+        {"note": "Out of stock — decide again"}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["sent_back_to"] == parts_job["schedule"].title
+
+    line.refresh_from_db()
+    issuance.refresh_from_db()
+    assert issuance.status == IssuanceRequest.Status.CANCELLED
+    assert line.status == MaintenancePartRequest.Status.REQUESTED, "back with the supervisor"
+    assert line.quantity_approved is None and line.issuance_request_id is None
+    assert "Out of stock" in line.decision_note
+
+    # And the supervisor can answer it again, which asks the store afresh.
+    r = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{line_id}/decide/",
+        {"approve": True, "quantity": 4}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["quantity_approved"] == 4
+    assert r.data["issuance_request"] != str(issuance.id), "a fresh request, not the cancelled one"
+
+
+@pytest.mark.django_db
+def test_a_jobs_parts_are_collected_by_whoever_is_on_the_job(parts_job):
+    """Parts and the work they are for stay with the same person.
+
+    Handing them to anyone else leaves the job's record saying something
+    untrue about who holds what.
+    """
+    from apps.accounts.models import User
+    from apps.inventory.models import IssuanceRequest
+
+    store = User.objects.create_user(username="collect-store", password="x", role="warehouse")
+    line_id = _approved_line(parts_job, quantity=3)
+    issuance = IssuanceRequest.objects.get(maintenance_part_request=line_id)
+    tech = parts_job["tech"].get_full_name() or parts_job["tech"].username
+
+    r = _client(store).post(f"/api/inventory/issuance-requests/{issuance.id}/issue/",
+                            {"quantity": 1, "received_by": "Someone off the street"}, format="json")
+    assert r.status_code == 400, r.content
+    assert tech in str(r.data["received_by"])
+
+    r = _client(store).post(f"/api/inventory/issuance-requests/{issuance.id}/issue/",
+                            {"quantity": 1, "received_by": tech}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["request"]["received_by"] == tech
+
+    # Left blank, the store does not have to type it: the job already says.
+    r = _client(store).post(f"/api/inventory/issuance-requests/{issuance.id}/issue/",
+                            {"quantity": 1}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["request"]["received_by"] == tech
+    assert r.data["request"]["maintenance_assignee"] == tech
+
+
+@pytest.mark.django_db
+def test_every_round_is_planned_on_its_own(parts_job):
+    """A recurring schedule is an arrangement, not one person's job.
+
+    Each round is its own row: due on its own date, attended by whoever is
+    free, and closing one opens the next.
+    """
+    from apps.accounts.models import User
+    from apps.maintenance.models import MaintenanceVisit
+
+    schedule = parts_job["schedule"]
+    visit = schedule.visits.get()
+    assert visit.status == MaintenanceVisit.Status.PLANNED
+    assert visit.due_date == schedule.next_due
+    assert visit.assigned_to_id == schedule.assigned_to_id, "the standing technician, to start with"
+
+    # This round goes to somebody else, and the schedule's default is untouched.
+    stand_in = User.objects.create_user(
+        username="stand-in", password="x", role="technician", is_field_staff=True,
+    )
+    r = _client(parts_job["boss"]).patch(
+        f"/api/maintenance/visits/{visit.id}/",
+        {"assigned_to": str(stand_in.id), "due_date": str(schedule.next_due + timedelta(days=2))},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    visit.refresh_from_db()
+    schedule.refresh_from_db()
+    assert visit.assigned_to_id == stand_in.id
+    assert schedule.assigned_to_id == parts_job["tech"].id, "the arrangement keeps its own technician"
+    assert schedule.next_due == visit.due_date, "the open round is when it is next due"
+
+    # A technician cannot hand their own round to somebody else.
+    r = _client(parts_job["tech"]).patch(
+        f"/api/maintenance/visits/{visit.id}/", {"assigned_to": str(parts_job["tech"].id)}, format="json",
+    )
+    assert r.status_code == 403, r.content
+
+    # Starting says so on the round and on the schedule.
+    r = _client(parts_job["tech"]).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
+    assert r.status_code == 200, r.content
+    visit.refresh_from_db(); schedule.refresh_from_db()
+    assert visit.status == MaintenanceVisit.Status.IN_PROGRESS and visit.started_at is not None
+    assert schedule.status == MaintenanceSchedule.Status.IN_PROCESS
+    r = _client(parts_job["tech"]).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
+    assert r.status_code == 400, "a round already under way cannot start again"
+
+    # Closing it out records the round and opens the next one.
+    r = _client(parts_job["tech"]).post("/api/maintenance/records/", {
+        "schedule": str(schedule.id),
+        "performed_at": timezone.now().isoformat(),
+        "status": "completed",
+        "notes": "Round one done.",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    visit.refresh_from_db(); schedule.refresh_from_db()
+    assert visit.status == MaintenanceVisit.Status.COMPLETED
+    assert str(visit.record_id) == r.data["id"]
+
+    nxt = schedule.visits.exclude(pk=visit.pk).get()
+    assert nxt.status == MaintenanceVisit.Status.PLANNED
+    assert nxt.due_date == schedule.next_due > visit.due_date
+    assert nxt.assigned_to_id == schedule.assigned_to_id, "back to the standing technician"
+
+
+@pytest.mark.django_db
+def test_a_part_is_asked_for_on_the_round_it_is_needed_for(parts_job):
+    schedule = parts_job["schedule"]
+    r = _ask(_client(parts_job["tech"]), parts_job, quantity=2)
+    assert r.status_code == 201, r.content
+    assert str(r.data["visit"]) == str(schedule.open_visit().id)
+
+
+@pytest.mark.django_db
+def test_a_ticket_raised_against_an_asset_shows_up_as_a_corrective_job():
+    """A fault reported is work to be done, and work lives in the register.
+
+    Tickets take the complaint; the repair is planned, parted and recorded in
+    maintenance, so raising one opens the job there and closing it files the
+    job's completion record.
+    """
+    from apps.assets.models import AssetType
+    from apps.maintenance.models import MaintenanceSchedule
+    from apps.tickets.models import Ticket
+
+    boss = User.objects.create_user(username="ticket-boss", password="x", role="ops_manager")
+    site = Site.objects.create(name="Ticket Site", address="2 Road")
+    device = Device.objects.create(
+        asset_type=AssetType.objects.create(name="Ticket Kind"), current_site=site,
+        status=Device.Status.ACTIVE,
+    )
+
+    r = _client(boss).post("/api/tickets/", {
+        "title": "Screen flickering", "description": "Flickers on the hour.",
+        "device": str(device.id), "priority": "high", "category": "repair",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    ticket = Ticket.objects.get(pk=r.data["id"])
+
+    job = MaintenanceSchedule.objects.get(ticket=ticket)
+    assert job.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE
+    assert job.device_id == device.id and job.site_id == site.id
+    assert job.title == "Screen flickering"
+    assert job.frequency == MaintenanceSchedule.Frequency.ONE_TIME
+    assert job.visits.count() == 1, "and it has a round to plan, like any other job"
+
+    # A second ticket on the same asset joins the outage rather than doubling it.
+    r2 = _client(boss).post("/api/tickets/", {
+        "title": "Screen still flickering", "device": str(device.id), "category": "repair",
+    }, format="json")
+    assert r2.status_code == 201, r2.content
+    assert MaintenanceSchedule.objects.filter(device=device).count() == 1
+
+    device.refresh_from_db()
+    assert device.status == Device.Status.UNDER_MAINTENANCE, (
+        "an asset with a fault open against it is not in service"
+    )
+
+    # Closing the ticket closes the job it raised, and the asset comes back.
+    ticket.status = Ticket.Status.CLOSED
+    ticket.save(update_fields=["status"])
+    job.refresh_from_db()
+    device.refresh_from_db()
+    assert job.status == MaintenanceSchedule.Status.COMPLETED
+    assert job.records.count() == 1
+    assert device.status == Device.Status.ACTIVE
+
+
+
+@pytest.mark.django_db
+def test_a_ticket_over_several_assets_opens_a_job_for_each():
+    """Each asset on a ticket is its own repair.
+
+    One complaint can cover two standees, but they are attended, parted and
+    closed out separately — so each gets its own job, and closing the ticket
+    closes them all.
+    """
+    from apps.assets.models import AssetType
+    from apps.maintenance.models import MaintenanceSchedule
+    from apps.tickets.models import Ticket
+
+    boss = User.objects.create_user(username="multi-boss", password="x", role="ops_manager")
+    site = Site.objects.create(name="Multi Site", address="3 Road")
+    kind = AssetType.objects.create(name="Multi Kind")
+    first = Device.objects.create(asset_type=kind, current_site=site, status=Device.Status.ACTIVE)
+    second = Device.objects.create(asset_type=kind, current_site=site, status=Device.Status.ACTIVE)
+
+    r = _client(boss).post("/api/tickets/", {
+        "title": "Both standees dark", "device": str(first.id),
+        "devices": [str(first.id), str(second.id)], "category": "repair",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    ticket = Ticket.objects.get(pk=r.data["id"])
+
+    jobs = MaintenanceSchedule.objects.filter(ticket=ticket)
+    assert jobs.count() == 2
+    assert {j.device_id for j in jobs} == {first.id, second.id}
+    assert all(j.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE for j in jobs)
+    first.refresh_from_db(); second.refresh_from_db()
+    assert first.status == second.status == Device.Status.UNDER_MAINTENANCE
+
+    # An asset added later joins with its own job too.
+    third = Device.objects.create(asset_type=kind, current_site=site, status=Device.Status.ACTIVE)
+    ticket.devices.add(third)
+    assert MaintenanceSchedule.objects.filter(ticket=ticket, device=third).exists()
+
+    ticket.status = Ticket.Status.CLOSED
+    ticket.save(update_fields=["status"])
+    assert not MaintenanceSchedule.objects.filter(ticket=ticket).exclude(
+        status=MaintenanceSchedule.Status.COMPLETED
+    ).exists(), "every job the ticket raised is closed with it"
+    for d in (first, second, third):
+        d.refresh_from_db()
+        assert d.status == Device.Status.ACTIVE

@@ -1523,3 +1523,117 @@ def test_the_receiving_log_lists_inspected_lines_and_exports(ops, received_line)
     got = dict(zip(hdr, row))
     assert got["Received Qty"] == 10 and got["Accepted"] == 8 and got["Rejected"] == 2 and got["Placed At"] == "Rack L"
     assert got["UOM"] == "meter" and str(got["Result"]).startswith("Passed") and got["Notes"] == "Two drums dented"
+
+
+@pytest.mark.django_db
+def test_a_returned_unit_goes_back_under_its_own_serial():
+    """A unit that comes back is the one that went out, not a second copy.
+
+    Receiving it as a new unit would fail on the serial it already holds, and
+    leave the return stuck in the queue with the unit still shown as issued.
+    """
+    from apps.accounts.models import User
+    from rest_framework.test import APIClient
+
+    from apps.inventory.models import GoodsReceipt, InventoryUnit
+
+    user = User.objects.create_user(username="return-wh", password="x", role="warehouse")
+    c = APIClient()
+    c.force_authenticate(user)
+
+    r = c.post("/api/inventory/products/", {
+        "name": "Returning Player", "opening_quantity": 1, "opening_serials": ["RET-1"],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    product_id = r.data["id"]
+    unit = InventoryUnit.objects.get(serial_number="RET-1")
+    first_receipt_line = unit.goods_receipt_line_id
+
+    # Out on a job, then handed back at the door.
+    unit.status = InventoryUnit.Status.ISSUED
+    unit.save(update_fields=["status"])
+    r = c.post("/api/inventory/receipts/return/", {
+        "source": "maintenance_return", "unit_type": product_id, "quantity": 1,
+        "serial_numbers": ["RET-1"], "reference": "Cable round",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    receipt = GoodsReceipt.objects.get(pk=r.data["id"])
+    line = receipt.lines.get()
+
+    # Receiving sees what it is and which serial is on the way back.
+    r = c.get("/api/inventory/receipt-lines/pending/")
+    mine = [x for x in (r.data["results"] if "results" in r.data else r.data) if x["id"] == str(line.id)][0]
+    assert mine["kind"] == "unique"
+    assert mine["serial_numbers"] == ["RET-1"]
+    assert mine["source_display"] == "Returned from Maintenance"
+    assert mine["component_code"], "the store is told which component it files under"
+
+    r = c.post(f"/api/inventory/receipt-lines/{line.id}/inspect/", {
+        "route": "unique", "accepted_quantity": 1,
+        "units": [{"serial_number": "RET-1"}],
+    }, format="json")
+    assert r.status_code == 200, r.content
+    assert InventoryUnit.objects.filter(serial_number="RET-1").count() == 1, "one unit, not two"
+
+    unit.refresh_from_db()
+    assert unit.status == InventoryUnit.Status.IN_STOCK
+    assert unit.goods_receipt_line_id == line.id != first_receipt_line, "traceable to the return"
+    assert receipt.grn_number in unit.notes
+
+    # A serial that never left cannot come back.
+    r = c.post("/api/inventory/receipts/return/", {
+        "source": "maintenance_return", "unit_type": product_id, "quantity": 1,
+        "serial_numbers": ["RET-1"],
+    }, format="json")
+    second = GoodsReceipt.objects.get(pk=r.data["id"]).lines.get()
+    r = c.post(f"/api/inventory/receipt-lines/{second.id}/inspect/", {
+        "route": "unique", "accepted_quantity": 1, "units": [{"serial_number": "RET-1"}],
+    }, format="json")
+    assert r.status_code == 400 and "already in stock" in str(r.data).lower()
+
+
+@pytest.mark.django_db
+def test_the_store_sends_a_request_back_to_where_it_was_raised(ops):
+    """The store is not where it is decided whether a job needs a part.
+
+    A request the store will not fill goes back a step — to the requirement
+    that asked for it — rather than disappearing off every screen it was
+    raised from.
+    """
+    from apps.assets.models import AssetComponent, Brand, Device, DeviceModel
+    from apps.inventory.models import IssuanceRequest
+
+    brand = Brand.objects.create(name="BackBrand")
+    dm = DeviceModel.objects.create(brand=brand, name="B-1")
+    device = Device.objects.create(device_model=dm, asset_code="AST-BACK-1", serial_number="BACK-1")
+    mt = MaterialType.objects.create(name="Back Stand", unit="piece")
+    stand = InventoryItem.objects.create(material_type=mt, quantity=5)
+    comp = AssetComponent.objects.create(
+        device=device, name="Back Stand", quantity=2, inventory_item=stand,
+        fulfilment=AssetComponent.Fulfilment.FROM_STOCK,
+    )
+    req = IssuanceRequest.objects.create(
+        item=stand, quantity_requested=2, asset_component=comp, source="project",
+    )
+
+    r = _client(ops).post(
+        f"/api/inventory/issuance-requests/{req.id}/send-back/",
+        {"note": "Nothing on the shelf until Thursday"}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert "Back Stand" in r.data["sent_back_to"]
+
+    req.refresh_from_db()
+    comp.refresh_from_db()
+    assert req.status == IssuanceRequest.Status.CANCELLED
+    assert "Nothing on the shelf" in req.notes
+    assert comp.fulfilment == AssetComponent.Fulfilment.PENDING, "the requirement is open again"
+    assert comp.undecided_quantity == 2, "and all of it is back to be decided"
+
+    # Once everything asked for has gone out there is nothing to hand back.
+    settled = IssuanceRequest.objects.create(
+        item=stand, quantity_requested=1, quantity_issued=1, status=IssuanceRequest.Status.FULFILLED,
+        asset_component=comp, source="project",
+    )
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{settled.id}/send-back/", {}, format="json")
+    assert r.status_code == 400 and "nothing to send back" in str(r.data["detail"])

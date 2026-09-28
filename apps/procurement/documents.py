@@ -87,8 +87,8 @@ def _money(value, currency: str) -> str:
     return f"{currency} {float(value or 0):,.2f}"
 
 
-def _address_block(supplier, s) -> list:
-    """Who the order is being placed with."""
+def _address_block(supplier, s, details: str = "") -> list:
+    """Who the order is being placed with, and anything particular to this order."""
     lines = [f"<b>{supplier.name}</b>"]
     if supplier.contact_person:
         lines.append(supplier.contact_person)
@@ -97,6 +97,8 @@ def _address_block(supplier, s) -> list:
     contact = " · ".join(x for x in (supplier.contact_phone, supplier.contact_email) if x)
     if contact:
         lines.append(contact)
+    if details:
+        lines.extend(details.splitlines())
     return [Paragraph("<br/>".join(lines), s["body"])]
 
 
@@ -154,7 +156,8 @@ def render_purchase_order_pdf(purchase_order) -> bytes:
     ]))
 
     supplier_box = Table(
-        [[Paragraph("SUPPLIER", s["label"])], _address_block(purchase_order.supplier, s)],
+        [[Paragraph("SUPPLIER", s["label"])],
+         _address_block(purchase_order.supplier, s, purchase_order.supplier_details)],
         colWidths=[64 * mm],
     )
     supplier_box.setStyle(TableStyle([

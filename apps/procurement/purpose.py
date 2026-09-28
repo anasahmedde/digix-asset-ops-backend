@@ -18,6 +18,10 @@ def describe_purpose(purchase_order) -> dict:
     projects: dict = {}
     assets: list[str] = []
     for_stock = False
+    # Replenishment is what the warehouse asks for when a line falls to its
+    # minimum; an order somebody typed out is a purchase, not a restock.
+    from_reorder = False
+    charges_only = True
 
     def note(device):
         # An asset reaches a project by its own link or by a Scope row, so ask
@@ -37,8 +41,10 @@ def describe_purpose(purchase_order) -> dict:
             projects[item.bom_line.project_id] = item.bom_line.project.name
         # A line that tops the warehouse up: raised from a reorder request, or
         # naming a stock row with no project behind it.
+        if not item.is_charge:
+            charges_only = False
         if item.reorder_requests.exists():
-            for_stock = True
+            for_stock = from_reorder = True
         elif not item.asset_components.exists() and not item.procured_devices.exists():
             if item.inventory_item_id or item.inventory_unit_type_id or item.material_type_id:
                 for_stock = True
@@ -53,6 +59,10 @@ def describe_purpose(purchase_order) -> dict:
         if len(names) == 1:
             return {"kind": "project", "label": names[0], "detail": detail}
         return {"kind": "mixed", "label": f"{len(names)} projects", "detail": ", ".join(names)}
+    if from_reorder:
+        return {"kind": "stock", "label": "Stock replenishment", "detail": detail}
     if for_stock:
-        return {"kind": "stock", "label": "Inventory restock", "detail": detail}
+        return {"kind": "stock", "label": "Stock purchase", "detail": detail}
+    if charges_only and purchase_order.items.exists():
+        return {"kind": "stock", "label": "Charges", "detail": detail}
     return {"kind": "unknown", "label": "Not linked", "detail": detail}

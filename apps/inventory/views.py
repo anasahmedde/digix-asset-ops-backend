@@ -455,46 +455,20 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
         source (project_return | maintenance_return), inventory_item or
         unit_type, quantity, optional serial_numbers, reference, notes.
         """
-        source = request.data.get("source")
-        if source not in (GoodsReceipt.Source.PROJECT_RETURN, GoodsReceipt.Source.MAINTENANCE_RETURN):
-            return Response({"source": ["Say whether this is a project or a maintenance return."]}, status=400)
-        try:
-            quantity = int(request.data.get("quantity") or 0)
-        except (TypeError, ValueError):
-            quantity = 0
-        if quantity < 1:
-            return Response({"quantity": ["Return at least one."]}, status=400)
+        from .returns import record_return as book_in
 
-        item_id = request.data.get("inventory_item") or None
-        unit_type_id = request.data.get("unit_type") or None
-        if not item_id and not unit_type_id:
-            return Response({"inventory_item": ["Name the component coming back."]}, status=400)
-        serials = request.data.get("serial_numbers") or []
-        if unit_type_id and len(serials) != quantity:
-            return Response(
-                {"serial_numbers": [f"Give {quantity} serial number(s) for the units coming back."]},
-                status=400,
-            )
-
-        with transaction.atomic():
-            receipt = GoodsReceipt.objects.create(
-                source=source,
-                reference=(request.data.get("reference") or "").strip(),
-                notes=(request.data.get("notes") or "").strip(),
-                received_by=request.user,
-            )
-            line = GoodsReceiptLine.objects.create(
-                receipt=receipt,
-                inventory_item_id=item_id,
-                quantity=quantity,
-                serial_numbers=serials,
-                inspection_status=GoodsReceiptLine.Inspection.PENDING,
-            )
-            # A unique product is remembered on the line's notes for the
-            # inspector, who files the serials against it.
-            if unit_type_id:
-                line.inspection_notes = f"unit_type:{unit_type_id}"
-                line.save(update_fields=["inspection_notes", "updated_at"])
+        receipt = book_in(
+            source=request.data.get("source"),
+            rows=[{
+                "item": request.data.get("inventory_item") or None,
+                "unit_type": request.data.get("unit_type") or None,
+                "quantity": request.data.get("quantity"),
+                "serials": request.data.get("serial_numbers") or [],
+            }],
+            reference=request.data.get("reference") or "",
+            notes=request.data.get("notes") or "",
+            user=request.user,
+        )
         return Response(GoodsReceiptSerializer(receipt).data, status=201)
 
     def perform_create(self, serializer):
@@ -600,6 +574,89 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
             "reason": result.get("reason", ""),
         })
 
+    @action(detail=True, methods=["post"], url_path="send-back")
+    def send_back(self, request, pk=None):
+        """Hand a request back to whoever raised it.
+
+        The store is not the place to decide whether a job needs a part. A
+        request it cannot or should not fill goes back one step instead of
+        vanishing: to the supervisor who released it on a maintenance job, or
+        to the requirement on a project, for that decision to be made again.
+        Anything already issued stays issued; only the balance comes off the
+        queue.
+        """
+        from django.utils import timezone
+
+        denied = self._store_only(request)
+        if denied is not None:
+            return denied
+
+        issuance_request = self.get_object()
+        if issuance_request.status == IssuanceRequest.Status.CANCELLED:
+            return Response({"detail": "This request is already off the queue."}, status=400)
+        if issuance_request.outstanding_quantity == 0:
+            return Response(
+                {"detail": "Everything asked for has been issued — there is nothing to send back."},
+                status=400,
+            )
+
+        note = (request.data.get("note") or "").strip()
+        part = getattr(issuance_request, "maintenance_part_request", None)
+        component = issuance_request.asset_component
+
+        with transaction.atomic():
+            issuance_request.status = IssuanceRequest.Status.CANCELLED
+            who = request.user.get_full_name() or request.user.username
+            trail = f"Sent back by {who} on {timezone.localdate():%d %b %Y}"
+            if issuance_request.quantity_issued:
+                trail += f" — {issuance_request.quantity_issued} already issued stays issued"
+            if note:
+                trail += f": {note}"
+            issuance_request.notes = "\n".join(
+                x for x in [issuance_request.notes, trail] if x
+            )
+            issuance_request.save(update_fields=["status", "notes", "updated_at"])
+
+            where = "the store"
+            if part is not None:
+                # Back to awaiting an answer: the supervisor decides again, and
+                # approving raises a fresh request on the store's queue.
+                from apps.maintenance.models import MaintenancePartRequest
+
+                part.status = MaintenancePartRequest.Status.REQUESTED
+                part.quantity_approved = None
+                part.decided_by = None
+                part.decided_at = None
+                part.decision_note = note or f"Sent back by the store on {timezone.localdate():%d %b %Y}"
+                part.issuance_request = None
+                part.save(update_fields=[
+                    "status", "quantity_approved", "decided_by", "decided_at",
+                    "decision_note", "issuance_request", "updated_at",
+                ])
+                where = part.schedule.title
+            elif component is not None:
+                # A cancelled request stops counting against the requirement,
+                # so the quantity is undecided again; all that is left is to
+                # say so on the line itself.
+                from apps.assets.models import AssetComponent
+
+                component.refresh_from_db()
+                if component.outstanding_quantity == 0:
+                    component.fulfilment = AssetComponent.Fulfilment.FULFILLED
+                elif component.procure_quantity:
+                    component.fulfilment = AssetComponent.Fulfilment.PROCUREMENT
+                elif component.stock_requested_quantity:
+                    component.fulfilment = AssetComponent.Fulfilment.FROM_STOCK
+                else:
+                    component.fulfilment = AssetComponent.Fulfilment.PENDING
+                component.save(update_fields=["fulfilment", "updated_at"])
+                where = f"{component.device.asset_code} · {component.name}"
+
+        return Response({
+            "request": IssuanceRequestSerializer(issuance_request).data,
+            "sent_back_to": where,
+        })
+
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
         """Close a request that is no longer needed; issued stock is untouched."""
@@ -683,6 +740,22 @@ class LowStockView(APIView):
             .select_related("purchase_order_item__purchase_order")
         })
 
+        declines = {}
+        for r in (
+            ReorderRequest.objects.filter(status=ReorderRequest.Status.CANCELLED)
+            .exclude(declined_at=None).select_related("declined_by").order_by("declined_at")
+        ):
+            key = ("item", r.item_id) if r.item_id else ("unit_type", r.unit_type_id)
+            who = r.declined_by
+            declines[key] = {
+                "reason": r.declined_reason,
+                "at": r.declined_at,
+                "by": (who.get_full_name() or who.username) if who else None,
+            }
+
+        def last_decline(kind, pk):
+            return declines.get((kind, pk))
+
         def open_request(kind, pk):
             r = live.get((kind, pk))
             if r is None:
@@ -708,6 +781,7 @@ class LowStockView(APIView):
                 "shortfall": max(it.min_stock_level - it.quantity, 0),
                 "unit_cost": it.unit_cost,
                 "open_request": open_request("item", it.pk),
+                "last_decline": last_decline("item", it.pk),
             })
         products = InventoryUnitType.objects.filter(min_stock_level__gt=0, is_active=True).order_by("name")
         for p in products:
@@ -720,6 +794,7 @@ class LowStockView(APIView):
                 "shortfall": max(p.min_stock_level - on_hand, 0),
                 "unit_cost": p.unit_cost,
                 "open_request": open_request("unit_type", p.pk),
+                "last_decline": last_decline("unit_type", p.pk),
             })
         return Response({"results": rows, "count": len(rows), "unrequested": sum(1 for r in rows if not r["open_request"])})
 

@@ -1,9 +1,11 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import Quotation, QuotationItem
 
 
-class QuotationItemSerializer(serializers.ModelSerializer):
+class QuotationItemSerializer(HidesMoney, serializers.ModelSerializer):
     """Nested under QuotationSerializer (mirrors the Wave-1 PO item pattern).
 
     ``id`` is writable so nested updates can upsert: rows carrying an existing
@@ -32,7 +34,7 @@ class QuotationItemSerializer(serializers.ModelSerializer):
         return value
 
 
-class QuotationSerializer(serializers.ModelSerializer):
+class QuotationSerializer(HidesMoney, serializers.ModelSerializer):
     items = QuotationItemSerializer(many=True, required=False)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)

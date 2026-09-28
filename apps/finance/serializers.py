@@ -1,9 +1,11 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import Invoice, Payment
 
 
-class PaymentSerializer(serializers.ModelSerializer):
+class PaymentSerializer(HidesMoney, serializers.ModelSerializer):
     class Meta:
         model = Payment
         fields = [
@@ -14,7 +16,7 @@ class PaymentSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
-class InvoiceSerializer(serializers.ModelSerializer):
+class InvoiceSerializer(HidesMoney, serializers.ModelSerializer):
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)

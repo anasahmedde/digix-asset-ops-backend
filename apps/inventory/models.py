@@ -234,6 +234,14 @@ class InventoryUnit(TimeStampedModel):
     converted_device = models.OneToOneField(
         "assets.Device", on_delete=models.SET_NULL, null=True, blank=True, related_name="source_inventory_unit"
     )
+    # The requirement this unit was issued against, once it has been fitted
+    # into an asset's build. A requirement takes as many units as it needs, so
+    # this is the record of which ones — the asset names its serials, and the
+    # unit says where it went.
+    fitted_to = models.ForeignKey(
+        "assets.AssetComponent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="fitted_units",
+    )
     notes = models.TextField(blank=True)
 
     class Meta:
@@ -620,6 +628,15 @@ class ReorderRequest(TimeStampedModel):
     )
     quantity = models.PositiveIntegerField(help_text="Reorder quantity")
     reason = models.CharField(max_length=300, blank=True)
+    # Procurement sending a request back is an answer the store has to see:
+    # the line drops below its minimum again on the next page load, and
+    # raising it a second time without knowing why helps nobody.
+    declined_reason = models.CharField(max_length=300, blank=True)
+    declined_at = models.DateTimeField(null=True, blank=True)
+    declined_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="declined_reorders",
+    )
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.OPEN, db_index=True)
     purchase_order_item = models.ForeignKey(
         "procurement.PurchaseOrderItem", on_delete=models.SET_NULL, null=True, blank=True,

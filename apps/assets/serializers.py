@@ -2,6 +2,8 @@ from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from apps.sites.models import Site
 from apps.suppliers.models import Supplier
 
@@ -251,6 +253,15 @@ class AssetComponentSerializer(serializers.ModelSerializer):
     )
     inventory_item_sku = serializers.CharField(source="inventory_item.sku", read_only=True, default=None)
     inventory_unit_code = serializers.CharField(source="inventory_unit.unit_code", read_only=True, default=None)
+    # Every unit fitted against this requirement, by serial — a line for three
+    # players is built from three particular players.
+    fitted_serials = serializers.SerializerMethodField()
+
+    def get_fitted_serials(self, obj):
+        serials = [u.serial_number for u in obj.fitted_units.all() if u.serial_number]
+        if not serials and obj.inventory_unit_id and obj.inventory_unit.serial_number:
+            serials = [obj.inventory_unit.serial_number]
+        return serials
     # StringRelatedField, not source="…__str__": with no related row DRF walks
     # to a bound method-wrapper on None and renders it verbatim.
     inventory_unit_type_name = serializers.StringRelatedField(
@@ -278,7 +289,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
     class Meta:
         model = AssetComponent
         fields = [
-            "id", "device", "name", "component_type", "serial_number",
+            "id", "device", "name", "component_type", "serial_number", "fitted_serials",
             "quantity", "supplier", "supplier_name",
             "inventory_item", "inventory_item_name", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name", "available_quantity",
@@ -475,7 +486,7 @@ class DeviceListSerializer(serializers.ModelSerializer):
         return _warranty_status(obj)
 
 
-class DeviceDetailSerializer(serializers.ModelSerializer):
+class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
     device_model_name = serializers.StringRelatedField(source="device_model", read_only=True)
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     brand_name = serializers.CharField(source="device_model.brand.name", read_only=True, default=None)
@@ -576,7 +587,7 @@ class DeviceDetailSerializer(serializers.ModelSerializer):
             # device_model stays readable for historical assets but is no longer
             # part of registration; identity comes from type + name + components.
             "device_model", "device_model_name", "brand_name",
-            "length_in", "width_in", "depth_in", "diagonal_inches",
+            "length_in", "width_in", "depth_in", "diagonal_inches", "dimension_unit",
             "hardware_revision",
             "status", "status_display", "source", "source_display", "allowed_transitions",
             "image", "display_image", "images",
@@ -951,7 +962,7 @@ class DeviceAssignmentSerializer(serializers.Serializer):
         )
 
 
-class ProductionStepSerializer(serializers.ModelSerializer):
+class ProductionStepSerializer(HidesMoney, serializers.ModelSerializer):
     """One operation in an in-house build route."""
 
     workshop_display = serializers.CharField(read_only=True)

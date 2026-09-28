@@ -35,6 +35,8 @@ def supplier(db):
 def _create_po(client, supplier, **extra):
     payload = {
         "supplier": str(supplier.id),
+        # An order says when the goods are wanted, as a real one would.
+        "expected_delivery": str(timezone.localdate()),
         "items": [
             {"description": "P6 LED module", "quantity": 2, "unit_price": "100.00"},
             {"description": "Cat6 cable", "quantity": 3, "unit_price": "10.50"},
@@ -252,7 +254,8 @@ def test_full_transition_flow_and_approved_by_stamp(people, supplier):
     assert po.status == "approved"
     assert po.approved_by == people["group_head"]  # the signature is the Group Head's
 
-    assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "ordered"}, format="json").status_code == 200
+    # Approval placed the order: goods are received against it directly.
+    assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "ordered"}, format="json").status_code == 400
     assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "partially_received"}, format="json").status_code == 200
     assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "received"}, format="json").status_code == 200
     # received is terminal
@@ -547,6 +550,7 @@ def receivable_po(db, people, supplier):
     material = MaterialType.objects.create(name="GRN Cable", unit="meter")
 
     po = PurchaseOrder.objects.create(
+        expected_delivery=timezone.localdate(),
         supplier=supplier, ordered_by=people["finance"], status=PurchaseOrder.Status.ORDERED
     )
     serialized = PurchaseOrderItem.objects.create(
@@ -852,8 +856,10 @@ def test_receive_over_receive_400(people, receivable_po):
 @pytest.mark.django_db
 def test_receive_rejected_for_wrong_po_status(people, supplier, receivable_po):
     c = _client(people["finance"])
-    for bad_status in ("draft", "pending_approval", "approved", "received", "cancelled"):
-        po = PurchaseOrder.objects.create(supplier=supplier, status=bad_status)
+    # Approved is receivable now — approval is what places the order — so the
+    # statuses that still refuse goods are the ones either side of it.
+    for bad_status in ("draft", "pending_approval", "received", "cancelled"):
+        po = PurchaseOrder.objects.create(supplier=supplier, status=bad_status, expected_delivery=timezone.localdate())
         item = PurchaseOrderItem.objects.create(
             purchase_order=po, description="Line", quantity=1, unit_price=Decimal("1.00"),
             material_type=receivable_po["material"],
@@ -864,18 +870,18 @@ def test_receive_rejected_for_wrong_po_status(people, supplier, receivable_po):
 
 @pytest.mark.django_db
 def test_receive_line_without_type_400(people, supplier):
-    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED)
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED, expected_delivery=timezone.localdate())
     untyped = PurchaseOrderItem.objects.create(
         purchase_order=po, description="Untyped line", quantity=2, unit_price=Decimal("9.00"),
     )
     r = _receive(_client(people["finance"]), po.pk, [{"po_item": str(untyped.pk), "quantity": 2}])
     assert r.status_code == 400, r.content
-    assert "no unique product, device model or material type" in str(r.json())
+    assert "names no component or asset" in str(r.json())
 
 
 @pytest.mark.django_db
 def test_receive_foreign_po_item_400(people, supplier, receivable_po):
-    other = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED)
+    other = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED, expected_delivery=timezone.localdate())
     foreign = PurchaseOrderItem.objects.create(
         purchase_order=other, description="Foreign", quantity=1, unit_price=Decimal("2.00"),
         material_type=receivable_po["material"],
@@ -990,6 +996,7 @@ def test_flagged_requirements_appear_as_requisitions(people, requisitions):
 def test_raise_a_po_from_requisitions(people, requisitions, supplier):
     c = _client(people["finance"])
     r = c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),
         "supplier": str(supplier.pk),
         "components": [str(requisitions["generic"].pk), str(requisitions["unique"].pk)],
     }, format="json")
@@ -1015,6 +1022,7 @@ def test_raise_a_po_from_requisitions(people, requisitions, supplier):
 def test_requisitions_can_be_filtered_to_unordered(people, requisitions, supplier):
     c = _client(people["finance"])
     c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),
         "supplier": str(supplier.pk), "components": [str(requisitions["generic"].pk)],
     }, format="json")
 
@@ -1049,13 +1057,14 @@ def test_receiving_a_product_line_only_needs_serials(people, requisitions, suppl
 
     c = _client(people["finance"])
     po_resp = c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),
         "supplier": str(supplier.pk), "components": [str(requisitions["unique"].pk)],
     }, format="json")
     assert po_resp.status_code == 201, po_resp.content
     po_id = po_resp.data["id"]
     item_id = po_resp.data["items"][0]["id"]
 
-    for st in ("pending_approval", "approved", "ordered"):
+    for st in ("pending_approval", "approved"):
         # Approval is the Group Head's step; the rest is Operations/Finance.
         mover = _client(people["group_head"]) if st == "approved" else c
         r_st = mover.post(f"/api/procurement/purchase-orders/{po_id}/transition/", {"status": st}, format="json")
@@ -1114,6 +1123,7 @@ def test_clearing_a_decision_lets_it_be_procured_again(people, requisitions, sup
     component = requisitions["generic"]
     c = _client(people["finance"])
     assert c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),
         "supplier": str(supplier.pk), "components": [str(component.pk)],
     }, format="json").status_code == 201
     component.refresh_from_db()
@@ -1172,7 +1182,8 @@ def test_approval_stamps_the_order_date_and_lines_say_what_they_buy(people, supp
     device = Device.objects.create(asset_type=kind, display_name="Lobby Wall", source=Device.Source.VENDOR_SUPPLIED,
                                    serial_number="PO-LINE-1", diagonal_inches="55.0")
     c = _client(people["ops"])
-    r = c.post("/api/procurement/purchase-orders/raise-po/", {"supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)], "prices": {}}, format="json")
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),"supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)], "prices": {}}, format="json")
     assert r.status_code == 201, r.content
     line = r.data["items"][0]
     assert line["description"].startswith("Lobby Wall (PO Line Display")
@@ -1228,14 +1239,14 @@ def test_procurement_can_send_a_line_back_to_the_project():
     # On an order already: stays until that order is cancelled.
     c.post(f"/api/assets/components/{comp.id}/mark-for-procurement/", {"quantity": 2}, format="json")
     supplier = Supplier.objects.create(name="SB Supplier")
-    r = c.post("/api/procurement/purchase-orders/raise-po/", {"supplier": str(supplier.id), "components": [str(comp.id)], "devices": []}, format="json")
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),"supplier": str(supplier.id), "components": [str(comp.id)], "devices": []}, format="json")
     assert r.status_code == 201, r.content
     r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"component": str(comp.id), "reason": "no"}, format="json")
     assert r.status_code == 400 and "cancel that order first" in r.data["detail"]
 
     # A vendor-supplied asset asked to be bought can go back too.
     vendor_asset = Device.objects.create(device_model=dm, asset_code="AST-SB-V", serial_number="SB-V", source="vendor_supplied")
-    from django.utils import timezone
     vendor_asset.procurement_requested_at = timezone.now()
     vendor_asset.save(update_fields=["procurement_requested_at"])
     r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"device": str(vendor_asset.id), "reason": "Client cancelled the unit"}, format="json")
@@ -1263,6 +1274,7 @@ def test_receiving_a_complete_asset_asks_for_no_serial_number(people, supplier):
 
     ops = _client(people["ops"])
     r = ops.post("/api/procurement/purchase-orders/raise-po/", {
+            "expected_delivery": str(timezone.localdate()),
         "supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)],
         "prices": {str(device.pk): "9000.00"},
     }, format="json")
@@ -1280,8 +1292,6 @@ def test_receiving_a_complete_asset_asks_for_no_serial_number(people, supplier):
     assert gh.post(f"/api/procurement/purchase-orders/{po_id}/transition/",
                    {"status": "approved"}, format="json").status_code == 200
     store = _client(people["finance"])
-    assert store.post(f"/api/procurement/purchase-orders/{po_id}/transition/",
-                      {"status": "ordered"}, format="json").status_code == 200
 
     # No serial_numbers key at all — the receipt is accepted.
     r = _receive(store, po_id, [{"po_item": item_id, "quantity": 1}])
@@ -1310,3 +1320,115 @@ def test_two_assets_with_no_serial_can_both_exist(people, supplier):
     b.serial_number = "MFR-REAL-1"
     with pytest.raises(Exception):
         b.save(update_fields=["serial_number"])
+
+
+
+@pytest.mark.django_db
+def test_a_charge_on_an_order_is_not_goods_to_receive():
+    """Delivery charges are money owed, not something that arrives at the door.
+
+    An order carrying a cable and a delivery charge is complete once the cable
+    is in, and receiving cannot be asked to take delivery of the charge.
+    """
+    from apps.accounts.models import User
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem
+    from apps.procurement.models import PurchaseOrder
+    from apps.suppliers.models import Supplier
+    from rest_framework.test import APIClient
+
+    # Operations raise the order, the Group Head signs it off, the store
+    # receives against it — three hands, as on a real order.
+    c = APIClient()
+    c.force_authenticate(User.objects.create_user(username="charge-ops", password="x", role="ops_manager"))
+    head = APIClient()
+    head.force_authenticate(User.objects.create_user(username="charge-head", password="x", role="group_head"))
+    store = APIClient()
+    store.force_authenticate(User.objects.create_user(username="charge-fin", password="x", role="finance"))
+    supplier = Supplier.objects.create(name="Charge Supplies")
+    cable = InventoryItem.objects.create(
+        material_type=MaterialType.objects.create(name="Charge Cable", unit="meter"), quantity=0,
+    )
+
+    r = c.post("/api/procurement/purchase-orders/", {
+        "supplier": str(supplier.id), "currency": "PKR",
+        "expected_delivery": str(timezone.localdate()),
+        "supplier_details": "Quote Q-118 · deliver to the Multan store",
+        "items": [
+            {"description": "Charge Cable", "quantity": 10, "unit_price": "50.00",
+             "inventory_item": str(cable.id)},
+            {"description": "Delivery charges", "quantity": 1, "unit_price": "1500.00", "is_charge": True},
+        ],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    po = PurchaseOrder.objects.get(pk=r.data["id"])
+    assert po.supplier_details.startswith("Quote Q-118")
+    assert str(po.total_amount) == "2000.00", "the charge still counts in the total"
+    charge = po.items.get(is_charge=True)
+    goods = po.items.get(is_charge=False)
+    charge_row = next(i for i in r.data["items"] if i["is_charge"])
+    assert charge_row["line_detail"] == "charge, not goods"
+
+    for who, status in ((c, "pending_approval"), (head, "approved")):
+        r = who.post(f"/api/procurement/purchase-orders/{po.id}/transition/", {"status": status}, format="json")
+        assert r.status_code == 200, (status, r.content)
+
+    # Nothing arrives for a charge.
+    r = store.post(f"/api/procurement/purchase-orders/{po.id}/receive/", {
+        "lines": [{"po_item": str(charge.id), "quantity": 1}],
+    }, format="json")
+    assert r.status_code == 400, r.content
+    assert "charge" in str(r.data).lower()
+
+    # The goods arriving is the whole delivery.
+    r = store.post(f"/api/procurement/purchase-orders/{po.id}/receive/", {
+        "lines": [{"po_item": str(goods.id), "quantity": 10}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    po.refresh_from_db()
+    assert po.status == PurchaseOrder.Status.RECEIVED, "the charge does not hold the order open"
+
+    # And the printed order carries the supplier's particulars.
+    r = c.get(f"/api/procurement/purchase-orders/{po.id}/document/")
+    assert r.status_code == 200
+    assert r["Content-Type"].startswith("application/pdf")
+
+
+@pytest.mark.django_db
+def test_an_order_can_buy_an_asset_already_registered():
+    """An asset bought complete is registered first, then ordered by name."""
+    from apps.accounts.models import User
+    from apps.assets.models import AssetType, Device
+    from apps.procurement.models import PurchaseOrder
+    from apps.suppliers.models import Supplier
+    from rest_framework.test import APIClient
+
+    boss = User.objects.create_user(username="asset-boss", password="x", role="ops_manager")
+    c = APIClient()
+    c.force_authenticate(boss)
+    supplier = Supplier.objects.create(name="Standee Makers")
+    kind = AssetType.objects.create(name="Bought Standee")
+    device = Device.objects.create(asset_type=kind, status=Device.Status.PROCURED)
+
+    r = c.post("/api/procurement/purchase-orders/", {
+        "supplier": str(supplier.id), "currency": "PKR",
+        "expected_delivery": str(timezone.localdate()),
+        "items": [{"description": "Standee, complete", "quantity": 1, "unit_price": "90000.00",
+                   "device": str(device.id)}],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    device.refresh_from_db()
+    po = PurchaseOrder.objects.get(pk=r.data["id"])
+    assert device.procurement_item.purchase_order_id == po.id
+    assert r.data["items"][0]["procured_device"] == str(device.id)
+    assert r.data["items"][0]["procured_asset_codes"] == [device.asset_code]
+
+    # One asset is bought once.
+    r = c.post("/api/procurement/purchase-orders/", {
+        "supplier": str(supplier.id), "currency": "PKR",
+        "expected_delivery": str(timezone.localdate()),
+        "items": [{"description": "Standee again", "quantity": 1, "unit_price": "1.00",
+                   "device": str(device.id)}],
+    }, format="json")
+    assert r.status_code == 400, r.content
+    assert po.po_number in str(r.data)
