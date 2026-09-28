@@ -1,12 +1,41 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from apps.suppliers.models import Supplier
 from apps.teams.models import Project
 
 from .models import PurchaseOrder, PurchaseOrderItem
 
 
-class PurchaseOrderItemSerializer(serializers.ModelSerializer):
+def _buy_asset_on(item, device_id):
+    """Point a registered asset at the line that buys it.
+
+    An asset bought complete is registered first and then ordered, so the
+    order names the asset rather than describing one; receiving the line is
+    what brings it into stock. One asset is bought once.
+    """
+    from apps.assets.models import Device
+
+    item.procured_devices.update(procurement_item=None)
+    if not device_id:
+        return
+    device = Device.objects.filter(pk=device_id).first()
+    if device is None:
+        raise serializers.ValidationError({"items": "That asset is not in the registry."})
+    if device.procurement_item_id and device.procurement_item_id != item.pk:
+        raise serializers.ValidationError({
+            "items": f"{device.asset_code} is already on {device.procurement_item.purchase_order.po_number}."
+        })
+    if device.status != "procured":
+        raise serializers.ValidationError({
+            "items": f"{device.asset_code} is {device.get_status_display()} — only an asset in procurement is bought."
+        })
+    device.procurement_item = item
+    device.save(update_fields=["procurement_item", "updated_at"])
+
+
+class PurchaseOrderItemSerializer(HidesMoney, serializers.ModelSerializer):
     """Nested under PurchaseOrderSerializer (mirrors WorkOrderItemSerializer).
 
     ``id`` is writable so nested updates can upsert: rows carrying an existing
@@ -64,6 +93,14 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
         source="inventory_item.sku", read_only=True, default=None
     )
     line_total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    # A complete asset bought on this line: named by the caller when the order
+    # is written, read back as the asset it buys.
+    device = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+    procured_device = serializers.SerializerMethodField()
+
+    def get_procured_device(self, obj):
+        first = obj.procured_devices.first() if hasattr(obj, "procured_devices") else None
+        return str(first.pk) if first else None
 
     def get_inventory_unit_type_name(self, obj):
         return str(obj.inventory_unit_type) if obj.inventory_unit_type_id else None
@@ -75,6 +112,7 @@ class PurchaseOrderItemSerializer(serializers.ModelSerializer):
             "material_type", "material_type_name", "bom_line", "description", "line_title", "line_detail", "procured_asset_codes",
             "inventory_item", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name",
+            "device", "procured_device", "is_charge",
             "quantity", "unit", "unit_price", "received_quantity", "line_total",
         ]
         # received_quantity is owned by goods receiving — never writable via the API.
@@ -103,7 +141,7 @@ def _can_see_prices(context) -> bool:
     return getattr(user, "role", "") in PRICE_VIEW_ROLES
 
 
-class PurchaseOrderSerializer(serializers.ModelSerializer):
+class PurchaseOrderSerializer(HidesMoney, serializers.ModelSerializer):
     items = PurchaseOrderItemSerializer(many=True, required=False)
 
     def to_representation(self, instance):
@@ -142,7 +180,7 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         fields = [
             "id", "po_number", "supplier", "supplier_name",
             "status", "status_display", "currency", "order_date", "expected_delivery",
-            "total_amount", "notes", "terms", "effective_terms", "raised_for",
+            "total_amount", "notes", "supplier_details", "terms", "effective_terms", "raised_for",
             "ordered_by", "ordered_by_name", "approved_by", "approved_by_name",
             "items", "created_at", "updated_at",
         ]
@@ -164,7 +202,9 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         purchase_order = PurchaseOrder.objects.create(**validated_data)
         for item in items:
             item.pop("id", None)
-            PurchaseOrderItem.objects.create(purchase_order=purchase_order, **item)
+            device_id = item.pop("device", None)
+            row = PurchaseOrderItem.objects.create(purchase_order=purchase_order, **item)
+            _buy_asset_on(row, device_id)
         purchase_order.recalc_total()
         return purchase_order
 
@@ -192,6 +232,7 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             seen_ids = set()
             for item_data in items:
                 item_id = item_data.pop("id", None)
+                device_id = item_data.pop("device", "__unchanged__")
                 if item_id is not None:
                     item = existing.get(item_id)
                     if item is None:
@@ -205,6 +246,8 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
                 else:
                     item = PurchaseOrderItem.objects.create(purchase_order=instance, **item_data)
                     seen_ids.add(item.pk)
+                if device_id != "__unchanged__":
+                    _buy_asset_on(item, device_id)
             for item_id, item in existing.items():
                 if item_id not in seen_ids:
                     item.delete()
@@ -272,6 +315,9 @@ class PurchaseOrderReceiveSerializer(serializers.Serializer):
 class PurchaseOrderTransitionSerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=PurchaseOrder.Status.choices)
     notes = serializers.CharField(required=False, allow_blank=True)
+    # A draft may be given its delivery date on the way out, rather than
+    # bounced for not having one.
+    expected_delivery = serializers.DateField(required=False, allow_null=True)
 
     def validate_status(self, value):
         purchase_order = self.context["purchase_order"]

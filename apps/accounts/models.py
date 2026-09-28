@@ -1,5 +1,6 @@
 import uuid
 
+from django.conf import settings
 from django.contrib.auth.models import AbstractUser
 from django.core.validators import RegexValidator
 from django.db import models
@@ -22,7 +23,10 @@ class User(AbstractUser):
         VENDOR = "vendor", "Vendor"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    role = models.CharField(max_length=20, choices=Role.choices, default=Role.TECHNICIAN)
+    # Not restricted to Role.choices: roles are records now, and a custom
+    # one is as real as a built-in. The choices stay for the admin site and
+    # for the labels the built-ins are known by.
+    role = models.CharField(max_length=50, default=Role.TECHNICIAN)
     # Display title within a role tier, e.g. "Production Supervisor" vs
     # "Execution Supervisor" — permissions stay on `role`.
     job_title = models.CharField(max_length=100, blank=True)
@@ -38,6 +42,12 @@ class User(AbstractUser):
     )
     join_date = models.DateField(null=True, blank=True)
     leaving_date = models.DateField(null=True, blank=True)
+    # The reporting line, as the organogram draws it. Permissions come from
+    # `role`; this is who the person answers to, which is a different
+    # question and the one the org chart asks.
+    reports_to = models.ForeignKey(
+        "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="direct_reports",
+    )
     # Vendor-portal accounts (XC-04): which supplier this login belongs to.
     # Everything a role=vendor user can see/do is scoped to this supplier.
     supplier = models.ForeignKey(
@@ -53,6 +63,119 @@ class User(AbstractUser):
 
     def __str__(self):
         return f"{self.get_full_name()} ({self.role})"
+
+    # ---- What this person may do ----------------------------------------
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        """Everything this person may do: the role's defaults, adjusted.
+
+        An override is absolute — granted means granted even if the role
+        would not, withdrawn means withdrawn even if it would.
+        """
+        from .roles import defaults_for
+
+        allowed = set(defaults_for(self.role))
+        for row in self.capability_overrides.all():
+            if row.allowed:
+                allowed.add(row.capability)
+            else:
+                allowed.discard(row.capability)
+        return frozenset(allowed)
+
+    def can(self, capability: str) -> bool:
+        return capability in self.capabilities
+
+    def manages(self, other) -> bool:
+        """Is this person somewhere up the other's reporting line?
+
+        A team lead may adjust their own team, however deep it runs, which
+        is what makes the delegation useful rather than decorative.
+        """
+        seen = set()
+        boss = other.reports_to
+        while boss is not None and boss.pk not in seen:
+            if boss.pk == self.pk:
+                return True
+            seen.add(boss.pk)
+            boss = boss.reports_to
+        return False
+
+
+class RoleDefinition(TimeStampedModel):
+    """A role, and everything somebody holding it may do.
+
+    The eleven built-in roles are seeded from the code defaults and can be
+    adjusted from the screen; new ones can be written outright. A built-in
+    is never deleted — accounts hold its key, and losing the record would
+    take their rights with it.
+    """
+
+    key = models.SlugField(max_length=50, unique=True)
+    label = models.CharField(max_length=100)
+    description = models.CharField(max_length=300, blank=True)
+    # The capability keys this role grants, as a plain list. Small, read
+    # constantly, and never joined against — a table would earn nothing.
+    capabilities = models.JSONField(default=list, blank=True)
+    is_builtin = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="roles_created",
+    )
+
+    class Meta:
+        ordering = ["-is_builtin", "label"]
+
+    def __str__(self):
+        return self.label
+
+    @property
+    def holders(self) -> int:
+        from django.contrib.auth import get_user_model
+
+        return get_user_model().objects.filter(role=self.key).count()
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        from .roles import forget
+
+        forget()
+
+    def delete(self, *args, **kwargs):
+        from .roles import forget
+
+        result = super().delete(*args, **kwargs)
+        forget()
+        return result
+
+
+class UserCapability(TimeStampedModel):
+    """One capability granted to, or withdrawn from, one person.
+
+    Rows exist only where somebody differs from their role, so the table
+    stays small and every row is a decision a person made and can explain.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="capability_overrides",
+    )
+    capability = models.CharField(max_length=50)
+    allowed = models.BooleanField()
+    granted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="capabilities_granted",
+    )
+    reason = models.CharField(max_length=300, blank=True)
+
+    class Meta:
+        unique_together = [("user", "capability")]
+        ordering = ["capability"]
+        verbose_name_plural = "user capabilities"
+
+    def __str__(self):
+        verb = "granted" if self.allowed else "withdrawn"
+        return f"{self.capability} {verb} for {self.user}"
 
 
 class AuditLog(TimeStampedModel):

@@ -166,6 +166,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         from .ordering import apply_step_order
 
         installation = self.get_object()
+        refuse_if_closed_out(installation)
         ids = request.data.get("steps")
         if not isinstance(ids, list) or not ids:
             return Response(
@@ -553,16 +554,43 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         )
 
 
+def refuse_if_closed_out(installation):
+    """An installation whose asset is live or handed over is history.
+
+    Its checklist is the record of how the asset came to be in service, and a
+    record is read, not edited: no step is added, moved, reset or re-done once
+    the asset has gone live or the client has signed for it.
+    """
+    from rest_framework.exceptions import ValidationError
+
+    device = installation.device
+    live = device.status in ("active", "under_maintenance", "client_property", "decommissioned")
+    if live or getattr(installation, "handover", None) is not None:
+        why = "handed over" if getattr(installation, "handover", None) is not None else "live"
+        raise ValidationError({
+            "detail": f"{device.asset_code} is {why} — its installation steps are a record now and cannot be changed."
+        })
+
+
 class InstallationStepViewSet(viewsets.ModelViewSet):
-    queryset = InstallationStep.objects.select_related("installation").all()
+    queryset = InstallationStep.objects.select_related("installation", "installation__device").all()
     serializer_class = InstallationStepSerializer
     filterset_fields = ["installation", "step_type", "status"]
     ordering_fields = ["step_number"]
+
+    def perform_create(self, serializer):
+        refuse_if_closed_out(serializer.validated_data["installation"])
+        serializer.save()
+
+    def perform_update(self, serializer):
+        refuse_if_closed_out(serializer.instance.installation)
+        serializer.save()
 
     def perform_destroy(self, instance):
         """Remove the step, then close the gap it leaves in the numbering."""
         from .ordering import renumber_steps
 
+        refuse_if_closed_out(instance.installation)
         installation_id = instance.installation_id
         with transaction.atomic():
             instance.delete()

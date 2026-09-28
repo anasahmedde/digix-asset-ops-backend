@@ -84,15 +84,16 @@ class Project(TimeStampedModel):
         Phase.INSTALLATION, Phase.HANDOVER,
     )
 
-    def phase_from_work(self):
+    def phase_from_work(self, ignore_off_ramp=False):
         """The first phase that is not finished — that is where the project is.
 
         A phase is done when its bar reads 100%. When every one of them does,
         the project sits on the last phase with nothing left in it. On Hold and
         Order Lost are off-ramps somebody chooses, so the work does not
-        overrule them.
+        overrule them — except when asked what the work says regardless, which
+        is what coming back off one needs to know.
         """
-        if self.phase in (self.Phase.ON_HOLD, self.Phase.LOST):
+        if not ignore_off_ramp and self.phase in (self.Phase.ON_HOLD, self.Phase.LOST):
             return self.phase
         from .phases import phase_progress
 

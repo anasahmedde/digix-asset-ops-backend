@@ -293,6 +293,8 @@ def test_operations_raise_purchase_orders_and_the_group_head_signs_them(group_he
     supplier = Supplier.objects.create(name="GH Authority Supplier")
     payload = {
         "supplier": str(supplier.id),
+        # An order leaving draft says when the goods are needed by.
+        "expected_delivery": (timezone.now().date() + timedelta(days=14)).isoformat(),
         "items": [{"description": "Cable", "quantity": 2, "unit_price": "100.00"}],
     }
     # The Group Head does not raise orders…

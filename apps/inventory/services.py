@@ -4,7 +4,7 @@ transaction.atomic()."""
 
 from rest_framework import serializers
 
-from .models import GoodsReceiptLine, InventoryItem, InventoryUnit, StockMovement
+from .models import GoodsReceipt, GoodsReceiptLine, InventoryItem, InventoryUnit, StockMovement
 
 
 class _LazyFulfilment:
@@ -145,7 +145,9 @@ def issue_stock_for_component(component, user, quantity, *, via_request=None):
             })
         for unit in units:
             unit.status = InventoryUnit.Status.ISSUED
-            unit.save(update_fields=["status", "updated_at"])
+            # Which asset it went into: the requirement knows its device.
+            unit.fitted_to = component
+            unit.save(update_fields=["status", "fitted_to", "updated_at"])
             issued_units.append(unit)
         # Record the first serial on the requirement when it covers one unit.
         if component.inventory_unit_id is None and len(units) == 1:
@@ -364,14 +366,33 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
                 raise serializers.ValidationError({"units": "Every unit needs a serial number."})
             if len(set(serials)) != len(serials):
                 raise serializers.ValidationError({"units": "Serial numbers must be unique."})
-            clashes = list(
-                InventoryUnit.objects.filter(serial_number__in=serials)
-                .values_list("serial_number", flat=True)[:5]
+            # A unit coming back is the same unit that went out, so it goes
+            # back on the shelf under its own serial rather than being created
+            # a second time. On a purchase, a serial already on file is a
+            # mistake — two units cannot share one.
+            coming_back = receipt.source in (
+                GoodsReceipt.Source.PROJECT_RETURN, GoodsReceipt.Source.MAINTENANCE_RETURN,
             )
-            if clashes:
+            on_file = {
+                u.serial_number: u
+                for u in InventoryUnit.objects.select_for_update().filter(serial_number__in=serials)
+            }
+            if on_file and not coming_back:
                 raise serializers.ValidationError(
-                    {"units": "Already in inventory: " + ", ".join(clashes)}
+                    {"units": "Already in inventory: " + ", ".join(list(on_file)[:5])}
                 )
+            if coming_back:
+                stuck = [
+                    sn for sn, u in on_file.items()
+                    if u.status in (InventoryUnit.Status.IN_STOCK, InventoryUnit.Status.CONVERTED)
+                ]
+                if stuck:
+                    raise serializers.ValidationError({
+                        "units": (
+                            "Cannot come back — already in stock or registered as an asset: "
+                            + ", ".join(stuck[:5])
+                        )
+                    })
 
             material_type_id = po_item.material_type_id if po_item else None
             # Serialized PO lines describe a device model, not a material —
@@ -388,6 +409,21 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
                 or (stashed.split("unit_type:", 1)[1].split()[0] if "unit_type:" in stashed else None)
             )
             for payload in units:
+                back = on_file.get(str(payload["serial_number"]).strip())
+                if back is not None:
+                    back.status = InventoryUnit.Status.IN_STOCK
+                    back.location = InventoryItem.Location.WAREHOUSE
+                    # The unit points at the receipt it last came in on, and
+                    # its notes keep the history of the ones before.
+                    back.goods_receipt_line = line
+                    back.notes = "\n".join(
+                        x for x in [back.notes, f"Back in stock on {trace}"] if x
+                    )
+                    back.save(update_fields=[
+                        "status", "location", "goods_receipt_line", "notes", "updated_at",
+                    ])
+                    created_units.append(back)
+                    continue
                 material = payload.get("material_type") or material_type_id
                 brand = payload.get("brand") or (po_model.brand_id if po_model else None)
                 model_name = payload.get("model_name") or (po_model.name if po_model else "")
@@ -523,6 +559,18 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
                 f"({request_row.quantity_issued} of {request_row.quantity_requested} already issued)."
             )
         })
+
+    # Material for a job goes to whoever is on that job. Handing it to anybody
+    # else leaves the parts with one person and the work with another, and the
+    # job's own record of who holds what says something untrue.
+    job = request_row.maintenance_schedule
+    if job is not None and job.assigned_to_id:
+        on_the_job = job.assigned_to.get_full_name() or job.assigned_to.username
+        if received_by and received_by.strip() != on_the_job:
+            raise serializers.ValidationError({"received_by": (
+                f"{job.title} is {on_the_job}'s job — the parts for it are collected by them."
+            )})
+        received_by = on_the_job
 
     serials = []
 

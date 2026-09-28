@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import (
     ProjectCostLine,
     BOMAllocation,
@@ -28,7 +30,7 @@ class BOMAllocationSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "status", "allocated_by", "created_at"]
 
 
-class ProjectBOMLineSerializer(serializers.ModelSerializer):
+class ProjectBOMLineSerializer(HidesMoney, serializers.ModelSerializer):
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     device_model_name = serializers.CharField(source="device_model.name", read_only=True, default=None)
     material_type_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
@@ -151,12 +153,19 @@ class ProjectListSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerializ
     def get_site_names(self, obj):
         return [site.name for site in obj.sites.all()]
 
+    # Where the work stands regardless of an off-ramp. The list draws the
+    # button that lifts On Hold, so the list has to know what it lifts to.
+    resume_phase = serializers.SerializerMethodField()
+
+    def get_resume_phase(self, obj):
+        return obj.phase_from_work(ignore_off_ramp=True)
+
     class Meta:
         model = Project
         fields = [
             "id", "name", "location", "image", "client", "client_name",
             "site", "site_name", "status", "status_display",
-            "phase", "phase_display", "progress",
+            "phase", "phase_display", "resume_phase", "progress",
             "contract_type", "contract_type_display", "rental_end_date",
             "start_date", "target_date", "completed_date",
             "manager", "manager_name", "bottleneck_count", "created_at",
@@ -190,6 +199,12 @@ class ProjectDetailSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerial
     phase_display = serializers.CharField(source="get_phase_display", read_only=True)
     contract_type_display = serializers.CharField(source="get_contract_type_display", read_only=True)
     progress = serializers.SerializerMethodField()
+    # Where the work stands regardless of an off-ramp: what a project comes
+    # back to when On Hold or Order Lost is lifted.
+    resume_phase = serializers.SerializerMethodField()
+
+    def get_resume_phase(self, obj):
+        return obj.phase_from_work(ignore_off_ramp=True)
 
     class Meta:
         model = Project
@@ -197,7 +212,7 @@ class ProjectDetailSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerial
             "id", "name", "description", "location", "image",
             "client", "client_name", "client_contact_person", "client_contact_phone",
             "site", "site_name",
-            "status", "status_display", "phase", "phase_display",
+            "status", "status_display", "phase", "phase_display", "resume_phase",
             "contract_type", "contract_type_display", "rental_end_date",
             "progress", "start_date", "target_date", "completed_date",
             "manager", "manager_name", "budget", "notes", "sites", "site_names",
@@ -220,7 +235,7 @@ class ProjectDetailSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerial
         return phase_progress(obj)
 
 
-class ProjectCostLineSerializer(serializers.ModelSerializer):
+class ProjectCostLineSerializer(HidesMoney, serializers.ModelSerializer):
     """An overhead line on a project's cost plan."""
 
     amount = serializers.SerializerMethodField()

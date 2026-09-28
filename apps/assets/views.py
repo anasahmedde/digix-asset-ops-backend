@@ -546,7 +546,15 @@ class DeviceViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def map_data(self, request):
-        """Device locations with status for map rendering."""
+        """Device locations with status for map rendering.
+
+        Each pin names the project the asset belongs to, so the map can be
+        read one project at a time. An asset reaches a project by its own
+        link or by a scope row added from the project screen, and the second
+        is how most of them get there — both are resolved here.
+        """
+        from apps.teams.models import Project, ProjectScopeItem
+
         devices = (
             Device.objects.filter(
                 current_site__isnull=False,
@@ -562,13 +570,28 @@ class DeviceViewSet(viewsets.ModelViewSet):
             )
             .values(
                 "id", "asset_code", "status", "open_tickets",
+                "project_id", "project__name",
                 "current_site__id",
                 "current_site__name", "current_site__city",
                 "current_site__state_province", "current_site__country",
                 "current_site__latitude", "current_site__longitude",
             )
         )
-        return Response(list(devices))
+        rows = list(devices)
+        # One query for the scope rows, rather than one per pin.
+        scoped = dict(
+            ProjectScopeItem.objects.filter(device__in=[r["id"] for r in rows])
+            .exclude(project=None)
+            .values_list("device_id", "project_id")
+        )
+        names = dict(
+            Project.objects.filter(pk__in=set(scoped.values())).values_list("id", "name")
+        )
+        for row in rows:
+            if not row["project_id"] and row["id"] in scoped:
+                row["project_id"] = scoped[row["id"]]
+                row["project__name"] = names.get(scoped[row["id"]])
+        return Response(rows)
 
     @action(detail=False, methods=["get"], url_path="export")
     def export(self, request):

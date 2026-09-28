@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import (
     ReorderRequest,
     GoodsReceipt,
@@ -21,7 +23,7 @@ class InventoryCategorySerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
-class InventoryItemSerializer(serializers.ModelSerializer):
+class InventoryItemSerializer(HidesMoney, serializers.ModelSerializer):
     material_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
     category_name = serializers.CharField(source="category.name", read_only=True, default=None)
     unit = serializers.CharField(source="material_type.unit", read_only=True, default=None)
@@ -62,7 +64,7 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         return value
 
 
-class InventoryUnitTypeSerializer(serializers.ModelSerializer):
+class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
     """A unique product as opened in inventory — details now, serials later."""
 
     material_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
@@ -181,7 +183,21 @@ class InventoryUnitTypeSerializer(serializers.ModelSerializer):
         return self._validate_opening_stock(attrs)
 
 
-class InventoryUnitSerializer(serializers.ModelSerializer):
+class InventoryUnitSerializer(HidesMoney, serializers.ModelSerializer):
+    # Where the unit ended up, once it was fitted into an asset's build.
+    fitted_to_asset = serializers.SerializerMethodField()
+
+    def get_fitted_to_asset(self, obj):
+        component = obj.fitted_to
+        if component is None:
+            return None
+        device = component.device
+        return {
+            "device": str(device.pk),
+            "asset_code": device.asset_code,
+            "asset_name": device.display_name or (device.asset_type.name if device.asset_type_id else ""),
+            "component": component.name,
+        }
     """Serialized ("unique") inventory items — one row per physical unit."""
 
     material_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
@@ -220,7 +236,7 @@ class InventoryUnitSerializer(serializers.ModelSerializer):
             "goods_receipt_line", "grn_number", "po_number",
             "has_warranty", "warranty_type", "warranty_start", "warranty_months", "warranty_end",
             "warranty_state", "is_under_warranty",
-            "converted_device", "converted_device_code",
+            "converted_device", "converted_device_code", "fitted_to", "fitted_to_asset",
             "notes", "created_at", "updated_at",
         ]
         read_only_fields = [
@@ -453,6 +469,9 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
     # and inspection only has to show it.
     kind = serializers.SerializerMethodField()
     known_component = serializers.SerializerMethodField()
+    # The code of the component this line files into — the one the store will
+    # find it under once inspection passes it.
+    component_code = serializers.SerializerMethodField()
 
     def _product(self, obj):
         """The unique product a line is for, from whichever link it has: the
@@ -489,6 +508,18 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             return "unique"
         if self._item(obj) is not None or obj.routed_to == "generic":
             return "generic"
+        return None
+
+    def get_component_code(self, obj):
+        asset = self._asset(obj)
+        if asset is not None:
+            return asset.asset_code
+        product = self._product(obj)
+        if product is not None:
+            return product.type_code or None
+        item = self._item(obj)
+        if item is not None:
+            return item.sku or None
         return None
 
     def _legacy_label(self, obj):
@@ -572,7 +603,7 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             "quantity", "unit", "batch_number", "serial_numbers",
             "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
             "inspected_by", "inspected_by_name", "inspected_at", "inspection_notes",
-            "stocked_unit_count", "kind", "known_component", "created_at",
+            "stocked_unit_count", "kind", "known_component", "component_code", "created_at",
             "source", "source_display", "reference", "received_at", "received_by_name",
             "routed_to_display", "inspection_status_display", "stocked_item_sku", "storage_location", "stocked_units",
             "stocked_code", "stocked_name",
@@ -751,6 +782,13 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         source="maintenance_schedule.title", read_only=True, default=None,
     )
 
+    def get_maintenance_assignee(self, obj):
+        job = obj.maintenance_schedule
+        person = job.assigned_to if job is not None else None
+        if person is None:
+            return None
+        return person.get_full_name() or person.username
+
     def get_unit_type_code(self, obj):
         from .models import InventoryUnitType
 
@@ -794,22 +832,45 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
     def get_project_name(self, obj):
         if obj.project_id:
             return obj.project.name
-        component = obj.asset_component
-        if component is not None:
-            project = component.device.project_on
+        device = self._device(obj)
+        if device is not None:
+            project = device.project_on
             if project is not None:
                 return project.name
         return None
 
-    asset_code = serializers.CharField(
-        source="asset_component.device.asset_code", read_only=True, default=None
+    def _device(self, obj):
+        """The asset the material is for, whichever way it was asked for."""
+        if obj.asset_component_id:
+            return obj.asset_component.device
+        if obj.maintenance_schedule_id:
+            return obj.maintenance_schedule.device
+        return None
+
+    # A maintenance job names its asset too: the store is handing parts over
+    # for a particular standee, not for a job title.
+    asset_code = serializers.SerializerMethodField()
+    asset_name = serializers.SerializerMethodField()
+    maintenance_type = serializers.CharField(
+        source="maintenance_schedule.get_maintenance_type_display", read_only=True, default=None,
     )
+
+    def get_asset_code(self, obj):
+        device = self._device(obj)
+        return device.asset_code if device is not None else None
+
+    def get_asset_name(self, obj):
+        device = self._device(obj)
+        return (device.display_name or "") if device is not None else None
     component_name = serializers.CharField(
         source="asset_component.name", read_only=True, default=None
     )
     maintenance_title = serializers.CharField(
         source="maintenance_schedule.title", read_only=True, default=None
     )
+    # Parts for a job are collected by whoever is on that job, so the store is
+    # told who that is rather than asked who took them.
+    maintenance_assignee = serializers.SerializerMethodField()
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     source_display = serializers.CharField(source="get_source_display", read_only=True)
     outstanding_quantity = serializers.IntegerField(read_only=True)
@@ -878,7 +939,8 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "source", "source_display", "purpose",
             "project", "project_name", "asset_component", "asset_code", "component_name",
             "next_units", "unit_type_code", "asset_name",
-            "maintenance_schedule", "maintenance_title",
+            "maintenance_schedule", "maintenance_title", "maintenance_type", "maintenance_assignee",
+            "asset_name",
             "requested_by", "requested_by_name", "issued_by", "issued_by_name",
             "received_by", "issued_serials", "issued_units", "handovers", "last_issued_at", "awaiting_procurement", "po_number",
             "procured", "po_received_quantity",
