@@ -13,25 +13,48 @@ from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_resp
 from common.permissions import ADMIN_ROLES, AdminManagerWriteElseRead, CommercialWriteElseRead
 
 
-class IsSuperAdminOrAssignedInstaller(BasePermission):
-    """Step/delay actions: the assigned installer (mobile), the installation's
-    vendor (portal login, XC-04) or a platform admin (desktop)."""
+def may_advance_installation(user, installation) -> bool:
+    """Who may move an installation along.
 
-    message = "Only the assigned installer or a platform admin can do this."
+    The person doing the work, and whoever they answer to. A supervisor
+    could open the tracker and read every step but not touch one, because
+    the rule said "platform admin" where the organogram says "the installer's
+    own line" — so a job waiting on a correction waited for a Super Admin.
+
+    Deliberately not "any manager": marking a step done is a claim about
+    work that happened on site, so it stays with the people who were there
+    or who are answerable for them. Another technician cannot touch a job
+    that is not theirs.
+    """
+    if not getattr(user, "is_authenticated", False):
+        return False
+    role = getattr(user, "role", None)
+    if role in ADMIN_ROLES:
+        return True
+    if installation.installed_by_id == user.id:
+        return True
+    installer = installation.installed_by
+    if installer is not None and user.manages(installer):
+        return True
+    return bool(
+        role == "vendor"
+        and getattr(user, "supplier_id", None)
+        and installation.vendor_id == user.supplier_id
+    )
+
+
+class IsSuperAdminOrAssignedInstaller(BasePermission):
+    """Step/delay actions: the assigned installer (mobile), their reporting
+    line, the installation's vendor (portal login, XC-04) or Operations."""
+
+    message = "This installation is not yours to advance."
 
     def has_object_permission(self, request, view, obj):
         installation = obj.installation if hasattr(obj, "installation") else obj
         user = request.user
-        if getattr(user, "role", None) in ADMIN_ROLES:
+        if may_advance_installation(user, installation):
             return True
-        if installation.installed_by_id == user.id:
-            return True
-        # Vendor-portal users may advance steps on their own installations.
-        return bool(
-            getattr(user, "role", None) == "vendor"
-            and getattr(user, "supplier_id", None)
-            and installation.vendor_id == user.supplier_id
-        )
+        return False
 
 from .models import (
     InstallationRouteTemplate,
@@ -625,10 +648,10 @@ class InstallationDelayViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         installation = serializer.validated_data["installation"]
         user = self.request.user
-        if getattr(user, "role", None) not in ADMIN_ROLES and installation.installed_by_id != user.id:
+        if not may_advance_installation(user, installation):
             from rest_framework.exceptions import PermissionDenied
 
-            raise PermissionDenied("Only the assigned installer or a platform admin can flag a delay.")
+            raise PermissionDenied("This installation is not yours to flag a delay on.")
         serializer.save(reported_by=user)
 
 

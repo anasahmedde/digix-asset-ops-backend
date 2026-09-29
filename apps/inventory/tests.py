@@ -1122,8 +1122,19 @@ def test_a_request_can_be_issued_in_part_and_the_balance_stays_owed(ops, items):
     tech_client = APIClient()
     tech_client.force_authenticate(asker)
 
-    # Anyone running work may ask the store for material.
-    r = tech_client.post("/api/inventory/issuance-requests/", {
+    # A technician asks on the job, so that a supervisor answers before the
+    # store ever sees it. Posting here would skip that answer.
+    straight = tech_client.post("/api/inventory/issuance-requests/", {
+        "item": str(item.id), "quantity_requested": 6,
+        "source": "maintenance", "purpose": "Screen repair at site",
+    }, format="json")
+    assert straight.status_code == 403, straight.content
+
+    # The people running work put the line on the queue.
+    lead = User.objects.create_user(username="req-lead", password="x", role="supervisor")
+    lead_client = APIClient()
+    lead_client.force_authenticate(lead)
+    r = lead_client.post("/api/inventory/issuance-requests/", {
         "item": str(item.id), "quantity_requested": 6,
         "source": "maintenance", "purpose": "Screen repair at site",
     }, format="json")

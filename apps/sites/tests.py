@@ -180,9 +180,16 @@ def test_installer_phone_exposed(ops, tech, installation):
 @pytest.mark.django_db
 def test_step_update_restricted_to_installer_or_super_admin(ops, tech, installation):
     step = installation.steps.first()
-    # ops manager may NOT advance steps from desktop
+    # A manager who is not over this installer may NOT advance steps: marking
+    # one done is a claim about work on site.
     r = _client(ops).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
     assert r.status_code == 403
+    # The installer's own supervisor may — that is what the organogram is for.
+    boss = User.objects.create_user(username="site-boss", password="x", role="supervisor")
+    tech.reports_to = boss
+    tech.save(update_fields=["reports_to"])
+    r = _client(boss).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 200, r.content
     # assigned installer may
     r = _client(tech).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
     assert r.status_code == 200, r.content
@@ -195,11 +202,19 @@ def test_step_update_restricted_to_installer_or_super_admin(ops, tech, installat
 
 
 @pytest.mark.django_db
-def test_delay_create_restricted(ops, installation):
+def test_delay_create_restricted(ops, tech, installation):
     r = _client(ops).post("/api/sites/installation-delays/", {
         "installation": str(installation.id), "cause": "client",
     }, format="json")
     assert r.status_code == 403
+    # The installer's supervisor can flag it without waiting for an admin.
+    boss = User.objects.create_user(username="delay-boss", password="x", role="supervisor")
+    tech.reports_to = boss
+    tech.save(update_fields=["reports_to"])
+    r = _client(boss).post("/api/sites/installation-delays/", {
+        "installation": str(installation.id), "cause": "client",
+    }, format="json")
+    assert r.status_code == 201, r.content
 
 
 @pytest.mark.django_db

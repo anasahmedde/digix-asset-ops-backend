@@ -35,6 +35,16 @@ def _is_assigned_vendor(user, ticket):
     )
 
 
+def _did_the_work(user, ticket) -> bool:
+    """Did this person carry out the work that is now being signed off?"""
+    return user.id in (ticket.assigned_to_id, ticket.completed_by_id)
+
+
+# Accounts that exist to read, not to attend a fault. A vendor is engaged
+# through assigned_vendor, which is a different field and a different thing.
+NON_WORKING_ROLES = ("client_viewer", "vendor")
+
+
 class TicketIssueTypeViewSet(viewsets.ModelViewSet):
     """Fault catalogue (Module Burnt, HDMI Cable Issue, …) managed from Setup."""
 
@@ -183,6 +193,19 @@ class TicketViewSet(viewsets.ModelViewSet):
 
             user_id = ser.validated_data["assigned_to"]
             assignee = User.objects.filter(pk=user_id).first() if user_id else None
+            # A ticket handed to a client login or a left employee is a ticket
+            # nobody is working, and it looks assigned on every report.
+            if assignee is not None:
+                if not assignee.is_active:
+                    return Response(
+                        {"assigned_to": "That person has left. Assign someone active."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if getattr(assignee, "role", "") in NON_WORKING_ROLES:
+                    return Response(
+                        {"assigned_to": "That account cannot attend faults. Assign a member of staff, or set a vendor instead."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
             ticket.assigned_to = assignee
             parts.append(f"assignee → {assignee.get_full_name() or assignee.username}" if assignee else "assignee cleared")
         if "assigned_vendor" in ser.validated_data:
@@ -249,6 +272,18 @@ class TicketViewSet(viewsets.ModelViewSet):
                     {"detail": "Only Operations or the reporter can reopen a closed ticket."},
                     status=status.HTTP_403_FORBIDDEN,
                 )
+            # Reopening undoes somebody else's sign-off, so it is the close
+            # rule walked backwards: barring the person who did the work from
+            # closing their own ticket achieves nothing if they can reopen it
+            # the moment it is closed, as often as they like.
+            if _did_the_work(user, ticket) and not is_manager:
+                return Response(
+                    {"detail": (
+                        "You carried out this work. Ask Operations to reopen it, "
+                        "or raise a new ticket if the fault has come back."
+                    )},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
             # Legacy rows closed before closed_at existed fall back to the
             # last update so the window never fails open.
             closed_reference = ticket.closed_at or ticket.updated_at
@@ -303,6 +338,19 @@ class TicketViewSet(viewsets.ModelViewSet):
         if new_status == Ticket.Status.CLOSED and not (is_manager or is_marketing or is_reporter):
             return Response(
                 {"detail": "Only Marketing, Operations or the reporter can close a ticket."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Sign-off is somebody else confirming the work, or it is not sign-off.
+        # Raising a fault, attending it and then closing it yourself is one
+        # person all the way through, and that is the loop this closes.
+        if (
+            new_status in (Ticket.Status.APPROVED, Ticket.Status.CLOSED)
+            and not is_reopen
+            and _did_the_work(user, ticket)
+        ):
+            return Response(
+                {"detail": "You carried out this work, so somebody else signs it off."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -436,6 +484,13 @@ class TicketViewSet(viewsets.ModelViewSet):
         if not is_reporter and not is_manager:
             return Response(
                 {"detail": "Only the reporter or a manager can review tickets."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # The point of a review is that somebody else looks at it.
+        if _did_the_work(user, ticket) and (request.data.get("action") or "") == "approve":
+            return Response(
+                {"detail": "You carried out this work, so somebody else reviews it."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 

@@ -170,6 +170,10 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
         "view_clients", "manage_quotations", "view_team", "view_warranties",
     ),
     "technician": _keys(
+        # Asking for a part means naming one, so the person asking has to be
+        # able to see what the store carries. It is a list of materials, not
+        # of money — prices are `view_prices`, which they do not have.
+        "view_stock",
         "view_assets", "edit_installation", "view_tickets", "work_tickets",
         "view_team",
     ),

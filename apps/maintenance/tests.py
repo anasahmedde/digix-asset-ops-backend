@@ -708,6 +708,9 @@ def parts_job(db):
         username="parts-tech", password="x", role="technician", is_field_staff=True,
     )
     boss = User.objects.create_user(username="parts-boss", password="x", role="supervisor")
+    # The organogram is what says whose line this is to answer.
+    tech.reports_to = boss
+    tech.save(update_fields=["reports_to"])
     material = MaterialType.objects.create(name="Parts Cable", unit="meter")
     item = InventoryItem.objects.create(material_type=material, quantity=100)
     schedule = MaintenanceSchedule.objects.create(
@@ -806,9 +809,16 @@ def test_a_line_is_answered_once(parts_job):
 
 @pytest.mark.django_db
 def test_an_unanswered_line_can_be_withdrawn_but_an_answered_one_cannot(parts_job):
+    from apps.maintenance.models import MaintenancePartRequest
+
     tech = _client(parts_job["tech"])
     r = _ask(tech, parts_job)
-    assert tech.delete(f"/api/maintenance/part-requests/{r.data['id']}/").status_code == 204
+    line_id = r.data["id"]
+    assert tech.delete(f"/api/maintenance/part-requests/{line_id}/").status_code == 204
+    # Off the queue, still on the record — what was asked for and what became
+    # of it is the question a job history answers.
+    withdrawn = MaintenancePartRequest.objects.get(pk=line_id)
+    assert withdrawn.status == MaintenancePartRequest.Status.CANCELLED
 
     r = _ask(tech, parts_job)
     _client(parts_job["boss"]).post(
@@ -816,6 +826,53 @@ def test_an_unanswered_line_can_be_withdrawn_but_an_answered_one_cannot(parts_jo
         {"approve": True}, format="json",
     )
     assert tech.delete(f"/api/maintenance/part-requests/{r.data['id']}/").status_code == 400
+
+
+@pytest.mark.django_db
+def test_a_line_is_withdrawn_by_the_person_who_asked_not_by_a_colleague(parts_job):
+    mate = User.objects.create_user(
+        username="parts-mate", password="x", role="technician", is_field_staff=True,
+    )
+    r = _ask(_client(parts_job["tech"]), parts_job)
+    assert _client(mate).delete(
+        f"/api/maintenance/part-requests/{r.data['id']}/"
+    ).status_code == 403
+    assert _client(parts_job["boss"]).delete(
+        f"/api/maintenance/part-requests/{r.data['id']}/"
+    ).status_code == 204
+
+
+@pytest.mark.django_db
+def test_a_supervisor_answers_for_their_own_team_only(parts_job):
+    other_boss = User.objects.create_user(
+        username="parts-other-boss", password="x", role="supervisor",
+    )
+    r = _ask(_client(parts_job["tech"]), parts_job)
+    denied = _client(other_boss).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert denied.status_code == 403
+    assert "team" in str(denied.data)
+
+    allowed = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert allowed.status_code == 200, allowed.content
+
+
+@pytest.mark.django_db
+def test_nobody_approves_their_own_request_for_parts(parts_job):
+    boss = _client(parts_job["boss"])
+    r = _ask(boss, parts_job)
+    assert r.status_code == 201, r.content
+    denied = boss.post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert denied.status_code == 403
+    assert "your own" in str(denied.data)
 
 
 def _issue(job, line_id, quantity, serials=None):

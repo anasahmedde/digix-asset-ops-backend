@@ -400,6 +400,18 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
         source="device.get_source_display", read_only=True
     )
     site_city = serializers.CharField(source="site.city", read_only=True)
+    # Whether the person reading this may move it along. The screen used to
+    # work this out from the role name and got it wrong in both directions:
+    # it hid the controls from the supervisor who owns the job, and offered
+    # them to people the API then refused.
+    can_advance = serializers.SerializerMethodField()
+
+    def get_can_advance(self, obj) -> bool:
+        from .views import may_advance_installation
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return bool(user and may_advance_installation(user, obj))
 
     class Meta:
         model = DeviceInstallation
@@ -407,7 +419,7 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
             "id", "device", "device_code", "device_name", "asset_name", "asset_type_name",
             "device_image", "device_status", "device_activated_at", "device_source", "device_source_display",
             "client_names", "client_id", "project_name", "poc_name", "poc_phone",
-            "site", "site_name", "site_city", "zone",
+            "site", "site_name", "site_city", "zone", "can_advance",
             "installed_by", "installed_by_name", "installed_by_phone",
             "installed_by_employee_id", "installed_by_job_title", "installed_by_role",
             "installed_at", "removed_at",

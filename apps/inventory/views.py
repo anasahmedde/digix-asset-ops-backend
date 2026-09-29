@@ -528,6 +528,40 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
     search_fields = ["request_number", "purpose", "item__sku", "unit_type__name"]
     ordering_fields = ["created_at", "status"]
 
+    def create(self, request, *args, **kwargs):
+        """A technician asks on the job; the approval is what reaches the store.
+
+        Posting straight here put a line on the store's queue that nobody had
+        agreed to, and the store issues against the queue — so the supervisor's
+        decision, which is the whole of the approval, was simply skipped.
+        """
+        user = request.user
+        if getattr(user, "role", "") == "technician" and not user.is_superuser:
+            return Response(
+                {"detail": (
+                    "Ask for the part on the job. Your supervisor's approval "
+                    "is what puts it on the store's queue."
+                )},
+                status=403,
+            )
+        return super().create(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        """A request comes off the queue by being cancelled, not deleted.
+
+        DELETE was open to anyone signed in, and it took the request's history
+        with it. Cancelling says the same thing and leaves the record.
+        """
+        denied = self._management_only(request)
+        if denied is not None:
+            return denied
+        if self.get_object().quantity_issued:
+            return Response(
+                {"detail": "Stock has already gone out against this — cancel it so the issue stays on record."},
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         serializer.save(requested_by=self.request.user)
 

@@ -2,10 +2,11 @@ from rest_framework import serializers as drf_serializers
 from rest_framework import status as drf_status
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import CapabilityGate, TechnicianCanCreate
+from common.permissions import MANAGER_ROLES, CapabilityGate, TechnicianCanCreate
 
 from .models import (
     MaintenancePartRequest,
@@ -29,6 +30,29 @@ DECIDING_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
 # Who may raise or withdraw one: the people who actually attend the job, and
 # the managers above them.
 ASKING_ROLES = DECIDING_ROLES + ("technician",)
+
+
+def _answers_for(user, line) -> bool:
+    """May this person answer this particular line?
+
+    Being a supervisor is not the same as being *their* supervisor. The
+    organogram already records who answers to whom, so a line is answered by
+    the asker's own reporting line and nobody else's; Operations answers for
+    everyone, which is what makes them Operations.
+    """
+    if getattr(user, "is_superuser", False) or getattr(user, "role", None) in MANAGER_ROLES:
+        return True
+    asker = line.requested_by
+    return asker is not None and user.manages(asker)
+
+
+def _may_withdraw(user, line) -> bool:
+    """The person who asked, or somebody above them."""
+    if getattr(user, "is_superuser", False) or getattr(user, "role", None) in MANAGER_ROLES:
+        return True
+    if line.requested_by_id == user.pk:
+        return True
+    return line.requested_by is not None and user.manages(line.requested_by)
 
 
 class CanAskOrAnswerForParts(BasePermission):
@@ -74,12 +98,29 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
         )
 
     def perform_destroy(self, instance):
-        """A line can be withdrawn while nobody has answered it yet."""
+        """Withdrawing a line takes it off the queue. It does not erase it.
+
+        Two things were wrong with deleting the row. Any technician could
+        withdraw any other technician's line, and the line then left no trace
+        — but what was asked for and what became of it is the whole point of
+        a job history, so a withdrawn line stays on the record saying so.
+        """
+        from django.utils import timezone
+
+        user = self.request.user
         if instance.status != MaintenancePartRequest.Status.REQUESTED:
             raise drf_serializers.ValidationError(
                 {"detail": "A line that has been answered stays on the record."}
             )
-        instance.delete()
+        if not _may_withdraw(user, instance):
+            raise PermissionDenied("You can only withdraw a line you asked for.")
+        instance.status = MaintenancePartRequest.Status.CANCELLED
+        instance.decided_by = user
+        instance.decided_at = timezone.now()
+        instance.decision_note = f"Withdrawn by {user.get_full_name() or user.username}"
+        instance.save(update_fields=[
+            "status", "decided_by", "decided_at", "decision_note", "updated_at",
+        ])
 
     @action(detail=True, methods=["post"])
     def decide(self, request, pk=None):
@@ -95,10 +136,23 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
                 {"detail": "Only a supervisor or above can answer a request for parts."},
                 status=drf_status.HTTP_403_FORBIDDEN,
             )
+        asked = self.get_object()
+        # Nobody signs off their own request, whatever they hold. A supervisor
+        # who needs a part asks the person they report to, the same as anyone.
+        if asked.requested_by_id == request.user.pk:
+            return Response(
+                {"detail": "You cannot approve your own request. Ask the person you report to."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+        if not _answers_for(request.user, asked):
+            return Response(
+                {"detail": "This line is not from your team — their own supervisor answers it."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
         ser = MaintenancePartDecisionSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         line = decide_line(
-            self.get_object(),
+            asked,
             user=request.user,
             approve=ser.validated_data["approve"],
             quantity=ser.validated_data.get("quantity"),
@@ -121,6 +175,23 @@ class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
     ]
     search_fields = ["title", "device__asset_code", "device__display_name"]
     ordering_fields = ["next_due", "created_at", "priority"]
+
+    def get_object(self):
+        """A technician works their own rounds, not everybody else's.
+
+        Creating a round is theirs to do — they are the ones who find work
+        that needs scheduling. Editing one was not scoped at all, so any
+        technician could rewrite any round in the company, including its
+        dates and who is on it.
+        """
+        obj = super().get_object()
+        if self.request.method in SAFE_METHODS:
+            return obj
+        user = self.request.user
+        if getattr(user, "role", None) == "technician" and not user.is_superuser:
+            if obj.assigned_to_id not in (user.pk, None):
+                raise PermissionDenied("This round is not yours to change.")
+        return obj
 
     @action(detail=False, methods=["get"])
     def map_data(self, request):
