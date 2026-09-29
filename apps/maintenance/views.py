@@ -1,5 +1,6 @@
 from rest_framework import serializers as drf_serializers
 from rest_framework import status as drf_status
+from common.noops import RefusesSilentNoOps
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -161,7 +162,7 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
         return Response(self.get_serializer(line).data)
 
 
-class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
+class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # Reading this is a permission, not just a menu entry.
     read_capability = "view_tickets"
     queryset = MaintenanceSchedule.objects.select_related(
@@ -314,10 +315,12 @@ class MaintenanceRecordViewSet(viewsets.ModelViewSet):
         # A completed visit rolls its schedule to the next cycle.
         if record.status == MaintenanceRecord.Status.COMPLETED:
             record.schedule.advance_after_completion(record.performed_at.date())
-            # Closing a corrective job is what returns the asset to Active.
-            from .services import return_to_service_if_done
+            # Closing a corrective job is what returns the asset to Active,
+            # and what tells the ticket that raised it that the work is done.
+            from .services import report_back_to_ticket, return_to_service_if_done
 
             return_to_service_if_done(record, self.request.user)
+            report_back_to_ticket(record, self.request.user)
 
 
 class MaintenanceRecordPhotoViewSet(viewsets.ModelViewSet):

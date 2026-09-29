@@ -4,6 +4,7 @@ from django.db import transaction
 from django.db.models import Count, F, Q
 from django.http import HttpResponse
 from django.utils import timezone
+from common.noops import RefusesSilentNoOps
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -117,7 +118,7 @@ class MaterialTypeViewSet(viewsets.ModelViewSet):
     search_fields = ["name", "category__name"]
 
 
-class DeviceViewSet(viewsets.ModelViewSet):
+class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # Reading the register is a permission, and the Excel export
     # carries the same rows, so it answers to the same one.
     read_capability = "view_assets"

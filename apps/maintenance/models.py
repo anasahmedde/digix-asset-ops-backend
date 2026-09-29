@@ -31,6 +31,10 @@ class MaintenanceSchedule(TimeStampedModel):
         ON_HOLD = "on_hold", "On Hold"
         OVERDUE = "overdue", "Over Due"
         COMPLETED = "completed", "Completed"
+        # A job raised against a fault that turned out not to be one. Not
+        # Completed: no work was done, and saying it was would put the visit
+        # in the history and roll the cycle on.
+        CANCELLED = "cancelled", "Cancelled"
 
     class Priority(models.TextChoices):
         LOW = "low", "Low"

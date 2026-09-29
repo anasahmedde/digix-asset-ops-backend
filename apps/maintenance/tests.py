@@ -802,9 +802,18 @@ def test_a_line_is_answered_once(parts_job):
     boss = _client(parts_job["boss"])
     line = f"/api/maintenance/part-requests/{r.data['id']}/decide/"
     assert boss.post(line, {"approve": True}, format="json").status_code == 200
-    again = boss.post(line, {"approve": False}, format="json")
+    again = boss.post(line, {"approve": False, "note": "Changed my mind"}, format="json")
     assert again.status_code == 400
     assert "already approved" in str(again.data["status"])
+
+    # And a refusal has to say why, or the technician learns nothing from it.
+    fresh = _ask(_client(parts_job["tech"]), parts_job)
+    bare = boss.post(
+        f"/api/maintenance/part-requests/{fresh.data['id']}/decide/",
+        {"approve": False}, format="json",
+    )
+    assert bare.status_code == 400
+    assert "note" in bare.data
 
 
 @pytest.mark.django_db
@@ -1267,3 +1276,81 @@ def test_a_ticket_over_several_assets_opens_a_job_for_each():
     for d in (first, second, third):
         d.refresh_from_db()
         assert d.status == Device.Status.ACTIVE
+
+
+# ---------------------------------------------------------------------------
+# A job and the ticket that asked for it stay in step
+# ---------------------------------------------------------------------------
+@_pytest.mark.django_db
+def test_finishing_the_job_sends_the_ticket_for_review(corrective_client):
+    """The register said the repair was done; the queue still showed the fault."""
+    from apps.tickets.models import Ticket
+
+    c, ops = corrective_client
+    asset = _Device.objects.create(
+        asset_code="AST-RB-1", serial_number="RB-SN-1", status=_Device.Status.ACTIVE,
+    )
+    ticket = Ticket.objects.create(
+        title="Panel dark on the left", device=asset, reported_by=ops,
+        status=Ticket.Status.IN_PROGRESS,
+    )
+    c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "under_maintenance", "reason": "Panel dark", **_down()}, format="json",
+    )
+    job = _Schedule.objects.get(device=asset)
+    job.ticket = ticket
+    job.save(update_fields=["ticket"])
+
+    r = c.post("/api/maintenance/records/", {
+        "schedule": str(job.id), "status": "completed",
+        "performed_at": timezone.now().isoformat(),
+        "notes": "Driver board replaced",
+    }, format="json")
+    assert r.status_code == 201, r.content
+
+    ticket.refresh_from_db()
+    assert ticket.status == Ticket.Status.PENDING_REVIEW
+    assert ticket.completed_at is not None
+    assert "Driver board replaced" in ticket.completion_notes
+    # And the work is on the ticket's own trail, not only in the register.
+    assert ticket.comments.filter(new_status=Ticket.Status.PENDING_REVIEW).exists()
+
+
+@_pytest.mark.django_db
+def test_cancelling_a_ticket_puts_the_asset_back_in_service(corrective_client):
+    """Deleting was the only way out, and it left the asset stranded."""
+    from apps.tickets.models import Ticket
+
+    c, ops = corrective_client
+    asset = _Device.objects.create(
+        asset_code="AST-CX-1", serial_number="CX-SN-1", status=_Device.Status.ACTIVE,
+    )
+    ticket = Ticket.objects.create(
+        title="Reported flicker", device=asset, reported_by=ops,
+        status=Ticket.Status.IN_PROGRESS,
+    )
+    c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "under_maintenance", "reason": "Reported flicker", **_down()}, format="json",
+    )
+    job = _Schedule.objects.get(device=asset)
+    job.ticket = ticket
+    job.save(update_fields=["ticket"])
+
+    # A reason is not optional: "cancelled" with no why is a gap in the record.
+    bare = c.post(f"/api/tickets/{ticket.id}/transition/",
+                  {"status": "cancelled"}, format="json")
+    assert bare.status_code == 400
+    assert "notes" in bare.data
+
+    r = c.post(f"/api/tickets/{ticket.id}/transition/",
+               {"status": "cancelled", "notes": "Duplicate of the earlier call"}, format="json")
+    assert r.status_code == 200, r.content
+
+    ticket.refresh_from_db()
+    job.refresh_from_db()
+    asset.refresh_from_db()
+    assert ticket.status == Ticket.Status.CANCELLED
+    assert job.status == _Schedule.Status.CANCELLED
+    assert asset.status == _Device.Status.ACTIVE, "the asset must not be left under maintenance"

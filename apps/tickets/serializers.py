@@ -271,6 +271,16 @@ class TicketReviewSerializer(serializers.Serializer):
     comments = serializers.CharField(required=False, allow_blank=True, default="")
 
     def validate(self, attrs):
+        # Sending work back without saying what is wrong with it sends the
+        # assignee back to the same job with no more information than the
+        # first time.
+        if attrs.get("action") == "reject" and not (attrs.get("comments") or "").strip():
+            raise serializers.ValidationError(
+                {"comments": "Say what needs putting right."}
+            )
+        return attrs
+
+    def validate(self, attrs):
         if attrs["action"] == "reject" and not attrs.get("comments", "").strip():
             raise serializers.ValidationError(
                 {"comments": "Comments are required when rejecting."}

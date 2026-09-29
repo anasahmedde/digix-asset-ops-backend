@@ -3,6 +3,7 @@ from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum, 
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils import timezone
+from common.noops import RefusesSilentNoOps
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -58,7 +59,7 @@ class InventoryCategoryViewSet(viewsets.ModelViewSet):
     search_fields = ["name"]
 
 
-class InventoryItemViewSet(viewsets.ModelViewSet):
+class InventoryItemViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # Reading this is a permission, not just a menu entry.
     read_capability = "view_stock"
     # Coalesce so unpriced items sort as zero value instead of NULLs-first.
@@ -657,20 +658,39 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
 
             where = "the store"
             if part is not None:
-                # Back to awaiting an answer: the supervisor decides again, and
-                # approving raises a fresh request on the store's queue.
                 from apps.maintenance.models import MaintenancePartRequest
 
-                part.status = MaintenancePartRequest.Status.REQUESTED
-                part.quantity_approved = None
-                part.decided_by = None
-                part.decided_at = None
-                part.decision_note = note or f"Sent back by the store on {timezone.localdate():%d %b %Y}"
-                part.issuance_request = None
-                part.save(update_fields=[
-                    "status", "quantity_approved", "decided_by", "decided_at",
-                    "decision_note", "issuance_request", "updated_at",
-                ])
+                already = issuance_request.quantity_issued
+                if already:
+                    # Some of it is already in the technician's hands. That
+                    # much was approved and was issued, so the line stays
+                    # approved for it — clearing the link made the job say
+                    # nothing had been issued at all, and the visit could
+                    # then not be settled for parts the technician was
+                    # holding. Only the balance goes back.
+                    part.quantity_approved = already
+                    balance = issuance_request.outstanding_quantity
+                    part.decision_note = (
+                        f"{already} issued; the balance of {balance} sent back by the store"
+                        + (f": {note}" if note else ".")
+                    )
+                    part.save(update_fields=[
+                        "quantity_approved", "decision_note", "updated_at",
+                    ])
+                else:
+                    # Nothing went out, so the answer is undecided again: the
+                    # supervisor decides afresh, and approving raises a new
+                    # request on the store's queue.
+                    part.status = MaintenancePartRequest.Status.REQUESTED
+                    part.quantity_approved = None
+                    part.decided_by = None
+                    part.decided_at = None
+                    part.decision_note = note or f"Sent back by the store on {timezone.localdate():%d %b %Y}"
+                    part.issuance_request = None
+                    part.save(update_fields=[
+                        "status", "quantity_approved", "decided_by", "decided_at",
+                        "decision_note", "issuance_request", "updated_at",
+                    ])
                 where = part.schedule.title
             elif component is not None:
                 # A cancelled request stops counting against the requirement,

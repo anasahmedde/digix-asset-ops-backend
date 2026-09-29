@@ -461,6 +461,30 @@ def test_status_not_editable_via_plain_update(admin_client, device):
 
 
 @pytest.mark.django_db
+def test_a_patch_naming_nothing_real_says_so(admin_client, device):
+    """A field that does not exist is a caller that is wrong, not a rule.
+
+    It used to answer 200 with the record untouched, so the screen said
+    "Saved" and nothing had been. A field the serializer knows but will not
+    write is a different thing and is still ignored — the test above.
+    """
+    resp = admin_client.patch(
+        f"/api/assets/devices/{device.id}/", {"dsiplay_name": "typo"}, format="json"
+    )
+    assert resp.status_code == 400, resp.content
+    assert "dsiplay_name" in str(resp.data)
+
+    # A real field alongside it still saves; the typo is not fatal to the rest.
+    resp = admin_client.patch(
+        f"/api/assets/devices/{device.id}/",
+        {"display_name": "Named properly", "dsiplay_name": "typo"}, format="json",
+    )
+    assert resp.status_code == 200, resp.content
+    device.refresh_from_db()
+    assert device.display_name == "Named properly"
+
+
+@pytest.mark.django_db
 def test_the_three_delivery_routes(admin_client):
     """In-house build, vendor supplied, or vendor supplied and installed."""
     routes = {

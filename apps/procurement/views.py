@@ -4,6 +4,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.http import HttpResponse
 from django.utils import timezone
+from common.noops import RefusesSilentNoOps
 from rest_framework import status as drf_status
 from rest_framework import serializers, viewsets
 from rest_framework.decorators import action
@@ -25,7 +26,7 @@ from .serializers import (
 from .services import receive_against_po
 
 
-class PurchaseOrderViewSet(viewsets.ModelViewSet):
+class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # Reading an order is not the same as seeing its money: the store
     # reads orders with every figure masked. No read gate here — the
     # price masking is the control, and scoping does the rest.

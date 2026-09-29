@@ -3,6 +3,7 @@ from datetime import timedelta
 from django.db.models import Q
 from django.utils import timezone
 from common.scoping import for_client
+from common.noops import RefusesSilentNoOps
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -55,7 +56,7 @@ class TicketIssueTypeViewSet(viewsets.ModelViewSet):
     search_fields = ["name"]
 
 
-class TicketViewSet(viewsets.ModelViewSet):
+class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # Reading the register is a permission, and the Excel export
     # carries the same rows, so it answers to the same one.
     read_capability = "view_tickets"
@@ -354,6 +355,18 @@ class TicketViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        if new_status == Ticket.Status.CANCELLED:
+            if not (is_manager or is_reporter):
+                return Response(
+                    {"detail": "Only Operations or the person who raised it can cancel a ticket."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            if not notes.strip():
+                return Response(
+                    {"notes": "Say why this is being cancelled."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         if new_status == Ticket.Status.PENDING_OPS_APPROVAL and not notes.strip():
             return Response(
                 {"notes": "Describe what needs approval (issue found, expected cost/parts)."},
@@ -387,6 +400,15 @@ class TicketViewSet(viewsets.ModelViewSet):
             ticket.closed_at = timezone.now()
         elif is_reopen:
             ticket.closed_at = None
+
+        # Cancelling has to undo what raising it did. A ticket against a
+        # fault puts the asset out of service and opens a corrective job;
+        # leaving those behind is exactly what deleting the ticket did.
+        if new_status == Ticket.Status.CANCELLED:
+            ticket.closed_at = timezone.now()
+            from apps.maintenance.services import release_asset_for_cancelled_ticket
+
+            release_asset_for_cancelled_ticket(ticket, request.user, notes)
 
         ticket.status = new_status
         ticket.save(update_fields=[

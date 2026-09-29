@@ -390,3 +390,13 @@ class MaintenancePartDecisionSerializer(serializers.Serializer):
     # amount asked for is agreed.
     quantity = serializers.IntegerField(required=False, min_value=1)
     note = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        # A rejection with no reason tells the technician nothing: they
+        # cannot tell a wrong part from a part the store has not got, so
+        # they ask again and the same answer comes back.
+        if not attrs.get("approve") and not (attrs.get("note") or "").strip():
+            raise serializers.ValidationError(
+                {"note": "Say why this is being refused."}
+            )
+        return attrs

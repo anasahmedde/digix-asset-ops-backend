@@ -5,6 +5,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.db.models import Count, Q, Sum
 from rest_framework import status as drf_status
+from common.noops import RefusesSilentNoOps
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -86,7 +87,7 @@ def _installations_for(devices):
     return out
 
 
-class ProjectViewSet(viewsets.ModelViewSet):
+class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # Reading this is a permission, not just a menu entry.
     read_capability = "view_projects"
     write_capability = "edit_projects"
@@ -518,6 +519,30 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
         return Response(scrub(build_actuals(self.get_object()), {"request": request}, also=COSTING_TOTALS))
 
+    def perform_destroy(self, instance):
+        """A project with a signed-off budget behind it is closed, not deleted.
+
+        Deleting took the approved figure, the requirements raised against
+        it and the handover record with it, and left the assets that were
+        installed for it pointing at nothing. Marking it lost or complete
+        says the same thing and keeps what happened.
+        """
+        from rest_framework.exceptions import ValidationError as _VE
+
+        plan = getattr(instance, "cost_plan", None)
+        if plan is not None and plan.approved_total:
+            raise _VE(
+                "This project has an approved budget. Mark it complete or lost "
+                "instead — deleting it would take the approval and everything "
+                "raised against it with it."
+            )
+        if instance.phase == Project.Phase.HANDOVER:
+            raise _VE(
+                "This project has been handed over. Mark it complete instead — "
+                "the handover is the client's record as much as ours."
+            )
+        instance.delete()
+
     @action(detail=True, methods=["post"], url_path="submit-budget")
     def submit_budget(self, request, pk=None):
         """Send the estimate up for approval."""
@@ -611,7 +636,21 @@ class ProjectViewSet(viewsets.ModelViewSet):
         if plan.is_editable:
             return Response({"detail": "The budget is already open for changes."}, status=400)
         plan.status = ProjectBudget.Status.DRAFT
-        plan.save(update_fields=["status", "updated_at"])
+        # Reopening withdraws the approval. The figure that was signed off
+        # stayed on the plan, so a budget being rewritten still read as
+        # approved — for an amount nobody had agreed to any more. The
+        # project keeps `budget` as the last figure that was agreed, which
+        # is what reports compare actuals against.
+        plan.approved_total = None
+        plan.decided_by = None
+        plan.decided_at = None
+        plan.decision_notes = (
+            f"Reopened for changes by {request.user.get_full_name() or request.user.username}."
+        )
+        plan.save(update_fields=[
+            "status", "approved_total", "decided_by", "decided_at",
+            "decision_notes", "updated_at",
+        ])
         return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=False, methods=["get"])

@@ -245,6 +245,10 @@ def build_plan(project):
         "unpriced_lines": unpriced,
         "approved_total": plan.approved_total,
         "submitted_by": _name(plan.submitted_by),
+        # The id as well as the name: the screen has to know whether the
+        # person reading it is the one who submitted this, because they may
+        # not approve it and the Approve button was offered to them anyway.
+        "submitted_by_id": str(plan.submitted_by_id) if plan.submitted_by_id else None,
         "submitted_at": plan.submitted_at,
         "decided_by": _name(plan.decided_by),
         "decided_at": plan.decided_at,

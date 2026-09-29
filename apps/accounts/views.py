@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from common.noops import RefusesSilentNoOps
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
@@ -89,7 +90,7 @@ class IsSelfOrSuperAdmin(BasePermission):
         return obj.pk == user.pk
 
 
-class UserViewSet(viewsets.ModelViewSet):
+class UserViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     queryset = User.objects.all()
     # Seeing who works here is a capability. An external client portal
     # login does not hold it, and used to read the whole directory.
