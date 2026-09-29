@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import Ticket, TicketAttachment, TicketComment, TicketIssueType
 
 MANAGER_ROLES = ("super_admin", "group_head", "ops_manager")
@@ -51,7 +53,7 @@ class _AssignmentGuardMixin:
         return super().validate(attrs)
 
 
-class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
+class TicketSerializer(HidesMoney, _AssignmentGuardMixin, serializers.ModelSerializer):
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     issue_type_name = serializers.CharField(source="issue_type.name", read_only=True, default=None)
@@ -175,7 +177,7 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
         ]
 
 
-class TicketListSerializer(serializers.ModelSerializer):
+class TicketListSerializer(HidesMoney, serializers.ModelSerializer):
     """Lighter serializer for list views (no nested comments/attachments)."""
 
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)

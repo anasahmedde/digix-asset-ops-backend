@@ -343,6 +343,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get", "patch"], url_path="plan")
     def plan(self, request, pk=None):
         """The project's cost plan; PATCH sets the contingency percentage."""
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -361,7 +362,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 return Response({"contingency_percent": ["Must be between 0 and 100."]}, status=400)
             plan.contingency_percent = pct
             plan.save(update_fields=["contingency_percent", "updated_at"])
-        return Response(build_plan(project))
+        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["get"], url_path="actuals/document")
     def actuals_document(self, request, pk=None):
@@ -382,6 +383,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         """The cost plan as a PDF, for approval or the file."""
         from django.http import HttpResponse
 
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_plan
         from .documents import render_cost_plan_pdf
 
@@ -394,9 +396,10 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="boq")
     def boq(self, request, pk=None):
         """Bill of quantities: every component the whole project needs."""
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_boq
 
-        return Response(build_boq(self.get_object()))
+        return Response(scrub(build_boq(self.get_object()), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["get"], url_path="boq/document")
     def boq_document(self, request, pk=None):
@@ -507,13 +510,15 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="actuals")
     def actuals(self, request, pk=None):
         """What the project is actually costing, against what was approved."""
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_actuals
 
-        return Response(build_actuals(self.get_object()))
+        return Response(scrub(build_actuals(self.get_object()), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["post"], url_path="submit-budget")
     def submit_budget(self, request, pk=None):
         """Send the estimate up for approval."""
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -532,7 +537,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         plan.submitted_at = timezone.now()
         plan.decision_notes = ""
         plan.save(update_fields=["status", "submitted_by", "submitted_at", "decision_notes", "updated_at"])
-        return Response(build_plan(project))
+        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["post"], url_path="approve-budget")
     def approve_budget(self, request, pk=None):
@@ -543,6 +548,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         return self._decide_budget(request, approve=False)
 
     def _decide_budget(self, request, *, approve):
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -586,7 +592,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 moved.append("status")
             project.save(update_fields=moved)
         plan.save(update_fields=update)
-        return Response(build_plan(project))
+        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["post"], url_path="revise-budget")
     def revise_budget(self, request, pk=None):
@@ -594,6 +600,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
         Execution locks again until the revised figure is approved.
         """
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -602,7 +609,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             return Response({"detail": "The budget is already open for changes."}, status=400)
         plan.status = ProjectBudget.Status.DRAFT
         plan.save(update_fields=["status", "updated_at"])
-        return Response(build_plan(project))
+        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=False, methods=["get"])
     def dashboard_stats(self, request):

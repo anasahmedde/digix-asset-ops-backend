@@ -47,8 +47,15 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         """The order as a PDF, ready to send to the supplier."""
         from .documents import render_purchase_order_pdf
 
+        from common.money import viewer_sees_prices
+
         purchase_order = self.get_object()
-        pdf = render_purchase_order_pdf(purchase_order)
+        # The PDF is a copy of the screen, and the screen masks prices for
+        # readers without the capability. A download that did not would be
+        # the easiest way around the control.
+        pdf = render_purchase_order_pdf(
+            purchase_order, show_prices=viewer_sees_prices({"request": request})
+        )
         response = HttpResponse(pdf, content_type="application/pdf")
         name = purchase_order.po_number or "purchase-order"
         response["Content-Disposition"] = f'attachment; filename="{name}.pdf"'

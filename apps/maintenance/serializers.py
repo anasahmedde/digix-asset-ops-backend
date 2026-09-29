@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import (
     MaintenancePartRequest,
     MaintenanceRecord,
@@ -144,7 +146,7 @@ class MaintenanceRecordPhotoSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "taken_by", "created_at"]
 
 
-class MaintenanceVisitSerializer(serializers.ModelSerializer):
+class MaintenanceVisitSerializer(HidesMoney, serializers.ModelSerializer):
     """One round of a schedule — when it is due and who is going."""
 
     assigned_to_name = serializers.SerializerMethodField()
@@ -204,7 +206,7 @@ class MaintenanceVisitSerializer(serializers.ModelSerializer):
         return visit
 
 
-class MaintenanceRecordSerializer(serializers.ModelSerializer):
+class MaintenanceRecordSerializer(HidesMoney, serializers.ModelSerializer):
     schedule_title = serializers.CharField(source="schedule.title", read_only=True, default=None)
     performed_by_name = serializers.SerializerMethodField()
     status_display = serializers.CharField(source="get_status_display", read_only=True)

@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
+from common.money import scrub
 from common.permissions import (
     ISSUING_ROLES,
     MANAGER_ROLES,
@@ -796,7 +797,11 @@ class LowStockView(APIView):
                 "open_request": open_request("unit_type", p.pk),
                 "last_decline": last_decline("unit_type", p.pk),
             })
-        return Response({"results": rows, "count": len(rows), "unrequested": sum(1 for r in rows if not r["open_request"])})
+        # Hand-built payload: it never meets a serializer, so the
+        # price gate has to be applied here.
+        return Response(scrub({"results": rows, "count": len(rows), "unrequested": sum(1 for r in rows if not r["open_request"])}, self.get_serializer_context()
+                              if hasattr(self, 'get_serializer_context')
+                              else {'request': request}))
 
 
 class ReorderRequestViewSet(viewsets.ModelViewSet):

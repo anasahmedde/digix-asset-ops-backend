@@ -18,6 +18,12 @@ MONEY_FIELDS = frozenset({
     "estimated_cost", "labour_cost", "material_cost", "overhead_cost",
     "paid_amount", "balance", "margin", "selling_price", "last_unit_price",
     "declared_value", "insured_value", "rate", "value",
+    # Found leaking during the organogram walkthrough: a repair's cost
+    # reached technicians through the maintenance record and the ticket,
+    # and an asset's installation figures through the device payload.
+    "cost", "repair_cost", "planned_installation_cost",
+    "actual_installation_cost", "approved_total", "variance",
+    "contingency", "quoted_price", "price",
 })
 
 
@@ -31,6 +37,37 @@ def viewer_sees_prices(context) -> bool:
     # it was rather than silently blanked.
     can = getattr(user, "can", None)
     return can("view_prices") if callable(can) else True
+
+
+def scrub(data, context=None, *, also=()):
+    """Blank every amount in an already-built payload.
+
+    For the code that never passes through a serializer — a hand-rolled
+    APIView, a dict assembled by hand, a nested summary. Walks lists and
+    dicts to any depth, so a total buried three levels down is caught too.
+
+    `also` names fields that mean money *in this payload*. Some names are
+    ambiguous — `total` is a cost on a plan and a row count on a list — so
+    the caller says which it is rather than the catalogue guessing.
+    """
+    if viewer_sees_prices(context):
+        return data
+    return _blank(data, MONEY_FIELDS | frozenset(also))
+
+
+def _blank(node, names):
+    if isinstance(node, dict):
+        return {
+            k: (None if k in names else _blank(v, names))
+            for k, v in node.items()
+        }
+    if isinstance(node, (list, tuple)):
+        return [_blank(v, names) for v in node]
+    return node
+
+
+# What a cost document calls its bottom line.
+COSTING_TOTALS = ("total", "subtotal", "grand_total", "sum", "overall")
 
 
 class HidesMoney:
