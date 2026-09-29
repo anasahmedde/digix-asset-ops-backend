@@ -173,8 +173,14 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
         "view_assets", "edit_installation", "view_tickets", "work_tickets",
         "view_team",
     ),
-    "client_viewer": _keys("view_assets", "view_tickets"),
-    "vendor": _keys("view_tickets"),
+    # A client portal login is scoped to its own client by `for_client`,
+    # so `view_clients` here means "your own record", not "the client
+    # list". Without it the Clients entry in their menu leads to a 403.
+    "client_viewer": _keys("view_assets", "view_tickets", "view_clients"),
+    # Scoped by `DeviceViewSet.get_queryset` to devices on their own
+    # tickets and installations, so this is "your own work", not the
+    # register.
+    "vendor": _keys("view_tickets", "view_assets"),
 }
 
 

@@ -6,7 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import CommercialWriteElseRead
+from common.permissions import CapabilityGate, CommercialWriteElseRead
 
 from .models import Quotation
 from .pdf import build_quotation_pdf
@@ -43,6 +43,7 @@ def _spawn_project_if_needed(quotation: Quotation):
 
 
 class QuotationViewSet(viewsets.ModelViewSet):
+    # Reading a quotation is not the same as working one.
     queryset = (
         Quotation.objects.select_related("client", "site", "created_by")
         .prefetch_related(
@@ -52,7 +53,7 @@ class QuotationViewSet(viewsets.ModelViewSet):
         .all()
     )
     serializer_class = QuotationSerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead, CapabilityGate]
     filterset_fields = ["status", "client", "site", "currency"]
     search_fields = ["quote_number", "title", "description"]
     ordering_fields = ["created_at", "valid_until", "total_amount"]

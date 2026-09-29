@@ -10,7 +10,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import AdminManagerWriteElseRead, WarehouseWriteElseRead
+from common.permissions import CapabilityGate, AdminManagerWriteElseRead, WarehouseWriteElseRead
 
 from .costing import project_devices
 from .models import (
@@ -87,7 +87,10 @@ def _installations_for(devices):
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    # Reading this is a permission, not just a menu entry.
+    read_capability = "view_projects"
+    write_capability = "edit_projects"
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead, CapabilityGate]
     filterset_fields = ["status", "phase", "contract_type", "client", "site", "manager"]
     search_fields = ["name", "location", "description", "client__name", "site__name", "sites__name"]
     ordering_fields = ["created_at", "start_date", "target_date", "progress"]

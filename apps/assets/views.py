@@ -13,6 +13,7 @@ from rest_framework.response import Response
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from common.permissions import (
     MANAGER_ROLES,
+    CapabilityGate,
     AdminManagerWriteElseRead,
     WarehouseWriteElseRead,
 )
@@ -117,13 +118,16 @@ class MaterialTypeViewSet(viewsets.ModelViewSet):
 
 
 class DeviceViewSet(viewsets.ModelViewSet):
+    # Reading the register is a permission, and the Excel export
+    # carries the same rows, so it answers to the same one.
+    read_capability = "view_assets"
     queryset = Device.objects.select_related(
         "asset_type", "device_model", "device_model__brand", "current_site",
         "assigned_client", "supplier", "assigned_technician", "installed_by", "project",
     ).prefetch_related(
         "images", "warranties", "clients", "project_scope_items__project",
     ).all()
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead, CapabilityGate]
     filterset_fields = [
         "status", "source", "asset_type", "device_model", "current_site",
         "assigned_client", "assigned_technician", "project",
@@ -1077,7 +1081,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
 
     def _increase_decision(self, request, component):
         """Guard shared by the two decisions on a requested increase."""
-        from common.permissions import MANAGER_ROLES
+        from common.permissions import CapabilityGate, MANAGER_ROLES
 
         if getattr(request.user, "role", "") not in MANAGER_ROLES:
             return Response(

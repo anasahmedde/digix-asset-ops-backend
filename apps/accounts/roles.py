@@ -14,6 +14,14 @@ deleted, but only once nobody holds it.
 from django.core.cache import cache
 
 CACHE_KEY = "role-capabilities-v1"
+# Django's default cache is per-process, so `forget()` clears the web
+# worker that served the change and nobody else — a management command, a
+# second worker or celery keeps the stale map until it expires. A minute is
+# short enough that a permission change is never long in arriving, and long
+# enough that "what may this person do" is not a query on every request.
+# With a shared cache configured (Redis), invalidation is immediate and
+# this is only a backstop.
+CACHE_SECONDS = 60
 
 
 def ensure_seeded():
@@ -76,7 +84,7 @@ def capability_map() -> dict[str, frozenset[str]]:
     # yet still behaves, and a role added in code appears without a step.
     merged = {key: frozenset(caps) for key, caps in ROLE_DEFAULTS.items()}
     merged.update({key: frozenset(caps or ()) for key, caps in rows.items()})
-    cache.set(CACHE_KEY, merged, 300)
+    cache.set(CACHE_KEY, merged, CACHE_SECONDS)
     return merged
 
 

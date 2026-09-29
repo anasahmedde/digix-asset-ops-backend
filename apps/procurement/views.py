@@ -10,7 +10,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import FinanceWriteElseRead, PurchaseOrderActionElseRead
+from common.permissions import CapabilityGate, FinanceWriteElseRead, PurchaseOrderActionElseRead
 
 from .lines import describe_asset, describe_component, line_text
 from .models import PurchaseOrder, PurchaseOrderItem
@@ -26,6 +26,9 @@ from .services import receive_against_po
 
 
 class PurchaseOrderViewSet(viewsets.ModelViewSet):
+    # Reading an order is not the same as seeing its money: the store
+    # reads orders with every figure masked. No read gate here — the
+    # price masking is the control, and scoping does the rest.
     queryset = (
         PurchaseOrder.objects.select_related("supplier", "ordered_by", "approved_by")
         .prefetch_related(
@@ -34,7 +37,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         .all()
     )
     serializer_class = PurchaseOrderSerializer
-    permission_classes = [IsAuthenticated, FinanceWriteElseRead]
+    permission_classes = [IsAuthenticated, FinanceWriteElseRead, CapabilityGate]
     filterset_fields = ["status", "supplier"]
     search_fields = ["po_number"]
     ordering_fields = ["created_at", "order_date", "total_amount"]

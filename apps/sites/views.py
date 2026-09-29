@@ -1,6 +1,7 @@
 from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
+from common.scoping import for_client
 from rest_framework import status as drf_status
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -65,11 +66,13 @@ class SiteViewSet(viewsets.ModelViewSet):
     ordering_fields = ["name", "created_at"]
 
     def get_queryset(self):
-        return (
+        # A client portal login sees its own client's sites only.
+        return for_client(
             Site.objects.select_related("client")
             .prefetch_related("contacts")
-            .annotate(device_count=Count("devices"))
-            .all()
+            .annotate(device_count=Count("devices")),
+            self.request.user,
+            "client_id",
         )
 
     def get_serializer_class(self):

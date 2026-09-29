@@ -9,7 +9,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from common.permissions import ADMIN_ROLES, IsSuperAdmin
+from common.permissions import ADMIN_ROLES, CapabilityGate, IsSuperAdmin
 
 from .models import AuditLog, RoleDefinition, UserCapability
 from .serializers import (
@@ -91,7 +91,10 @@ class IsSelfOrSuperAdmin(BasePermission):
 
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
-    permission_classes = [IsAuthenticated, IsSelfOrSuperAdmin]
+    # Seeing who works here is a capability. An external client portal
+    # login does not hold it, and used to read the whole directory.
+    read_capability = "view_team"
+    permission_classes = [IsAuthenticated, IsSelfOrSuperAdmin, CapabilityGate]
     filterset_fields = ["role", "is_active", "is_field_staff"]
     search_fields = ["username", "email", "first_name", "last_name"]
     ordering_fields = ["date_joined", "username"]
@@ -231,7 +234,8 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
 class CapabilityCatalogueView(APIView):
     """Every capability the system knows about, with each role's defaults."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_team"
 
     def get(self, request):
         from .capabilities import MODULES, catalogue
@@ -283,7 +287,11 @@ class RoleDefinitionViewSet(viewsets.ModelViewSet):
     """
 
     serializer_class = RoleDefinitionSerializer
-    permission_classes = [IsAuthenticated, ManagesPermissions]
+    permission_classes = [IsAuthenticated, ManagesPermissions, CapabilityGate]
+    # The permission model itself is internal: it says who may approve
+    # spending and who may administer the system. An external viewer read
+    # the whole matrix, headcounts included.
+    read_capability = "view_team"
 
     def get_queryset(self):
         from .roles import ensure_seeded

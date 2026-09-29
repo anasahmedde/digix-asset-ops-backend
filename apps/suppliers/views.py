@@ -1,7 +1,7 @@
 from rest_framework import viewsets
 from rest_framework.permissions import IsAuthenticated
 
-from common.permissions import AdminManagerWriteElseRead
+from common.permissions import CapabilityGate, AdminManagerWriteElseRead
 
 from .models import Supplier, SupplierContact, SupplierServiceCategory
 from .serializers import (
@@ -21,9 +21,11 @@ class SupplierServiceCategoryViewSet(viewsets.ModelViewSet):
 
 
 class SupplierViewSet(viewsets.ModelViewSet):
+    # Reading this is a permission, not just a menu entry.
+    read_capability = "manage_suppliers"
     queryset = Supplier.objects.prefetch_related("contacts", "service_categories").all()
     serializer_class = SupplierSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead, CapabilityGate]
     filterset_fields = ["is_active", "service_categories"]
     search_fields = ["name", "code", "contact_person"]
     ordering_fields = ["name", "created_at"]

@@ -5,7 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import TechnicianCanCreate
+from common.permissions import CapabilityGate, TechnicianCanCreate
 
 from .models import (
     MaintenancePartRequest,
@@ -108,11 +108,13 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
 
 
 class MaintenanceScheduleViewSet(viewsets.ModelViewSet):
+    # Reading this is a permission, not just a menu entry.
+    read_capability = "view_tickets"
     queryset = MaintenanceSchedule.objects.select_related(
         "device", "site", "assigned_to", "ticket"
     ).prefetch_related("vendors", "visits__assigned_to").all()
     serializer_class = MaintenanceScheduleSerializer
-    permission_classes = [IsAuthenticated, TechnicianCanCreate]
+    permission_classes = [IsAuthenticated, TechnicianCanCreate, CapabilityGate]
     filterset_fields = [
         "maintenance_type", "frequency", "status", "is_active", "assigned_to", "device", "priority",
         "ticket",

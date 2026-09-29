@@ -2,6 +2,7 @@ from datetime import timedelta
 
 from django.db.models import Q
 from django.utils import timezone
+from common.scoping import for_client
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -9,7 +10,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
-from common.permissions import MANAGER_ROLES, AdminManagerWriteElseRead, TechnicianCanCreate
+from common.permissions import CapabilityGate, MANAGER_ROLES, AdminManagerWriteElseRead, TechnicianCanCreate
 
 from .models import Ticket, TicketAttachment, TicketComment, TicketIssueType
 from .serializers import (
@@ -45,11 +46,14 @@ class TicketIssueTypeViewSet(viewsets.ModelViewSet):
 
 
 class TicketViewSet(viewsets.ModelViewSet):
+    # Reading the register is a permission, and the Excel export
+    # carries the same rows, so it answers to the same one.
+    read_capability = "view_tickets"
     queryset = Ticket.objects.select_related(
         "device", "site", "issue_type", "assigned_to", "assigned_vendor",
         "reported_by", "completed_by", "reviewed_by",
     ).prefetch_related("attachments", "comments", "devices").all()
-    permission_classes = [IsAuthenticated, TechnicianCanCreate]
+    permission_classes = [IsAuthenticated, TechnicianCanCreate, CapabilityGate]
     filterset_fields = [
         "status", "priority", "category", "issue_type", "assigned_to",
         "assigned_vendor", "site", "escalated", "is_billable",
@@ -111,7 +115,11 @@ class TicketViewSet(viewsets.ModelViewSet):
             if not user.supplier_id:
                 return qs.none()
             return qs.filter(assigned_vendor_id=user.supplier_id)
-        return qs
+        # A client portal login sees its own client's tickets only. This
+        # was the fall-through that let an external viewer read every
+        # client's faults.
+        return for_client(qs, user, "device__assigned_client_id",
+                          "device__current_site__client_id")
 
     def get_serializer_class(self):
         if self.action == "list":

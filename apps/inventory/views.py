@@ -12,6 +12,7 @@ from rest_framework.views import APIView
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from common.money import scrub
 from common.permissions import (
+    CapabilityGate,
     ISSUING_ROLES,
     MANAGER_ROLES,
     InspectionWriteElseRead,
@@ -58,6 +59,8 @@ class InventoryCategoryViewSet(viewsets.ModelViewSet):
 
 
 class InventoryItemViewSet(viewsets.ModelViewSet):
+    # Reading this is a permission, not just a menu entry.
+    read_capability = "view_stock"
     # Coalesce so unpriced items sort as zero value instead of NULLs-first.
     queryset = (
         InventoryItem.objects.select_related("material_type", "category")
@@ -74,7 +77,7 @@ class InventoryItemViewSet(viewsets.ModelViewSet):
         .all()
     )
     serializer_class = InventoryItemSerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    permission_classes = [IsAuthenticated, WarehouseWriteElseRead, CapabilityGate]
     filterset_fields = ["location", "category", "material_type", "watch_on_dashboard"]
     search_fields = ["sku", "material_type__name", "category__name"]
 
