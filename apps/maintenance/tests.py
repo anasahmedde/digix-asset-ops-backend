@@ -11,6 +11,20 @@ from apps.maintenance.models import MaintenanceSchedule
 from apps.sites.models import Site
 
 
+def _about():
+    """What a ticket is about, for tests that are about something else.
+
+    The API requires an asset, a category and a priority on every new
+    ticket; a payload can still override any of them after this spread.
+    """
+    from apps.assets.models import Device
+
+    device, _ = Device.objects.get_or_create(
+        asset_code="TKT-ABOUT-1", defaults={"serial_number": "TKT-ABOUT-SN-1"},
+    )
+    return {"device": str(device.id), "category": "repair", "priority": "medium"}
+
+
 @pytest.fixture
 def ops(db):
     return User.objects.create_user(username="maint-ops", password="x", role="ops_manager")
@@ -1194,7 +1208,7 @@ def test_a_ticket_raised_against_an_asset_shows_up_as_a_corrective_job():
         status=Device.Status.ACTIVE,
     )
 
-    r = _client(boss).post("/api/tickets/", {
+    r = _client(boss).post("/api/tickets/", {**_about(), 
         "title": "Screen flickering", "description": "Flickers on the hour.",
         "device": str(device.id), "priority": "high", "category": "repair",
     }, format="json")
@@ -1209,7 +1223,7 @@ def test_a_ticket_raised_against_an_asset_shows_up_as_a_corrective_job():
     assert job.visits.count() == 1, "and it has a round to plan, like any other job"
 
     # A second ticket on the same asset joins the outage rather than doubling it.
-    r2 = _client(boss).post("/api/tickets/", {
+    r2 = _client(boss).post("/api/tickets/", {**_about(), 
         "title": "Screen still flickering", "device": str(device.id), "category": "repair",
     }, format="json")
     assert r2.status_code == 201, r2.content
@@ -1249,7 +1263,7 @@ def test_a_ticket_over_several_assets_opens_a_job_for_each():
     first = Device.objects.create(asset_type=kind, current_site=site, status=Device.Status.ACTIVE)
     second = Device.objects.create(asset_type=kind, current_site=site, status=Device.Status.ACTIVE)
 
-    r = _client(boss).post("/api/tickets/", {
+    r = _client(boss).post("/api/tickets/", {**_about(), 
         "title": "Both standees dark", "device": str(first.id),
         "devices": [str(first.id), str(second.id)], "category": "repair",
     }, format="json")

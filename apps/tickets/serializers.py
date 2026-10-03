@@ -54,6 +54,7 @@ class _AssignmentGuardMixin:
 
 
 class TicketSerializer(HidesMoney, _AssignmentGuardMixin, serializers.ModelSerializer):
+
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     issue_type_name = serializers.CharField(source="issue_type.name", read_only=True, default=None)
@@ -99,6 +100,22 @@ class TicketSerializer(HidesMoney, _AssignmentGuardMixin, serializers.ModelSeria
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        # Only a title was required, so a ticket could be raised about
+        # nothing, for nothing in particular, at the default urgency — and
+        # everything downstream reads those three: the asset is how the
+        # fault reaches maintenance and the client, the category decides
+        # who pays, the priority sets the clock. Naming the assets in
+        # `devices` is naming the asset.
+        if self.instance is None:
+            missing = {}
+            if not attrs.get("device") and not attrs.get("devices"):
+                missing["device"] = "Say which asset this is about."
+            if not attrs.get("category"):
+                missing["category"] = "Say what kind of work this is."
+            if not attrs.get("priority"):
+                missing["priority"] = "Say how urgent it is."
+            if missing:
+                raise serializers.ValidationError(missing)
         # A ticket may only claim against a warranty of its own asset, so a
         # claim cannot be filed against an unrelated asset's cover (which would
         # also skew that asset's billability).
