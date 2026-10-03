@@ -22,6 +22,38 @@ class UserSerializer(serializers.ModelSerializer):
     reports_to_name = serializers.SerializerMethodField()
     direct_report_count = serializers.SerializerMethodField()
 
+    def validate_reports_to(self, boss):
+        """The chart is a tree, and moving somebody on it is a manager's call.
+
+        Two things could go wrong and nothing stopped either: a person could
+        be put under one of their own reports, which turns the line into a
+        loop the chart cannot draw and `manages()` cannot walk; and anyone
+        with the write rule could re-hang anyone, so a team lead could move
+        the Operations Head under themselves.
+        """
+        if boss is None:
+            return boss
+        person = self.instance
+        if person is not None:
+            if boss.pk == person.pk:
+                raise serializers.ValidationError("Nobody reports to themselves.")
+            if person.manages(boss):
+                who = boss.get_full_name() or boss.username
+                raise serializers.ValidationError(
+                    f"{who} reports to this person - that would make a loop."
+                )
+        request = self.context.get("request")
+        actor = getattr(request, "user", None)
+        if actor is not None and person is not None and not (
+            actor.is_superuser
+            or actor.role in ("super_admin", "group_head")
+            or actor.manages(person)
+        ):
+            raise serializers.ValidationError(
+                "You can only move people who report to you."
+            )
+        return boss
+
     def get_reports_to_name(self, obj):
         boss = obj.reports_to
         if boss is None:
@@ -64,6 +96,20 @@ class UserSerializer(serializers.ModelSerializer):
         # record, not just their own profile fields.
         can = getattr(actor, "can", None)
         may_manage = _is_super_admin(actor) or (callable(can) and can("manage_team"))
+
+        # Nobody rewrites their own authority. The rule was enforced on the
+        # capabilities endpoint but not here, so a super_admin could PATCH
+        # his own `role` and change what he may do through the side door.
+        editing_self = (
+            self.instance is not None
+            and getattr(actor, "pk", None) == getattr(self.instance, "pk", None)
+        )
+        if editing_self:
+            # Nobody picks their own manager, either.
+            for name in ("role", "is_active", "is_staff", "is_superuser", "reports_to"):
+                if name in fields:
+                    fields[name].read_only = True
+
         if not may_manage:
             # Non-admins can only edit safe profile fields; everything else
             # (role, is_active, HR fields, username, ...) becomes read-only.

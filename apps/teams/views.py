@@ -5,12 +5,13 @@ from django.db import transaction
 from django.utils import timezone
 from django.db.models import Count, Q, Sum
 from rest_framework import status as drf_status
+from common.noops import RefusesSilentNoOps
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import AdminManagerWriteElseRead, WarehouseWriteElseRead
+from common.permissions import CapabilityGate, AdminManagerWriteElseRead, WarehouseWriteElseRead
 
 from .costing import project_devices
 from .models import (
@@ -86,8 +87,11 @@ def _installations_for(devices):
     return out
 
 
-class ProjectViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
+    # Reading this is a permission, not just a menu entry.
+    read_capability = "view_projects"
+    write_capability = "edit_projects"
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead, CapabilityGate]
     filterset_fields = ["status", "phase", "contract_type", "client", "site", "manager"]
     search_fields = ["name", "location", "description", "client__name", "site__name", "sites__name"]
     ordering_fields = ["created_at", "start_date", "target_date", "progress"]
@@ -343,6 +347,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get", "patch"], url_path="plan")
     def plan(self, request, pk=None):
         """The project's cost plan; PATCH sets the contingency percentage."""
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -361,7 +366,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 return Response({"contingency_percent": ["Must be between 0 and 100."]}, status=400)
             plan.contingency_percent = pct
             plan.save(update_fields=["contingency_percent", "updated_at"])
-        return Response(build_plan(project))
+        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["get"], url_path="actuals/document")
     def actuals_document(self, request, pk=None):
@@ -382,6 +387,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         """The cost plan as a PDF, for approval or the file."""
         from django.http import HttpResponse
 
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_plan
         from .documents import render_cost_plan_pdf
 
@@ -394,9 +400,10 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="boq")
     def boq(self, request, pk=None):
         """Bill of quantities: every component the whole project needs."""
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_boq
 
-        return Response(build_boq(self.get_object()))
+        return Response(scrub(build_boq(self.get_object()), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["get"], url_path="boq/document")
     def boq_document(self, request, pk=None):
@@ -507,13 +514,39 @@ class ProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="actuals")
     def actuals(self, request, pk=None):
         """What the project is actually costing, against what was approved."""
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_actuals
 
-        return Response(build_actuals(self.get_object()))
+        return Response(scrub(build_actuals(self.get_object()), {"request": request}, also=COSTING_TOTALS))
+
+    def perform_destroy(self, instance):
+        """A project with a signed-off budget behind it is closed, not deleted.
+
+        Deleting took the approved figure, the requirements raised against
+        it and the handover record with it, and left the assets that were
+        installed for it pointing at nothing. Marking it lost or complete
+        says the same thing and keeps what happened.
+        """
+        from rest_framework.exceptions import ValidationError as _VE
+
+        plan = getattr(instance, "cost_plan", None)
+        if plan is not None and plan.approved_total:
+            raise _VE(
+                "This project has an approved budget. Mark it complete or lost "
+                "instead — deleting it would take the approval and everything "
+                "raised against it with it."
+            )
+        if instance.phase == Project.Phase.HANDOVER:
+            raise _VE(
+                "This project has been handed over. Mark it complete instead — "
+                "the handover is the client's record as much as ours."
+            )
+        instance.delete()
 
     @action(detail=True, methods=["post"], url_path="submit-budget")
     def submit_budget(self, request, pk=None):
         """Send the estimate up for approval."""
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -532,7 +565,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         plan.submitted_at = timezone.now()
         plan.decision_notes = ""
         plan.save(update_fields=["status", "submitted_by", "submitted_at", "decision_notes", "updated_at"])
-        return Response(build_plan(project))
+        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["post"], url_path="approve-budget")
     def approve_budget(self, request, pk=None):
@@ -543,6 +576,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         return self._decide_budget(request, approve=False)
 
     def _decide_budget(self, request, *, approve):
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -586,7 +620,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 moved.append("status")
             project.save(update_fields=moved)
         plan.save(update_fields=update)
-        return Response(build_plan(project))
+        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["post"], url_path="revise-budget")
     def revise_budget(self, request, pk=None):
@@ -594,6 +628,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
         Execution locks again until the revised figure is approved.
         """
+        from common.money import COSTING_TOTALS, scrub
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -601,8 +636,22 @@ class ProjectViewSet(viewsets.ModelViewSet):
         if plan.is_editable:
             return Response({"detail": "The budget is already open for changes."}, status=400)
         plan.status = ProjectBudget.Status.DRAFT
-        plan.save(update_fields=["status", "updated_at"])
-        return Response(build_plan(project))
+        # Reopening withdraws the approval. The figure that was signed off
+        # stayed on the plan, so a budget being rewritten still read as
+        # approved — for an amount nobody had agreed to any more. The
+        # project keeps `budget` as the last figure that was agreed, which
+        # is what reports compare actuals against.
+        plan.approved_total = None
+        plan.decided_by = None
+        plan.decided_at = None
+        plan.decision_notes = (
+            f"Reopened for changes by {request.user.get_full_name() or request.user.username}."
+        )
+        plan.save(update_fields=[
+            "status", "approved_total", "decided_by", "decided_at",
+            "decision_notes", "updated_at",
+        ])
+        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=False, methods=["get"])
     def dashboard_stats(self, request):

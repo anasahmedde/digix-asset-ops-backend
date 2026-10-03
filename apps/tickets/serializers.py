@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import Ticket, TicketAttachment, TicketComment, TicketIssueType
 
 MANAGER_ROLES = ("super_admin", "group_head", "ops_manager")
@@ -51,7 +53,8 @@ class _AssignmentGuardMixin:
         return super().validate(attrs)
 
 
-class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
+class TicketSerializer(HidesMoney, _AssignmentGuardMixin, serializers.ModelSerializer):
+
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     issue_type_name = serializers.CharField(source="issue_type.name", read_only=True, default=None)
@@ -97,6 +100,22 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        # Only a title was required, so a ticket could be raised about
+        # nothing, for nothing in particular, at the default urgency — and
+        # everything downstream reads those three: the asset is how the
+        # fault reaches maintenance and the client, the category decides
+        # who pays, the priority sets the clock. Naming the assets in
+        # `devices` is naming the asset.
+        if self.instance is None:
+            missing = {}
+            if not attrs.get("device") and not attrs.get("devices"):
+                missing["device"] = "Say which asset this is about."
+            if not attrs.get("category"):
+                missing["category"] = "Say what kind of work this is."
+            if not attrs.get("priority"):
+                missing["priority"] = "Say how urgent it is."
+            if missing:
+                raise serializers.ValidationError(missing)
         # A ticket may only claim against a warranty of its own asset, so a
         # claim cannot be filed against an unrelated asset's cover (which would
         # also skew that asset's billability).
@@ -175,7 +194,7 @@ class TicketSerializer(_AssignmentGuardMixin, serializers.ModelSerializer):
         ]
 
 
-class TicketListSerializer(serializers.ModelSerializer):
+class TicketListSerializer(HidesMoney, serializers.ModelSerializer):
     """Lighter serializer for list views (no nested comments/attachments)."""
 
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
@@ -267,6 +286,16 @@ class TicketSubmitCompletionSerializer(serializers.Serializer):
 class TicketReviewSerializer(serializers.Serializer):
     action = serializers.ChoiceField(choices=["approve", "reject"])
     comments = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        # Sending work back without saying what is wrong with it sends the
+        # assignee back to the same job with no more information than the
+        # first time.
+        if attrs.get("action") == "reject" and not (attrs.get("comments") or "").strip():
+            raise serializers.ValidationError(
+                {"comments": "Say what needs putting right."}
+            )
+        return attrs
 
     def validate(self, attrs):
         if attrs["action"] == "reject" and not attrs.get("comments", "").strip():

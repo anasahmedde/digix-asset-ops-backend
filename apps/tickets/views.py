@@ -2,6 +2,8 @@ from datetime import timedelta
 
 from django.db.models import Q
 from django.utils import timezone
+from common.scoping import for_client
+from common.noops import RefusesSilentNoOps
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -9,7 +11,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
-from common.permissions import MANAGER_ROLES, AdminManagerWriteElseRead, TechnicianCanCreate
+from common.permissions import CapabilityGate, MANAGER_ROLES, AdminManagerWriteElseRead, TechnicianCanCreate
 
 from .models import Ticket, TicketAttachment, TicketComment, TicketIssueType
 from .serializers import (
@@ -34,6 +36,16 @@ def _is_assigned_vendor(user, ticket):
     )
 
 
+def _did_the_work(user, ticket) -> bool:
+    """Did this person carry out the work that is now being signed off?"""
+    return user.id in (ticket.assigned_to_id, ticket.completed_by_id)
+
+
+# Accounts that exist to read, not to attend a fault. A vendor is engaged
+# through assigned_vendor, which is a different field and a different thing.
+NON_WORKING_ROLES = ("client_viewer", "vendor")
+
+
 class TicketIssueTypeViewSet(viewsets.ModelViewSet):
     """Fault catalogue (Module Burnt, HDMI Cable Issue, …) managed from Setup."""
 
@@ -44,12 +56,15 @@ class TicketIssueTypeViewSet(viewsets.ModelViewSet):
     search_fields = ["name"]
 
 
-class TicketViewSet(viewsets.ModelViewSet):
+class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
+    # Reading the register is a permission, and the Excel export
+    # carries the same rows, so it answers to the same one.
+    read_capability = "view_tickets"
     queryset = Ticket.objects.select_related(
         "device", "site", "issue_type", "assigned_to", "assigned_vendor",
         "reported_by", "completed_by", "reviewed_by",
     ).prefetch_related("attachments", "comments", "devices").all()
-    permission_classes = [IsAuthenticated, TechnicianCanCreate]
+    permission_classes = [IsAuthenticated, TechnicianCanCreate, CapabilityGate]
     filterset_fields = [
         "status", "priority", "category", "issue_type", "assigned_to",
         "assigned_vendor", "site", "escalated", "is_billable",
@@ -111,7 +126,11 @@ class TicketViewSet(viewsets.ModelViewSet):
             if not user.supplier_id:
                 return qs.none()
             return qs.filter(assigned_vendor_id=user.supplier_id)
-        return qs
+        # A client portal login sees its own client's tickets only. This
+        # was the fall-through that let an external viewer read every
+        # client's faults.
+        return for_client(qs, user, "device__assigned_client_id",
+                          "device__current_site__client_id")
 
     def get_serializer_class(self):
         if self.action == "list":
@@ -175,6 +194,19 @@ class TicketViewSet(viewsets.ModelViewSet):
 
             user_id = ser.validated_data["assigned_to"]
             assignee = User.objects.filter(pk=user_id).first() if user_id else None
+            # A ticket handed to a client login or a left employee is a ticket
+            # nobody is working, and it looks assigned on every report.
+            if assignee is not None:
+                if not assignee.is_active:
+                    return Response(
+                        {"assigned_to": "That person has left. Assign someone active."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if getattr(assignee, "role", "") in NON_WORKING_ROLES:
+                    return Response(
+                        {"assigned_to": "That account cannot attend faults. Assign a member of staff, or set a vendor instead."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
             ticket.assigned_to = assignee
             parts.append(f"assignee → {assignee.get_full_name() or assignee.username}" if assignee else "assignee cleared")
         if "assigned_vendor" in ser.validated_data:
@@ -241,6 +273,18 @@ class TicketViewSet(viewsets.ModelViewSet):
                     {"detail": "Only Operations or the reporter can reopen a closed ticket."},
                     status=status.HTTP_403_FORBIDDEN,
                 )
+            # Reopening undoes somebody else's sign-off, so it is the close
+            # rule walked backwards: barring the person who did the work from
+            # closing their own ticket achieves nothing if they can reopen it
+            # the moment it is closed, as often as they like.
+            if _did_the_work(user, ticket) and not is_manager:
+                return Response(
+                    {"detail": (
+                        "You carried out this work. Ask Operations to reopen it, "
+                        "or raise a new ticket if the fault has come back."
+                    )},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
             # Legacy rows closed before closed_at existed fall back to the
             # last update so the window never fails open.
             closed_reference = ticket.closed_at or ticket.updated_at
@@ -298,6 +342,31 @@ class TicketViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        # Sign-off is somebody else confirming the work, or it is not sign-off.
+        # Raising a fault, attending it and then closing it yourself is one
+        # person all the way through, and that is the loop this closes.
+        if (
+            new_status in (Ticket.Status.APPROVED, Ticket.Status.CLOSED)
+            and not is_reopen
+            and _did_the_work(user, ticket)
+        ):
+            return Response(
+                {"detail": "You carried out this work, so somebody else signs it off."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if new_status == Ticket.Status.CANCELLED:
+            if not (is_manager or is_reporter):
+                return Response(
+                    {"detail": "Only Operations or the person who raised it can cancel a ticket."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            if not notes.strip():
+                return Response(
+                    {"notes": "Say why this is being cancelled."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         if new_status == Ticket.Status.PENDING_OPS_APPROVAL and not notes.strip():
             return Response(
                 {"notes": "Describe what needs approval (issue found, expected cost/parts)."},
@@ -331,6 +400,15 @@ class TicketViewSet(viewsets.ModelViewSet):
             ticket.closed_at = timezone.now()
         elif is_reopen:
             ticket.closed_at = None
+
+        # Cancelling has to undo what raising it did. A ticket against a
+        # fault puts the asset out of service and opens a corrective job;
+        # leaving those behind is exactly what deleting the ticket did.
+        if new_status == Ticket.Status.CANCELLED:
+            ticket.closed_at = timezone.now()
+            from apps.maintenance.services import release_asset_for_cancelled_ticket
+
+            release_asset_for_cancelled_ticket(ticket, request.user, notes)
 
         ticket.status = new_status
         ticket.save(update_fields=[
@@ -428,6 +506,13 @@ class TicketViewSet(viewsets.ModelViewSet):
         if not is_reporter and not is_manager:
             return Response(
                 {"detail": "Only the reporter or a manager can review tickets."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # The point of a review is that somebody else looks at it.
+        if _did_the_work(user, ticket) and (request.data.get("action") or "") == "approve":
+            return Response(
+                {"detail": "You carried out this work, so somebody else reviews it."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 

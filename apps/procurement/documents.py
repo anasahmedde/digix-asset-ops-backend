@@ -102,8 +102,13 @@ def _address_block(supplier, s, details: str = "") -> list:
     return [Paragraph("<br/>".join(lines), s["body"])]
 
 
-def render_purchase_order_pdf(purchase_order) -> bytes:
-    """The order as a single-page (or flowing) A4 document."""
+def render_purchase_order_pdf(purchase_order, *, show_prices: bool = True) -> bytes:
+    """The order as a single-page (or flowing) A4 document.
+
+    `show_prices=False` prints the same document with every figure
+    struck out — the screen already masks them for those readers, and a
+    downloadable copy that did not would defeat the control entirely.
+    """
     s = _styles()
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -197,8 +202,8 @@ def render_purchase_order_pdf(purchase_order) -> bytes:
             Paragraph(str(n), s["cell"]),
             Paragraph(text, s["cell"]),
             Paragraph(f"{item.quantity} {unit_of(item)}", s["num"]),
-            Paragraph(_money(item.unit_price, currency), s["num"]),
-            Paragraph(_money(item.line_total, currency), s["num"]),
+            Paragraph(_money(item.unit_price, currency) if show_prices else "—", s["num"]),
+            Paragraph(_money(item.line_total, currency) if show_prices else "—", s["num"]),
         ])
     if len(rows) == 1:
         rows.append([Paragraph("No items on this order.", s["cell"]), "", "", "", ""])
@@ -219,7 +224,8 @@ def render_purchase_order_pdf(purchase_order) -> bytes:
 
     total = Table(
         [[Paragraph("TOTAL", s["head"]),
-          Paragraph(f"<b>{_money(purchase_order.total_amount, currency)}</b>", s["num"])]],
+          Paragraph(f"<b>{_money(purchase_order.total_amount, currency)}</b>"
+                    if show_prices else "<b>—</b>", s["num"])]],
         colWidths=[108 * mm, 66 * mm],
     )
     total.setStyle(TableStyle([

@@ -89,6 +89,12 @@ CAPABILITIES: tuple[Capability, ...] = (
     Capability("manage_maintenance", "Schedule maintenance", "Maintenance",
                "Create schedules, assign visits, complete rounds."),
 
+    # --- Warranty ------------------------------------------------------------
+    Capability("view_warranties", "See warranty cover", "Warranty",
+               "Vendor and client warranties, what is covered and when it runs out."),
+    Capability("manage_warranties", "Record warranty cover", "Warranty",
+               "Add cover, extend it, reissue it and work claims."),
+
     # --- Commercial ---------------------------------------------------------
     Capability("view_clients", "See clients", "Commercial",
                "Client records and the sites that belong to them."),
@@ -96,6 +102,8 @@ CAPABILITIES: tuple[Capability, ...] = (
                "Draft, revise and send quotations."),
 
     # --- People and the system ---------------------------------------------
+    Capability("view_attendance", "See attendance", "People",
+               "Registers, who is in, and corrections."),
     Capability("view_team", "See the team", "People",
                "The employee list and the organogram."),
     Capability("manage_team", "Manage people", "People",
@@ -134,20 +142,24 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
         "close_installation", "view_tickets", "work_tickets", "close_ticket",
         "manage_maintenance", "view_clients", "view_team", "view_reports",
         "manage_setup", "manage_team", "manage_permissions",
+        "view_warranties", "manage_warranties", "view_attendance",
     ),
     "marketing_head": _keys(
         "view_prices", "edit_prices", "view_assets", "view_projects", "view_tickets",
         "work_tickets", "close_ticket", "view_clients", "manage_quotations",
         "view_team", "view_reports", "manage_permissions",
+        "view_warranties", "manage_warranties",
     ),
     "finance": _keys(
         "view_prices", "edit_prices", "view_margins", "view_stock", "view_assets",
         "view_projects", "view_clients", "view_reports", "view_team",
+        "view_warranties",
     ),
     "supervisor": _keys(
         "view_stock", "inspect_goods", "view_assets", "edit_assets",
         "view_projects", "edit_installation", "view_tickets", "work_tickets",
         "close_ticket", "manage_maintenance", "view_team", "manage_permissions",
+        "view_attendance",
     ),
     "warehouse": _keys(
         "receive_goods", "inspect_goods", "view_stock", "issue_stock",
@@ -155,14 +167,24 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
     ),
     "marketing": _keys(
         "view_assets", "view_projects", "view_tickets", "work_tickets",
-        "view_clients", "manage_quotations", "view_team",
+        "view_clients", "manage_quotations", "view_team", "view_warranties",
     ),
     "technician": _keys(
+        # Asking for a part means naming one, so the person asking has to be
+        # able to see what the store carries. It is a list of materials, not
+        # of money — prices are `view_prices`, which they do not have.
+        "view_stock",
         "view_assets", "edit_installation", "view_tickets", "work_tickets",
         "view_team",
     ),
-    "client_viewer": _keys("view_assets", "view_tickets"),
-    "vendor": _keys("view_tickets"),
+    # A client portal login is scoped to its own client by `for_client`,
+    # so `view_clients` here means "your own record", not "the client
+    # list". Without it the Clients entry in their menu leads to a 403.
+    "client_viewer": _keys("view_assets", "view_tickets", "view_clients"),
+    # Scoped by `DeviceViewSet.get_queryset` to devices on their own
+    # tickets and installations, so this is "your own work", not the
+    # register.
+    "vendor": _keys("view_tickets", "view_assets"),
 }
 
 

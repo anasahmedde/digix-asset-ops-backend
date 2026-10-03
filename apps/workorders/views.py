@@ -6,7 +6,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import AdminManagerWriteElseRead
+from common.permissions import CapabilityGate, AdminManagerWriteElseRead
 
 from .models import WorkOrder, WorkOrderItem
 from .pdf import build_work_order_pdf
@@ -57,6 +57,8 @@ def _status_from_lines(work_order) -> str:
 
 
 class WorkOrderViewSet(viewsets.ModelViewSet):
+    # Reading this is a permission, not just a menu entry.
+    read_capability = "view_projects"
     queryset = (
         WorkOrder.objects.select_related(
             "supplier", "client", "site", "payment_terms", "terms_template",
@@ -68,7 +70,7 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         )
         .all()
     )
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead, CapabilityGate]
     filterset_fields = ["status", "order_type", "supplier", "client", "site"]
     search_fields = ["wo_number", "title", "description"]
     ordering_fields = ["created_at", "expected_delivery", "total_amount"]

@@ -12,6 +12,24 @@ from apps.tickets.models import Ticket, TicketIssueType, add_business_days
 from apps.tickets.tasks import escalate_overdue_tickets
 
 
+def _about(device=True):
+    """What a ticket is about, for tests that are about something else.
+
+    The API requires an asset, a category and a priority on every new
+    ticket; a payload can still override any of them after this spread.
+    A test that names its assets in `devices` passes device=False.
+    """
+    from apps.assets.models import Device
+
+    basics = {"category": "repair", "priority": "medium"}
+    if not device:
+        return basics
+    dev, _ = Device.objects.get_or_create(
+        asset_code="TKT-ABOUT-1", defaults={"serial_number": "TKT-ABOUT-SN-1"},
+    )
+    return {"device": str(dev.id), **basics}
+
+
 def _client(user):
     c = APIClient()
     c.force_authenticate(user)
@@ -51,7 +69,7 @@ def test_occurrence_and_sla(people):
     c = _client(people["marketing"])
     ids = []
     for i in range(2):
-        r = c.post("/api/tickets/", {"title": f"t{i}", "priority": "critical", "device": str(device.id)}, format="json")
+        r = c.post("/api/tickets/", {**_about(), "title": f"t{i}", "priority": "critical", "device": str(device.id)}, format="json")
         assert r.status_code == 201, r.content
         ids.append(r.json())
     assert ids[0]["occurrence"] == 1 and ids[1]["occurrence"] == 2
@@ -63,10 +81,10 @@ def test_occurrence_and_sla(people):
 @pytest.mark.django_db
 def test_assignment_is_operations_only(people):
     c_mkt = _client(people["marketing"])
-    r = c_mkt.post("/api/tickets/", {"title": "no self-assign", "assigned_to": str(people["tech"].id)}, format="json")
+    r = c_mkt.post("/api/tickets/", {**_about(), "title": "no self-assign", "assigned_to": str(people["tech"].id)}, format="json")
     assert r.status_code == 400  # marketing cannot assign at creation
 
-    r = c_mkt.post("/api/tickets/", {"title": "raise only"}, format="json")
+    r = c_mkt.post("/api/tickets/", {**_about(), "title": "raise only"}, format="json")
     tid = r.json()["id"]
     r = c_mkt.post(f"/api/tickets/{tid}/assign/", {"assigned_to": str(people["tech"].id)}, format="json")
     assert r.status_code == 403
@@ -83,7 +101,7 @@ def test_assignment_is_operations_only(people):
 @pytest.mark.django_db
 def test_status_not_writable_via_patch(people):
     c = _client(people["ops"])
-    tid = c.post("/api/tickets/", {"title": "patch-guard"}, format="json").json()["id"]
+    tid = c.post("/api/tickets/", {**_about(), "title": "patch-guard"}, format="json").json()["id"]
     r = c.patch(f"/api/tickets/{tid}/", {"status": "closed"}, format="json")
     assert r.status_code == 200
     assert Ticket.objects.get(pk=tid).status == "open"  # silently ignored (read-only)
@@ -95,7 +113,7 @@ def test_full_meeting_workflow(people):
     c_ops, c_mkt, c_tech = _client(ops), _client(mkt), _client(tech)
 
     # Marketing raises; Operations assigns.
-    tid = c_mkt.post("/api/tickets/", {"title": "screen down", "priority": "high"}, format="json").json()["id"]
+    tid = c_mkt.post("/api/tickets/", {**_about(), "title": "screen down", "priority": "high"}, format="json").json()["id"]
     assert c_ops.post(f"/api/tickets/{tid}/assign/", {"assigned_to": str(tech.id)}, format="json").status_code == 200
 
     # Technician visits and starts work.
@@ -138,7 +156,7 @@ def test_client_decline_goes_on_hold_then_closable(people):
     ops, mkt, tech = people["ops"], people["marketing"], people["tech"]
     c_ops, c_mkt, c_tech = _client(ops), _client(mkt), _client(tech)
 
-    tid = c_mkt.post("/api/tickets/", {"title": "declined path"}, format="json").json()["id"]
+    tid = c_mkt.post("/api/tickets/", {**_about(), "title": "declined path"}, format="json").json()["id"]
     c_ops.post(f"/api/tickets/{tid}/assign/", {"assigned_to": str(tech.id)}, format="json")
     c_tech.post(f"/api/tickets/{tid}/transition/", {"status": "in_progress"}, format="json")
     c_tech.post(f"/api/tickets/{tid}/transition/", {"status": "pending_ops_approval", "notes": "needs parts"}, format="json")
@@ -153,7 +171,7 @@ def test_client_decline_goes_on_hold_then_closable(people):
 @pytest.mark.django_db
 def test_escalation_task(people):
     c = _client(people["marketing"])
-    tid = c.post("/api/tickets/", {"title": "stale ticket", "priority": "critical"}, format="json").json()["id"]
+    tid = c.post("/api/tickets/", {**_about(), "title": "stale ticket", "priority": "critical"}, format="json").json()["id"]
     Ticket.objects.filter(pk=tid).update(response_due_at=timezone.now() - timedelta(hours=1))
 
     assert escalate_overdue_tickets() == 1
@@ -169,7 +187,7 @@ def test_escalation_task(people):
 @pytest.mark.django_db
 def test_comment_with_image(people):
     c = _client(people["marketing"])
-    tid = c.post("/api/tickets/", {"title": "img comment"}, format="json").json()["id"]
+    tid = c.post("/api/tickets/", {**_about(), "title": "img comment"}, format="json").json()["id"]
     r = c.post(f"/api/tickets/{tid}/comments/", {"content": "see photo", "image": _png()}, format="multipart")
     assert r.status_code == 201, r.content
     assert r.json()["image"], "image URL missing"
@@ -186,8 +204,8 @@ def test_technician_sees_only_own_tickets(people):
     other = User.objects.create_user(username="wf-tech2", password="x", role="technician")
 
     c_mkt = _client(mkt)
-    mine = c_mkt.post("/api/tickets/", {"title": "for tech"}, format="json").json()["id"]
-    theirs = c_mkt.post("/api/tickets/", {"title": "for other"}, format="json").json()["id"]
+    mine = c_mkt.post("/api/tickets/", {**_about(), "title": "for tech"}, format="json").json()["id"]
+    theirs = c_mkt.post("/api/tickets/", {**_about(), "title": "for other"}, format="json").json()["id"]
     c_ops = _client(ops)
     c_ops.post(f"/api/tickets/{mine}/assign/", {"assigned_to": str(tech.id)}, format="json")
     c_ops.post(f"/api/tickets/{theirs}/assign/", {"assigned_to": str(other.id)}, format="json")
@@ -198,7 +216,7 @@ def test_technician_sees_only_own_tickets(people):
     # detail access to someone else's ticket is denied too
     assert c_tech.get(f"/api/tickets/{theirs}/").status_code == 404
     # tickets a technician raises themselves stay visible
-    raised = c_tech.post("/api/tickets/", {"title": "raised by tech"}, format="json").json()["id"]
+    raised = c_tech.post("/api/tickets/", {**_about(), "title": "raised by tech"}, format="json").json()["id"]
     ids = [t["id"] for t in c_tech.get("/api/tickets/").json()["results"]]
     assert raised in ids
 
@@ -390,7 +408,7 @@ def test_escalation_state_read_only_on_api(people):
     c = _client(people["marketing"])
     r = c.post(
         "/api/tickets/",
-        {"title": "state ro", "escalation_state": {"response_sla:1": "boom"}},
+        {**_about(), "title": "state ro", "escalation_state": {"response_sla:1": "boom"}},
         format="json",
     )
     assert r.status_code == 201, r.content
@@ -439,7 +457,7 @@ def test_due_date_auto_set_per_priority(people):
         "low": add_business_days(now.date(), 10),
     }
     for priority, expected in expectations.items():
-        r = c.post("/api/tickets/", {"title": f"sla {priority}", "priority": priority}, format="json")
+        r = c.post("/api/tickets/", {**_about(), "title": f"sla {priority}", "priority": priority}, format="json")
         assert r.status_code == 201, r.content
         t = Ticket.objects.get(pk=r.json()["id"])
         assert t.due_date == expected, priority
@@ -451,7 +469,7 @@ def test_explicit_due_date_not_overridden(people):
     explicit = (timezone.now() + timedelta(days=30)).date()
     r = c.post(
         "/api/tickets/",
-        {"title": "explicit due", "priority": "critical", "due_date": explicit.isoformat()},
+        {**_about(), "title": "explicit due", "priority": "critical", "due_date": explicit.isoformat()},
         format="json",
     )
     assert r.status_code == 201, r.content
@@ -469,7 +487,7 @@ def test_add_business_days_skips_weekends():
 def _closed_ticket(people):
     """Marketing raises, Operations closes — returns the ticket id."""
     c_mkt, c_ops = _client(people["marketing"]), _client(people["ops"])
-    tid = c_mkt.post("/api/tickets/", {"title": "close me"}, format="json").json()["id"]
+    tid = c_mkt.post("/api/tickets/", {**_about(), "title": "close me"}, format="json").json()["id"]
     r = c_ops.post(f"/api/tickets/{tid}/transition/", {"status": "closed"}, format="json")
     assert r.status_code == 200, r.content
     return tid
@@ -592,7 +610,7 @@ def test_migration_backfills_closed_at_from_updated_at(people):
 @pytest.mark.django_db
 def test_reopen_denied_for_technician(people):
     c_mkt, c_ops = _client(people["marketing"]), _client(people["ops"])
-    tid = c_mkt.post("/api/tickets/", {"title": "close me"}, format="json").json()["id"]
+    tid = c_mkt.post("/api/tickets/", {**_about(), "title": "close me"}, format="json").json()["id"]
     # Assign the technician so the ticket stays visible to them, then close.
     c_ops.post(f"/api/tickets/{tid}/assign/", {"assigned_to": str(people["tech"].id)}, format="json")
     assert c_ops.post(f"/api/tickets/{tid}/transition/", {"status": "closed"}, format="json").status_code == 200
@@ -640,7 +658,7 @@ def _make_warranty(device, wtype="client", months=12, start_offset_days=0):
 def test_billability_defaults_under_client_warranty(people, warranty_device):
     warranty = _make_warranty(warranty_device)
     c = _client(people["marketing"])
-    r = c.post("/api/tickets/", {
+    r = c.post("/api/tickets/", {**_about(), 
         "title": "Panel flicker", "category": "repair",
         "device": str(warranty_device.pk), "priority": "high",
     }, format="json")
@@ -654,7 +672,7 @@ def test_billability_defaults_under_client_warranty(people, warranty_device):
 
 def test_billability_defaults_when_no_warranty(people, warranty_device):
     c = _client(people["marketing"])
-    r = c.post("/api/tickets/", {
+    r = c.post("/api/tickets/", {**_about(), 
         "title": "Out of cover repair", "category": "repair",
         "device": str(warranty_device.pk),
     }, format="json")
@@ -669,7 +687,7 @@ def test_billability_vendor_when_supplier_warranty_active(people, warranty_devic
     _make_warranty(warranty_device, wtype="client")
     _make_warranty(warranty_device, wtype="supplier")
     c = _client(people["marketing"])
-    r = c.post("/api/tickets/", {
+    r = c.post("/api/tickets/", {**_about(), 
         "title": "Module burnt", "category": "repair",
         "device": str(warranty_device.pk),
     }, format="json")
@@ -680,7 +698,7 @@ def test_billability_vendor_when_supplier_warranty_active(people, warranty_devic
 def test_explicit_billability_overrides_defaults(people, warranty_device):
     _make_warranty(warranty_device)
     c = _client(people["marketing"])
-    r = c.post("/api/tickets/", {
+    r = c.post("/api/tickets/", {**_about(), 
         "title": "Client-caused damage", "category": "repair",
         "device": str(warranty_device.pk),
         "is_billable": True, "charge_to": "client",
@@ -700,7 +718,7 @@ def test_work_under_cover_leaves_the_warranty_status_alone(people, warranty_devi
 
     warranty = _make_warranty(warranty_device)
     c = _client(people["ops"])
-    r = c.post("/api/tickets/", {
+    r = c.post("/api/tickets/", {**_about(), 
         "title": "Claim: dead pixels", "category": "repair",
         "device": str(warranty_device.pk),
     }, format="json")
@@ -722,7 +740,7 @@ def test_multi_asset_ticket(people, warranty_device):
     dm = DeviceModel.objects.create(brand=brand, name="MA-1")
     second = Device.objects.create(device_model=dm, asset_code="AST-MA-2", serial_number="MA-2")
     c = _client(people["ops"])
-    r = c.post("/api/tickets/", {
+    r = c.post("/api/tickets/", {**_about(device=False),
         "title": "Predictive: adapters batch", "category": "predictive_maintenance",
         "devices": [str(warranty_device.pk), str(second.pk)],
     }, format="json")
@@ -749,7 +767,7 @@ def test_warranty_must_belong_to_ticket_device(people, warranty_device):
     )
     foreign_warranty = _make_warranty(foreign_device)
     c = _client(people["tech"])
-    r = c.post("/api/tickets/", {
+    r = c.post("/api/tickets/", {**_about(), 
         "title": "Hijack attempt", "category": "repair",
         "device": str(warranty_device.pk), "warranty": str(foreign_warranty.pk),
     }, format="json")
@@ -770,7 +788,7 @@ def test_reopening_a_claim_still_leaves_the_warranty_alone(people, warranty_devi
 
     warranty = _make_warranty(warranty_device)
     c = _client(people["ops"])
-    ticket_id = c.post("/api/tickets/", {
+    ticket_id = c.post("/api/tickets/", {**_about(), 
         "title": "Claim cycle", "category": "repair",
         "device": str(warranty_device.pk),
     }, format="json").json()["id"]
@@ -789,7 +807,7 @@ def test_update_keeps_primary_device_linked(people, warranty_device):
     from apps.assets.models import Brand, Device, DeviceModel
 
     c = _client(people["ops"])
-    ticket_id = c.post("/api/tickets/", {
+    ticket_id = c.post("/api/tickets/", {**_about(), 
         "title": "Sync check", "category": "inspection",
         "device": str(warranty_device.pk),
     }, format="json").json()["id"]
@@ -973,10 +991,10 @@ def vendor_setup(db, people):
     vendor_none = User.objects.create_user(username="wf-vendor-none", password="x", role="vendor")
 
     c_mkt, c_ops = _client(people["marketing"]), _client(people["ops"])
-    assigned_id = c_mkt.post("/api/tickets/", {"title": "vendor job"}, format="json").json()["id"]
+    assigned_id = c_mkt.post("/api/tickets/", {**_about(), "title": "vendor job"}, format="json").json()["id"]
     r = c_ops.post(f"/api/tickets/{assigned_id}/assign/", {"assigned_vendor": str(supplier_a.id)}, format="json")
     assert r.status_code == 200, r.content
-    other_id = c_mkt.post("/api/tickets/", {"title": "internal job"}, format="json").json()["id"]
+    other_id = c_mkt.post("/api/tickets/", {**_about(), "title": "internal job"}, format="json").json()["id"]
     return {
         "supplier_a": supplier_a, "supplier_b": supplier_b,
         "vendor_a": vendor_a, "vendor_b": vendor_b, "vendor_none": vendor_none,
@@ -1033,6 +1051,27 @@ def test_vendor_blocked_on_other_tickets(vendor_setup):
 @pytest.mark.django_db
 def test_vendor_cannot_create_or_edit_tickets(vendor_setup):
     c = _client(vendor_setup["vendor_a"])
-    assert c.post("/api/tickets/", {"title": "vendor raised"}, format="json").status_code == 403
+    assert c.post("/api/tickets/", {**_about(), "title": "vendor raised"}, format="json").status_code == 403
     r = c.patch(f"/api/tickets/{vendor_setup['assigned_id']}/", {"title": "renamed"}, format="json")
     assert r.status_code == 403
+
+
+@pytest.mark.django_db
+def test_a_ticket_says_what_it_is_about(people):
+    """A title alone used to be enough, so tickets came in about nothing,
+    as Other / Medium, and nothing downstream had anything to work from."""
+    c = _client(people["ops"])
+    bare = c.post("/api/tickets/", {"title": "something is wrong"}, format="json")
+    assert bare.status_code == 400, bare.content
+    assert set(bare.data) >= {"device", "category", "priority"}
+
+    # Naming the assets in `devices` is naming the asset.
+    from apps.assets.models import Device
+
+    d1 = Device.objects.create(asset_code="AST-SAYS-1", serial_number="SAYS-1")
+    r = c.post("/api/tickets/", {
+        "title": "two screens flicker", "category": "repair", "priority": "high",
+        "devices": [str(d1.pk)],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert str(r.data["device"]) == str(d1.pk)

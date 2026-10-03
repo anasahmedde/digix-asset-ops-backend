@@ -1,6 +1,7 @@
 from django.utils import timezone
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from common.permissions import CapabilityGate
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -11,8 +12,10 @@ MANAGER_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
 
 
 class AttendanceRecordViewSet(viewsets.ModelViewSet):
+    # Reading this is a permission, not just a menu entry.
+    read_capability = "view_attendance"
     serializer_class = AttendanceRecordSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CapabilityGate]
     filterset_fields = ["user", "check_type", "site"]
     ordering_fields = ["created_at"]
 

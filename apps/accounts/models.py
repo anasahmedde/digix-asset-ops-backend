@@ -48,6 +48,18 @@ class User(AbstractUser):
     reports_to = models.ForeignKey(
         "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="direct_reports",
     )
+    # Client-portal accounts: which client this login belongs to. A
+    # client_viewer without one sees nothing rather than everything — an
+    # external person with no client attached is a misconfiguration, and
+    # the safe reading of it is "no access", not "all access".
+    client = models.ForeignKey(
+        "clients.Client",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="portal_users",
+        help_text="For client_viewer logins: the client whose records they may see.",
+    )
     # Vendor-portal accounts (XC-04): which supplier this login belongs to.
     # Everything a role=vendor user can see/do is scoped to this supplier.
     supplier = models.ForeignKey(

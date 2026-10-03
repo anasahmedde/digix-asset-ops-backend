@@ -98,10 +98,17 @@ class Project(TimeStampedModel):
         from .phases import phase_progress
 
         bars = phase_progress(self)
+        # Evidence at the end beats a gap in the middle. A job that has been
+        # handed over has been handed over, and a procurement line nobody
+        # ever marked received should not keep a delivered project reading
+        # as "Procurement" for the rest of its life.
+        delivered = self.MAIN_PHASE_ORDER[-1]
+        if bars[delivered]["percent"] >= 100:
+            return delivered
         for phase in self.MAIN_PHASE_ORDER:
             if bars[phase]["percent"] < 100:
                 return phase
-        return self.MAIN_PHASE_ORDER[-1]
+        return delivered
 
     def sync_phase(self):
         """Put the stored phase back in step with the work, and say what it is.

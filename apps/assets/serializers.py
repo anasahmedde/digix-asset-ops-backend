@@ -635,6 +635,24 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
 
     def validate(self, attrs):
         """Route rules, plus: an asset has one assignee — with one exception."""
+        # An asset has to be something. Every field here is optional on its
+        # own, so an empty POST minted a real asset with a real code and
+        # nothing else — nameless and typeless, and counted in every total
+        # from then on. Registering before the details are known is normal,
+        # so this asks for one of them, not all of them.
+        if self.instance is None:
+            identifying = (
+                "asset_type", "device_model", "display_name", "serial_number",
+                "copy_from", "brand", "asset_code",
+            )
+            if not any(str(attrs.get(f) or "").strip() for f in identifying):
+                raise serializers.ValidationError({
+                    "asset_type": (
+                        "Say something about this asset — its kind, model, "
+                        "name or serial. An asset with none of these cannot "
+                        "be told apart from any other."
+                    )
+                })
         # A new asset cannot arrive with cover that has already lapsed; an
         # existing one can, because recording history is legitimate.
         if self.instance is None:

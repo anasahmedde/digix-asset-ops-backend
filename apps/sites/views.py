@@ -1,6 +1,7 @@
 from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
+from common.scoping import for_client
 from rest_framework import status as drf_status
 from rest_framework import viewsets
 from rest_framework.decorators import action
@@ -12,25 +13,48 @@ from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_resp
 from common.permissions import ADMIN_ROLES, AdminManagerWriteElseRead, CommercialWriteElseRead
 
 
-class IsSuperAdminOrAssignedInstaller(BasePermission):
-    """Step/delay actions: the assigned installer (mobile), the installation's
-    vendor (portal login, XC-04) or a platform admin (desktop)."""
+def may_advance_installation(user, installation) -> bool:
+    """Who may move an installation along.
 
-    message = "Only the assigned installer or a platform admin can do this."
+    The person doing the work, and whoever they answer to. A supervisor
+    could open the tracker and read every step but not touch one, because
+    the rule said "platform admin" where the organogram says "the installer's
+    own line" — so a job waiting on a correction waited for a Super Admin.
+
+    Deliberately not "any manager": marking a step done is a claim about
+    work that happened on site, so it stays with the people who were there
+    or who are answerable for them. Another technician cannot touch a job
+    that is not theirs.
+    """
+    if not getattr(user, "is_authenticated", False):
+        return False
+    role = getattr(user, "role", None)
+    if role in ADMIN_ROLES:
+        return True
+    if installation.installed_by_id == user.id:
+        return True
+    installer = installation.installed_by
+    if installer is not None and user.manages(installer):
+        return True
+    return bool(
+        role == "vendor"
+        and getattr(user, "supplier_id", None)
+        and installation.vendor_id == user.supplier_id
+    )
+
+
+class IsSuperAdminOrAssignedInstaller(BasePermission):
+    """Step/delay actions: the assigned installer (mobile), their reporting
+    line, the installation's vendor (portal login, XC-04) or Operations."""
+
+    message = "This installation is not yours to advance."
 
     def has_object_permission(self, request, view, obj):
         installation = obj.installation if hasattr(obj, "installation") else obj
         user = request.user
-        if getattr(user, "role", None) in ADMIN_ROLES:
+        if may_advance_installation(user, installation):
             return True
-        if installation.installed_by_id == user.id:
-            return True
-        # Vendor-portal users may advance steps on their own installations.
-        return bool(
-            getattr(user, "role", None) == "vendor"
-            and getattr(user, "supplier_id", None)
-            and installation.vendor_id == user.supplier_id
-        )
+        return False
 
 from .models import (
     InstallationRouteTemplate,
@@ -65,11 +89,13 @@ class SiteViewSet(viewsets.ModelViewSet):
     ordering_fields = ["name", "created_at"]
 
     def get_queryset(self):
-        return (
+        # A client portal login sees its own client's sites only.
+        return for_client(
             Site.objects.select_related("client")
             .prefetch_related("contacts")
-            .annotate(device_count=Count("devices"))
-            .all()
+            .annotate(device_count=Count("devices")),
+            self.request.user,
+            "client_id",
         )
 
     def get_serializer_class(self):
@@ -136,6 +162,24 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         "site__name", "position_label",
     ]
     ordering_fields = ["installed_at", "due_date", "completed_at", "created_at"]
+
+    def perform_destroy(self, instance):
+        """A duplicate can go; a handed-over job cannot.
+
+        The handover is the client's record of acceptance as much as ours,
+        so the job it belongs to stays. Anything short of that — above all
+        the second entry opened by mistake for an asset already on the
+        tracker — can be removed, steps and photos with it.
+        """
+        from rest_framework.exceptions import ValidationError as _VE
+
+        if getattr(instance, "handover", None) is not None:
+            raise _VE(
+                "This installation has been handed over to the client, so it "
+                "stays on the record. Record its removal instead if the asset "
+                "has come down."
+            )
+        instance.delete()
 
     @action(detail=True, methods=["get"], url_path="handover-document")
     def handover_document(self, request, pk=None):
@@ -385,11 +429,32 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         device = installation.device
         if device.status == "active":
             return Response({"detail": "This asset is already active."}, status=drf_status.HTTP_400_BAD_REQUEST)
-        if device.status != "installed":
+        # Live means the checklist is finished, not merely that the asset
+        # reads Installed - an asset moved to Installed by hand could be
+        # activated with half its steps untouched.
+        unfinished = [
+            step.custom_label or step.get_step_type_display()
+            for step in installation.steps.exclude(step_type=InstallationStep.StepType.HANDOVER)
+            if step.status not in (InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.SKIPPED)
+        ]
+        if unfinished:
+            return Response(
+                {"detail": f"Finish the installation steps first: {', '.join(unfinished)}."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        # The checklist is done, so the asset is installed whatever word the
+        # registry holds - an asset still reading "In Production" with every
+        # step complete was stuck: Active waited on Installed, and nothing
+        # was left to make it Installed. Anything past Installed that is not
+        # Active (out of service, written off, the client's now) is a
+        # different story and stays one.
+        from .signals import PRE_INSTALL_STATUSES
+
+        if device.status not in PRE_INSTALL_STATUSES and device.status != "installed":
             return Response(
                 {"detail": (
-                    f"The asset is '{device.get_status_display()}'. It becomes Active once it is "
-                    f"installed — complete the installation steps first."
+                    f"The asset is '{device.get_status_display()}', which is not a state it "
+                    "goes live from. Sort that out in the asset registry first."
                 )},
                 status=drf_status.HTTP_400_BAD_REQUEST,
             )
@@ -412,6 +477,13 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 )
                 _attach_to_asset_gallery(device, image, user, "Installed — Active")
 
+            if device.status != "installed":
+                # Step through Installed so the registry's history reads the
+                # way the asset's life actually went.
+                device._transition_user = user
+                device._transition_reason = "Installation checklist complete"
+                device.status = "installed"
+                device.save(update_fields=["status", "updated_at"])
             device._transition_user = user
             device._transition_reason = (
                 request.data.get("notes") or "Marked active from the installation tracker"
@@ -583,8 +655,41 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         serializer.save()
 
     def perform_update(self, serializer):
-        refuse_if_closed_out(serializer.instance.installation)
-        serializer.save()
+        from django.utils import timezone
+        from rest_framework.exceptions import ValidationError as _VE
+
+        step = serializer.instance
+        refuse_if_closed_out(step.installation)
+
+        new_status = serializer.validated_data.get("status", step.status)
+        moving_on = new_status in (
+            InstallationStep.StepStatus.IN_PROGRESS,
+            InstallationStep.StepStatus.COMPLETED,
+        )
+        # A checklist is a sequence. Step 7 could be marked done with steps 2
+        # and 3 untouched, and then the asset went live over the gap - so
+        # "Completed" stopped meaning the work before it had been done.
+        if moving_on and new_status != step.status:
+            behind = [
+                s.custom_label or s.get_step_type_display()
+                for s in step.installation.steps.filter(step_number__lt=step.step_number)
+                if s.status not in (
+                    InstallationStep.StepStatus.COMPLETED,
+                    InstallationStep.StepStatus.SKIPPED,
+                )
+            ]
+            if behind:
+                raise _VE({"status": (
+                    f"Finish the steps before this one first: {', '.join(behind)}. "
+                    "A step can be skipped if it does not apply."
+                )})
+
+        extra = {}
+        if new_status == InstallationStep.StepStatus.COMPLETED and step.status != new_status:
+            extra["completed_by"] = self.request.user
+            if "completed_at" not in serializer.validated_data and not step.completed_at:
+                extra["completed_at"] = timezone.now()
+        serializer.save(**extra)
 
     def perform_destroy(self, instance):
         """Remove the step, then close the gap it leaves in the numbering."""
@@ -622,10 +727,10 @@ class InstallationDelayViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         installation = serializer.validated_data["installation"]
         user = self.request.user
-        if getattr(user, "role", None) not in ADMIN_ROLES and installation.installed_by_id != user.id:
+        if not may_advance_installation(user, installation):
             from rest_framework.exceptions import PermissionDenied
 
-            raise PermissionDenied("Only the assigned installer or a platform admin can flag a delay.")
+            raise PermissionDenied("This installation is not yours to flag a delay on.")
         serializer.save(reported_by=user)
 
 

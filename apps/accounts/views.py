@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from common.noops import RefusesSilentNoOps
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
@@ -9,7 +10,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from common.permissions import ADMIN_ROLES, IsSuperAdmin
+from common.permissions import ADMIN_ROLES, CapabilityGate, IsSuperAdmin
 
 from .models import AuditLog, RoleDefinition, UserCapability
 from .serializers import (
@@ -89,10 +90,51 @@ class IsSelfOrSuperAdmin(BasePermission):
         return obj.pk == user.pk
 
 
-class UserViewSet(viewsets.ModelViewSet):
+def may_remove(actor, subject) -> tuple[bool, str]:
+    """Two things a Super Admin still may not do when removing an account.
+
+    Creating and removing logins is the Super Admin's (see get_permissions),
+    and that gate stays. Inside it, nothing said whom: an admin could delete
+    their own login, or another superuser's. Neither is about rights - the
+    first locks the door from inside, the second is not one admin's call.
+    """
+    if actor.pk == subject.pk:
+        return False, "You cannot delete your own account."
+    if subject.is_superuser and not actor.is_superuser:
+        return False, "Only a superuser can delete a superuser."
+    return True, ""
+
+
+class UserViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     queryset = User.objects.all()
-    permission_classes = [IsAuthenticated, IsSelfOrSuperAdmin]
+    # Seeing who works here is a capability. An external client portal
+    # login does not hold it, and used to read the whole directory.
+    read_capability = "view_team"
+    permission_classes = [IsAuthenticated, IsSelfOrSuperAdmin, CapabilityGate]
     filterset_fields = ["role", "is_active", "is_field_staff"]
+
+    def perform_destroy(self, instance):
+        """Remove an account - once nobody is left hanging from it.
+
+        Deleting takes the person's own records with them (attendance, chat,
+        project memberships); what they did to other things stays, with the
+        name gone. Their reports would be left pointing at nobody, so those
+        move first - the chart is the place to drag them.
+        """
+        from rest_framework.exceptions import PermissionDenied
+        from rest_framework.exceptions import ValidationError as _VE
+
+        allowed, why = may_remove(self.request.user, instance)
+        if not allowed:
+            raise PermissionDenied(why)
+        reports = instance.direct_reports.count()
+        if reports:
+            who = instance.get_full_name() or instance.username
+            raise _VE({"detail": (
+                f"{who} has {reports} direct report{'s' if reports != 1 else ''}. "
+                "Move them to another manager first - drag them on the chart."
+            )})
+        instance.delete()
     search_fields = ["username", "email", "first_name", "last_name"]
     ordering_fields = ["date_joined", "username"]
 
@@ -231,7 +273,8 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
 class CapabilityCatalogueView(APIView):
     """Every capability the system knows about, with each role's defaults."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_team"
 
     def get(self, request):
         from .capabilities import MODULES, catalogue
@@ -283,7 +326,11 @@ class RoleDefinitionViewSet(viewsets.ModelViewSet):
     """
 
     serializer_class = RoleDefinitionSerializer
-    permission_classes = [IsAuthenticated, ManagesPermissions]
+    permission_classes = [IsAuthenticated, ManagesPermissions, CapabilityGate]
+    # The permission model itself is internal: it says who may approve
+    # spending and who may administer the system. An external viewer read
+    # the whole matrix, headcounts included.
+    read_capability = "view_team"
 
     def get_queryset(self):
         from .roles import ensure_seeded

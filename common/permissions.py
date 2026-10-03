@@ -28,6 +28,55 @@ ALL_INTERNAL_ROLES = (
 VENDOR_ROLES = ("vendor",)
 
 
+def _can(user, capability):
+    """Does this person hold the capability? Superusers always do."""
+    if getattr(user, "is_superuser", False):
+        return True
+    can = getattr(user, "can", None)
+    return bool(capability and callable(can) and can(capability))
+
+
+class CapabilityGate(BasePermission):
+    """Reading is a permission too.
+
+    Every other class here lets any signed-in person read anything — which
+    is how an external client viewer came to read the staff directory, the
+    client list and the whole permission model just by typing a URL. A view
+    using this one names the capability each half needs:
+
+        class ProjectViewSet(...):
+            permission_classes = [IsAuthenticated, CapabilityGate]
+            read_capability = "view_projects"
+            write_capability = "edit_projects"
+
+    A view that names no capability for a half leaves that half to whatever
+    other permission class it carries, so this can be added alongside the
+    existing ones without widening anything.
+    """
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        # Self-service always works: a person can read their own profile
+        # and change their own password whatever else they may not see.
+        # Without this, gating the staff directory would lock out anyone
+        # who cannot see it — which is everyone it is meant to protect it
+        # from.
+        if getattr(view, "action", None) in getattr(
+            view, "capability_exempt_actions", ("me", "change_password")
+        ):
+            return True
+        needed = (
+            getattr(view, "read_capability", None)
+            if request.method in SAFE_METHODS
+            else getattr(view, "write_capability", None)
+        )
+        if not needed:
+            return True
+        return _can(user, needed)
+
+
 def _role(user):
     return getattr(user, "role", None)
 
