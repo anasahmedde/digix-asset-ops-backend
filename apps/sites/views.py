@@ -163,6 +163,24 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
     ]
     ordering_fields = ["installed_at", "due_date", "completed_at", "created_at"]
 
+    def perform_destroy(self, instance):
+        """A duplicate can go; a handed-over job cannot.
+
+        The handover is the client's record of acceptance as much as ours,
+        so the job it belongs to stays. Anything short of that — above all
+        the second entry opened by mistake for an asset already on the
+        tracker — can be removed, steps and photos with it.
+        """
+        from rest_framework.exceptions import ValidationError as _VE
+
+        if getattr(instance, "handover", None) is not None:
+            raise _VE(
+                "This installation has been handed over to the client, so it "
+                "stays on the record. Record its removal instead if the asset "
+                "has come down."
+            )
+        instance.delete()
+
     @action(detail=True, methods=["get"], url_path="handover-document")
     def handover_document(self, request, pk=None):
         """The handover certificate as a PDF.
@@ -411,11 +429,32 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         device = installation.device
         if device.status == "active":
             return Response({"detail": "This asset is already active."}, status=drf_status.HTTP_400_BAD_REQUEST)
-        if device.status != "installed":
+        # Live means the checklist is finished, not merely that the asset
+        # reads Installed - an asset moved to Installed by hand could be
+        # activated with half its steps untouched.
+        unfinished = [
+            step.custom_label or step.get_step_type_display()
+            for step in installation.steps.exclude(step_type=InstallationStep.StepType.HANDOVER)
+            if step.status not in (InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.SKIPPED)
+        ]
+        if unfinished:
+            return Response(
+                {"detail": f"Finish the installation steps first: {', '.join(unfinished)}."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        # The checklist is done, so the asset is installed whatever word the
+        # registry holds - an asset still reading "In Production" with every
+        # step complete was stuck: Active waited on Installed, and nothing
+        # was left to make it Installed. Anything past Installed that is not
+        # Active (out of service, written off, the client's now) is a
+        # different story and stays one.
+        from .signals import PRE_INSTALL_STATUSES
+
+        if device.status not in PRE_INSTALL_STATUSES and device.status != "installed":
             return Response(
                 {"detail": (
-                    f"The asset is '{device.get_status_display()}'. It becomes Active once it is "
-                    f"installed — complete the installation steps first."
+                    f"The asset is '{device.get_status_display()}', which is not a state it "
+                    "goes live from. Sort that out in the asset registry first."
                 )},
                 status=drf_status.HTTP_400_BAD_REQUEST,
             )
@@ -438,6 +477,13 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 )
                 _attach_to_asset_gallery(device, image, user, "Installed — Active")
 
+            if device.status != "installed":
+                # Step through Installed so the registry's history reads the
+                # way the asset's life actually went.
+                device._transition_user = user
+                device._transition_reason = "Installation checklist complete"
+                device.status = "installed"
+                device.save(update_fields=["status", "updated_at"])
             device._transition_user = user
             device._transition_reason = (
                 request.data.get("notes") or "Marked active from the installation tracker"
@@ -609,8 +655,41 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         serializer.save()
 
     def perform_update(self, serializer):
-        refuse_if_closed_out(serializer.instance.installation)
-        serializer.save()
+        from django.utils import timezone
+        from rest_framework.exceptions import ValidationError as _VE
+
+        step = serializer.instance
+        refuse_if_closed_out(step.installation)
+
+        new_status = serializer.validated_data.get("status", step.status)
+        moving_on = new_status in (
+            InstallationStep.StepStatus.IN_PROGRESS,
+            InstallationStep.StepStatus.COMPLETED,
+        )
+        # A checklist is a sequence. Step 7 could be marked done with steps 2
+        # and 3 untouched, and then the asset went live over the gap - so
+        # "Completed" stopped meaning the work before it had been done.
+        if moving_on and new_status != step.status:
+            behind = [
+                s.custom_label or s.get_step_type_display()
+                for s in step.installation.steps.filter(step_number__lt=step.step_number)
+                if s.status not in (
+                    InstallationStep.StepStatus.COMPLETED,
+                    InstallationStep.StepStatus.SKIPPED,
+                )
+            ]
+            if behind:
+                raise _VE({"status": (
+                    f"Finish the steps before this one first: {', '.join(behind)}. "
+                    "A step can be skipped if it does not apply."
+                )})
+
+        extra = {}
+        if new_status == InstallationStep.StepStatus.COMPLETED and step.status != new_status:
+            extra["completed_by"] = self.request.user
+            if "completed_at" not in serializer.validated_data and not step.completed_at:
+                extra["completed_at"] = timezone.now()
+        serializer.save(**extra)
 
     def perform_destroy(self, instance):
         """Remove the step, then close the gap it leaves in the numbering."""

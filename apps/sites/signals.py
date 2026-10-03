@@ -157,13 +157,19 @@ def installation_date_for(installation: DeviceInstallation):
     return timezone.localdate(stamp) if stamp else None
 
 
+# Everything an asset can be before it goes in. "In Production" was left out,
+# which stranded every in-house build: its checklist finished and nothing
+# followed.
+PRE_INSTALL_STATUSES = ("procured", "in_production", "in_transit", "in_stock", "assigned")
+
+
 def _mark_device_installed(installation: DeviceInstallation) -> None:
     """Finishing the checklist flips a pre-install asset to Installed and
     records when it went in — the registry stays honest without anyone
     editing it by hand."""
     device = installation.device
     fields = []
-    if device.status in ("procured", "in_transit", "in_stock", "assigned"):
+    if device.status in PRE_INSTALL_STATUSES:
         device.status = "installed"
         fields.append("status")
     # Set even when the status was already moved by hand: the date belongs to

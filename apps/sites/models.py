@@ -139,6 +139,13 @@ class InstallationStep(TimeStampedModel):
     description = models.TextField(blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+    # Who marked it done. The timeline read "System" against every finished
+    # step because nothing recorded a person - and the tracker is the record
+    # of who did what on site.
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installation_steps_completed",
+    )
 
     class Meta:
         ordering = ["step_number"]
