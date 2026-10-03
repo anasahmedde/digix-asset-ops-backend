@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from common.money import HidesMoney
+
 from .models import (
     MaintenancePartRequest,
     MaintenanceRecord,
@@ -144,7 +146,7 @@ class MaintenanceRecordPhotoSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "taken_by", "created_at"]
 
 
-class MaintenanceVisitSerializer(serializers.ModelSerializer):
+class MaintenanceVisitSerializer(HidesMoney, serializers.ModelSerializer):
     """One round of a schedule — when it is due and who is going."""
 
     assigned_to_name = serializers.SerializerMethodField()
@@ -204,7 +206,7 @@ class MaintenanceVisitSerializer(serializers.ModelSerializer):
         return visit
 
 
-class MaintenanceRecordSerializer(serializers.ModelSerializer):
+class MaintenanceRecordSerializer(HidesMoney, serializers.ModelSerializer):
     schedule_title = serializers.CharField(source="schedule.title", read_only=True, default=None)
     performed_by_name = serializers.SerializerMethodField()
     status_display = serializers.CharField(source="get_status_display", read_only=True)
@@ -388,3 +390,13 @@ class MaintenancePartDecisionSerializer(serializers.Serializer):
     # amount asked for is agreed.
     quantity = serializers.IntegerField(required=False, min_value=1)
     note = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        # A rejection with no reason tells the technician nothing: they
+        # cannot tell a wrong part from a part the store has not got, so
+        # they ask again and the same answer comes back.
+        if not attrs.get("approve") and not (attrs.get("note") or "").strip():
+            raise serializers.ValidationError(
+                {"note": "Say why this is being refused."}
+            )
+        return attrs

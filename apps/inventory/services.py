@@ -297,6 +297,14 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
             material_type_id = (
                 generic.get("material_type")
                 or (po_item.material_type_id if po_item else None)
+                # A line raised from an asset requirement names the stock row,
+                # not the material — the material is on the row. Without this
+                # step such a delivery could never be inspected at all: it
+                # asked for a material type that the order had no way to give.
+                or (
+                    po_item.inventory_item.material_type_id
+                    if po_item and po_item.inventory_item_id else None
+                )
                 # a return names the stock row it came from
                 or (line.inventory_item.material_type_id if line.inventory_item_id else None)
             )

@@ -11,6 +11,20 @@ from apps.maintenance.models import MaintenanceSchedule
 from apps.sites.models import Site
 
 
+def _about():
+    """What a ticket is about, for tests that are about something else.
+
+    The API requires an asset, a category and a priority on every new
+    ticket; a payload can still override any of them after this spread.
+    """
+    from apps.assets.models import Device
+
+    device, _ = Device.objects.get_or_create(
+        asset_code="TKT-ABOUT-1", defaults={"serial_number": "TKT-ABOUT-SN-1"},
+    )
+    return {"device": str(device.id), "category": "repair", "priority": "medium"}
+
+
 @pytest.fixture
 def ops(db):
     return User.objects.create_user(username="maint-ops", password="x", role="ops_manager")
@@ -708,6 +722,9 @@ def parts_job(db):
         username="parts-tech", password="x", role="technician", is_field_staff=True,
     )
     boss = User.objects.create_user(username="parts-boss", password="x", role="supervisor")
+    # The organogram is what says whose line this is to answer.
+    tech.reports_to = boss
+    tech.save(update_fields=["reports_to"])
     material = MaterialType.objects.create(name="Parts Cable", unit="meter")
     item = InventoryItem.objects.create(material_type=material, quantity=100)
     schedule = MaintenanceSchedule.objects.create(
@@ -799,16 +816,32 @@ def test_a_line_is_answered_once(parts_job):
     boss = _client(parts_job["boss"])
     line = f"/api/maintenance/part-requests/{r.data['id']}/decide/"
     assert boss.post(line, {"approve": True}, format="json").status_code == 200
-    again = boss.post(line, {"approve": False}, format="json")
+    again = boss.post(line, {"approve": False, "note": "Changed my mind"}, format="json")
     assert again.status_code == 400
     assert "already approved" in str(again.data["status"])
+
+    # And a refusal has to say why, or the technician learns nothing from it.
+    fresh = _ask(_client(parts_job["tech"]), parts_job)
+    bare = boss.post(
+        f"/api/maintenance/part-requests/{fresh.data['id']}/decide/",
+        {"approve": False}, format="json",
+    )
+    assert bare.status_code == 400
+    assert "note" in bare.data
 
 
 @pytest.mark.django_db
 def test_an_unanswered_line_can_be_withdrawn_but_an_answered_one_cannot(parts_job):
+    from apps.maintenance.models import MaintenancePartRequest
+
     tech = _client(parts_job["tech"])
     r = _ask(tech, parts_job)
-    assert tech.delete(f"/api/maintenance/part-requests/{r.data['id']}/").status_code == 204
+    line_id = r.data["id"]
+    assert tech.delete(f"/api/maintenance/part-requests/{line_id}/").status_code == 204
+    # Off the queue, still on the record — what was asked for and what became
+    # of it is the question a job history answers.
+    withdrawn = MaintenancePartRequest.objects.get(pk=line_id)
+    assert withdrawn.status == MaintenancePartRequest.Status.CANCELLED
 
     r = _ask(tech, parts_job)
     _client(parts_job["boss"]).post(
@@ -816,6 +849,53 @@ def test_an_unanswered_line_can_be_withdrawn_but_an_answered_one_cannot(parts_jo
         {"approve": True}, format="json",
     )
     assert tech.delete(f"/api/maintenance/part-requests/{r.data['id']}/").status_code == 400
+
+
+@pytest.mark.django_db
+def test_a_line_is_withdrawn_by_the_person_who_asked_not_by_a_colleague(parts_job):
+    mate = User.objects.create_user(
+        username="parts-mate", password="x", role="technician", is_field_staff=True,
+    )
+    r = _ask(_client(parts_job["tech"]), parts_job)
+    assert _client(mate).delete(
+        f"/api/maintenance/part-requests/{r.data['id']}/"
+    ).status_code == 403
+    assert _client(parts_job["boss"]).delete(
+        f"/api/maintenance/part-requests/{r.data['id']}/"
+    ).status_code == 204
+
+
+@pytest.mark.django_db
+def test_a_supervisor_answers_for_their_own_team_only(parts_job):
+    other_boss = User.objects.create_user(
+        username="parts-other-boss", password="x", role="supervisor",
+    )
+    r = _ask(_client(parts_job["tech"]), parts_job)
+    denied = _client(other_boss).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert denied.status_code == 403
+    assert "team" in str(denied.data)
+
+    allowed = _client(parts_job["boss"]).post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert allowed.status_code == 200, allowed.content
+
+
+@pytest.mark.django_db
+def test_nobody_approves_their_own_request_for_parts(parts_job):
+    boss = _client(parts_job["boss"])
+    r = _ask(boss, parts_job)
+    assert r.status_code == 201, r.content
+    denied = boss.post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert denied.status_code == 403
+    assert "your own" in str(denied.data)
 
 
 def _issue(job, line_id, quantity, serials=None):
@@ -1128,7 +1208,7 @@ def test_a_ticket_raised_against_an_asset_shows_up_as_a_corrective_job():
         status=Device.Status.ACTIVE,
     )
 
-    r = _client(boss).post("/api/tickets/", {
+    r = _client(boss).post("/api/tickets/", {**_about(), 
         "title": "Screen flickering", "description": "Flickers on the hour.",
         "device": str(device.id), "priority": "high", "category": "repair",
     }, format="json")
@@ -1143,7 +1223,7 @@ def test_a_ticket_raised_against_an_asset_shows_up_as_a_corrective_job():
     assert job.visits.count() == 1, "and it has a round to plan, like any other job"
 
     # A second ticket on the same asset joins the outage rather than doubling it.
-    r2 = _client(boss).post("/api/tickets/", {
+    r2 = _client(boss).post("/api/tickets/", {**_about(), 
         "title": "Screen still flickering", "device": str(device.id), "category": "repair",
     }, format="json")
     assert r2.status_code == 201, r2.content
@@ -1183,7 +1263,7 @@ def test_a_ticket_over_several_assets_opens_a_job_for_each():
     first = Device.objects.create(asset_type=kind, current_site=site, status=Device.Status.ACTIVE)
     second = Device.objects.create(asset_type=kind, current_site=site, status=Device.Status.ACTIVE)
 
-    r = _client(boss).post("/api/tickets/", {
+    r = _client(boss).post("/api/tickets/", {**_about(), 
         "title": "Both standees dark", "device": str(first.id),
         "devices": [str(first.id), str(second.id)], "category": "repair",
     }, format="json")
@@ -1210,3 +1290,81 @@ def test_a_ticket_over_several_assets_opens_a_job_for_each():
     for d in (first, second, third):
         d.refresh_from_db()
         assert d.status == Device.Status.ACTIVE
+
+
+# ---------------------------------------------------------------------------
+# A job and the ticket that asked for it stay in step
+# ---------------------------------------------------------------------------
+@_pytest.mark.django_db
+def test_finishing_the_job_sends_the_ticket_for_review(corrective_client):
+    """The register said the repair was done; the queue still showed the fault."""
+    from apps.tickets.models import Ticket
+
+    c, ops = corrective_client
+    asset = _Device.objects.create(
+        asset_code="AST-RB-1", serial_number="RB-SN-1", status=_Device.Status.ACTIVE,
+    )
+    ticket = Ticket.objects.create(
+        title="Panel dark on the left", device=asset, reported_by=ops,
+        status=Ticket.Status.IN_PROGRESS,
+    )
+    c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "under_maintenance", "reason": "Panel dark", **_down()}, format="json",
+    )
+    job = _Schedule.objects.get(device=asset)
+    job.ticket = ticket
+    job.save(update_fields=["ticket"])
+
+    r = c.post("/api/maintenance/records/", {
+        "schedule": str(job.id), "status": "completed",
+        "performed_at": timezone.now().isoformat(),
+        "notes": "Driver board replaced",
+    }, format="json")
+    assert r.status_code == 201, r.content
+
+    ticket.refresh_from_db()
+    assert ticket.status == Ticket.Status.PENDING_REVIEW
+    assert ticket.completed_at is not None
+    assert "Driver board replaced" in ticket.completion_notes
+    # And the work is on the ticket's own trail, not only in the register.
+    assert ticket.comments.filter(new_status=Ticket.Status.PENDING_REVIEW).exists()
+
+
+@_pytest.mark.django_db
+def test_cancelling_a_ticket_puts_the_asset_back_in_service(corrective_client):
+    """Deleting was the only way out, and it left the asset stranded."""
+    from apps.tickets.models import Ticket
+
+    c, ops = corrective_client
+    asset = _Device.objects.create(
+        asset_code="AST-CX-1", serial_number="CX-SN-1", status=_Device.Status.ACTIVE,
+    )
+    ticket = Ticket.objects.create(
+        title="Reported flicker", device=asset, reported_by=ops,
+        status=Ticket.Status.IN_PROGRESS,
+    )
+    c.post(
+        f"/api/assets/devices/{asset.id}/transition/",
+        {"status": "under_maintenance", "reason": "Reported flicker", **_down()}, format="json",
+    )
+    job = _Schedule.objects.get(device=asset)
+    job.ticket = ticket
+    job.save(update_fields=["ticket"])
+
+    # A reason is not optional: "cancelled" with no why is a gap in the record.
+    bare = c.post(f"/api/tickets/{ticket.id}/transition/",
+                  {"status": "cancelled"}, format="json")
+    assert bare.status_code == 400
+    assert "notes" in bare.data
+
+    r = c.post(f"/api/tickets/{ticket.id}/transition/",
+               {"status": "cancelled", "notes": "Duplicate of the earlier call"}, format="json")
+    assert r.status_code == 200, r.content
+
+    ticket.refresh_from_db()
+    job.refresh_from_db()
+    asset.refresh_from_db()
+    assert ticket.status == Ticket.Status.CANCELLED
+    assert job.status == _Schedule.Status.CANCELLED
+    assert asset.status == _Device.Status.ACTIVE, "the asset must not be left under maintenance"

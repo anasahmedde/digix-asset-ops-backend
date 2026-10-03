@@ -7,7 +7,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
-from common.permissions import CommercialWriteElseRead
+from common.permissions import CapabilityGate, CommercialWriteElseRead
 
 from .models import Warranty
 from .serializers import WarrantySerializer
@@ -23,9 +23,11 @@ SUPPLIER_SIDE_ROLES = ("ops_manager", "supervisor", "technician", "warehouse")
 
 
 class WarrantyViewSet(viewsets.ModelViewSet):
+    # Warranty cover is read across the business — the field needs to
+    # know what an asset is covered for. Writing is the gated half.
     queryset = Warranty.objects.select_related("device", "supplier", "component").all()
     serializer_class = WarrantySerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CommercialWriteElseRead, CapabilityGate]
     filterset_fields = ["status", "warranty_type", "device", "supplier"]
     search_fields = ["reference_number", "coverage_details", "device__asset_code", "device__display_name"]
     ordering_fields = ["end_date", "start_date"]

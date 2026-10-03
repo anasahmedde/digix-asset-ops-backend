@@ -55,6 +55,11 @@ class Ticket(TimeStampedModel):
         APPROVED = "approved", "Resolved (Ops Approved)"
         REJECTED = "rejected", "Rejected"
         CLOSED = "closed", "Closed"
+        # A fault reported that turns out not to be one — a duplicate, a
+        # misread, a call that resolved itself. Deleting the ticket was the
+        # only way to make it go away, and deleting it left the asset sitting
+        # under maintenance with nothing left to complete to bring it back.
+        CANCELLED = "cancelled", "Cancelled"
 
     class Category(models.TextChoices):
         INSTALLATION = "installation", "Installation"
@@ -197,23 +202,37 @@ class Ticket(TimeStampedModel):
     # The legacy booleans above stay in sync when stage 1 fires (badges).
     escalation_state = models.JSONField(default=dict, blank=True)
 
+    # Work that has not started can be called off. Once somebody has
+    # submitted it for review the answer is approve or reject, not cancel.
+    CANCELLABLE = (
+        Status.OPEN, Status.IN_PROGRESS, Status.ON_HOLD, Status.BLOCKED,
+        Status.ALIGNMENT_PENDING, Status.PENDING_OPS_APPROVAL,
+        Status.PENDING_CLIENT_APPROVAL,
+    )
+
     VALID_TRANSITIONS = {
-        Status.OPEN: (Status.IN_PROGRESS, Status.CLOSED),
+        Status.OPEN: (Status.IN_PROGRESS, Status.CLOSED, Status.CANCELLED),
         Status.IN_PROGRESS: (
             Status.ON_HOLD, Status.BLOCKED, Status.ALIGNMENT_PENDING,
             Status.PENDING_OPS_APPROVAL, Status.PENDING_REVIEW, Status.CLOSED,
+            Status.CANCELLED,
         ),
-        Status.ON_HOLD: (Status.IN_PROGRESS, Status.CLOSED),
-        Status.BLOCKED: (Status.IN_PROGRESS, Status.CLOSED),
-        Status.ALIGNMENT_PENDING: (Status.IN_PROGRESS, Status.PENDING_REVIEW, Status.CLOSED),
+        Status.ON_HOLD: (Status.IN_PROGRESS, Status.CLOSED, Status.CANCELLED),
+        Status.BLOCKED: (Status.IN_PROGRESS, Status.CLOSED, Status.CANCELLED),
+        Status.ALIGNMENT_PENDING: (
+            Status.IN_PROGRESS, Status.PENDING_REVIEW, Status.CLOSED, Status.CANCELLED,
+        ),
         # Ops decide: approve rectification (back to work), need client approval,
         # or decline (hold).
         Status.PENDING_OPS_APPROVAL: (
             Status.IN_PROGRESS, Status.PENDING_CLIENT_APPROVAL, Status.ON_HOLD,
+            Status.CANCELLED,
         ),
         # Marketing relay the client's decision: approved (back to work) or
         # declined (hold — may later be closed).
-        Status.PENDING_CLIENT_APPROVAL: (Status.IN_PROGRESS, Status.ON_HOLD),
+        Status.PENDING_CLIENT_APPROVAL: (
+            Status.IN_PROGRESS, Status.ON_HOLD, Status.CANCELLED,
+        ),
         Status.PENDING_REVIEW: (Status.APPROVED, Status.REJECTED),
         Status.REJECTED: (Status.IN_PROGRESS, Status.PENDING_REVIEW),
         Status.APPROVED: (Status.CLOSED,),

@@ -352,3 +352,70 @@ def test_four_eyes_rule_still_applies_to_the_group_head(group_head):
     r = c.post(f"/api/teams/projects/{project.id}/approve-budget/", {"notes": "mine"}, format="json")
     assert r.status_code == 403
     assert "someone else has to approve" in str(r.data)
+
+
+
+def _org():
+    """A small reporting line: head -> lead -> tech, and a lead elsewhere."""
+    head = User.objects.create_user(username="org-head", password="x", role="group_head")
+    lead = User.objects.create_user(username="org-lead", password="x", role="supervisor", reports_to=head)
+    tech = User.objects.create_user(username="org-tech", password="x", role="technician", reports_to=lead)
+    other = User.objects.create_user(username="org-other-lead", password="x", role="supervisor", reports_to=head)
+    return head, lead, tech, other
+
+
+@pytest.mark.django_db
+def test_an_account_is_removed_by_the_super_admin_once_nobody_hangs_from_it(admin):
+    head, lead, tech, other = _org()
+
+    # Removing logins is the Super Admin's, as creating them is.
+    assert _client(head).delete(f"/api/accounts/users/{tech.pk}/").status_code == 403
+    # Nobody removes themselves.
+    assert _client(admin).delete(f"/api/accounts/users/{admin.pk}/").status_code == 403
+    # Not while somebody still reports to them.
+    r = _client(admin).delete(f"/api/accounts/users/{lead.pk}/")
+    assert r.status_code == 400, r.content
+    assert "direct report" in str(r.data)
+    # Somebody with nobody under them: gone.
+    assert _client(admin).delete(f"/api/accounts/users/{tech.pk}/").status_code == 204
+    assert not User.objects.filter(pk=tech.pk).exists()
+    # And now the lead can go too.
+    assert _client(admin).delete(f"/api/accounts/users/{lead.pk}/").status_code == 204
+
+
+@pytest.mark.django_db
+def test_only_a_superuser_removes_a_superuser(admin):
+    root = User.objects.create_superuser(username="org-root", password="x", email="r@x.pk")
+    # A super_admin by role, but not a superuser: not their call.
+    assert _client(admin).delete(f"/api/accounts/users/{root.pk}/").status_code == 403
+    assert User.objects.filter(pk=root.pk).exists()
+
+
+@pytest.mark.django_db
+def test_the_reporting_line_stays_a_tree_and_is_moved_by_managers():
+    head, lead, tech, other = _org()
+
+    # A loop: the lead cannot be hung under their own report.
+    r = _client(head).patch(f"/api/accounts/users/{lead.pk}/", {"reports_to": str(tech.pk)}, format="json")
+    assert r.status_code == 400, r.content
+    assert "loop" in str(r.data["reports_to"])
+    # Nobody reports to themselves.
+    r = _client(head).patch(f"/api/accounts/users/{lead.pk}/", {"reports_to": str(lead.pk)}, format="json")
+    assert r.status_code == 400
+    # A supervisor does not hold manage_team, so cannot re-hang anyone.
+    r = _client(other).patch(f"/api/accounts/users/{tech.pk}/", {"reports_to": str(other.pk)}, format="json")
+    assert r.status_code == 403, r.content
+    # Somebody who does hold it is still scoped to the people under them.
+    ops = User.objects.create_user(username="org-ops-elsewhere", password="x", role="ops_manager")
+    r = _client(ops).patch(f"/api/accounts/users/{tech.pk}/", {"reports_to": str(ops.pk)}, format="json")
+    assert r.status_code == 400, r.content
+    assert "report to you" in str(r.data["reports_to"])
+    # The head moves anyone.
+    r = _client(head).patch(f"/api/accounts/users/{tech.pk}/", {"reports_to": str(other.pk)}, format="json")
+    assert r.status_code == 200, r.content
+    tech.refresh_from_db()
+    assert tech.reports_to_id == other.pk
+    # And nobody picks their own manager.
+    r = _client(tech).patch(f"/api/accounts/users/{tech.pk}/", {"reports_to": str(head.pk)}, format="json")
+    tech.refresh_from_db()
+    assert tech.reports_to_id == other.pk

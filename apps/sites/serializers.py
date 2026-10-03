@@ -64,6 +64,11 @@ class SiteDetailSerializer(serializers.ModelSerializer):
 class InstallationStepSerializer(serializers.ModelSerializer):
     step_type_display = serializers.SerializerMethodField()
     status_display = serializers.CharField(source="get_status_display", read_only=True)
+    completed_by_name = serializers.SerializerMethodField()
+
+    def get_completed_by_name(self, obj):
+        who = obj.completed_by
+        return (who.get_full_name() or who.username) if who else None
 
     class Meta:
         model = InstallationStep
@@ -71,9 +76,9 @@ class InstallationStepSerializer(serializers.ModelSerializer):
             "id", "installation", "step_type", "step_type_display", "custom_label",
             "step_number", "status", "status_display",
             "assigned_team", "description",
-            "started_at", "completed_at", "created_at",
+            "started_at", "completed_at", "completed_by", "completed_by_name", "created_at",
         ]
-        read_only_fields = ["id", "created_at"]
+        read_only_fields = ["id", "created_at", "completed_by", "completed_by_name"]
 
     def get_step_type_display(self, obj):
         return obj.custom_label or obj.get_step_type_display()
@@ -253,6 +258,10 @@ class _InstallationCommonMixin(serializers.Serializer):
 # because that is the thing somebody has to act on.
 HEALTH_LABELS = {
     "completed": "Completed",
+    # The checklist is done but the client has not signed: the one state
+    # where "Completed" and "100%" were both true and both misleading, since
+    # the thing left to do was nowhere on the row.
+    "handover_pending": "Handover Pending",
     "on_hold": "On Hold",
     "delayed": "Delayed",
     "overdue": "Overdue",
@@ -271,6 +280,11 @@ def _health(installation):
     from django.utils import timezone
 
     if installation.completed_at is not None:
+        if getattr(installation, "handover", None) is None:
+            return (
+                "handover_pending", HEALTH_LABELS["handover_pending"],
+                "Checklist done — awaiting the client's handover",
+            )
         return "completed", HEALTH_LABELS["completed"], ""
 
     steps = list(installation.steps.all())
@@ -387,12 +401,31 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
     device_activated_at = serializers.SerializerMethodField()
 
     def get_device_activated_at(self, obj):
+        event = self._activation_event(obj)
+        return event.created_at if event else None
+
+    # Who actually marked it live. The tracker credited the booked installer,
+    # so a supervisor activating an asset from their desk showed up as the
+    # technician - the registry had the right name all along.
+    device_activated_by = serializers.SerializerMethodField()
+
+    def get_device_activated_by(self, obj):
+        event = self._activation_event(obj)
+        who = event.performed_by if event else None
+        return (who.get_full_name() or who.username) if who else None
+
+    def _activation_event(self, obj):
+        cached = getattr(obj, "_activation_event_cache", "unset")
+        if cached != "unset":
+            return cached
         event = (
             obj.device.lifecycle_events.filter(event_type="status_change", to_value="active")
+            .select_related("performed_by")
             .order_by("-created_at")
             .first()
         )
-        return event.created_at if event else None
+        obj._activation_event_cache = event
+        return event
     # How the asset is made decides who installs it, which is what the vendor
     # field on this screen is really answering.
     device_source = serializers.CharField(source="device.source", read_only=True)
@@ -400,6 +433,18 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
         source="device.get_source_display", read_only=True
     )
     site_city = serializers.CharField(source="site.city", read_only=True)
+    # Whether the person reading this may move it along. The screen used to
+    # work this out from the role name and got it wrong in both directions:
+    # it hid the controls from the supervisor who owns the job, and offered
+    # them to people the API then refused.
+    can_advance = serializers.SerializerMethodField()
+
+    def get_can_advance(self, obj) -> bool:
+        from .views import may_advance_installation
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return bool(user and may_advance_installation(user, obj))
 
     class Meta:
         model = DeviceInstallation
@@ -407,7 +452,7 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
             "id", "device", "device_code", "device_name", "asset_name", "asset_type_name",
             "device_image", "device_status", "device_activated_at", "device_source", "device_source_display",
             "client_names", "client_id", "project_name", "poc_name", "poc_phone",
-            "site", "site_name", "site_city", "zone",
+            "site", "site_name", "site_city", "zone", "can_advance", "device_activated_by",
             "installed_by", "installed_by_name", "installed_by_phone",
             "installed_by_employee_id", "installed_by_job_title", "installed_by_role",
             "installed_at", "removed_at",
@@ -434,6 +479,33 @@ class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.M
             raise serializers.ValidationError({
                 "external_vendor_name": "Enter the vendor's name alongside their contact."
             })
+
+        # An asset is installed in one place at a time. Nothing stopped a
+        # second job being opened for an asset that already had one, so the
+        # tracker showed the same asset twice — once finished, once at 0% —
+        # and there was no way to take the second one away again. Moving an
+        # asset is still possible: the old job records when it came down,
+        # and then a new one can be opened where it is going.
+        if self.instance is None:
+            device = attrs.get("device")
+            if device is not None:
+                live = (
+                    DeviceInstallation.objects
+                    .filter(device=device, removed_at__isnull=True)
+                    .select_related("site")
+                    .order_by("-installed_at")
+                    .first()
+                )
+                if live is not None:
+                    where = live.site.name if live.site_id else "a site"
+                    state = "finished" if live.completed_at else "still in progress"
+                    raise serializers.ValidationError({
+                        "device": (
+                            f"{device.asset_code} is already on the tracker at {where}, "
+                            f"{state}. Open that job instead — or, if the asset has "
+                            "come down, record its removal there first."
+                        )
+                    })
         return attrs
 
     def create(self, validated_data):

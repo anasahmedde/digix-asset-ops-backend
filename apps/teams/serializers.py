@@ -136,7 +136,7 @@ class _PhaseFollowsTheWorkMixin:
         return super().to_representation(instance)
 
 
-class ProjectListSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
+class ProjectListSerializer(HidesMoney, _PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
     assets_count = serializers.IntegerField(source="devices.count", read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
@@ -176,7 +176,7 @@ class ProjectListSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerializ
         return obj.computed_progress()
 
 
-class ProjectDetailSerializer(_PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
+class ProjectDetailSerializer(HidesMoney, _PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     # Who the work is for, with the contact the team will actually ring.
     client_contact_person = serializers.CharField(

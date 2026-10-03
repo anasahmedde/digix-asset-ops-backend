@@ -220,6 +220,89 @@ def close_job_for_ticket(ticket, user=None):
     return records
 
 
+def report_back_to_ticket(record, user=None):
+    """A finished job reports back to the ticket that asked for it.
+
+    The fault came in as a ticket, the repair was filed against the job, and
+    the ticket then sat open with the work already done — somebody had to
+    notice and close it by hand, and mostly nobody did. So a register full
+    of finished work showed a queue full of open faults.
+
+    It goes for review, not straight to closed: signing work off is somebody
+    else's, which is the same rule the ticket screen applies.
+    """
+    from apps.tickets.models import Ticket, TicketComment
+
+    ticket = record.schedule.ticket
+    if ticket is None or record.status != MaintenanceRecord.Status.COMPLETED:
+        return False
+    settled = (
+        Ticket.Status.PENDING_REVIEW, Ticket.Status.APPROVED,
+        Ticket.Status.CLOSED, Ticket.Status.REJECTED,
+    )
+    if ticket.status in settled:
+        return False
+
+    was = ticket.status
+    ticket.status = Ticket.Status.PENDING_REVIEW
+    ticket.completed_by = user or record.performed_by
+    ticket.completed_at = record.performed_at or timezone.now()
+    if not ticket.completion_notes:
+        ticket.completion_notes = (record.notes or "").strip()
+    ticket.save(update_fields=[
+        "status", "completed_by", "completed_at", "completion_notes", "updated_at",
+    ])
+    TicketComment.objects.create(
+        ticket=ticket,
+        author=user or record.performed_by,
+        content=(
+            f"Work completed on {record.schedule.title}"
+            + (f": {record.notes.strip()}" if (record.notes or "").strip() else ".")
+        ),
+        comment_type=TicketComment.CommentType.STATUS_CHANGE,
+        old_status=was,
+        new_status=Ticket.Status.PENDING_REVIEW,
+    )
+    return True
+
+
+def release_asset_for_cancelled_ticket(ticket, user=None, reason: str = ""):
+    """Undo what raising the ticket did, when it turns out not to be a fault.
+
+    A ticket against a fault takes the asset out of service and opens a
+    corrective job. Cancelling the ticket has to put both back, or the asset
+    stays Under Maintenance against a job nobody will ever complete — which
+    is precisely what deleting the ticket used to leave behind.
+    """
+    from apps.assets.models import Device
+
+    device = ticket.device
+    if device is None:
+        return False
+
+    note = (reason or "").strip()
+    jobs = open_corrective_jobs(device).filter(ticket=ticket)
+    released = False
+    for job in jobs:
+        job.status = MaintenanceSchedule.Status.CANCELLED
+        job.is_active = False
+        trail = f"Cancelled with the ticket: {note}" if note else "Cancelled with the ticket."
+        job.instructions = "\n".join(x for x in [job.instructions, trail] if x)
+        job.save(update_fields=["status", "is_active", "instructions", "updated_at"])
+        released = True
+
+    device.refresh_from_db()
+    if device.status == Device.Status.UNDER_MAINTENANCE and not open_corrective_jobs(device).exists():
+        device._transition_user = user
+        device._transition_reason = (
+            f"Ticket {ticket.ticket_number} cancelled" + (f": {note}" if note else "")
+        )
+        device.status = Device.Status.ACTIVE
+        device.save(update_fields=["status", "updated_at"])
+        released = True
+    return released
+
+
 def return_to_service_if_done(record, user=None):
     """Put the asset back in service when its corrective job is completed.
 

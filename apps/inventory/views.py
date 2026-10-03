@@ -3,6 +3,7 @@ from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum, 
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils import timezone
+from common.noops import RefusesSilentNoOps
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -10,7 +11,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
+from common.money import scrub
 from common.permissions import (
+    CapabilityGate,
     ISSUING_ROLES,
     MANAGER_ROLES,
     InspectionWriteElseRead,
@@ -56,7 +59,9 @@ class InventoryCategoryViewSet(viewsets.ModelViewSet):
     search_fields = ["name"]
 
 
-class InventoryItemViewSet(viewsets.ModelViewSet):
+class InventoryItemViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
+    # Reading this is a permission, not just a menu entry.
+    read_capability = "view_stock"
     # Coalesce so unpriced items sort as zero value instead of NULLs-first.
     queryset = (
         InventoryItem.objects.select_related("material_type", "category")
@@ -73,7 +78,7 @@ class InventoryItemViewSet(viewsets.ModelViewSet):
         .all()
     )
     serializer_class = InventoryItemSerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    permission_classes = [IsAuthenticated, WarehouseWriteElseRead, CapabilityGate]
     filterset_fields = ["location", "category", "material_type", "watch_on_dashboard"]
     search_fields = ["sku", "material_type__name", "category__name"]
 
@@ -524,6 +529,40 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
     search_fields = ["request_number", "purpose", "item__sku", "unit_type__name"]
     ordering_fields = ["created_at", "status"]
 
+    def create(self, request, *args, **kwargs):
+        """A technician asks on the job; the approval is what reaches the store.
+
+        Posting straight here put a line on the store's queue that nobody had
+        agreed to, and the store issues against the queue — so the supervisor's
+        decision, which is the whole of the approval, was simply skipped.
+        """
+        user = request.user
+        if getattr(user, "role", "") == "technician" and not user.is_superuser:
+            return Response(
+                {"detail": (
+                    "Ask for the part on the job. Your supervisor's approval "
+                    "is what puts it on the store's queue."
+                )},
+                status=403,
+            )
+        return super().create(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        """A request comes off the queue by being cancelled, not deleted.
+
+        DELETE was open to anyone signed in, and it took the request's history
+        with it. Cancelling says the same thing and leaves the record.
+        """
+        denied = self._management_only(request)
+        if denied is not None:
+            return denied
+        if self.get_object().quantity_issued:
+            return Response(
+                {"detail": "Stock has already gone out against this — cancel it so the issue stays on record."},
+                status=400,
+            )
+        return super().destroy(request, *args, **kwargs)
+
     def perform_create(self, serializer):
         serializer.save(requested_by=self.request.user)
 
@@ -619,20 +658,39 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
 
             where = "the store"
             if part is not None:
-                # Back to awaiting an answer: the supervisor decides again, and
-                # approving raises a fresh request on the store's queue.
                 from apps.maintenance.models import MaintenancePartRequest
 
-                part.status = MaintenancePartRequest.Status.REQUESTED
-                part.quantity_approved = None
-                part.decided_by = None
-                part.decided_at = None
-                part.decision_note = note or f"Sent back by the store on {timezone.localdate():%d %b %Y}"
-                part.issuance_request = None
-                part.save(update_fields=[
-                    "status", "quantity_approved", "decided_by", "decided_at",
-                    "decision_note", "issuance_request", "updated_at",
-                ])
+                already = issuance_request.quantity_issued
+                if already:
+                    # Some of it is already in the technician's hands. That
+                    # much was approved and was issued, so the line stays
+                    # approved for it — clearing the link made the job say
+                    # nothing had been issued at all, and the visit could
+                    # then not be settled for parts the technician was
+                    # holding. Only the balance goes back.
+                    part.quantity_approved = already
+                    balance = issuance_request.outstanding_quantity
+                    part.decision_note = (
+                        f"{already} issued; the balance of {balance} sent back by the store"
+                        + (f": {note}" if note else ".")
+                    )
+                    part.save(update_fields=[
+                        "quantity_approved", "decision_note", "updated_at",
+                    ])
+                else:
+                    # Nothing went out, so the answer is undecided again: the
+                    # supervisor decides afresh, and approving raises a new
+                    # request on the store's queue.
+                    part.status = MaintenancePartRequest.Status.REQUESTED
+                    part.quantity_approved = None
+                    part.decided_by = None
+                    part.decided_at = None
+                    part.decision_note = note or f"Sent back by the store on {timezone.localdate():%d %b %Y}"
+                    part.issuance_request = None
+                    part.save(update_fields=[
+                        "status", "quantity_approved", "decided_by", "decided_at",
+                        "decision_note", "issuance_request", "updated_at",
+                    ])
                 where = part.schedule.title
             elif component is not None:
                 # A cancelled request stops counting against the requirement,
@@ -796,7 +854,11 @@ class LowStockView(APIView):
                 "open_request": open_request("unit_type", p.pk),
                 "last_decline": last_decline("unit_type", p.pk),
             })
-        return Response({"results": rows, "count": len(rows), "unrequested": sum(1 for r in rows if not r["open_request"])})
+        # Hand-built payload: it never meets a serializer, so the
+        # price gate has to be applied here.
+        return Response(scrub({"results": rows, "count": len(rows), "unrequested": sum(1 for r in rows if not r["open_request"])}, self.get_serializer_context()
+                              if hasattr(self, 'get_serializer_context')
+                              else {'request': request}))
 
 
 class ReorderRequestViewSet(viewsets.ModelViewSet):

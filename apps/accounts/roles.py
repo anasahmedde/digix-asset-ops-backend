@@ -14,6 +14,14 @@ deleted, but only once nobody holds it.
 from django.core.cache import cache
 
 CACHE_KEY = "role-capabilities-v1"
+# Django's default cache is per-process, so `forget()` clears the web
+# worker that served the change and nobody else — a management command, a
+# second worker or celery keeps the stale map until it expires. A minute is
+# short enough that a permission change is never long in arriving, and long
+# enough that "what may this person do" is not a query on every request.
+# With a shared cache configured (Redis), invalidation is immediate and
+# this is only a backstop.
+CACHE_SECONDS = 60
 
 
 def ensure_seeded():
@@ -27,7 +35,8 @@ def ensure_seeded():
     from .models import RoleDefinition, User
 
     labels = dict(User.Role.choices)
-    existing = set(RoleDefinition.objects.values_list("key", flat=True))
+    rows = list(RoleDefinition.objects.all())
+    existing = {r.key for r in rows}
     missing = [
         RoleDefinition(
             key=key,
@@ -40,6 +49,24 @@ def ensure_seeded():
     ]
     if missing:
         RoleDefinition.objects.bulk_create(missing)
+        forget()
+        rows += missing
+
+    # A capability added to the catalogue after the roles were seeded would
+    # otherwise reach nobody: the records hold the list as it was. Anything
+    # no role has heard of yet is new, so it is granted to the built-in
+    # roles the code says should have it. Only ever added, never removed,
+    # and a role somebody has edited keeps every choice they made.
+    known = set().union(*(set(r.capabilities or ()) for r in rows)) if rows else set()
+    fresh = {k for caps in ROLE_DEFAULTS.values() for k in caps} - known
+    if fresh:
+        for row in rows:
+            if not row.is_builtin:
+                continue
+            should = ROLE_DEFAULTS.get(row.key, frozenset()) & fresh
+            if should:
+                row.capabilities = sorted(set(row.capabilities or ()) | should)
+                row.save(update_fields=["capabilities", "updated_at"])
         forget()
 
 
@@ -57,7 +84,7 @@ def capability_map() -> dict[str, frozenset[str]]:
     # yet still behaves, and a role added in code appears without a step.
     merged = {key: frozenset(caps) for key, caps in ROLE_DEFAULTS.items()}
     merged.update({key: frozenset(caps or ()) for key, caps in rows.items()})
-    cache.set(CACHE_KEY, merged, 300)
+    cache.set(CACHE_KEY, merged, CACHE_SECONDS)
     return merged
 
 
