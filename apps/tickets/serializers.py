@@ -112,6 +112,10 @@ class TicketSerializer(HidesMoney, _AssignmentGuardMixin, serializers.ModelSeria
                 missing["device"] = "Say which asset this is about."
             if not attrs.get("category"):
                 missing["category"] = "Say what kind of work this is."
+            # The issue type is what the fault actually is, and what the
+            # recurrence count and the issue-type reports are built on.
+            if not attrs.get("issue_type"):
+                missing["issue_type"] = "Say what the fault is."
             if not attrs.get("priority"):
                 missing["priority"] = "Say how urgent it is."
             if missing:

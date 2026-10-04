@@ -21,7 +21,10 @@ def _about(device=True):
     """
     from apps.assets.models import Device
 
-    basics = {"category": "repair", "priority": "medium"}
+    from apps.tickets.models import TicketIssueType
+
+    kind, _ = TicketIssueType.objects.get_or_create(name="General Fault")
+    basics = {"category": "repair", "priority": "medium", "issue_type": str(kind.id)}
     if not device:
         return basics
     dev, _ = Device.objects.get_or_create(
@@ -1063,7 +1066,7 @@ def test_a_ticket_says_what_it_is_about(people):
     c = _client(people["ops"])
     bare = c.post("/api/tickets/", {"title": "something is wrong"}, format="json")
     assert bare.status_code == 400, bare.content
-    assert set(bare.data) >= {"device", "category", "priority"}
+    assert set(bare.data) >= {"device", "category", "priority", "issue_type"}
 
     # Naming the assets in `devices` is naming the asset.
     from apps.assets.models import Device
@@ -1071,6 +1074,7 @@ def test_a_ticket_says_what_it_is_about(people):
     d1 = Device.objects.create(asset_code="AST-SAYS-1", serial_number="SAYS-1")
     r = c.post("/api/tickets/", {
         "title": "two screens flicker", "category": "repair", "priority": "high",
+        "issue_type": str(TicketIssueType.objects.first().id),
         "devices": [str(d1.pk)],
     }, format="json")
     assert r.status_code == 201, r.content

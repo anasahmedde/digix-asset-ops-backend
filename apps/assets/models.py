@@ -93,7 +93,11 @@ class Device(TimeStampedModel):
         PROCURED = "procured", "In Procurement"
         IN_PRODUCTION = "in_production", "In Production"
         IN_STOCK = "in_stock", "In Stock"
-        ASSIGNED = "assigned", "Assigned to Client"
+        # Assigned for the work, not handed over: this is the step that
+        # names the technician and the site and opens the job on the
+        # Installation Tracker. The asset becomes the client's at handover,
+        # which is CLIENT_PROPERTY below.
+        ASSIGNED = "assigned", "Assigned for Installation"
         INSTALLED = "installed", "Installed"
         ACTIVE = "active", "Active"
         UNDER_MAINTENANCE = "under_maintenance", "Under Maintenance"

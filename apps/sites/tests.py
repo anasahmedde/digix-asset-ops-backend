@@ -1613,3 +1613,16 @@ def test_an_in_house_build_can_go_live_once_its_checklist_is_done(ops, tech, ins
     assert device.status == "active"
     # And the record names the person who pressed the button, not the installer.
     assert live.data["device_activated_by"] == (ops.get_full_name() or ops.username)
+
+
+@pytest.mark.django_db
+def test_a_pin_dropped_on_the_map_is_accepted(ops):
+    """A map hands back every digit it has; the column keeps seven decimal
+    places, and DRF counted the digits before rounding any of them."""
+    r = _client(ops).post("/api/sites/sites/", {
+        "name": "Pin Site", "city": "Karachi", "address": "Saddar Town",
+        "latitude": 24.858363984674215, "longitude": 67.05144901275635,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert str(r.data["latitude"]) == "24.8583640"
+    assert str(r.data["longitude"]) == "67.0514490"

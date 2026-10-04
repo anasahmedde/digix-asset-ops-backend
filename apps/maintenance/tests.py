@@ -14,15 +14,21 @@ from apps.sites.models import Site
 def _about():
     """What a ticket is about, for tests that are about something else.
 
-    The API requires an asset, a category and a priority on every new
-    ticket; a payload can still override any of them after this spread.
+    The API requires an asset, what the fault is, a category and a priority
+    on every new ticket; a payload can still override any of them after
+    this spread.
     """
     from apps.assets.models import Device
+    from apps.tickets.models import TicketIssueType
 
     device, _ = Device.objects.get_or_create(
         asset_code="TKT-ABOUT-1", defaults={"serial_number": "TKT-ABOUT-SN-1"},
     )
-    return {"device": str(device.id), "category": "repair", "priority": "medium"}
+    kind, _ = TicketIssueType.objects.get_or_create(name="General Fault")
+    return {
+        "device": str(device.id), "issue_type": str(kind.id),
+        "category": "repair", "priority": "medium",
+    }
 
 
 @pytest.fixture
