@@ -93,7 +93,8 @@ class SiteViewSet(viewsets.ModelViewSet):
         return for_client(
             Site.objects.select_related("client")
             .prefetch_related("contacts")
-            .annotate(device_count=Count("devices")),
+            .annotate(device_count=Count("devices"))
+            .order_by("-created_at"),
             self.request.user,
             "client_id",
         )

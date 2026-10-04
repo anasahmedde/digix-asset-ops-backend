@@ -1626,3 +1626,46 @@ def test_a_pin_dropped_on_the_map_is_accepted(ops):
     assert r.status_code == 201, r.content
     assert str(r.data["latitude"]) == "24.8583640"
     assert str(r.data["longitude"]) == "67.0514490"
+
+
+@pytest.mark.django_db
+def test_the_site_s_headline_contact_follows_its_primary_poc(ops):
+    """The form asked for a contact twice — three fields on the site, and a
+    list of people. It asks once now; reports still read the three."""
+    from apps.sites.models import SiteContact
+
+    site = Site.objects.create(name="Contact Site", address="1 Road", city="Lahore")
+    c = _client(ops)
+
+    first = SiteContact.objects.create(
+        site=site, name="Ayesha Khan", designation="Facilities Manager",
+        phone="0300-1112222", email="ayesha@example.pk", is_primary=True,
+    )
+    site.refresh_from_db()
+    assert site.contact_person == "Ayesha Khan"
+    assert site.contact_phone == "0300-1112222"
+    assert site.contact_email == "ayesha@example.pk"
+
+    # A second person marked primary takes over, and only one stays primary.
+    second = SiteContact.objects.create(
+        site=site, name="Bilal Ahmed", designation="Security Lead",
+        phone="0301-3334444", is_primary=True,
+    )
+    site.refresh_from_db()
+    first.refresh_from_db()
+    assert site.contact_person == "Bilal Ahmed" and first.is_primary is False
+
+    # Added through the API, the same way the dialog adds them.
+    r = c.post("/api/sites/site-contacts/", {
+        "site": str(site.id), "name": "Dania Raza", "designation": "Ops",
+        "phone": "0302-5556666", "is_primary": True,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    site.refresh_from_db()
+    assert site.contact_person == "Dania Raza"
+
+    # And removing everyone leaves nothing behind pretending to be a contact.
+    SiteContact.objects.filter(site=site).delete()
+    second.delete()
+    site.refresh_from_db()
+    assert site.contact_person == "" and site.contact_phone == ""

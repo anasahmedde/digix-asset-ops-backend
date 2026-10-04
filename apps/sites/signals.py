@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import logging
 
-from django.db.models.signals import post_save
+from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 
 from apps.assets.models import Device
 
-from .models import DeviceInstallation, InstallationStep
+from .models import DeviceInstallation, InstallationStep, Site, SiteContact
 
 logger = logging.getLogger(__name__)
 
@@ -198,3 +198,37 @@ def _anchor_client_warranties(installation: DeviceInstallation) -> None:
         warranty.start_date = handover
         warranty.end_date = handover + relativedelta(months=warranty.months)
         warranty.save(update_fields=["start_date", "end_date", "updated_at"])
+
+
+@receiver(post_save, sender=SiteContact)
+@receiver(post_delete, sender=SiteContact)
+def keep_the_site_s_headline_contact_in_step(sender, instance: SiteContact, **kwargs):
+    """One primary contact, and the site's own fields follow it.
+
+    A site used to be asked for a contact twice: three fields on the site
+    itself, and a list of people with their designations. The form asks
+    once now, for the list — but reports and exports still read the three
+    fields, so they are kept true from whoever is marked primary (or, with
+    nobody marked, the first one on the list).
+
+    Both halves live in one receiver because the order matters: unmark the
+    others first, then read who the primary is. Split across two, the
+    headline was computed while the outgoing primary was still marked.
+    """
+    site = instance.site
+    if getattr(instance, "is_primary", False) and instance.pk:
+        SiteContact.objects.filter(site=site, is_primary=True).exclude(
+            pk=instance.pk
+        ).update(is_primary=False)
+
+    lead = SiteContact.objects.filter(site=site).order_by("-is_primary", "name").first()
+    fields = {
+        "contact_person": lead.name if lead else "",
+        "contact_phone": lead.phone if lead else "",
+        "contact_email": lead.email if lead else "",
+    }
+    changed = {f: v for f, v in fields.items() if getattr(site, f) != v}
+    if changed:
+        for f, v in changed.items():
+            setattr(site, f, v)
+        Site.objects.filter(pk=site.pk).update(**changed)

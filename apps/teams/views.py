@@ -154,7 +154,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             .select_related("client", "site", "manager")
             .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
             .prefetch_related("scope_items", "milestones")
-            .all()
+            .order_by("-created_at")
         )
 
     def get_serializer_class(self):

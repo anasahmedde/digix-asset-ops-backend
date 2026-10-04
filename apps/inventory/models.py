@@ -49,7 +49,9 @@ class InventoryItem(TimeStampedModel):
     notes = models.TextField(blank=True)
 
     class Meta:
-        ordering = ["material_type__name"]
+        # Newest first, like every other register. A catalogue that
+        # fills a dropdown stays alphabetical — see PLATFORM_STANDARD §6.4.
+        ordering = ["-created_at"]
 
     def __str__(self):
         return f"{self.material_type.name} ({self.sku})"
@@ -118,7 +120,9 @@ class InventoryUnitType(TimeStampedModel):
     is_active = models.BooleanField(default=True)
 
     class Meta:
-        ordering = ["name"]
+        # Newest first, like every other register. A catalogue that
+        # fills a dropdown stays alphabetical — see PLATFORM_STANDARD §6.4.
+        ordering = ["-created_at"]
 
     def __str__(self):
         parts = [self.name]
