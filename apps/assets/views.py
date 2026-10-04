@@ -1323,6 +1323,19 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
                 {"detail": f"'{step.name}' is on a work order — cancel that first to change the decision."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if step.work_order_requested:
+            # Asking for a work order hands the operation to Work Orders. It
+            # comes back the way it went — they send it back under Work
+            # Orders > Requests, with a reason, and it is undecided again.
+            # Taking it back quietly from this screen left their queue
+            # holding a request for work the floor had already started.
+            return Response(
+                {"detail": (
+                    f"'{step.name}' is with Work Orders. They send it back under "
+                    "Work Orders > Requests, and then it can be decided again."
+                )},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if step.status in (ProductionStep.Status.COMPLETED, ProductionStep.Status.SKIPPED):
             return Response({"detail": f"'{step.name}' is already finished."}, status=400)
         where = request.data.get("location", ProductionStep.Location.IN_HOUSE)
