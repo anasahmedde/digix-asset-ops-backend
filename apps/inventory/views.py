@@ -801,7 +801,7 @@ class LowStockView(APIView):
         declines = {}
         for r in (
             ReorderRequest.objects.filter(status=ReorderRequest.Status.CANCELLED)
-            .exclude(declined_at=None).select_related("declined_by").order_by("declined_at")
+            .exclude(declined_at=None).select_related("declined_by").order_by("-declined_at")
         ):
             key = ("item", r.item_id) if r.item_id else ("unit_type", r.unit_type_id)
             who = r.declined_by

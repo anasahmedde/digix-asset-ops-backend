@@ -2803,3 +2803,88 @@ def test_the_due_date_agreed_at_assignment_lands_on_the_tracker(admin_client, in
     # rolls over five hours earlier there than it does here.
     assert timezone.localdate(job.installed_at) == timezone.localdate()
     assert job.completed_at is None
+
+
+@pytest.mark.django_db
+def test_inventory_is_offered_against_stock_not_already_claimed(admin_client):
+    """Eight on the shelf, all eight already asked for: the line could still
+    be sent to inventory for the two it was short, against stock that was
+    already promised."""
+    from apps.assets.models import AssetComponent, AssetType, Device, MaterialType
+    from apps.inventory.models import InventoryItem
+
+    kind = AssetType.objects.create(name="Free Qty Kind")
+    device = Device.objects.create(asset_type=kind, asset_code="AST-FREE-1")
+    material = MaterialType.objects.create(name="Receiving card", unit="piece")
+    item = InventoryItem.objects.create(material_type=material, quantity=8)
+    line = AssetComponent.objects.create(
+        device=device, name="Receiving cards", quantity=10, inventory_item=item,
+    )
+    assert line.available_quantity == 8 and line.free_quantity == 8
+
+    r = admin_client.post(f"/api/assets/components/{line.id}/fulfil-from-stock/", {"quantity": 8}, format="json")
+    assert r.status_code in (200, 201), r.content
+
+    line.refresh_from_db()
+    assert line.available_quantity == 8, "nothing has been issued yet, so the shelf is untouched"
+    assert line.free_quantity == 0, "but all eight are promised to this line"
+
+    # Which is exactly what the endpoint refuses, so the button must not offer it.
+    again = admin_client.post(f"/api/assets/components/{line.id}/fulfil-from-stock/", {"quantity": 2}, format="json")
+    assert again.status_code == 400, again.content
+    assert "in stock" in str(again.data["quantity"]).lower()
+
+    body = admin_client.get(f"/api/assets/devices/{device.id}/").json()
+    row = next(c for c in body["components"] if c["id"] == str(line.id))
+    assert row["available_quantity"] == 8 and row["free_quantity"] == 0
+
+
+@pytest.mark.django_db
+def test_a_route_waits_for_its_parts_and_a_decision_can_be_sent_back(admin_client):
+    """Every operation could be marked complete on an asset whose parts were
+    still on the shelf, or not yet ordered at all."""
+    from apps.assets.models import AssetComponent, AssetType, Device, MaterialType, ProductionStep
+    from apps.inventory.models import InventoryItem
+    from apps.teams.models import Project, ProjectScopeItem
+
+    kind = AssetType.objects.create(name="Route Kind")
+    device = Device.objects.create(asset_type=kind, asset_code="AST-ROUTE-1", source="inhouse")
+    project = Project.objects.create(name="Route Project")
+    ProjectScopeItem.objects.create(project=project, device=device, quantity=1)
+    material = MaterialType.objects.create(name="Route Cable", unit="piece")
+    item = InventoryItem.objects.create(material_type=material, quantity=50)
+    line = AssetComponent.objects.create(
+        device=device, name="Route Cable", quantity=5, inventory_item=item,
+    )
+    step = ProductionStep.objects.create(
+        device=device, name="Fabrication", step_number=1,
+        location=ProductionStep.Location.IN_HOUSE,
+    )
+
+    assert step.materials_pending == ["Route Cable"]
+    assert step.manual_moves == ()
+    r = admin_client.post(f"/api/assets/production-steps/{step.id}/transition/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 400, r.content
+    assert "Waiting on material" in str(r.data["detail"])
+
+    # The parts arrive; the route opens.
+    line.issued_quantity = 5
+    line.save(update_fields=["issued_quantity"])
+    step.refresh_from_db()
+    assert step.materials_pending == [] and step.manual_moves
+    r = admin_client.post(f"/api/assets/production-steps/{step.id}/transition/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 200, r.content
+
+    # A started step has nothing left to decide again.
+    back = admin_client.post(f"/api/assets/production-steps/{step.id}/send-back/", {}, format="json")
+    assert back.status_code == 400 and "already started" in str(back.data["detail"])
+
+    # One that has not started goes back for the project to decide afresh.
+    later = ProductionStep.objects.create(
+        device=device, name="Painting", step_number=2,
+        location=ProductionStep.Location.IN_HOUSE,
+    )
+    r = admin_client.post(f"/api/assets/production-steps/{later.id}/send-back/", {}, format="json")
+    assert r.status_code == 200, r.content
+    later.refresh_from_db()
+    assert later.location == ProductionStep.Location.UNDECIDED

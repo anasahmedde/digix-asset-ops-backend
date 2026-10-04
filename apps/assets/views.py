@@ -924,7 +924,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
 
         # The store can only give what is on the shelf and not already promised.
         on_shelf = component.available_quantity
-        free = max(on_shelf - already_open, 0)
+        free = component.free_quantity
         if on_shelf <= 0:
             return Response({"quantity": ["Nothing in stock — procure this line instead."]}, status=400)
         if quantity > free:
@@ -1350,6 +1350,47 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
         step.workshop = None
         step.workshop_name = ""
         step.save(update_fields=["location", "workshop", "workshop_name", "work_order_requested_at", "updated_at"])
+        return Response(ProductionStepSerializer(step).data)
+
+    @action(detail=True, methods=["post"], url_path="send-back")
+    def send_back(self, request, pk=None):
+        """Hand the decision back to the project, to be taken again.
+
+        In-house and work order are both final once chosen - a decision
+        that can be flipped from either side is not a decision anybody can
+        rely on. This is the way to change one: it goes back undecided, and
+        the project's Execution tab chooses afresh.
+        """
+        step = self.get_object()
+        if step.live_work_orders().exists():
+            return Response(
+                {"detail": f"'{step.name}' is on a work order — cancel that first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if step.status != ProductionStep.Status.PENDING:
+            return Response(
+                {"detail": f"'{step.name}' has already started — there is nothing to decide again."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not step.on_project:
+            return Response(
+                {"detail": "This asset is not on a project, so there is nobody to send it back to."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        step.location = ProductionStep.Location.UNDECIDED
+        step.workshop = None
+        step.workshop_name = ""
+        step.work_order_requested_at = None
+        step.save(update_fields=[
+            "location", "workshop", "workshop_name", "work_order_requested_at", "updated_at",
+        ])
+        DeviceLifecycleEvent.objects.create(
+            device=step.device,
+            event_type=DeviceLifecycleEvent.EventType.NOTE,
+            description=f"'{step.name}' sent back to the project to be decided again",
+            performed_by=request.user,
+            metadata={"step": str(step.pk), "sent_back": True},
+        )
         return Response(ProductionStepSerializer(step).data)
 
     @action(detail=True, methods=["post"])

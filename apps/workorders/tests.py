@@ -47,12 +47,14 @@ def test_execution_asks_work_orders_raises_group_head_approves(build):
         assert r.data["allowed_transitions"] == [] and "Requests" in r.data["hold_reason"]
     assert ops.post(f"/api/assets/production-steps/{assemble.id}/decide/", {"location": "in_house"}, format="json").status_code == 200
 
-    # Work Orders › Requests lists exactly those two, with what the planner expected them to cost.
+    # Work Orders › Requests lists exactly those two, newest first, with what
+    # the planner expected them to cost.
     rows = ops.get("/api/work-orders/requests/").json()["results"]
     assert [(r["operation"], r["asset_code"], r["project_name"]) for r in rows] == [
-        ("Cutting", "AST-WO-1", "WO Rollout"), ("Painting", "AST-WO-1", "WO Rollout"),
+        ("Painting", "AST-WO-1", "WO Rollout"), ("Cutting", "AST-WO-1", "WO Rollout"),
     ]
-    assert str(rows[0]["planned_cost"]).startswith("400")
+    cutting = next(r for r in rows if r["operation"] == "Cutting")
+    assert str(cutting["planned_cost"]).startswith("400")
 
     # One draft order to one vendor, a line per operation, priced from the plan unless overtyped.
     r = ops.post("/api/work-orders/raise/", {

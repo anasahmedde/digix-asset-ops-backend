@@ -221,7 +221,10 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 "device", "device__project", "inventory_item__material_type",
                 "inventory_unit_type", "purchase_order_item__purchase_order",
             )
-            .order_by("device__project__name", "device__asset_code", "name")
+            # Newest first: the line raised today is the one being acted on.
+            # Project and asset stay as the tiebreak so one asset's lines sit
+            # together when they were raised together.
+            .order_by("-created_at", "device__project__name", "device__asset_code", "name")
         )
         from apps.teams.models import ProjectScopeItem
 
@@ -313,7 +316,7 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         reorders = (
             ReorderRequest.objects.filter(status__in=(ReorderRequest.Status.OPEN, ReorderRequest.Status.ORDERED))
             .select_related("item__material_type", "unit_type", "purchase_order_item__purchase_order")
-            .order_by("created_at")
+            .order_by("-created_at")
         )
         if project_id:
             reorders = reorders.none()

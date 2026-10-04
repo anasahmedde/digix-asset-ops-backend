@@ -292,7 +292,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "id", "device", "name", "component_type", "serial_number", "fitted_serials",
             "quantity", "supplier", "supplier_name",
             "inventory_item", "inventory_item_name", "inventory_item_sku",
-            "inventory_unit_type", "inventory_unit_type_name", "available_quantity",
+            "inventory_unit_type", "inventory_unit_type_name", "available_quantity", "free_quantity",
             "fulfilment", "issued_quantity", "outstanding_quantity", "stock_requested_quantity", "procure_quantity", "undecided_quantity",
             "purchase_order_item", "po_number", "po_stocked_quantity", "procure_requests", "planned_unit_price",
             "pending_increase", "increase_reason", "increase_notes",
@@ -313,6 +313,12 @@ class AssetComponentSerializer(serializers.ModelSerializer):
         if obj.inventory_item_id:
             return obj.inventory_item.quantity
         return None
+
+    # What the next "from inventory" decision can actually draw on. The
+    # screen offered the button against the shelf, so a line that had
+    # already claimed the whole shelf still invited another claim on it,
+    # and the server then refused.
+    free_quantity = serializers.IntegerField(read_only=True)
 
     def get_po_stocked_quantity(self, obj):
         if obj.purchase_order_item_id is None:
@@ -990,6 +996,10 @@ class ProductionStepSerializer(HidesMoney, serializers.ModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     location_display = serializers.CharField(source="get_location_display", read_only=True)
     allowed_transitions = serializers.SerializerMethodField()
+    # Whether there is a project behind this asset. Sending a decision back
+    # means sending it back to somebody, and an asset outside a project has
+    # no Execution tab waiting to take it.
+    on_project = serializers.BooleanField(read_only=True)
     # The open work order for this operation, when it was given to a workshop.
     work_order = serializers.SerializerMethodField()
 
@@ -1017,7 +1027,7 @@ class ProductionStepSerializer(HidesMoney, serializers.ModelSerializer):
         fields = [
             "id", "device", "step_number", "name",
             "location", "location_display", "workshop", "workshop_name", "workshop_display",
-            "status", "status_display", "allowed_transitions", "hold_reason", "decision_pending", "work_order",
+            "status", "status_display", "allowed_transitions", "hold_reason", "decision_pending", "on_project", "work_order",
             "work_order_requested", "work_order_requested_at",
             "assigned_to", "assigned_to_name", "expected_days", "planned_cost", "actual_cost",
             "started_at", "sent_at", "returned_at", "completed_at",
