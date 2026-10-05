@@ -493,6 +493,15 @@ class DeviceListSerializer(serializers.ModelSerializer):
 
 
 class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
+    # What this asset has cost: building it, from the project's own costing,
+    # and keeping it running, from the maintenance register.
+    cost_of_ownership = serializers.SerializerMethodField()
+
+    def get_cost_of_ownership(self, obj):
+        from .costs import cost_of_ownership
+
+        return cost_of_ownership(obj)
+
     device_model_name = serializers.StringRelatedField(source="device_model", read_only=True)
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     brand_name = serializers.CharField(source="device_model.brand.name", read_only=True, default=None)
@@ -585,6 +594,25 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
     )
 
     status_display = serializers.CharField(source="get_status_display", read_only=True)
+    def validate(self, attrs):
+        """A registered asset has a size.
+
+        Length and width describe any physical thing; depth and diagonal
+        depend on what it is, so they stay optional. Checked on creation
+        only — an asset already on the books is not made uneditable by a
+        rule brought in after it was registered.
+        """
+        if self.instance is None:
+            missing = [
+                name for name in ("length_in", "width_in")
+                if attrs.get(name) in (None, "")
+            ]
+            if missing:
+                raise serializers.ValidationError({
+                    name: "Say how big it is." for name in missing
+                })
+        return attrs
+
     class Meta:
         model = Device
         fields = [
@@ -599,6 +627,7 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
             "image", "display_image", "images",
             "purchase_date", "purchase_price", "supplier", "supplier_name",
             "planned_installation_cost", "actual_installation_cost",
+            "cost_of_ownership",
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
             "clients", "client_names",
