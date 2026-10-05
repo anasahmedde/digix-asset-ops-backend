@@ -15,7 +15,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-COMPANY_NAME = "DIGIX Asset Ops"
+COMPANY_NAME = "DIGIX Asset Management"
 
 INK = colors.HexColor("#111827")
 MUTED = colors.HexColor("#6b7280")
@@ -111,8 +111,8 @@ def render_cost_plan_pdf(project, plan: dict) -> bytes:
     """The estimate as it stands, asset by asset, then the totals."""
     s = _styles()
     buf = io.BytesIO()
-    doc = _doc(buf, f"Cost Plan — {project.name}")
-    story = _masthead("COST PLAN", project, s)
+    doc = _doc(buf, f"Budget and Costing — {project.name}")
+    story = _masthead("BUDGET AND COSTING", project, s)
 
     status = plan.get("status_display") or "Draft"
     approved = plan.get("approved_total")
