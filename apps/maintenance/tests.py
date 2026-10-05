@@ -313,7 +313,9 @@ def test_due_alert_site_only_schedule_dedupes_by_message(db):
 import pytest as _pytest
 from rest_framework.test import APIClient as _APIClient
 
+
 from apps.accounts.models import User as _User
+from apps.maintenance.test_corrective import _png
 from apps.assets.models import Device as _Device
 from apps.maintenance.models import (
     MaintenanceRecord as _Record,
@@ -347,7 +349,9 @@ def test_taking_an_asset_out_of_service_raises_a_corrective_job(corrective_clien
     job = _Schedule.objects.get(device=asset)
     assert job.maintenance_type == _Schedule.MaintenanceType.CORRECTIVE
     assert job.frequency == _Schedule.Frequency.ONE_TIME
-    assert job.status == _Schedule.Status.IN_PROCESS
+    assert job.status == _Schedule.Status.PENDING, (
+        "a job nobody has been sent on has not been started"
+    )
     assert job.title == "Screen flickering intermittently"
     assert job.priority == _Schedule.Priority.HIGH
 
@@ -425,7 +429,6 @@ def test_leaving_maintenance_for_rma_also_closes_the_job(corrective_client):
     job = _Schedule.objects.get(device=asset)
     assert job.status == _Schedule.Status.COMPLETED
     assert _Record.objects.filter(schedule=job).count() == 1
-
 
 
 def _down():
@@ -530,7 +533,6 @@ def test_schedule_materials_are_picked_from_inventory(corrective_client):
     assert row["quantity"] == 2
 
 
-
 @_pytest.mark.django_db
 def test_a_closed_job_cannot_be_reopened_from_a_stale_edit(corrective_client):
     c, _ = corrective_client
@@ -551,7 +553,6 @@ def test_a_closed_job_cannot_be_reopened_from_a_stale_edit(corrective_client):
     # Editing other details without touching the status is still allowed.
     r = c.patch(f"/api/maintenance/schedules/{job.id}/", {"instructions": "Filed"}, format="json")
     assert r.status_code == 200, r.content
-
 
 
 @_pytest.mark.django_db
@@ -814,6 +815,32 @@ def test_a_technician_cannot_answer_their_own_request(parts_job):
         {"approve": True}, format="json",
     )
     assert r.status_code == 403, r.content
+
+
+@pytest.mark.django_db
+def test_a_super_admin_may_answer_its_own_request(parts_job):
+    """It reports to nobody, so the four-eyes rule would just block it.
+
+    Exempted by instruction. The decision is still stamped with who made
+    it, so the trail shows the asker and the approver were one person.
+    """
+    boss = User.objects.create_user(username="parts-root", password="x", role="super_admin")
+    c = _client(boss)
+    r = _ask(c, parts_job)
+    decided = c.post(
+        f"/api/maintenance/part-requests/{r.data['id']}/decide/",
+        {"approve": True}, format="json",
+    )
+    assert decided.status_code == 200, decided.content
+    assert decided.data["decided_by_name"] in (boss.get_full_name() or boss.username,)
+
+    # Everybody else still asks the person they report to.
+    tech = _client(parts_job["tech"])
+    mine = _ask(tech, parts_job)
+    assert tech.post(
+        f"/api/maintenance/part-requests/{mine.data['id']}/decide/",
+        {"approve": True}, format="json",
+    ).status_code == 403
 
 
 @pytest.mark.django_db
@@ -1160,6 +1187,22 @@ def test_every_round_is_planned_on_its_own(parts_job):
     )
     assert r.status_code == 403, r.content
 
+    # It is given back to the technician it belongs to before they set off.
+    _client(parts_job["boss"]).patch(
+        f"/api/maintenance/visits/{visit.id}/",
+        {"assigned_to": str(parts_job["tech"].id)}, format="json",
+    )
+
+    # A round starts on the same terms a breakdown does: there has to be a
+    # photograph of what was found, or there is nothing to compare against.
+    bare = _client(parts_job["tech"]).post(
+        f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
+    assert bare.status_code == 400 and "BEFORE photo" in str(bare.data["detail"])
+    _client(parts_job["tech"]).post(
+        f"/api/maintenance/visits/{visit.id}/photos/",
+        {"kind": "before", "image": _png()}, format="multipart",
+    )
+
     # Starting says so on the round and on the schedule.
     r = _client(parts_job["tech"]).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
     assert r.status_code == 200, r.content
@@ -1184,7 +1227,10 @@ def test_every_round_is_planned_on_its_own(parts_job):
     nxt = schedule.visits.exclude(pk=visit.pk).get()
     assert nxt.status == MaintenanceVisit.Status.PLANNED
     assert nxt.due_date == schedule.next_due > visit.due_date
-    assert nxt.assigned_to_id == schedule.assigned_to_id, "back to the standing technician"
+    assert nxt.assigned_to_id is None, (
+        "a fresh round goes out to nobody — the supervisor decides again, "
+        "rather than the last technician being volunteered by default"
+    )
 
 
 @pytest.mark.django_db
@@ -1228,11 +1274,13 @@ def test_a_ticket_raised_against_an_asset_shows_up_as_a_corrective_job():
     assert job.frequency == MaintenanceSchedule.Frequency.ONE_TIME
     assert job.visits.count() == 1, "and it has a round to plan, like any other job"
 
-    # A second ticket on the same asset joins the outage rather than doubling it.
+    # A second ticket on the same asset is refused: the asset is already out
+    # of service on the first one, and two jobs for one fault is the bug.
     r2 = _client(boss).post("/api/tickets/", {**_about(), 
         "title": "Screen still flickering", "device": str(device.id), "category": "repair",
     }, format="json")
-    assert r2.status_code == 201, r2.content
+    assert r2.status_code == 400, r2.content
+    assert ticket.ticket_number in str(r2.data["device"])
     assert MaintenanceSchedule.objects.filter(device=device).count() == 1
 
     device.refresh_from_db()
@@ -1248,7 +1296,6 @@ def test_a_ticket_raised_against_an_asset_shows_up_as_a_corrective_job():
     assert job.status == MaintenanceSchedule.Status.COMPLETED
     assert job.records.count() == 1
     assert device.status == Device.Status.ACTIVE
-
 
 
 @pytest.mark.django_db
@@ -1310,9 +1357,10 @@ def test_finishing_the_job_sends_the_ticket_for_review(corrective_client):
     asset = _Device.objects.create(
         asset_code="AST-RB-1", serial_number="RB-SN-1", status=_Device.Status.ACTIVE,
     )
+    # Raised and nothing more: the lifecycle is what moves it from here.
     ticket = Ticket.objects.create(
         title="Panel dark on the left", device=asset, reported_by=ops,
-        status=Ticket.Status.IN_PROGRESS,
+        status=Ticket.Status.OPEN,
     )
     c.post(
         f"/api/assets/devices/{asset.id}/transition/",
@@ -1322,12 +1370,33 @@ def test_finishing_the_job_sends_the_ticket_for_review(corrective_client):
     job.ticket = ticket
     job.save(update_fields=["ticket"])
 
-    r = c.post("/api/maintenance/records/", {
+    # Filing a record is no longer a way to finish corrective work: it
+    # closed the job with nobody assigned and no evidence of anything.
+    refused = c.post("/api/maintenance/records/", {
         "schedule": str(job.id), "status": "completed",
         "performed_at": timezone.now().isoformat(),
         "notes": "Driver board replaced",
     }, format="json")
-    assert r.status_code == 201, r.content
+    assert refused.status_code == 400, refused.content
+    assert "visit" in str(refused.data["detail"])
+
+    # It is finished on the visit instead: given to somebody, photographed
+    # at both ends, and only then completed.
+    from apps.maintenance import lifecycle
+    from apps.maintenance.models import MaintenanceVisitPhoto
+
+    tech = _User.objects.create_user(username="rb-tech", password="x", role="technician")
+    visit = lifecycle.assign(
+        job, user=ops, technician=tech, due_date=timezone.localdate(),
+    )
+    MaintenanceVisitPhoto.objects.create(
+        visit=visit, kind=MaintenanceVisitPhoto.Kind.BEFORE, image=_png(), taken_by=tech,
+    )
+    lifecycle.start(visit, user=tech)
+    MaintenanceVisitPhoto.objects.create(
+        visit=visit, kind=MaintenanceVisitPhoto.Kind.AFTER, image=_png(), taken_by=tech,
+    )
+    lifecycle.complete(visit, user=tech, resolved=True, remarks="Driver board replaced")
 
     ticket.refresh_from_db()
     assert ticket.status == Ticket.Status.PENDING_REVIEW
@@ -1358,14 +1427,20 @@ def test_cancelling_a_ticket_puts_the_asset_back_in_service(corrective_client):
     job.ticket = ticket
     job.save(update_fields=["ticket"])
 
-    # A reason is not optional: "cancelled" with no why is a gap in the record.
-    bare = c.post(f"/api/tickets/{ticket.id}/transition/",
-                  {"status": "cancelled"}, format="json")
-    assert bare.status_code == 400
-    assert "notes" in bare.data
+    # The ticket no longer carries the work, so it does not carry the
+    # cancelling either — it says where that happens.
+    elsewhere = c.post(f"/api/tickets/{ticket.id}/transition/",
+                       {"status": "cancelled", "notes": "Duplicate"}, format="json")
+    assert elsewhere.status_code == 409, elsewhere.content
+    assert str(job.id) == elsewhere.data["job"]
 
-    r = c.post(f"/api/tickets/{ticket.id}/transition/",
-               {"status": "cancelled", "notes": "Duplicate of the earlier call"}, format="json")
+    # A reason is not optional: "cancelled" with no why is a gap in the record.
+    bare = c.post(f"/api/maintenance/schedules/{job.id}/cancel/", {}, format="json")
+    assert bare.status_code == 400
+    assert "reason" in bare.data
+
+    r = c.post(f"/api/maintenance/schedules/{job.id}/cancel/",
+               {"reason": "Duplicate of the earlier call"}, format="json")
     assert r.status_code == 200, r.content
 
     ticket.refresh_from_db()

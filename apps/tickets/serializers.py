@@ -27,6 +27,18 @@ class TicketAttachmentSerializer(serializers.ModelSerializer):
 
 
 class TicketCommentSerializer(serializers.ModelSerializer):
+    # A data migration needs somewhere durable to record what a value was
+    # before it touched it, and it wrote that next to its explanation. The
+    # explanation belongs in the feed; a job id and a quoted status do not,
+    # so they are kept in the row and taken off on the way out.
+    content = serializers.SerializerMethodField()
+
+    def get_content(self, obj):
+        return "\n".join(
+            line for line in (obj.content or "").splitlines()
+            if not line.lstrip().startswith("[migration ")
+        ).strip()
+
     author_name = serializers.CharField(source="author.get_full_name", read_only=True, default=None)
     author_avatar = serializers.ImageField(source="author.avatar", read_only=True, default=None)
 
@@ -70,6 +82,7 @@ class TicketSerializer(HidesMoney, _AssignmentGuardMixin, serializers.ModelSeria
     is_response_overdue = serializers.BooleanField(read_only=True)
     devices_info = serializers.SerializerMethodField()
     warranty_info = serializers.SerializerMethodField()
+    maintenance_jobs = serializers.SerializerMethodField()
     inventory_unit_serial = serializers.CharField(
         source="inventory_unit.serial_number", read_only=True, default=None
     )
@@ -87,6 +100,26 @@ class TicketSerializer(HidesMoney, _AssignmentGuardMixin, serializers.ModelSeria
         return [
             {"id": str(d.pk), "asset_code": d.asset_code, "display_name": d.display_name}
             for d in obj.devices.all()
+        ]
+
+    def get_maintenance_jobs(self, obj):
+        """The corrective jobs this ticket raised, one per asset.
+
+        The ticket points at the work rather than carrying it, so it has to
+        say exactly where that work is — and a complaint covering two
+        standees has two places to go.
+        """
+        return [
+            {
+                "id": str(j.pk),
+                "status": j.status,
+                "asset_code": j.device.asset_code if j.device_id else None,
+                "asset_name": j.device.display_name if j.device_id else None,
+                "site_name": j.site.name if j.site_id else None,
+            }
+            for j in obj.maintenance_jobs.filter(
+                maintenance_type="corrective"
+            ).select_related("device", "site").order_by("created_at")
         ]
 
     def get_warranty_info(self, obj):
@@ -110,6 +143,45 @@ class TicketSerializer(HidesMoney, _AssignmentGuardMixin, serializers.ModelSeria
             missing = {}
             if not attrs.get("device") and not attrs.get("devices"):
                 missing["device"] = "Say which asset this is about."
+            else:
+                # A fault is reported against something that was in use.
+                # An asset still in procurement, in the store or written off
+                # is not something to raise a fault on.
+                #
+                # Being under maintenance is different, and used to be
+                # lumped in with those: a scheduled clean does not mean the
+                # screen is not broken, and an asset left stranded out of
+                # service could never be reported at all. What actually
+                # stops a second report is the first one still being open.
+                from apps.assets.models import Device
+
+                from apps.maintenance.services import open_corrective_jobs
+
+                usable = (Device.Status.ACTIVE, Device.Status.UNDER_MAINTENANCE)
+                named = [d for d in [attrs.get("device"), *(attrs.get("devices") or [])] if d]
+                idle = [d for d in named if d.status not in usable]
+                if idle:
+                    which = ", ".join(
+                        f"{d.asset_code} is {d.get_status_display()}" for d in idle[:3]
+                    )
+                    missing["device"] = (
+                        f"A ticket is raised on an asset that is in use. {which}."
+                    )
+                else:
+                    busy = []
+                    for d in named:
+                        job = open_corrective_jobs(d).select_related("ticket").first()
+                        live = job.ticket if job and job.ticket_id else None
+                        if live is not None and live.status not in (
+                            Ticket.Status.CLOSED, Ticket.Status.CANCELLED,
+                        ):
+                            busy.append(f"{d.asset_code} is already on {live.ticket_number}")
+                    if busy:
+                        missing["device"] = (
+                            "That fault is already open. "
+                            + ", ".join(busy[:3])
+                            + " — add to it rather than raising a second one."
+                        )
             if not attrs.get("category"):
                 missing["category"] = "Say what kind of work this is."
             # The issue type is what the fault actually is, and what the
@@ -186,6 +258,7 @@ class TicketSerializer(HidesMoney, _AssignmentGuardMixin, serializers.ModelSeria
             "reviewed_by", "reviewed_by_name", "reviewed_at", "review_comments",
             "blocked_reason", "hold_reason",
             "attachments", "comments", "attachment_count", "comment_count",
+            "maintenance_jobs",
             "created_at", "updated_at",
         ]
         read_only_fields = [

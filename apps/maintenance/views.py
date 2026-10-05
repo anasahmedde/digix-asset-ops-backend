@@ -1,11 +1,55 @@
+from django.db.models import DateField
+from django.db.models.functions import Cast, Coalesce
 from rest_framework import serializers as drf_serializers
 from rest_framework import status as drf_status
 from common.noops import RefusesSilentNoOps
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.response import Response
+
+from . import lifecycle
+
+
+def _where_from(data):
+    """The latitude and longitude a client offered, rounded to the column.
+
+    A browser hands back every digit it has and the column keeps seven, so
+    this is the same rounding the map pins get — and a reading that is not
+    a number at all is simply no reading.
+    """
+    from common.geo import Coordinate
+
+    field = Coordinate()
+    out = []
+    for name in ("latitude", "longitude"):
+        raw = data.get(name)
+        try:
+            out.append(field.to_internal_value(raw) if raw not in (None, "", "null") else None)
+        except Exception:
+            out.append(None)
+    # Half a fix is no fix: a latitude with no longitude is not a place.
+    return tuple(out) if all(v is not None for v in out) else (None, None)
+
+
+def _as_date(value, field):
+    """JSON carries a date as text; the lifecycle wants a date.
+
+    Parsing it here rather than deeper down means a typed date is the only
+    kind the state machine ever sees.
+    """
+    from rest_framework.fields import DateField
+
+    if value in (None, ""):
+        return None
+    try:
+        return DateField().to_internal_value(value)
+    except Exception:
+        raise drf_serializers.ValidationError(
+            {field: ["Use a date like 2026-10-31."]}
+        )
 
 from common.permissions import MANAGER_ROLES, CapabilityGate, TechnicianCanCreate
 
@@ -17,6 +61,7 @@ from .models import (
     MaintenanceVisit,
 )
 from .serializers import (
+    MaintenanceVisitPhotoSerializer,
     MaintenancePartDecisionSerializer,
     MaintenancePartRequestSerializer,
     MaintenanceRecordPhotoSerializer,
@@ -138,9 +183,13 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
                 status=drf_status.HTTP_403_FORBIDDEN,
             )
         asked = self.get_object()
-        # Nobody signs off their own request, whatever they hold. A supervisor
-        # who needs a part asks the person they report to, the same as anyone.
-        if asked.requested_by_id == request.user.pk:
+        # Nobody signs off their own request: a supervisor who needs a part
+        # asks the person they report to, the same as anyone. A super admin
+        # is the exception by instruction — it has nobody to report to, so
+        # the rule would simply stop it releasing anything it asked for.
+        # The decision is still recorded against them, so the trail shows
+        # who asked and who released it were the same person.
+        if asked.requested_by_id == request.user.pk and not lifecycle.is_admin(request.user):
             return Response(
                 {"detail": "You cannot approve your own request. Ask the person you report to."},
                 status=drf_status.HTTP_403_FORBIDDEN,
@@ -165,9 +214,24 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
 class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # Reading this is a permission, not just a menu entry.
     read_capability = "view_tickets"
-    queryset = MaintenanceSchedule.objects.select_related(
-        "device", "site", "assigned_to", "ticket"
-    ).prefetch_related("vendors", "visits__assigned_to").all()
+    # Newest first, by the day the work began — which is a different date
+    # depending on what kind of job it is. A breakdown began when somebody
+    # reported it; a schedule began on the day its rounds start. Ordering
+    # by next_due put a job raised this morning below one from last month.
+    queryset = (
+        MaintenanceSchedule.objects.select_related(
+            "device", "site", "assigned_to", "ticket"
+        )
+        .prefetch_related("vendors", "visits__assigned_to", "visits__photos")
+        .annotate(
+            began=Coalesce(
+                Cast("ticket__created_at", DateField()),
+                "start_date",
+                Cast("created_at", DateField()),
+            )
+        )
+        .order_by("-began", "-created_at")
+    )
     serializer_class = MaintenanceScheduleSerializer
     permission_classes = [IsAuthenticated, TechnicianCanCreate, CapabilityGate]
     filterset_fields = [
@@ -175,7 +239,7 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         "ticket",
     ]
     search_fields = ["title", "device__asset_code", "device__display_name"]
-    ordering_fields = ["next_due", "created_at", "priority"]
+    ordering_fields = ["began", "next_due", "created_at", "priority"]
 
     def get_object(self):
         """A technician works their own rounds, not everybody else's.
@@ -193,6 +257,31 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             if obj.assigned_to_id not in (user.pk, None):
                 raise PermissionDenied("This round is not yours to change.")
         return obj
+
+    @action(detail=True, methods=["post"])
+    def assign(self, request, pk=None):
+        """Give the work to a technician, with a date. Opens the next visit."""
+        from apps.accounts.models import User
+
+        job = self.get_object()
+        tech = User.objects.filter(pk=request.data.get("technician")).first()
+        due = _as_date(request.data.get("due_date"), "due_date")
+        visit = (
+            lifecycle.assign(job, user=request.user, technician=tech, due_date=due)
+            if job.ticket_id
+            else lifecycle.assign_round(job, user=request.user, technician=tech, due_date=due)
+        )
+        return Response(
+            MaintenanceVisitSerializer(visit, context=self.get_serializer_context()).data
+        )
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        """Called off: the job closes and the asset goes back into service."""
+        job = self.get_object()
+        lifecycle.cancel(job, user=request.user, reason=request.data.get("reason", "") or "")
+        job.refresh_from_db()
+        return Response(self.get_serializer(job).data)
 
     @action(detail=False, methods=["get"])
     def map_data(self, request):
@@ -256,6 +345,12 @@ class CanPlanOrStartARound(BasePermission):
             return getattr(request.user, "role", None) in ASKING_ROLES
         if view.action in ("update", "partial_update"):
             return getattr(request.user, "role", None) in DECIDING_ROLES
+        # The corrective moves carry their own, finer rules — only the
+        # technician this visit was given to may photograph or finish it,
+        # only the office may review it — and those need the visit itself
+        # to decide, which a has_permission check cannot see.
+        if view.action in ("photos", "complete_visit", "review"):
+            return True
         return False
 
 
@@ -280,20 +375,182 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             {"detail": "A round is completed or skipped, not deleted."}
         )
 
+    def _corrective(self, visit):
+        """Corrective work answers to the lifecycle; preventive does not."""
+        return (
+            visit.schedule.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE
+            and visit.schedule.ticket_id is not None
+        )
+
+    @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
+    def photos(self, request, pk=None):
+        """A photograph of this visit, and what it is a photograph of."""
+        from .models import MaintenanceVisitPhoto
+
+        visit = self.get_object()
+        if visit.assigned_to_id != request.user.pk and not lifecycle.is_office(request.user):
+            return Response(
+                {"detail": "Only the technician on this visit, or the office, can add photos."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+        kind = request.data.get("kind") or MaintenanceVisitPhoto.Kind.OTHER
+        if kind not in dict(MaintenanceVisitPhoto.Kind.choices):
+            return Response({"kind": ["Say whether it is a before, after or other photo."]}, status=400)
+        images = request.FILES.getlist("images") or (
+            [request.FILES["image"]] if "image" in request.FILES else []
+        )
+        if not images:
+            return Response({"images": ["Attach at least one photo."]}, status=400)
+
+        def coord(name):
+            raw = request.data.get(name)
+            return raw if raw not in (None, "", "null") else None
+
+        made = [
+            MaintenanceVisitPhoto.objects.create(
+                visit=visit, kind=kind, image=image,
+                caption=request.data.get("caption", "") or "",
+                taken_by=request.user,
+                latitude=coord("latitude"), longitude=coord("longitude"),
+            )
+            for image in images
+        ]
+        return Response(
+            MaintenanceVisitPhotoSerializer(made, many=True, context=self.get_serializer_context()).data,
+            status=drf_status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"], url_path="complete")
+    def complete_visit(self, request, pk=None):
+        """The technician is done, and says whether the fault is fixed."""
+        visit = self.get_object()
+        if not self._corrective(visit):
+            # A round has no ticket to move, but it is handed in and
+            # accepted exactly as a breakdown is.
+            visit = lifecycle.complete_round(
+                visit, user=request.user,
+                remarks=request.data.get("remarks", "") or "",
+                settlement=request.data.get("parts_settlement") or None,
+            )
+            body = self.get_serializer(visit).data
+            body["return_grn"] = getattr(visit, "return_grn", None)
+            return Response(body)
+        resolved = request.data.get("resolved")
+        if isinstance(resolved, str):
+            resolved = resolved.lower() in ("true", "1", "yes")
+        visit = lifecycle.complete(
+            visit, user=request.user, resolved=resolved,
+            remarks=request.data.get("remarks", "") or "",
+            settlement=request.data.get("parts_settlement") or None,
+        )
+        body = self.get_serializer(visit).data
+        # Where the leftovers went, so the technician is told rather than
+        # left wondering whether the store has them.
+        body["return_grn"] = getattr(visit, "return_grn", None)
+        return Response(body)
+
+    @action(detail=True, methods=["post"])
+    def review(self, request, pk=None):
+        """The office decides: accepted as resolved, or another visit."""
+        from apps.accounts.models import User
+
+        visit = self.get_object()
+        if not self._corrective(visit):
+            # A round is reviewed the same way a breakdown is: accepted, or
+            # sent back for another visit with a reason on the record.
+            call = request.data.get("decision") or MaintenanceVisit.Review.ACCEPTED
+            if call == MaintenanceVisit.Review.UNRESOLVED:
+                tech = User.objects.filter(pk=request.data.get("technician")).first()
+                nxt = lifecycle.send_round_back(
+                    visit, user=request.user,
+                    reason=request.data.get("reason") or "",
+                    technician=tech,
+                    next_due=_as_date(request.data.get("next_due"), "next_due"),
+                    note=request.data.get("note", "") or "",
+                )
+                return Response(self.get_serializer(nxt).data)
+            if call != MaintenanceVisit.Review.ACCEPTED:
+                return Response(
+                    {"decision": ["Say 'accepted' or 'unresolved'."]},
+                    status=drf_status.HTTP_400_BAD_REQUEST,
+                )
+            visit = lifecycle.accept_round(
+                visit, user=request.user,
+                note=request.data.get("note", "") or "",
+                cost_lines=request.data.get("cost_lines") or None,
+                component_prices=request.data.get("component_prices") or None,
+            )
+            return Response(self.get_serializer(visit).data)
+        decision = request.data.get("decision")
+        if decision == MaintenanceVisit.Review.ACCEPTED:
+            visit = lifecycle.accept(
+                visit, user=request.user, note=request.data.get("note", "") or "",
+                cost_lines=request.data.get("cost_lines") or None,
+                component_prices=request.data.get("component_prices") or None,
+            )
+            return Response(self.get_serializer(visit).data)
+        if decision == MaintenanceVisit.Review.UNRESOLVED:
+            tech = User.objects.filter(pk=request.data.get("technician")).first()
+            nxt = lifecycle.mark_unresolved(
+                visit, user=request.user,
+                reason=request.data.get("reason") or "",
+                technician=tech,
+                next_due=_as_date(request.data.get("next_due"), "next_due"),
+                note=request.data.get("note", "") or "",
+            )
+            return Response(self.get_serializer(nxt).data)
+        return Response(
+            {"decision": ["Say 'accepted' or 'unresolved'."]},
+            status=drf_status.HTTP_400_BAD_REQUEST,
+        )
+
     @action(detail=True, methods=["post"])
     def start(self, request, pk=None):
         """Somebody is on site: the round is under way, and so is the job."""
         from django.utils import timezone
 
         visit = self.get_object()
+        # Where the phone says it is. Offered, never demanded: a basement
+        # with no signal is still a place work gets done.
+        where = _where_from(request.data)
+        # Corrective work goes through the lifecycle, which asks for a
+        # BEFORE photo and for the person starting it to be the one it was
+        # given to. Preventive rounds carry on exactly as they were.
+        if self._corrective(visit):
+            return Response(self.get_serializer(
+                lifecycle.start(visit, user=request.user, where=where)
+            ).data)
         if visit.status != MaintenanceVisit.Status.PLANNED:
             return Response(
                 {"detail": f"This round is already {visit.get_status_display().lower()}."},
                 status=drf_status.HTTP_400_BAD_REQUEST,
             )
+        if visit.assigned_to_id is None:
+            return Response(
+                {"detail": "Assign a technician before this round starts."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        # The same evidence a breakdown asks for. A round that starts with
+        # no photograph of what was found cannot later show what changed.
+        if not visit.has_before_photo:
+            return Response(
+                {"detail": "Upload a BEFORE photo first — it is the record of what was found."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        # Asked for a part? Then it is in hand before anybody sets off.
+        waiting = lifecycle.parts_not_yet_in_hand(visit)
+        if waiting:
+            return Response({"detail": (
+                "The store has not handed these over yet: "
+                + ", ".join(f"{line.what} ({why})" for line, why in waiting)
+                + "."
+            )}, status=drf_status.HTTP_400_BAD_REQUEST)
         visit.status = MaintenanceVisit.Status.IN_PROGRESS
         visit.started_at = timezone.now()
-        visit.save(update_fields=["status", "started_at", "updated_at"])
+        visit.start_latitude, visit.start_longitude = where
+        visit.save(update_fields=[
+            "status", "started_at", "start_latitude", "start_longitude", "updated_at",
+        ])
         schedule = visit.schedule
         if schedule.status != MaintenanceSchedule.Status.IN_PROCESS:
             schedule.status = MaintenanceSchedule.Status.IN_PROCESS
@@ -311,6 +568,20 @@ class MaintenanceRecordViewSet(viewsets.ModelViewSet):
     ordering_fields = ["performed_at"]
 
     def perform_create(self, serializer):
+        # Corrective work is finished on its visit: the technician completes
+        # it with an after photo and a verdict, the office accepts it, and
+        # the record is written from that. Filing a record here walked past
+        # all of it and closed a job nobody had even been assigned to.
+        job = serializer.validated_data.get("schedule")
+        if (
+            job is not None
+            and job.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE
+            and job.ticket_id is not None
+        ):
+            raise drf_serializers.ValidationError({"detail": (
+                "Corrective work is completed on its visit, not recorded here. "
+                "Open the job and complete the visit."
+            )})
         record = serializer.save(performed_by=self.request.user)
         # A completed visit rolls its schedule to the next cycle.
         if record.status == MaintenanceRecord.Status.COMPLETED:
