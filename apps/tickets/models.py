@@ -45,6 +45,10 @@ class Ticket(TimeStampedModel):
 
     class Status(models.TextChoices):
         OPEN = "open", "Open"
+        # A technician has been given the work and a visit is planned. The
+        # step between raising a fault and somebody being on site for it,
+        # which the stepper had no word for.
+        ASSIGNED = "assigned", "Assigned"
         IN_PROGRESS = "in_progress", "In Progress"
         ON_HOLD = "on_hold", "On Hold"
         BLOCKED = "blocked", "Blocked"

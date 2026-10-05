@@ -24,7 +24,7 @@ from reportlab.platypus import (
 )
 
 # Printed as the buyer. One place to change it when the letterhead changes.
-COMPANY_NAME = "DIGIX Asset Ops"
+COMPANY_NAME = "DIGIX Asset Management"
 
 # The house standard, seeded onto a new order and editable per order.
 DEFAULT_TERMS = """1. This purchase order number must be quoted on all invoices, packing notes and correspondence.

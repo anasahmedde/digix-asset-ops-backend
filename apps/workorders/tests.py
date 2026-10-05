@@ -47,12 +47,14 @@ def test_execution_asks_work_orders_raises_group_head_approves(build):
         assert r.data["allowed_transitions"] == [] and "Requests" in r.data["hold_reason"]
     assert ops.post(f"/api/assets/production-steps/{assemble.id}/decide/", {"location": "in_house"}, format="json").status_code == 200
 
-    # Work Orders › Requests lists exactly those two, with what the planner expected them to cost.
+    # Work Orders › Requests lists exactly those two, newest first, with what
+    # the planner expected them to cost.
     rows = ops.get("/api/work-orders/requests/").json()["results"]
     assert [(r["operation"], r["asset_code"], r["project_name"]) for r in rows] == [
-        ("Cutting", "AST-WO-1", "WO Rollout"), ("Painting", "AST-WO-1", "WO Rollout"),
+        ("Painting", "AST-WO-1", "WO Rollout"), ("Cutting", "AST-WO-1", "WO Rollout"),
     ]
-    assert str(rows[0]["planned_cost"]).startswith("400")
+    cutting = next(r for r in rows if r["operation"] == "Cutting")
+    assert str(cutting["planned_cost"]).startswith("400")
 
     # One draft order to one vendor, a line per operation, priced from the plan unless overtyped.
     r = ops.post("/api/work-orders/raise/", {
@@ -368,3 +370,28 @@ def test_a_vendor_sends_jobs_in_one_at_a_time(build):
     detail = ops.get(f"/api/work-orders/{order_id}/").json()
     assert all(i["line_state"] == "accepted" for i in detail["items"])
     assert detail["lines_awaiting_inspection"] == 0 and detail["lines_with_vendor"] == 0
+
+
+@pytest.mark.django_db
+def test_a_requested_operation_is_not_taken_back_from_the_project(build):
+    """The project could flip it back in-house on its own, leaving Work
+    Orders holding a request for work the floor had already started."""
+    ops, _ = _client("ops_manager", "ops-takeback")
+    cut = build["steps"][0]
+    assert ops.post(f"/api/assets/production-steps/{cut.id}/decide/", {"location": "external"}, format="json").status_code == 200
+
+    r = ops.post(f"/api/assets/production-steps/{cut.id}/decide/", {"location": "in_house"}, format="json")
+    assert r.status_code == 400, r.content
+    assert "Work Orders" in str(r.data["detail"])
+    cut.refresh_from_db()
+    assert cut.location == "external" and cut.work_order_requested_at is not None
+
+    # The way back is theirs: once sent back, the project decides again.
+    assert ops.post(
+        "/api/work-orders/requests/send-back/",
+        {"step": str(cut.id), "reason": "Our floor is free"}, format="json",
+    ).status_code == 200
+    r = ops.post(f"/api/assets/production-steps/{cut.id}/decide/", {"location": "in_house"}, format="json")
+    assert r.status_code == 200, r.content
+    cut.refresh_from_db()
+    assert cut.location == "in_house"

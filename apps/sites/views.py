@@ -93,7 +93,8 @@ class SiteViewSet(viewsets.ModelViewSet):
         return for_client(
             Site.objects.select_related("client")
             .prefetch_related("contacts")
-            .annotate(device_count=Count("devices")),
+            .annotate(device_count=Count("devices"))
+            .order_by("-created_at"),
             self.request.user,
             "client_id",
         )
@@ -669,6 +670,20 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         # A checklist is a sequence. Step 7 could be marked done with steps 2
         # and 3 untouched, and then the asset went live over the gap - so
         # "Completed" stopped meaning the work before it had been done.
+        # An installation with nobody on it can still be worked through to
+        # the end by whoever has the rights, and the asset then goes live
+        # with no record of who put it up. Somebody has to be named before
+        # the first step moves — our own installer, or the vendor whose
+        # crew is doing it on a turnkey job.
+        job = step.installation
+        if moving_on and new_status != step.status and not (
+            job.installed_by_id or job.vendor_id or (job.external_vendor_name or "").strip()
+        ):
+            raise _VE({"status": (
+                "Nobody is assigned to this installation. Name the installer, "
+                "or the vendor doing it, before the work is recorded against it."
+            )})
+
         if moving_on and new_status != step.status:
             behind = [
                 s.custom_label or s.get_step_type_display()

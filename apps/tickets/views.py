@@ -176,6 +176,38 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
     # ── Assignment (Operations only) ──────────────────────────────────
 
+    @staticmethod
+    def _corrective_job(ticket):
+        """The maintenance job that owns this ticket's work, if there is one."""
+        from apps.maintenance.models import MaintenanceSchedule
+
+        return (
+            MaintenanceSchedule.objects.filter(
+                ticket=ticket,
+                maintenance_type=MaintenanceSchedule.MaintenanceType.CORRECTIVE,
+            )
+            .order_by("created_at")
+            .first()
+        )
+
+    def _refuse_if_owned_by_maintenance(self, ticket, what):
+        """The ticket raises the work; the job carries it.
+
+        Assigning, starting, completing and reviewing all happen on the job
+        now. Leaving a second set of the same actions here is what let one
+        repair hold two statuses and two technicians at once.
+        """
+        job = self._corrective_job(ticket)
+        if job is None:
+            return None
+        return Response(
+            {"detail": (
+                f"{what} happens on this ticket's maintenance job, not here. "
+                f"Open {ticket.ticket_number} in Maintenance."
+            ), "job": str(job.pk)},
+            status=status.HTTP_409_CONFLICT,
+        )
+
     @action(detail=True, methods=["post"], url_path="assign")
     def assign(self, request, pk=None):
         """Assign the ticket to an employee and/or a vendor (in-warranty assets)."""
@@ -185,6 +217,9 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
         ticket = self.get_object()
+        stop = self._refuse_if_owned_by_maintenance(ticket, "Assigning a technician")
+        if stop is not None:
+            return stop
         ser = TicketAssignSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
@@ -235,6 +270,9 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="transition")
     def transition(self, request, pk=None):
         ticket = self.get_object()
+        stop = self._refuse_if_owned_by_maintenance(ticket, "Moving this ticket along")
+        if stop is not None:
+            return stop
         user = request.user
         role = getattr(user, "role", "")
         # A vendor-portal user counts as the assignee on tickets assigned to
@@ -439,6 +477,10 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         parser_classes=[MultiPartParser, FormParser],
     )
     def submit_completion(self, request, pk=None):
+        # Completing a visit is the technician's, on the visit.
+        _stop = self._refuse_if_owned_by_maintenance(self.get_object(), "Submitting work")
+        if _stop is not None:
+            return _stop
         ticket = self.get_object()
 
         if ticket.assigned_to_id != request.user.id and not _is_assigned_vendor(request.user, ticket):
@@ -498,6 +540,9 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="review")
     def review(self, request, pk=None):
         ticket = self.get_object()
+        stop = self._refuse_if_owned_by_maintenance(ticket, "Reviewing the work")
+        if stop is not None:
+            return stop
         user = request.user
         role = getattr(user, "role", "")
         is_reporter = ticket.reported_by_id == user.id

@@ -79,13 +79,20 @@ class ProjectScopeItemSerializer(serializers.ModelSerializer):
     device_name = serializers.CharField(source="device.display_name", read_only=True, default=None)
     component_name = serializers.CharField(source="component.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
+    # Where the asset is actually going. The site used to be typed in here
+    # at planning and again on the asset when it was assigned for
+    # installation, and the two could disagree. Assigning is what opens the
+    # job on the tracker, so that is the answer worth reading.
+    device_site_name = serializers.CharField(
+        source="device.current_site.name", read_only=True, default=None,
+    )
 
     class Meta:
         model = ProjectScopeItem
         fields = [
             "id", "project", "device", "device_code", "device_name",
             "component", "component_name", "quantity",
-            "site", "site_name", "start_date", "notes", "created_at",
+            "site", "site_name", "device_site_name", "start_date", "notes", "created_at",
         ]
         read_only_fields = ["id", "created_at"]
 

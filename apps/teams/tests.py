@@ -721,6 +721,36 @@ def test_plan_costs_each_asset_and_ignores_zero_priced_purchases():
 # ---------------------------------------------------------------------------
 # Execution records what things actually cost, without moving the estimate
 # ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+def test_an_overhead_can_be_corrected_while_the_budget_is_open():
+    """A rate typed wrong meant deleting the line and starting again."""
+    from apps.clients.models import Client
+    from apps.teams.models import Project, ProjectCostLine
+
+    boss = User.objects.create_user(username="oh-boss", password="x", role="ops_manager")
+    client = Client.objects.create(name="Overhead Client")
+    project = Project.objects.create(name="Overhead Project", client=client)
+    c = _client(boss)
+
+    r = c.post("/api/teams/cost-lines/", {
+        "project": str(project.id), "cost_type": "Travelling",
+        "description": "Travelling", "quantity": "2", "unit_cost": "20000",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    line = ProjectCostLine.objects.get(pk=r.data["id"])
+
+    fixed = c.patch(f"/api/teams/cost-lines/{line.id}/", {
+        "cost_type": "Transport", "description": "Transport and delivery",
+        "quantity": "3", "unit_cost": "15000",
+    }, format="json")
+    assert fixed.status_code == 200, fixed.content
+    line.refresh_from_db()
+    assert line.cost_type == "Transport" and str(line.quantity) == "3.00"
+    assert str(line.unit_cost) == "15000.00"
+
+
+
 @pytest.mark.django_db
 def test_actual_costs_are_recorded_against_the_approved_budget():
     from decimal import Decimal

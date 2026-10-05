@@ -40,7 +40,7 @@ def build_quotation_pdf(quotation) -> bytes:
     company = _company()
 
     # ── Header: company + quotation number ───────────────────────────
-    company_name = company.name if company else "DIGIX Asset Ops"
+    company_name = company.name if company else "DIGIX Asset Management"
     company_lines = [company_name]
     if company:
         if company.address:

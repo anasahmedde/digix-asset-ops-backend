@@ -196,7 +196,7 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             )
             .exclude(status__in=(ProductionStep.Status.COMPLETED, ProductionStep.Status.SKIPPED))
             .select_related("device", "device__project", "device__device_model")
-            .order_by("work_order_requested_at")
+            .order_by("-work_order_requested_at")
         )
         scope = {
             r["device_id"]: (str(r["project_id"]), r["project__name"], r["project__target_date"])
@@ -259,6 +259,13 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         for step in steps:
             if step.live_work_orders().exists():
                 return Response({"steps": [f"'{step.name}' on {step.device.asset_code} is already on a work order."]}, status=400)
+            waiting = step.materials_pending
+            if waiting:
+                named = ", ".join(waiting[:3]) + ("…" if len(waiting) > 3 else "")
+                return Response({"steps": [
+                    f"'{step.name}' on {step.device.asset_code} is still waiting on material "
+                    f"({named}). A vendor cannot start on parts that have not been issued."
+                ]}, status=400)
             if step.status in (ProductionStep.Status.COMPLETED, ProductionStep.Status.SKIPPED):
                 return Response({"steps": [f"'{step.name}' on {step.device.asset_code} is already finished."]}, status=400)
 
@@ -420,7 +427,7 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         """Delivered work waiting to be inspected."""
         qs = self.filter_queryset(self.get_queryset()).filter(
             status__in=(WorkOrder.Status.DELIVERED, WorkOrder.Status.PARTIALLY_DELIVERED)
-        ).order_by("delivered_at", "updated_at")
+        ).order_by("-delivered_at", "-updated_at")
         return Response({"results": WorkOrderSerializer(qs, many=True).data})
 
     @action(detail=True, methods=["get"], url_path="print")
