@@ -21,11 +21,15 @@ def _about(device=True):
     """
     from apps.assets.models import Device
 
-    basics = {"category": "repair", "priority": "medium"}
+    from apps.tickets.models import TicketIssueType
+
+    kind, _ = TicketIssueType.objects.get_or_create(name="General Fault")
+    basics = {"category": "repair", "priority": "medium", "issue_type": str(kind.id)}
     if not device:
         return basics
     dev, _ = Device.objects.get_or_create(
-        asset_code="TKT-ABOUT-1", defaults={"serial_number": "TKT-ABOUT-SN-1"},
+        asset_code="TKT-ABOUT-1",
+        defaults={"serial_number": "TKT-ABOUT-SN-1", "status": Device.Status.ACTIVE},
     )
     return {"device": str(dev.id), **basics}
 
@@ -64,7 +68,7 @@ def test_occurrence_and_sla(people):
     from apps.assets.models import Brand, Device, DeviceModel
 
     model = DeviceModel.objects.create(brand=Brand.objects.create(name="WFB"), name="WF-55")
-    device = Device.objects.create(device_model=model, serial_number="WF-SN-1")
+    device = Device.objects.create(device_model=model, serial_number="WF-SN-1", status=Device.Status.ACTIVE)
 
     c = _client(people["marketing"])
     ids = []
@@ -640,7 +644,7 @@ def warranty_device(db):
 
     brand = Brand.objects.create(name="WtyBrand")
     dm = DeviceModel.objects.create(brand=brand, name="W-1")
-    return Device.objects.create(device_model=dm, asset_code="AST-WTY-1", serial_number="WTY-1")
+    return Device.objects.create(device_model=dm, asset_code="AST-WTY-1", serial_number="WTY-1", status=Device.Status.ACTIVE)
 
 
 def _make_warranty(device, wtype="client", months=12, start_offset_days=0):
@@ -738,7 +742,7 @@ def test_multi_asset_ticket(people, warranty_device):
 
     brand = Brand.objects.create(name="MABrand")
     dm = DeviceModel.objects.create(brand=brand, name="MA-1")
-    second = Device.objects.create(device_model=dm, asset_code="AST-MA-2", serial_number="MA-2")
+    second = Device.objects.create(device_model=dm, asset_code="AST-MA-2", serial_number="MA-2", status=Device.Status.ACTIVE)
     c = _client(people["ops"])
     r = c.post("/api/tickets/", {**_about(device=False),
         "title": "Predictive: adapters batch", "category": "predictive_maintenance",
@@ -763,7 +767,8 @@ def test_warranty_must_belong_to_ticket_device(people, warranty_device):
     foreign_brand = Brand.objects.create(name="ForeignBrand")
     foreign_dm = DeviceModel.objects.create(brand=foreign_brand, name="F-1")
     foreign_device = Device.objects.create(
-        device_model=foreign_dm, asset_code="AST-F-1", serial_number="F-1"
+        device_model=foreign_dm, asset_code="AST-F-1", serial_number="F-1",
+        status=Device.Status.ACTIVE,
     )
     foreign_warranty = _make_warranty(foreign_device)
     c = _client(people["tech"])
@@ -813,7 +818,7 @@ def test_update_keeps_primary_device_linked(people, warranty_device):
     }, format="json").json()["id"]
     brand = Brand.objects.create(name="SyncBrand")
     dm = DeviceModel.objects.create(brand=brand, name="S-1")
-    new_primary = Device.objects.create(device_model=dm, asset_code="AST-S-1", serial_number="S-1")
+    new_primary = Device.objects.create(device_model=dm, asset_code="AST-S-1", serial_number="S-1", status=Device.Status.ACTIVE)
     r = c.patch(f"/api/tickets/{ticket_id}/", {"device": str(new_primary.pk)}, format="json")
     assert r.status_code == 200, r.content
     codes = {d["asset_code"] for d in r.json()["devices_info"]}
@@ -1063,14 +1068,15 @@ def test_a_ticket_says_what_it_is_about(people):
     c = _client(people["ops"])
     bare = c.post("/api/tickets/", {"title": "something is wrong"}, format="json")
     assert bare.status_code == 400, bare.content
-    assert set(bare.data) >= {"device", "category", "priority"}
+    assert set(bare.data) >= {"device", "category", "priority", "issue_type"}
 
     # Naming the assets in `devices` is naming the asset.
     from apps.assets.models import Device
 
-    d1 = Device.objects.create(asset_code="AST-SAYS-1", serial_number="SAYS-1")
+    d1 = Device.objects.create(asset_code="AST-SAYS-1", serial_number="SAYS-1", status=Device.Status.ACTIVE)
     r = c.post("/api/tickets/", {
         "title": "two screens flicker", "category": "repair", "priority": "high",
+        "issue_type": str(TicketIssueType.objects.first().id),
         "devices": [str(d1.pk)],
     }, format="json")
     assert r.status_code == 201, r.content

@@ -45,18 +45,32 @@ def component_unit(component) -> str:
     return "piece"
 
 
+def last_procured_price(**lookup):
+    """(unit price, PO number) of the last receipt of this inventory line.
+
+    Only goods that were really received count — an order that never arrived
+    says nothing about the price — and a line received at zero was never
+    priced. ``lookup`` is ``inventory_item_id`` or ``inventory_unit_type_id``.
+    """
+    from apps.procurement.models import PurchaseOrderItem
+
+    last = (
+        PurchaseOrderItem.objects.filter(received_quantity__gt=0, unit_price__gt=0, **lookup)
+        .select_related("purchase_order")
+        .order_by("-purchase_order__order_date", "-created_at")
+        .first()
+    )
+    return (money(last.unit_price), last.purchase_order.po_number) if last else (None, None)
+
+
 def component_unit_price(component):
     """(unit price, where it came from) for one component line.
 
     A price set by hand wins: the planner knows something the record does not
     — a quote, a price rise, a one-off rate. Otherwise the last procured price
     wins, since it is what the thing actually costs now, and an item that has
-    never been bought falls back to the cost it was opened with. Only goods
-    that were really received count as "procured" — an order that never
-    arrived says nothing about the price.
+    never been bought falls back to the cost it was opened with.
     """
-    from apps.procurement.models import PurchaseOrderItem
-
     if component.planned_unit_price is not None:
         return money(component.planned_unit_price), "Set by hand"
 
@@ -69,15 +83,9 @@ def component_unit_price(component):
     else:
         return None, "No inventory link"
 
-    last = (
-        # A line received at zero was never priced; it says nothing about cost.
-        PurchaseOrderItem.objects.filter(received_quantity__gt=0, unit_price__gt=0, **lookup)
-        .select_related("purchase_order")
-        .order_by("-purchase_order__order_date", "-created_at")
-        .first()
-    )
-    if last is not None:
-        return money(last.unit_price), f"Last procured · {last.purchase_order.po_number}"
+    price, po_number = last_procured_price(**lookup)
+    if price is not None:
+        return price, f"Last procured · {po_number}"
     if opening is not None and opening > 0:
         return money(opening), "Inventory opening cost"
     return None, "No price on record"

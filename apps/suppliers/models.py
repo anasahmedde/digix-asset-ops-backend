@@ -35,7 +35,9 @@ class Supplier(TimeStampedModel):
     is_active = models.BooleanField(default=True)
 
     class Meta:
-        ordering = ["name"]
+        # Newest first, like every other register. A catalogue that
+        # fills a dropdown stays alphabetical — see PLATFORM_STANDARD §6.4.
+        ordering = ["-created_at"]
 
     def __str__(self):
         return self.name

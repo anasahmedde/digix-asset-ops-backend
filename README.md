@@ -1,4 +1,4 @@
-# DIGIX Asset Ops -- Backend
+# DIGIX Asset Management -- Backend
 
 Django REST API for the DIGIX Asset Management & Operations Platform.
 

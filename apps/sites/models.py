@@ -25,7 +25,10 @@ class Site(TimeStampedModel):
     is_active = models.BooleanField(default=True)
 
     class Meta:
-        ordering = ["name"]
+        # Newest first, like every other register. Alphabetical meant a site
+        # defined this morning landed wherever its name fell, so the one you
+        # just added was the one you had to hunt for.
+        ordering = ["-created_at"]
 
     def __str__(self):
         return self.name

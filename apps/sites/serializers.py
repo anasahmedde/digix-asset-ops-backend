@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from apps.clients.models import Client
+from common.geo import Coordinate
 
 from .models import (
     DeviceInstallation,
@@ -32,6 +33,8 @@ class SiteContactSerializer(serializers.ModelSerializer):
 
 
 class SiteListSerializer(serializers.ModelSerializer):
+    latitude = Coordinate()
+    longitude = Coordinate()
     device_count = serializers.IntegerField(read_only=True, default=0)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
 
@@ -45,6 +48,8 @@ class SiteListSerializer(serializers.ModelSerializer):
 
 
 class SiteDetailSerializer(serializers.ModelSerializer):
+    latitude = Coordinate()
+    longitude = Coordinate()
     zones = SiteZoneSerializer(many=True, read_only=True)
     contacts = SiteContactSerializer(many=True, read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)

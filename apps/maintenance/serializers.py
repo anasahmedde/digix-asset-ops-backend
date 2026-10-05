@@ -8,6 +8,7 @@ from .models import (
     MaintenanceRecordPhoto,
     MaintenanceSchedule,
     MaintenanceVisit,
+    MaintenanceVisitPhoto,
 )
 
 
@@ -19,6 +20,36 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
     # Which order the asset belongs to. It reaches a project by its own link or
     # a Scope row, so the asset is asked rather than one field being read.
     project_name = serializers.SerializerMethodField()
+    # Corrective: the whole history, and what this reader may do next. The
+    # clients render their buttons from this instead of each keeping their
+    # own copy of the rules, which is how they came to disagree.
+    # Resolved at call time: the visit serializer is defined below this one.
+    visits = serializers.SerializerMethodField()
+    allowed_actions = serializers.SerializerMethodField()
+
+    def get_visits(self, obj):
+        """Every attendance on this job, breakdown or scheduled round alike.
+
+        Both are rendered by the same panel, so both are described the
+        same way — a round that reported itself differently is how the two
+        screens drifted apart in the first place.
+        """
+        rounds = obj.visits.order_by("sequence", "created_at")
+        return MaintenanceVisitSerializer(rounds, many=True, context=self.context).data
+    is_corrective = serializers.SerializerMethodField()
+
+    def get_is_corrective(self, obj):
+        return (
+            obj.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE
+            and obj.ticket_id is not None
+        )
+
+    def get_allowed_actions(self, obj):
+        from . import lifecycle
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return lifecycle.allowed_actions(obj, user) if user else []
 
     def get_project_name(self, obj):
         if obj.device_id is None:
@@ -33,6 +64,54 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
     next_visit_assignee = serializers.SerializerMethodField()
     # The fault that raised this job, when it came in as a ticket.
     ticket_number = serializers.CharField(source="ticket.ticket_number", read_only=True, default=None)
+    # What the person reporting the fault actually wrote. Read from the
+    # ticket, not kept again here: one answer, and it stays right when the
+    # ticket is edited.
+    ticket_description = serializers.CharField(
+        source="ticket.description", read_only=True, default="",
+    )
+    ticket_raised_at = serializers.DateTimeField(
+        source="ticket.created_at", read_only=True, default=None,
+    )
+    # The last person who actually worked on this asset, on any job of any
+    # kind. "Who was this schedule assigned to" is a different question and
+    # the wrong one for a fault: what the office wants to know is who was
+    # here last, because they are the one who knows the thing.
+    last_technician_on_asset = serializers.SerializerMethodField()
+
+    def get_last_technician_on_asset(self, obj):
+        if not obj.device_id:
+            return None
+        from .models import MaintenanceRecord
+
+        done = (
+            MaintenanceRecord.objects
+            .filter(schedule__device_id=obj.device_id, performed_by__isnull=False)
+            .select_related("performed_by")
+            .order_by("-performed_at")
+            .first()
+        )
+        if done is not None:
+            who = done.performed_by
+            return {
+                "name": who.get_full_name() or who.username,
+                "when": done.performed_at,
+            }
+        # Nothing finished yet — the last person who was sent is the best
+        # answer there is.
+        from .models import MaintenanceVisit
+
+        sent = (
+            MaintenanceVisit.objects
+            .filter(schedule__device_id=obj.device_id, assigned_to__isnull=False)
+            .select_related("assigned_to")
+            .order_by("-due_date", "-created_at")
+            .first()
+        )
+        if sent is None:
+            return None
+        who = sent.assigned_to
+        return {"name": who.get_full_name() or who.username, "when": None}
     vendor_names = serializers.SerializerMethodField()
     # A schedule has to say when its rounds begin: the next one due is worked
     # out from it, so without it there is nothing to work out.
@@ -48,7 +127,9 @@ class MaintenanceScheduleSerializer(serializers.ModelSerializer):
             "start_date", "next_due", "instructions", "required_components",
             "status", "status_display",
             "effective_status", "is_active", "next_visit_assignee",
-            "ticket", "ticket_number",
+            "ticket", "ticket_number", "ticket_description", "ticket_raised_at",
+            "last_technician_on_asset",
+            "visits", "allowed_actions", "is_corrective",
             "created_at", "updated_at",
         ]
         # next_due is worked out from the start date and the frequency, and
@@ -146,6 +227,27 @@ class MaintenanceRecordPhotoSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "taken_by", "created_at"]
 
 
+class MaintenanceVisitPhotoSerializer(serializers.ModelSerializer):
+    """A photograph, and what it is a photograph of."""
+
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+    taken_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MaintenanceVisitPhoto
+        fields = [
+            "id", "visit", "kind", "kind_display", "image", "caption",
+            "taken_by", "taken_by_name", "taken_at", "latitude", "longitude",
+        ]
+        # The time and the photographer are the server's to record, not the
+        # caller's to claim.
+        read_only_fields = ["id", "taken_by", "taken_by_name", "taken_at"]
+
+    def get_taken_by_name(self, obj):
+        who = obj.taken_by
+        return (who.get_full_name() or who.username) if who else None
+
+
 class MaintenanceVisitSerializer(HidesMoney, serializers.ModelSerializer):
     """One round of a schedule — when it is due and who is going."""
 
@@ -163,18 +265,73 @@ class MaintenanceVisitSerializer(HidesMoney, serializers.ModelSerializer):
     record_notes = serializers.CharField(source="record.notes", read_only=True, default="")
     component_names = serializers.SerializerMethodField()
     photos = serializers.SerializerMethodField()
+    # Corrective: the evidence and the verdicts the office reviews.
+    visit_photos = MaintenanceVisitPhotoSerializer(source="photos", many=True, read_only=True)
+    review_decision_display = serializers.CharField(
+        source="get_review_decision_display", read_only=True, default="",
+    )
+    reviewed_by_name = serializers.SerializerMethodField()
+    has_before_photo = serializers.BooleanField(read_only=True)
+    has_after_photo = serializers.BooleanField(read_only=True)
+    # What the parts this visit used are worth, so the person accepting it
+    # sees the figure before they commit to it rather than after.
+    component_costs = serializers.SerializerMethodField()
+    cost_lines = serializers.SerializerMethodField()
+
+    def get_component_costs(self, obj):
+        from . import lifecycle
+
+        return [
+            {
+                "part_request": row["part_request"],
+                "description": row["description"],
+                "quantity": str(row["quantity"]),
+                "unit_cost": str(row["unit_cost"]) if row["unit_cost"] is not None else None,
+                "amount": str(row["amount"]),
+            }
+            for row in lifecycle.component_costs(obj)
+        ]
+
+    def get_cost_lines(self, obj):
+        """What it came to in the end, once the office had accepted it."""
+        if not obj.record_id:
+            return []
+        return [
+            {
+                "id": str(line.pk), "source": line.source,
+                "description": line.description,
+                "quantity": str(line.quantity) if line.quantity is not None else None,
+                "unit_cost": str(line.unit_cost) if line.unit_cost is not None else None,
+                "amount": str(line.amount),
+            }
+            for line in obj.record.cost_lines.all()
+        ]
 
     class Meta:
         model = MaintenanceVisit
         fields = [
             "id", "schedule", "schedule_title", "due_date", "assigned_to", "assigned_to_name",
             "status", "status_display", "started_at", "record", "notes",
+            "start_latitude", "start_longitude",
             "performed_at", "performed_by_name", "cost", "is_billable", "charge_to",
             "record_notes", "component_names", "photos",
+            "sequence", "completed_at", "resolved", "remarks",
+            "review_decision", "review_decision_display", "review_reason",
+            "review_note", "reviewed_by", "reviewed_by_name",
+            "reviewed_at", "visit_photos", "has_before_photo", "has_after_photo",
+            "component_costs", "cost_lines",
             "created_at", "updated_at",
         ]
         # A round is closed out by recording the visit, not by editing it here.
-        read_only_fields = ["id", "schedule", "status", "started_at", "record", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "schedule", "status", "started_at", "record", "created_at", "updated_at",
+            # Stamped by the act of starting, never typed in afterwards.
+            "start_latitude", "start_longitude",
+            # Everything below is written by the lifecycle, never by a PATCH:
+            # a verdict somebody could edit is not a verdict.
+            "sequence", "completed_at", "resolved", "remarks", "review_decision",
+            "review_reason", "review_note", "reviewed_by", "reviewed_at",
+        ]
 
     def _name(self, user):
         if user is None:
@@ -183,6 +340,9 @@ class MaintenanceVisitSerializer(HidesMoney, serializers.ModelSerializer):
 
     def get_assigned_to_name(self, obj):
         return self._name(obj.assigned_to)
+
+    def get_reviewed_by_name(self, obj):
+        return self._name(obj.reviewed_by)
 
     def get_performed_by_name(self, obj):
         return self._name(obj.record.performed_by) if obj.record_id else None

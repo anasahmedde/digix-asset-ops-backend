@@ -150,20 +150,37 @@ class MaintenanceSchedule(TimeStampedModel):
         with whoever is going. Completing a round rolls the schedule and opens
         the round after it.
         """
+        # A round waiting on the office is still open. Leaving it out of
+        # this meant the next caller found nothing open and started a
+        # second round while the first was still being reviewed.
         visit = (
             self.visits.filter(
-                status__in=(MaintenanceVisit.Status.PLANNED, MaintenanceVisit.Status.IN_PROGRESS)
+                status__in=(
+                    MaintenanceVisit.Status.PLANNED,
+                    MaintenanceVisit.Status.IN_PROGRESS,
+                    MaintenanceVisit.Status.AWAITING_REVIEW,
+                )
             )
             .order_by("due_date", "created_at")
             .first()
         )
         if visit is None:
+            # A fresh round is numbered after the last one. The very first
+            # takes the technician the schedule was set up with, because
+            # that is what the form asked for; every round after it goes
+            # out to nobody, so the supervisor decides again each time.
+            # Carrying the last technician forward made the screen offer
+            # "Reassign" for a round nobody had been given.
+            from django.db.models import Max
+
+            last = self.visits.aggregate(n=Max("sequence"))["n"] or 0
             return MaintenanceVisit.objects.create(
-                schedule=self, due_date=self.next_due, assigned_to=self.assigned_to,
+                schedule=self, due_date=self.next_due, sequence=last + 1,
+                assigned_to=self.assigned_to if last == 0 else None,
             )
         # The open round is the next one due, so it follows the schedule when
-        # the schedule is what moved.
-        if visit.due_date != self.next_due:
+        # the schedule is what moved — but only while it is still plannable.
+        if visit.status == MaintenanceVisit.Status.PLANNED and visit.due_date != self.next_due:
             visit.due_date = self.next_due
             visit.save(update_fields=["due_date", "updated_at"])
         return visit
@@ -193,8 +210,15 @@ class MaintenanceVisit(TimeStampedModel):
     class Status(models.TextChoices):
         PLANNED = "planned", "Planned"
         IN_PROGRESS = "in_progress", "In Progress"
+        # Corrective only: the technician says the work is done; the office
+        # has not yet looked at it. A preventive round never sits here.
+        AWAITING_REVIEW = "awaiting_review", "Awaiting Review"
         COMPLETED = "completed", "Completed"
         SKIPPED = "skipped", "Skipped"
+
+    class Review(models.TextChoices):
+        ACCEPTED = "accepted", "Accepted as resolved"
+        UNRESOLVED = "unresolved", "Marked unresolved"
 
     schedule = models.ForeignKey(
         MaintenanceSchedule, on_delete=models.CASCADE, related_name="visits"
@@ -206,14 +230,49 @@ class MaintenanceVisit(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="maintenance_visits",
     )
-    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PLANNED)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PLANNED)
     started_at = models.DateTimeField(null=True, blank=True)
+    # Where the phone was standing when work began. A time on its own says
+    # somebody pressed a button; a time and a place says somebody was there.
+    start_latitude = models.DecimalField(
+        max_digits=10, decimal_places=7, null=True, blank=True,
+    )
+    start_longitude = models.DecimalField(
+        max_digits=10, decimal_places=7, null=True, blank=True,
+    )
     # What was recorded when the round was closed out.
     record = models.OneToOneField(
         "maintenance.MaintenanceRecord", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="visit",
     )
     notes = models.TextField(blank=True)
+
+    # ── Corrective only ───────────────────────────────────────────────
+    # A fault takes as many trips as it takes. Visit 1, 2, 3 on the same
+    # job, each with its own technician, photographs and verdict — which is
+    # the history the office reads when deciding whether it is really done.
+    sequence = models.PositiveSmallIntegerField(default=1)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    # What the technician reckons, which is a recommendation and not the
+    # decision: null until they say, then True or False.
+    resolved = models.BooleanField(null=True, blank=True)
+    remarks = models.TextField(blank=True)
+
+    # What the office decided about it.
+    review_decision = models.CharField(
+        max_length=12, choices=Review.choices, blank=True, default="",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="maintenance_visits_reviewed",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    # Why it went back, in the reviewer's own words. A list of reasons
+    # could never cover a real fault, and the reason is what the next
+    # technician reads before setting off.
+    review_reason = models.TextField(blank=True, default="")
+    review_note = models.TextField(blank=True)
 
     class Meta:
         ordering = ["due_date", "created_at"]
@@ -224,6 +283,52 @@ class MaintenanceVisit(TimeStampedModel):
     @property
     def is_open(self) -> bool:
         return self.status in (self.Status.PLANNED, self.Status.IN_PROGRESS)
+
+    def photos_of(self, kind) -> int:
+        return self.photos.filter(kind=kind).count()
+
+    @property
+    def has_before_photo(self) -> bool:
+        return self.photos_of(MaintenanceVisitPhoto.Kind.BEFORE) > 0
+
+    @property
+    def has_after_photo(self) -> bool:
+        return self.photos_of(MaintenanceVisitPhoto.Kind.AFTER) > 0
+
+
+class MaintenanceVisitPhoto(TimeStampedModel):
+    """A photograph of one visit, and what it is a photograph of.
+
+    Before and after are the evidence the office reviews, so which one a
+    picture is cannot be left to a caption. The time is the server's, not
+    the phone's: a device clock is somebody else's to set.
+    """
+
+    class Kind(models.TextChoices):
+        BEFORE = "before", "Before"
+        AFTER = "after", "After"
+        OTHER = "other", "Other"
+
+    visit = models.ForeignKey(
+        MaintenanceVisit, on_delete=models.CASCADE, related_name="photos",
+    )
+    kind = models.CharField(max_length=8, choices=Kind.choices, default=Kind.OTHER)
+    image = models.ImageField(upload_to="maintenance/visits/")
+    caption = models.CharField(max_length=300, blank=True)
+    taken_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="maintenance_visit_photos",
+    )
+    taken_at = models.DateTimeField(auto_now_add=True)
+    # Where the phone said it was, when it could say.
+    latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+    longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+
+    class Meta:
+        ordering = ["taken_at"]
+
+    def __str__(self):
+        return f"{self.get_kind_display()} — {self.visit}"
 
 
 class MaintenanceRecord(TimeStampedModel):
@@ -261,6 +366,36 @@ class MaintenanceRecord(TimeStampedModel):
 
     def __str__(self):
         return f"{self.schedule.title} - {self.performed_at.date()}"
+
+
+class MaintenanceCostLine(TimeStampedModel):
+    """One line of what a visit cost, and where the figure came from.
+
+    The parts are priced from the store's own unit cost so nobody retypes
+    them; everything else — a hired lift, a vendor's call-out, an hour of
+    somebody's Saturday — is written in by the person accepting the work.
+    Keeping both as lines means the total is always something you can read
+    the reasons for, rather than one number somebody has to be trusted on.
+    """
+
+    class Source(models.TextChoices):
+        COMPONENT = "component", "Component used"
+        MANUAL = "manual", "Added on review"
+
+    record = models.ForeignKey(
+        "maintenance.MaintenanceRecord", on_delete=models.CASCADE, related_name="cost_lines",
+    )
+    source = models.CharField(max_length=12, choices=Source.choices, default=Source.MANUAL)
+    description = models.CharField(max_length=255)
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    class Meta:
+        ordering = ["source", "created_at"]
+
+    def __str__(self):
+        return f"{self.description} — {self.amount}"
 
 
 class MaintenanceRecordPhoto(TimeStampedModel):

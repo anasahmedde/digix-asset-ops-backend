@@ -787,6 +787,36 @@ def test_vendor_sees_only_own_installations(vendor_install, installation):
     assert _client(vendor_install["unlinked_vendor"]).get("/api/sites/installations/").data["count"] == 0
 
 
+
+@pytest.mark.django_db
+def test_a_step_will_not_move_until_somebody_is_named(installation, tech):
+    """An asset went live with no record of who had put it up.
+
+    Somebody is named once, before the first step moves — our own
+    technician, or the vendor whose crew is doing a turnkey job.
+    """
+    installation.installed_by = None
+    installation.vendor = None
+    installation.external_vendor_name = ""
+    installation.save(update_fields=["installed_by", "vendor", "external_vendor_name"])
+
+    step = installation.steps.order_by("step_number").first()
+    url = f"/api/sites/installation-steps/{step.id}/"
+    # Only a super admin or the assigned installer may move a step, and
+    # there is no assigned installer — which is the whole point.
+    boss = User.objects.create_user(username="inst-boss", password="x", role="super_admin")
+    c = _client(boss)
+
+    bare = c.patch(url, {"status": "in_progress"}, format="json")
+    assert bare.status_code == 400, bare.content
+    assert "Nobody is assigned" in str(bare.data["status"])
+
+    installation.installed_by = tech
+    installation.save(update_fields=["installed_by"])
+    ok = c.patch(url, {"status": "in_progress"}, format="json")
+    assert ok.status_code == 200, ok.content
+
+
 @pytest.mark.django_db
 def test_vendor_advances_own_step_403_on_others(vendor_install, installation):
     c = _client(vendor_install["vendor_user"])
@@ -1613,3 +1643,59 @@ def test_an_in_house_build_can_go_live_once_its_checklist_is_done(ops, tech, ins
     assert device.status == "active"
     # And the record names the person who pressed the button, not the installer.
     assert live.data["device_activated_by"] == (ops.get_full_name() or ops.username)
+
+
+@pytest.mark.django_db
+def test_a_pin_dropped_on_the_map_is_accepted(ops):
+    """A map hands back every digit it has; the column keeps seven decimal
+    places, and DRF counted the digits before rounding any of them."""
+    r = _client(ops).post("/api/sites/sites/", {
+        "name": "Pin Site", "city": "Karachi", "address": "Saddar Town",
+        "latitude": 24.858363984674215, "longitude": 67.05144901275635,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert str(r.data["latitude"]) == "24.8583640"
+    assert str(r.data["longitude"]) == "67.0514490"
+
+
+@pytest.mark.django_db
+def test_the_site_s_headline_contact_follows_its_primary_poc(ops):
+    """The form asked for a contact twice — three fields on the site, and a
+    list of people. It asks once now; reports still read the three."""
+    from apps.sites.models import SiteContact
+
+    site = Site.objects.create(name="Contact Site", address="1 Road", city="Lahore")
+    c = _client(ops)
+
+    first = SiteContact.objects.create(
+        site=site, name="Ayesha Khan", designation="Facilities Manager",
+        phone="0300-1112222", email="ayesha@example.pk", is_primary=True,
+    )
+    site.refresh_from_db()
+    assert site.contact_person == "Ayesha Khan"
+    assert site.contact_phone == "0300-1112222"
+    assert site.contact_email == "ayesha@example.pk"
+
+    # A second person marked primary takes over, and only one stays primary.
+    second = SiteContact.objects.create(
+        site=site, name="Bilal Ahmed", designation="Security Lead",
+        phone="0301-3334444", is_primary=True,
+    )
+    site.refresh_from_db()
+    first.refresh_from_db()
+    assert site.contact_person == "Bilal Ahmed" and first.is_primary is False
+
+    # Added through the API, the same way the dialog adds them.
+    r = c.post("/api/sites/site-contacts/", {
+        "site": str(site.id), "name": "Dania Raza", "designation": "Ops",
+        "phone": "0302-5556666", "is_primary": True,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    site.refresh_from_db()
+    assert site.contact_person == "Dania Raza"
+
+    # And removing everyone leaves nothing behind pretending to be a contact.
+    SiteContact.objects.filter(site=site).delete()
+    second.delete()
+    site.refresh_from_db()
+    assert site.contact_person == "" and site.contact_phone == ""

@@ -27,11 +27,19 @@ OPEN_STATUSES = (
 
 
 def open_corrective_jobs(device):
-    """The unfinished corrective jobs raised against an asset."""
+    """The unfinished corrective jobs raised against an asset.
+
+    A job that has been switched off is not one of them, whatever its
+    status column still says. The two can disagree — a ticket deleted out
+    from under a job leaves it inactive but never closed — and a job in
+    that state can never be worked or finished, so holding an asset out of
+    service on its account strands the asset for good.
+    """
     return MaintenanceSchedule.objects.filter(
         device=device,
         maintenance_type=MaintenanceSchedule.MaintenanceType.CORRECTIVE,
         status__in=OPEN_STATUSES,
+        is_active=True,
     )
 
 
@@ -66,8 +74,18 @@ def open_corrective_job(device, user=None, reason: str = "", details=None, ticke
         assigned_to=details.get("assigned_to") or device.assigned_technician,
         # The date the repair was promised by — what "overdue" is measured against.
         next_due=details.get("next_due") or timezone.localdate(),
-        status=MaintenanceSchedule.Status.IN_PROCESS,
-        instructions=(details.get("instructions") or "").strip() or note,
+        # Nobody has been given it yet, so it is Pending — not In Process.
+        # Born "in process" was how a brand-new job came to say work was
+        # under way while its ticket still said Open.
+        status=MaintenanceSchedule.Status.PENDING,
+        # A caller that says what the instructions are is believed, even
+        # when it says there are none. Falling back to the reason here is
+        # what put the ticket's title in as the instructions and showed it
+        # twice on the same screen.
+        instructions=(
+            (details.get("instructions") or "").strip()
+            if "instructions" in details else note
+        ),
         ticket=ticket,
     )
 

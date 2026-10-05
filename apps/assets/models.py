@@ -93,7 +93,11 @@ class Device(TimeStampedModel):
         PROCURED = "procured", "In Procurement"
         IN_PRODUCTION = "in_production", "In Production"
         IN_STOCK = "in_stock", "In Stock"
-        ASSIGNED = "assigned", "Assigned to Client"
+        # Assigned for the work, not handed over: this is the step that
+        # names the technician and the site and opens the job on the
+        # Installation Tracker. The asset becomes the client's at handover,
+        # which is CLIENT_PROPERTY below.
+        ASSIGNED = "assigned", "Assigned for Installation"
         INSTALLED = "installed", "Installed"
         ACTIVE = "active", "Active"
         UNDER_MAINTENANCE = "under_maintenance", "Under Maintenance"
@@ -621,12 +625,33 @@ class ProductionStep(TimeStampedModel):
         return bool(device.project_id) or device.project_scope_items.exists()
 
     @property
+    def materials_pending(self) -> list:
+        """Parts this asset is still waiting for, by name.
+
+        A route could be run start to finish with nothing issued and nothing
+        bought - every operation marked complete on an asset whose parts
+        were still sitting on a shelf, or not yet ordered. Work begins when
+        the material is in hand, so until then there is nothing to move.
+
+        Only on a project: an asset outside one has no procurement behind
+        it, and its route is nobody's to hold up.
+        """
+        if not self.on_project:
+            return []
+        return [
+            line.name for line in self.device.components.all()
+            if line.outstanding_quantity > 0
+        ]
+
+    @property
     def manual_moves(self) -> tuple:
         """What a person may move this step to right now."""
         if self.location == self.Location.EXTERNAL and self.on_a_work_order:
             return ()  # follows its work order
         if self.location == self.Location.UNDECIDED and self.on_project:
             return ()  # the project decides first
+        if self.status not in (self.Status.COMPLETED, self.Status.SKIPPED) and self.materials_pending:
+            return ()  # the parts are not here yet
         return self.VALID_TRANSITIONS.get(self.status, ())
 
     @property
@@ -639,6 +664,13 @@ class ProductionStep(TimeStampedModel):
             return "On a work order — its status follows the work order."
         if self.location == self.Location.UNDECIDED and self.on_project:
             return "Decide in the project's Execution tab whether this is done in-house or on a work order."
+        waiting = self.materials_pending
+        if waiting:
+            named = ", ".join(waiting[:3]) + ("…" if len(waiting) > 3 else "")
+            return (
+                f"Waiting on material: {named}. Issue it from inventory or "
+                "procure it in the project's Execution tab, then the route opens."
+            )
         return ""
 
     @property
@@ -809,6 +841,23 @@ class AssetComponent(TimeStampedModel):
         if self.inventory_item_id:
             return self.inventory_item.quantity
         return 0
+
+    @property
+    def free_quantity(self) -> int:
+        """On-hand stock this line has not already asked the store for.
+
+        A shelf of eight with eight already claimed by this requirement is
+        a shelf of none, as far as the next decision goes: the store has
+        promised them, and asking again would promise the same eight twice.
+        Taking from inventory is offered against this, not against what is
+        physically on the shelf.
+        """
+        claimed = sum(
+            row.outstanding_quantity
+            for row in self.issuance_requests.all()
+            if row.status != row.Status.CANCELLED
+        )
+        return max(self.available_quantity - claimed, 0)
 
 
 class DeviceImage(TimeStampedModel):

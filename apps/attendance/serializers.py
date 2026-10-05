@@ -1,9 +1,13 @@
 from rest_framework import serializers
 
+from common.geo import Coordinate
+
 from .models import AttendanceRecord
 
 
 class AttendanceRecordSerializer(serializers.ModelSerializer):
+    latitude = Coordinate()
+    longitude = Coordinate()
     user_name = serializers.SerializerMethodField()
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     check_type_display = serializers.CharField(source="get_check_type_display", read_only=True)

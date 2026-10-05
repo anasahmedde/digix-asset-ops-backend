@@ -14,7 +14,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-COMPANY_NAME = "DIGIX Asset Ops"
+COMPANY_NAME = "DIGIX Asset Management"
 
 INK = colors.HexColor("#111827")
 MUTED = colors.HexColor("#6b7280")
