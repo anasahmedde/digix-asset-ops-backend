@@ -698,9 +698,12 @@ def test_client_viewer_cannot_inspect(db, received_line):
 def product_refs(db):
     from apps.assets.models import Brand
 
+    from apps.inventory.models import InventoryCategory
+
     return {
         "material": MaterialType.objects.create(name="Prod Media Player", unit="piece"),
         "brand": Brand.objects.create(name="Prod Brand"),
+        "category": InventoryCategory.objects.create(name="Prod Players"),
     }
 
 
@@ -710,6 +713,7 @@ def test_open_a_unique_product_at_zero_stock(ops, product_refs):
         "name": "55in Media Player",
         "material_type": str(product_refs["material"].id),
         "brand": str(product_refs["brand"].id),
+        "category": str(product_refs["category"].id),
         "model_name": "MP-900",
         "specifications": {"ports": "HDMI x2", "power": "45W"},
         "unit_cost": "4500.00",
@@ -1035,23 +1039,26 @@ def test_unique_product_can_be_opened_with_stock_already_on_the_shelf():
     user = User.objects.create_user(username="open-wh", password="x", role="warehouse")
     c = APIClient()
     c.force_authenticate(user)
+    from apps.inventory.models import InventoryCategory
+
+    kind = str(InventoryCategory.objects.create(name="Opening Players").id)
 
     # Stock on the shelf means a serial for every unit — none typed, no item.
     r = c.post("/api/inventory/products/", {
-        "name": "Opening Media Player", "opening_quantity": 3,
+        "name": "Opening Media Player", "category": kind, "opening_quantity": 3,
     }, format="json")
     assert r.status_code == 400 and "each of the 3" in str(r.data["opening_serials"])
     r = c.post("/api/inventory/products/", {
-        "name": "Opening Media Player", "opening_quantity": 3, "opening_serials": ["OMP-1", "OMP-2"],
+        "name": "Opening Media Player", "category": kind, "opening_quantity": 3, "opening_serials": ["OMP-1", "OMP-2"],
     }, format="json")
     assert r.status_code == 400 and "opening_serials" in r.data
     r = c.post("/api/inventory/products/", {
-        "name": "Opening Media Player", "opening_quantity": 3, "opening_serials": ["OMP-1", "omp-1", "OMP-3"],
+        "name": "Opening Media Player", "category": kind, "opening_quantity": 3, "opening_serials": ["OMP-1", "omp-1", "OMP-3"],
     }, format="json")
     assert r.status_code == 400 and "repeated" in str(r.data["opening_serials"])
 
     r = c.post("/api/inventory/products/", {
-        "name": "Opening Media Player", "opening_quantity": 3, "opening_serials": [" OMP-1 ", "OMP-2", "OMP-3"],
+        "name": "Opening Media Player", "category": kind, "opening_quantity": 3, "opening_serials": [" OMP-1 ", "OMP-2", "OMP-3"],
     }, format="json")
     assert r.status_code == 201, r.content
     assert r.data["in_stock_count"] == 3
@@ -1064,12 +1071,12 @@ def test_unique_product_can_be_opened_with_stock_already_on_the_shelf():
 
     # A serial already in inventory cannot be opened a second time.
     r = c.post("/api/inventory/products/", {
-        "name": "Second Player", "opening_quantity": 1, "opening_serials": ["OMP-2"],
+        "name": "Second Player", "category": kind, "opening_quantity": 1, "opening_serials": ["OMP-2"],
     }, format="json")
     assert r.status_code == 400 and "OMP-2" in str(r.data["opening_serials"])
 
     # Opening at zero is the normal case and creates nothing.
-    r = c.post("/api/inventory/products/", {"name": "Empty Product"}, format="json")
+    r = c.post("/api/inventory/products/", {"name": "Empty Product", "category": kind}, format="json")
     assert r.status_code == 201, r.content
     assert r.data["in_stock_count"] == 0
 
@@ -1087,9 +1094,12 @@ def test_opening_stock_units_can_be_corrected_on_a_bare_unit():
     user = User.objects.create_user(username="serial-wh", password="x", role="warehouse")
     c = APIClient()
     c.force_authenticate(user)
+    from apps.inventory.models import InventoryCategory
+
+    kind = str(InventoryCategory.objects.create(name="Unidentified Players").id)
 
     r = c.post("/api/inventory/products/", {
-        "name": "Unidentified Player", "opening_quantity": 2, "opening_serials": ["UP-A", "UP-B"],
+        "name": "Unidentified Player", "category": kind, "opening_quantity": 2, "opening_serials": ["UP-A", "UP-B"],
     }, format="json")
     assert r.status_code == 201, r.content
     unit_type = InventoryUnitType.objects.get(pk=r.data["id"])
@@ -1551,9 +1561,12 @@ def test_a_returned_unit_goes_back_under_its_own_serial():
     user = User.objects.create_user(username="return-wh", password="x", role="warehouse")
     c = APIClient()
     c.force_authenticate(user)
+    from apps.inventory.models import InventoryCategory
+
+    kind = str(InventoryCategory.objects.create(name="Returning Players").id)
 
     r = c.post("/api/inventory/products/", {
-        "name": "Returning Player", "opening_quantity": 1, "opening_serials": ["RET-1"],
+        "name": "Returning Player", "category": kind, "opening_quantity": 1, "opening_serials": ["RET-1"],
     }, format="json")
     assert r.status_code == 201, r.content
     product_id = r.data["id"]
@@ -1648,3 +1661,76 @@ def test_the_store_sends_a_request_back_to_where_it_was_raised(ops):
     )
     r = _client(ops).post(f"/api/inventory/issuance-requests/{settled.id}/send-back/", {}, format="json")
     assert r.status_code == 400 and "nothing to send back" in str(r.data["detail"])
+
+
+# ── Serials arrive as a list, not as two hundred keystrokes ──────────────
+
+def _sheet(rows):
+    """An .xlsx in memory, the way a supplier would send one."""
+    import io
+
+    from openpyxl import Workbook
+
+    book = Workbook()
+    for row in rows:
+        book.active.append(row)
+    buf = io.BytesIO()
+    book.save(buf)
+    buf.seek(0)
+    buf.name = "serials.xlsx"
+    return buf
+
+
+@pytest.mark.django_db
+def test_serials_are_read_out_of_a_spreadsheet(ops):
+    """Typing them one at a time is not a job to give anybody."""
+    c = _client(ops)
+    url = "/api/inventory/products/read-serials/"
+
+    sheet = _sheet([
+        ("Serial number", "Note"),
+        ("SN-001", "boxed"),
+        ("SN-002", ""),
+        ("", "blank row"),
+        ("SN-002", "same one twice"),
+        (1234567, "typed as a number"),
+    ])
+    r = c.post(url, {"file": sheet}, format="multipart")
+    assert r.status_code == 200, r.content
+    assert r.data["serials"] == ["SN-001", "SN-002", "1234567"], (
+        "in file order, blanks and repeats dropped, and a number is not a float"
+    )
+    assert any("repeated" in n for n in r.data["notes"])
+    assert any("blank" in n for n in r.data["notes"])
+
+    # No heading? The first column is the list.
+    plain = _sheet([("SN-010",), ("SN-011",)])
+    r = c.post(url, {"file": plain}, format="multipart")
+    assert r.data["serials"] == ["SN-010", "SN-011"]
+
+    # A csv is the same job.
+    import io
+
+    csv_file = io.BytesIO(b"Serial No\nSN-100\nSN-101\n")
+    csv_file.name = "serials.csv"
+    r = c.post(url, {"file": csv_file}, format="multipart")
+    assert r.data["serials"] == ["SN-100", "SN-101"]
+
+
+@pytest.mark.django_db
+def test_an_unreadable_file_says_so_rather_than_failing(ops):
+    c = _client(ops)
+    url = "/api/inventory/products/read-serials/"
+
+    assert c.post(url, {}, format="multipart").status_code == 400
+
+    import io
+
+    wrong = io.BytesIO(b"%PDF-1.4 not a list of serials")
+    wrong.name = "invoice.pdf"
+    r = c.post(url, {"file": wrong}, format="multipart")
+    assert r.status_code == 400 and ".xlsx" in str(r.data["file"])
+
+    empty = _sheet([("Serial number",)])
+    r = c.post(url, {"file": empty}, format="multipart")
+    assert r.status_code == 400 and "No serial numbers found" in str(r.data["file"])

@@ -102,6 +102,20 @@ class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
     def get_in_stock_count(self, obj):
         return getattr(obj, "stock_count", None) or obj.in_stock_count
 
+    def _validate_category(self, attrs):
+        """A unique component is filed under something.
+
+        The category is what the store searches and reports by, and a
+        shelf of uncategorised units is a shelf nobody can find anything
+        on. Asked for on the way in, not chased afterwards.
+        """
+        category = attrs.get("category", getattr(self.instance, "category", None))
+        if category is None:
+            raise serializers.ValidationError(
+                {"category": ["Say what kind of component this is."]}
+            )
+        return attrs
+
     def _validate_opening_stock(self, attrs):
         """Stock on the shelf needs a serial per unit; opened empty, none."""
         if self.instance is not None:
@@ -180,6 +194,7 @@ class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
             raise serializers.ValidationError({
                 "default_warranty_months": "Set the warranty term in months, or clear the warranty default."
             })
+        self._validate_category(attrs)
         return self._validate_opening_stock(attrs)
 
 

@@ -185,6 +185,36 @@ class InventoryUnitTypeViewSet(viewsets.ModelViewSet):
     search_fields = ["type_code", "name", "model_name", "brand__name", "material_type__name"]
     ordering_fields = ["name", "created_at", "stock_count"]
 
+    @action(detail=False, methods=["post"], url_path="read-serials")
+    def read_serials(self, request):
+        """Pull a column of serial numbers out of an uploaded sheet.
+
+        Two hundred serials typed by hand is not a job to give anybody, so
+        the list the supplier sent can be handed over instead. Nothing is
+        saved here — the serials go back to the form, into the same boxes
+        somebody would have typed, where they can still be corrected.
+        """
+        from .serial_import import read_serials as _read
+
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"file": ["Choose a file to read."]}, status=400)
+        if upload.size > 2 * 1024 * 1024:
+            return Response(
+                {"file": ["That file is larger than 2 MB — it is a list of serials, not a document."]},
+                status=400,
+            )
+        try:
+            serials, notes = _read(upload)
+        except ValueError as problem:
+            return Response({"file": [str(problem)]}, status=400)
+        except Exception:
+            return Response(
+                {"file": ["That file could not be read. Save it as .xlsx or .csv and try again."]},
+                status=400,
+            )
+        return Response({"serials": serials, "notes": notes})
+
     @action(detail=True, methods=["get"])
     def units(self, request, pk=None):
         """The physical units registered against this product.
