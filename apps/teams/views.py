@@ -901,11 +901,28 @@ class ProjectCostLineViewSet(viewsets.ModelViewSet):
         line = serializer.save()
         get_or_create_plan(line.project)
 
+    #: What the budget promised. Recording what was actually spent is the
+    #: whole point of an approved budget, so only these are frozen by one.
+    PLANNED = ("cost_type", "description", "quantity", "unit_cost")
+
+    def perform_update(self, serializer):
+        # Correcting what was planned is changing the budget, so it is
+        # held to the same rule as removing a line: a signed-off budget is
+        # revised, not quietly edited underneath the signature. Writing
+        # the actuals against it is not that, and goes through.
+        if any(f in serializer.validated_data for f in self.PLANNED):
+            self._refuse_if_signed_off(serializer.instance)
+        serializer.save()
+
     def perform_destroy(self, instance):
-        plan = getattr(instance.project, "cost_plan", None)
-        planned = (instance.quantity or 0) * (instance.unit_cost or 0)
+        self._refuse_if_signed_off(instance)
+        instance.delete()
+
+    @staticmethod
+    def _refuse_if_signed_off(line):
+        plan = getattr(line.project, "cost_plan", None)
+        planned = (line.quantity or 0) * (line.unit_cost or 0)
         if plan is not None and not plan.is_editable and planned:
             from rest_framework.exceptions import ValidationError as _VE
 
             raise _VE(f"The budget is {plan.get_status_display().lower()} — revise it before changing costs.")
-        instance.delete()
