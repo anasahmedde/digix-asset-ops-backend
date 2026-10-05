@@ -260,6 +260,43 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             return (str(scoped[0]), scoped[1], scoped[2]) if scoped else (None, None, None)
 
         rows = []
+        # Which part of the business asked for this, and from which screen.
+        # The buyer reads the queue top to bottom without knowing the history
+        # of each line, so every row says where it came from.
+        ORIGIN_PROJECT = ("Project", "Execution › Build Requirements")
+        ORIGIN_ASSET = ("Asset registry", "Vendor-supplied asset")
+        ORIGIN_INVENTORY = ("Inventory", "Low Stock")
+
+        # What the line should cost, to measure the quote against. A project
+        # line is held to the figure its budget was approved on; anything the
+        # store or a maintenance job asks for is held to the last price paid,
+        # because nobody planned it.
+        from apps.teams.costing import component_unit_price, last_procured_price
+        from apps.teams.models import ProjectBudget
+
+        budget_status = {
+            str(pk): st
+            for pk, st in ProjectBudget.objects.values_list("project_id", "status")
+        }
+
+        def reference(unit_price, label, quantity):
+            """The money figure a row is measured against, and where it is from."""
+            if unit_price is None:
+                return {"reference_unit_price": None, "reference_amount": None,
+                        "reference_label": label}
+            return {
+                "reference_unit_price": unit_price,
+                "reference_amount": unit_price * (quantity or 0),
+                "reference_label": label,
+            }
+
+        def planned_label(project_pk):
+            if project_pk is None:
+                return "Listed price"
+            if budget_status.get(str(project_pk)) == ProjectBudget.Status.APPROVED:
+                return "Planned · approved"
+            return "Planned · not approved yet"
+
         # Vendor-built assets: the whole asset is what gets bought.
         from apps.assets.models import Device
 
@@ -286,8 +323,18 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         for d in devices:
             project_pk, project_name, project_due = project_of(d)
             label = d.display_name or (d.asset_type.name if d.asset_type_id else d.asset_code)
+            # A vendor asset on a project was decided in Execution; one with no
+            # project behind it was simply registered and bought.
+            origin, origin_detail = (
+                (ORIGIN_PROJECT[0], "Vendor-supplied asset") if project_pk else ORIGIN_ASSET
+            )
             rows.append({
                 "kind": "asset",
+                "origin": origin,
+                "origin_detail": origin_detail,
+                # A whole asset is priced on the asset itself, so that figure
+                # is the one the project was costed on.
+                **reference(d.purchase_price, planned_label(project_pk), 1),
                 "component": None,
                 "device": str(d.pk),
                 "name": f"{label} (complete asset)",
@@ -323,8 +370,28 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         if request.query_params.get("unordered") in ("1", "true", "True"):
             reorders = reorders.filter(purchase_order_item__isnull=True)
         for rr in reorders:
+            # Nobody planned a replenishment, so the last price paid is the
+            # only figure to hold the quote against.
+            lookup = (
+                {"inventory_unit_type_id": rr.unit_type_id} if rr.unit_type_id
+                else {"inventory_item_id": rr.item_id} if rr.item_id else None
+            )
+            last_price, last_po = last_procured_price(**lookup) if lookup else (None, None)
+            opening = (
+                rr.unit_type.unit_cost if rr.unit_type_id
+                else rr.item.unit_cost if rr.item_id else None
+            )
+            if last_price is not None:
+                ref = reference(last_price, f"Last PO · {last_po}", rr.quantity)
+            elif opening:
+                ref = reference(opening, "Opening cost — never purchased", rr.quantity)
+            else:
+                ref = reference(None, "No price on record", rr.quantity)
             rows.append({
                 "kind": "reorder",
+                "origin": ORIGIN_INVENTORY[0],
+                "origin_detail": ORIGIN_INVENTORY[1],
+                **ref,
                 "reorder": str(rr.pk),
                 "request_number": rr.request_number,
                 "component": None,
@@ -361,8 +428,17 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             if c.outstanding_quantity <= 0 or (_to_buy(c) <= 0 and not c.purchase_order_item_id):
                 continue
             project_pk, project_name, project_due = project_of(c.device)
+            planned_unit, priced_from = component_unit_price(c)
             rows.append({
                 "kind": "component",
+                "origin": ORIGIN_PROJECT[0] if project_pk else ORIGIN_ASSET[0],
+                "origin_detail": (
+                    ORIGIN_PROJECT[1] if project_pk else "Asset components"
+                ),
+                # The figure the budget was approved on, for the quantity
+                # still being bought.
+                **reference(planned_unit, planned_label(project_pk), _to_buy(c)),
+                "priced_from": priced_from,
                 "device": None,
                 "component": str(c.pk),
                 "name": c.name,
@@ -471,6 +547,55 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             except (InvalidOperation, ValueError):
                 return fallback or 0
 
+        # ── what each line was expected to cost ───────────────────────
+        # Stamped onto the line so the figure that was agreed cannot drift
+        # when the next order changes what "the last price" means.
+        from apps.teams.costing import component_unit_price, last_procured_price
+
+        Owner = PurchaseOrderItem.VarianceOwner
+        reasons = request.data.get("variance_reasons") or {}
+
+        def on_a_project(device) -> bool:
+            from apps.teams.models import ProjectScopeItem
+            return bool(
+                device.project_id
+                or ProjectScopeItem.objects.filter(device_id=device.pk).exists()
+            )
+
+        def reference_for_component(c):
+            unit, label = component_unit_price(c)
+            owner = Owner.PROJECT if on_a_project(c.device) else Owner.OPERATIONS
+            return unit, label, owner
+
+        def reference_for_reorder(rr):
+            lookup = (
+                {"inventory_unit_type_id": rr.unit_type_id} if rr.unit_type_id
+                else {"inventory_item_id": rr.item_id} if rr.item_id else None
+            )
+            price, po_number = last_procured_price(**lookup) if lookup else (None, None)
+            if price is not None:
+                return price, f"Last PO · {po_number}", Owner.INVENTORY
+            opening = (
+                rr.unit_type.unit_cost if rr.unit_type_id
+                else rr.item.unit_cost if rr.item_id else None
+            )
+            if opening:
+                return opening, "Opening cost — never purchased", Owner.INVENTORY
+            return None, "No price on record", Owner.INVENTORY
+
+        def stamp(item, key, unit, label, owner):
+            """Fix the reference to the line and ask for a blessing if needed."""
+            if unit is None:
+                return
+            item.reference_unit_price = unit
+            item.reference_label = label or ""
+            item.variance_owner = owner
+            item.variance_reason = (reasons.get(str(key)) or "").strip()
+            item.save(update_fields=[
+                "reference_unit_price", "reference_label", "variance_owner",
+                "variance_reason", "unit_price", "updated_at",
+            ])
+
         # The added lines answer to the same rules as a hand-written order's.
         extra = PurchaseOrderItemSerializer(data=extra_items, many=True)
         extra.is_valid(raise_exception=True)
@@ -497,6 +622,10 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                     device_model=device.device_model,
                     asset_type=device.asset_type,
                 )
+                stamp(
+                    item, device.pk, device.purchase_price, "Listed price",
+                    Owner.PROJECT if on_a_project(device) else Owner.OPERATIONS,
+                )
                 device.procurement_item = item
                 device.save(update_fields=["procurement_item", "updated_at"])
             for component in components:
@@ -521,6 +650,7 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                     inventory_item=component.inventory_item,
                     inventory_unit_type=component.inventory_unit_type,
                 )
+                stamp(item, component.pk, *reference_for_component(component))
                 component.purchase_order_item = item
                 component.save(update_fields=["purchase_order_item", "updated_at"])
             for rr in reorders:
@@ -536,6 +666,7 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                     inventory_item=rr.item,
                     inventory_unit_type=rr.unit_type,
                 )
+                stamp(item, rr.pk, *reference_for_reorder(rr))
                 rr.purchase_order_item = item
                 rr.status = ReorderRequest.Status.ORDERED
                 rr.save(update_fields=["purchase_order_item", "status", "updated_at"])
@@ -546,13 +677,131 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 _buy_asset_on(line, device_id)
             purchase_order.recalc_total()
 
+        # Anything priced over plan goes straight to the desk that has to
+        # agree it, rather than waiting to be noticed.
+        flagged = list(purchase_order.unagreed_lines())
+        if flagged:
+            from .variance import tell_the_owner
+            tell_the_owner(flagged, raised_by=request.user)
+
         return Response(
             PurchaseOrderSerializer(purchase_order, context={"request": request}).data, status=drf_status.HTTP_201_CREATED
         )
 
+    # Who may agree to pay over the odds, by whose figure was exceeded.
+    VARIANCE_DECIDERS = {
+        PurchaseOrderItem.VarianceOwner.PROJECT:
+            ("super_admin", "group_head", "ops_manager", "supervisor"),
+        PurchaseOrderItem.VarianceOwner.INVENTORY:
+            ("super_admin", "ops_manager", "warehouse"),
+        PurchaseOrderItem.VarianceOwner.OPERATIONS:
+            ("super_admin", "group_head", "ops_manager"),
+    }
+
+    @action(detail=False, methods=["get"], url_path="price-variances")
+    def price_variances(self, request):
+        """Lines waiting on this user's side to agree the price.
+
+        Procurement cannot decide its own variance — that is the whole point
+        — so the queue is served to whoever owns the figure that was passed.
+        """
+        role = getattr(request.user, "role", "")
+        owners = [
+            owner for owner, roles in self.VARIANCE_DECIDERS.items() if role in roles
+        ]
+        items = (
+            PurchaseOrderItem.objects.filter(
+                variance_status=PurchaseOrderItem.VarianceStatus.PENDING,
+                variance_owner__in=owners,
+            )
+            .select_related("purchase_order", "purchase_order__supplier")
+            .order_by("-purchase_order__created_at")
+        )
+        rows = [{
+            "id": str(i.pk),
+            "purchase_order": str(i.purchase_order_id),
+            "po_number": i.purchase_order.po_number,
+            "supplier_name": i.purchase_order.supplier.name if i.purchase_order.supplier_id else None,
+            "currency": i.purchase_order.currency,
+            "description": i.description,
+            "quantity": i.quantity,
+            "unit_price": i.unit_price,
+            "reference_unit_price": i.reference_unit_price,
+            "reference_label": i.reference_label,
+            "variance_percent": i.variance_percent,
+            "variance_owner": i.variance_owner,
+            "variance_owner_display": i.get_variance_owner_display(),
+            "variance_reason": i.variance_reason,
+            "raised_by": (
+                i.purchase_order.ordered_by.get_full_name()
+                if i.purchase_order.ordered_by_id else None
+            ),
+        } for i in items]
+        return Response({"count": len(rows), "results": rows})
+
+    @action(detail=True, methods=["post"], url_path="price-variance")
+    def price_variance(self, request, pk=None):
+        """Agree, or refuse, the price on one line of this order.
+
+        Body: ``item`` (line id), ``approve`` (bool), ``notes``.
+        """
+        purchase_order = self.get_object()
+        item = purchase_order.items.filter(pk=request.data.get("item")).first()
+        if item is None:
+            return Response({"item": ["Pick the line to decide."]}, status=400)
+        if item.variance_status != PurchaseOrderItem.VarianceStatus.PENDING:
+            return Response({"detail": (
+                f"That line is already {item.get_variance_status_display().lower()}."
+            )}, status=400)
+
+        allowed = self.VARIANCE_DECIDERS.get(item.variance_owner, ())
+        if getattr(request.user, "role", "") not in allowed:
+            return Response({"detail": (
+                f"This one is {item.get_variance_owner_display()}'s to agree, not yours."
+            )}, status=drf_status.HTTP_403_FORBIDDEN)
+
+        approve = bool(request.data.get("approve"))
+        notes = (request.data.get("notes") or "").strip()
+        if not approve and not notes:
+            return Response(
+                {"notes": ["Say why the price is refused — the buyer has to act on it."]},
+                status=400,
+            )
+
+        item.variance_status = (
+            PurchaseOrderItem.VarianceStatus.APPROVED if approve
+            else PurchaseOrderItem.VarianceStatus.REJECTED
+        )
+        item.variance_notes = notes
+        item.variance_decided_by = request.user
+        item.variance_decided_at = timezone.now()
+        item.variance_decided_price = item.unit_price
+        item.save(update_fields=[
+            "variance_status", "variance_notes", "variance_decided_by",
+            "variance_decided_at", "variance_decided_price", "updated_at",
+        ])
+        from .variance import tell_the_buyer
+        tell_the_buyer(item, request.user, approve)
+
+        left = purchase_order.unagreed_lines().count()
+        return Response({
+            "detail": (
+                f"Price agreed for '{item.description}'." if approve
+                else f"Price refused for '{item.description}' — it goes back to Procurement."
+            ),
+            "unagreed_lines": left,
+            "can_submit": left == 0,
+        })
+
     def get_permissions(self):
-        if getattr(self, "action", None) == "transition":
+        action = getattr(self, "action", None)
+        if action == "transition":
             return [IsAuthenticated(), PurchaseOrderActionElseRead()]
+        # Agreeing a price is deliberately not a procurement right: the whole
+        # point is that somebody outside Procurement says yes. Who exactly is
+        # checked against the line's own owner, inside the action.
+        if action in ("price_variance", "price_variances"):
+            return [IsAuthenticated()]
         return super().get_permissions()
 
     @action(detail=True, methods=["post"])
@@ -569,6 +818,20 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         ser.is_valid(raise_exception=True)
         new_status = ser.validated_data["status"]
         notes = ser.validated_data.get("notes", "").strip()
+
+        # An order priced over what anybody planned for does not reach the
+        # Group Head until the side whose figure was exceeded has said yes.
+        if new_status == PurchaseOrder.Status.PENDING_APPROVAL:
+            unagreed = list(purchase_order.unagreed_lines())
+            if unagreed:
+                waiting = ", ".join(
+                    f"{i.description} ({i.get_variance_owner_display()})" for i in unagreed[:4]
+                )
+                return Response({"detail": (
+                    f"{len(unagreed)} line(s) are priced above what was planned and have not "
+                    f"been agreed: {waiting}. They go back for approval before this order "
+                    f"can go up for signature."
+                )}, status=drf_status.HTTP_400_BAD_REQUEST)
 
         # The date can arrive with the move: an order written without one
         # is given it here, at the moment it matters.

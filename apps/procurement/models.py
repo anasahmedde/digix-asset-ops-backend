@@ -77,6 +77,20 @@ class PurchaseOrder(TimeStampedModel):
     def can_transition_to(self, new_status: str) -> bool:
         return new_status in self.VALID_TRANSITIONS.get(self.status, ())
 
+    def unagreed_lines(self):
+        """Lines priced over their reference that nobody has yet agreed to.
+
+        An order carrying one of these must not reach the Group Head: the
+        signature commits the company, and the figure it commits to was never
+        the one anybody planned for.
+        """
+        return self.items.filter(
+            variance_status__in=(
+                PurchaseOrderItem.VarianceStatus.PENDING,
+                PurchaseOrderItem.VarianceStatus.REJECTED,
+            )
+        )
+
     def recalc_total(self, save: bool = True):
         total = sum((item.line_total for item in self.items.all()), Decimal("0"))
         self.total_amount = total
@@ -86,6 +100,27 @@ class PurchaseOrder(TimeStampedModel):
 
 
 class PurchaseOrderItem(TimeStampedModel):
+    """One line on an order, and whether its price has been agreed.
+
+    A line raised from a request carries the figure it was expected to cost
+    — what the project's budget was approved on, or what the store last paid.
+    Paying more than that is somebody else's money, so the side that owns the
+    figure has to say yes before the order can go up for signature.
+    """
+
+    class VarianceOwner(models.TextChoices):
+        PROJECT = "project", "Project Execution"
+        INVENTORY = "inventory", "Inventory"
+        # Nothing was planned and no shelf is being filled — a vendor asset
+        # bought on its own. Operations owns the call.
+        OPERATIONS = "operations", "Operations Head"
+
+    class VarianceStatus(models.TextChoices):
+        NOT_REQUIRED = "not_required", "Within reference"
+        PENDING = "pending", "Awaiting approval"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+
     purchase_order = models.ForeignKey(
         PurchaseOrder, on_delete=models.CASCADE, related_name="items"
     )
@@ -127,6 +162,34 @@ class PurchaseOrderItem(TimeStampedModel):
     # order can complete without it.
     is_charge = models.BooleanField(default=False)
 
+    # ── the price this line was expected to come in at ────────────────
+    # Frozen when the order is raised: the reference moves every time
+    # something is bought, and what was approved must not move with it.
+    reference_unit_price = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    reference_label = models.CharField(max_length=120, blank=True)
+    variance_owner = models.CharField(
+        max_length=12, choices=VarianceOwner.choices, blank=True
+    )
+    variance_status = models.CharField(
+        max_length=14, choices=VarianceStatus.choices,
+        default=VarianceStatus.NOT_REQUIRED, db_index=True,
+    )
+    # Why the buyer is paying over the odds, and what the owner said back.
+    variance_reason = models.TextField(blank=True)
+    variance_notes = models.TextField(blank=True)
+    variance_decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="price_variance_decisions",
+    )
+    variance_decided_at = models.DateTimeField(null=True, blank=True)
+    # The figure that was actually agreed. A decision is about a number, not
+    # about a row, so moving the number undoes the decision.
+    variance_decided_price = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+
     class Meta:
         ordering = ["id"]
 
@@ -136,6 +199,66 @@ class PurchaseOrderItem(TimeStampedModel):
     @property
     def line_total(self):
         return self.quantity * self.unit_price
+
+    @property
+    def over_reference(self) -> bool:
+        """Is this line priced above what it was expected to cost?"""
+        return (
+            self.reference_unit_price is not None
+            and self.unit_price is not None
+            and self.unit_price > self.reference_unit_price
+        )
+
+    @property
+    def variance_percent(self):
+        """How far over, as a percentage. None when there is nothing to compare."""
+        if not self.over_reference or not self.reference_unit_price:
+            return None
+        return (self.unit_price - self.reference_unit_price) / self.reference_unit_price * 100
+
+    @property
+    def blocks_submission(self) -> bool:
+        return self.variance_status in (
+            self.VarianceStatus.PENDING, self.VarianceStatus.REJECTED
+        )
+
+    def sync_variance(self):
+        """Keep the approval in step with the price on the line.
+
+        Priced over the reference and the owner has to bless it; priced back
+        within it and there is nothing left to bless. Changing an agreed price
+        undoes the agreement, because what was agreed was a figure.
+        """
+        if self.reference_unit_price is None or self.unit_price is None:
+            return
+        if not self.over_reference:
+            self.variance_status = self.VarianceStatus.NOT_REQUIRED
+            return
+        decided = self.variance_status in (
+            self.VarianceStatus.APPROVED, self.VarianceStatus.REJECTED
+        )
+        if self.variance_status == self.VarianceStatus.NOT_REQUIRED or (
+            decided and self.variance_decided_price != self.unit_price
+        ):
+            self.variance_status = self.VarianceStatus.PENDING
+            self.variance_decided_by = None
+            self.variance_decided_at = None
+            self.variance_decided_price = None
+            self.variance_notes = ""
+
+    def save(self, *args, **kwargs):
+        fields = kwargs.get("update_fields")
+        # A save that does not touch the price cannot change the agreement.
+        if fields is None or "unit_price" in fields or "reference_unit_price" in fields:
+            self.sync_variance()
+            if fields is not None:
+                kwargs["update_fields"] = list(dict.fromkeys(
+                    list(fields) + [
+                        "variance_status", "variance_decided_by", "variance_decided_at",
+                        "variance_decided_price", "variance_notes",
+                    ]
+                ))
+        super().save(*args, **kwargs)
 
     @property
     def stocked_quantity(self) -> int:

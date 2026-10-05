@@ -1432,3 +1432,174 @@ def test_an_order_can_buy_an_asset_already_registered():
     }, format="json")
     assert r.status_code == 400, r.content
     assert po.po_number in str(r.data)
+
+
+# ---------------------------------------------------------------------------
+# Paying over what was planned needs the owning side's agreement
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def over_plan(db, people, supplier, requisitions):
+    """A draft order whose component line is priced above the plan."""
+    c = _client(people["finance"])
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+        "supplier": str(supplier.pk),
+        "expected_delivery": str(timezone.localdate()),
+        "components": [str(requisitions["generic"].pk)],
+        # The plan priced it from the inventory opening cost of 25.
+        "prices": {str(requisitions["generic"].pk): "40"},
+        "variance_reasons": {str(requisitions["generic"].pk): "Only quote we could get"},
+    }, format="json")
+    assert r.status_code == 201, r.content
+    po = PurchaseOrder.objects.get(pk=r.data["id"])
+    return {"po": po, "item": po.items.first()}
+
+
+@pytest.mark.django_db
+def test_raising_over_the_plan_flags_the_line_for_the_project(over_plan):
+    item = over_plan["item"]
+    assert item.reference_unit_price == Decimal("25.00")
+    assert item.over_reference
+    assert item.variance_status == PurchaseOrderItem.VarianceStatus.PENDING
+    assert item.variance_owner == PurchaseOrderItem.VarianceOwner.PROJECT
+    assert item.variance_reason == "Only quote we could get"
+    assert round(item.variance_percent) == 60
+
+
+@pytest.mark.django_db
+def test_a_line_within_the_plan_needs_nobody(people, supplier, requisitions):
+    c = _client(people["finance"])
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+        "supplier": str(supplier.pk),
+        "expected_delivery": str(timezone.localdate()),
+        "components": [str(requisitions["generic"].pk)],
+        "prices": {str(requisitions["generic"].pk): "22"},
+    }, format="json")
+    assert r.status_code == 201, r.content
+    item = PurchaseOrder.objects.get(pk=r.data["id"]).items.first()
+    assert item.variance_status == PurchaseOrderItem.VarianceStatus.NOT_REQUIRED
+    assert item.variance_percent is None
+
+
+@pytest.mark.django_db
+def test_the_order_cannot_go_up_for_signature_while_a_price_is_unagreed(people, over_plan):
+    r = _client(people["ops"]).post(
+        f"/api/procurement/purchase-orders/{over_plan['po'].pk}/transition/",
+        {"status": "pending_approval"}, format="json",
+    )
+    assert r.status_code == 400, r.content
+    assert "priced above what was planned" in str(r.data)
+    over_plan["po"].refresh_from_db()
+    assert over_plan["po"].status == PurchaseOrder.Status.DRAFT
+
+
+@pytest.mark.django_db
+def test_the_store_cannot_agree_a_project_price(people, over_plan):
+    warehouse = User.objects.create_user(username="po-wh", password="x", role="warehouse")
+    r = _client(warehouse).post(
+        f"/api/procurement/purchase-orders/{over_plan['po'].pk}/price-variance/",
+        {"item": str(over_plan["item"].pk), "approve": True}, format="json",
+    )
+    assert r.status_code == 403, r.content
+    assert "Project Execution" in str(r.data)
+
+
+@pytest.mark.django_db
+def test_execution_agrees_and_the_order_moves(people, over_plan):
+    c = _client(people["inspector"])          # a supervisor works Execution
+    r = c.post(
+        f"/api/procurement/purchase-orders/{over_plan['po'].pk}/price-variance/",
+        {"item": str(over_plan["item"].pk), "approve": True, "notes": "Rate rise accepted"},
+        format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert r.data["can_submit"] is True
+
+    item = over_plan["item"]
+    item.refresh_from_db()
+    assert item.variance_status == PurchaseOrderItem.VarianceStatus.APPROVED
+    assert item.variance_decided_price == Decimal("40.00")
+
+    moved = _client(people["ops"]).post(
+        f"/api/procurement/purchase-orders/{over_plan['po'].pk}/transition/",
+        {"status": "pending_approval"}, format="json",
+    )
+    assert moved.status_code == 200, moved.content
+
+
+@pytest.mark.django_db
+def test_refusing_a_price_needs_a_reason_and_still_blocks(people, over_plan):
+    c = _client(people["inspector"])
+    bare = c.post(
+        f"/api/procurement/purchase-orders/{over_plan['po'].pk}/price-variance/",
+        {"item": str(over_plan["item"].pk), "approve": False}, format="json",
+    )
+    assert bare.status_code == 400, bare.content
+
+    said = c.post(
+        f"/api/procurement/purchase-orders/{over_plan['po'].pk}/price-variance/",
+        {"item": str(over_plan["item"].pk), "approve": False, "notes": "Find another supplier"},
+        format="json",
+    )
+    assert said.status_code == 200, said.content
+    assert said.data["can_submit"] is False
+
+    blocked = _client(people["ops"]).post(
+        f"/api/procurement/purchase-orders/{over_plan['po'].pk}/transition/",
+        {"status": "pending_approval"}, format="json",
+    )
+    assert blocked.status_code == 400, blocked.content
+
+
+@pytest.mark.django_db
+def test_moving_an_agreed_price_undoes_the_agreement(people, over_plan):
+    item = over_plan["item"]
+    _client(people["inspector"]).post(
+        f"/api/procurement/purchase-orders/{over_plan['po'].pk}/price-variance/",
+        {"item": str(item.pk), "approve": True, "notes": "ok"}, format="json",
+    )
+    item.refresh_from_db()
+    assert item.variance_status == PurchaseOrderItem.VarianceStatus.APPROVED
+
+    # The buyer reopens the quote at a higher figure: what was agreed was a
+    # number, not a row, so the agreement goes with it.
+    item.unit_price = Decimal("45.00")
+    item.save()
+    item.refresh_from_db()
+    assert item.variance_status == PurchaseOrderItem.VarianceStatus.PENDING
+    assert item.variance_decided_by is None
+
+    # Dropping back within the plan clears it with nobody's help.
+    item.unit_price = Decimal("20.00")
+    item.save()
+    item.refresh_from_db()
+    assert item.variance_status == PurchaseOrderItem.VarianceStatus.NOT_REQUIRED
+
+
+@pytest.mark.django_db
+def test_a_stock_reorder_over_the_last_price_goes_to_inventory(people, supplier):
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem, ReorderRequest
+
+    material = MaterialType.objects.create(name="Var Cable")
+    item = InventoryItem.objects.create(material_type=material, quantity=1, unit_cost=500)
+    rr = ReorderRequest.objects.create(item=item, quantity=10, reason="Below reorder level")
+
+    r = _client(people["finance"]).post("/api/procurement/purchase-orders/raise-po/", {
+        "supplier": str(supplier.pk),
+        "expected_delivery": str(timezone.localdate()),
+        "reorders": [str(rr.pk)],
+        "prices": {str(rr.pk): "600"},
+    }, format="json")
+    assert r.status_code == 201, r.content
+    line = PurchaseOrder.objects.get(pk=r.data["id"]).items.first()
+    assert line.variance_owner == PurchaseOrderItem.VarianceOwner.INVENTORY
+    assert line.variance_status == PurchaseOrderItem.VarianceStatus.PENDING
+
+    # It shows up on the store's queue, and not on a technician's.
+    warehouse = User.objects.create_user(username="po-wh2", password="x", role="warehouse")
+    mine = _client(warehouse).get("/api/procurement/purchase-orders/price-variances/")
+    assert mine.status_code == 200, mine.content
+    assert [row["id"] for row in mine.data["results"]] == [str(line.pk)]
+    assert _client(people["tech"]).get(
+        "/api/procurement/purchase-orders/price-variances/"
+    ).data["count"] == 0

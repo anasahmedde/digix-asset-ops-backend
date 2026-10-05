@@ -105,6 +105,23 @@ class PurchaseOrderItemSerializer(HidesMoney, serializers.ModelSerializer):
     def get_inventory_unit_type_name(self, obj):
         return str(obj.inventory_unit_type) if obj.inventory_unit_type_id else None
 
+    variance_percent = serializers.SerializerMethodField()
+    variance_owner_display = serializers.CharField(
+        source="get_variance_owner_display", read_only=True
+    )
+    variance_status_display = serializers.CharField(
+        source="get_variance_status_display", read_only=True
+    )
+    variance_decided_by_name = serializers.SerializerMethodField()
+
+    def get_variance_percent(self, obj):
+        pct = obj.variance_percent
+        return None if pct is None else round(float(pct), 1)
+
+    def get_variance_decided_by_name(self, obj):
+        user = obj.variance_decided_by
+        return (user.get_full_name() or user.username) if user else None
+
     class Meta:
         model = PurchaseOrderItem
         fields = [
@@ -114,9 +131,22 @@ class PurchaseOrderItemSerializer(HidesMoney, serializers.ModelSerializer):
             "inventory_unit_type", "inventory_unit_type_name",
             "device", "procured_device", "is_charge",
             "quantity", "unit", "unit_price", "received_quantity", "line_total",
+            # What the line was expected to cost, and whether paying more
+            # than that has been agreed.
+            "reference_unit_price", "reference_label", "variance_percent",
+            "variance_owner", "variance_owner_display",
+            "variance_status", "variance_status_display",
+            "variance_reason", "variance_notes",
+            "variance_decided_by_name", "variance_decided_at",
         ]
         # received_quantity is owned by goods receiving — never writable via the API.
-        read_only_fields = ["line_total", "received_quantity"]
+        # The variance is settled through its own endpoint, where the right to
+        # settle it is checked; it is never a field somebody can simply write.
+        read_only_fields = [
+            "line_total", "received_quantity", "reference_unit_price", "reference_label",
+            "variance_percent", "variance_owner", "variance_status",
+            "variance_notes", "variance_decided_at",
+        ]
 
 
 class PurchaseOrderItemDetailSerializer(PurchaseOrderItemSerializer):
