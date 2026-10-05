@@ -787,6 +787,36 @@ def test_vendor_sees_only_own_installations(vendor_install, installation):
     assert _client(vendor_install["unlinked_vendor"]).get("/api/sites/installations/").data["count"] == 0
 
 
+
+@pytest.mark.django_db
+def test_a_step_will_not_move_until_somebody_is_named(installation, tech):
+    """An asset went live with no record of who had put it up.
+
+    Somebody is named once, before the first step moves — our own
+    technician, or the vendor whose crew is doing a turnkey job.
+    """
+    installation.installed_by = None
+    installation.vendor = None
+    installation.external_vendor_name = ""
+    installation.save(update_fields=["installed_by", "vendor", "external_vendor_name"])
+
+    step = installation.steps.order_by("step_number").first()
+    url = f"/api/sites/installation-steps/{step.id}/"
+    # Only a super admin or the assigned installer may move a step, and
+    # there is no assigned installer — which is the whole point.
+    boss = User.objects.create_user(username="inst-boss", password="x", role="super_admin")
+    c = _client(boss)
+
+    bare = c.patch(url, {"status": "in_progress"}, format="json")
+    assert bare.status_code == 400, bare.content
+    assert "Nobody is assigned" in str(bare.data["status"])
+
+    installation.installed_by = tech
+    installation.save(update_fields=["installed_by"])
+    ok = c.patch(url, {"status": "in_progress"}, format="json")
+    assert ok.status_code == 200, ok.content
+
+
 @pytest.mark.django_db
 def test_vendor_advances_own_step_403_on_others(vendor_install, installation):
     c = _client(vendor_install["vendor_user"])
