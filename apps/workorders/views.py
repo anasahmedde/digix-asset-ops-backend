@@ -71,6 +71,14 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         .all()
     )
     permission_classes = [IsAuthenticated, AdminManagerWriteElseRead, CapabilityGate]
+
+    def get_permissions(self):
+        # Agreeing a price is deliberately not a work-order right: the point
+        # is that somebody outside says yes. Who exactly is checked against
+        # the line's own owner, inside the action.
+        if getattr(self, "action", None) == "price_variance":
+            return [IsAuthenticated()]
+        return super().get_permissions()
     filterset_fields = ["status", "order_type", "supplier", "client", "site"]
     search_fields = ["wo_number", "title", "description"]
     ordering_fields = ["created_at", "expected_delivery", "total_amount"]
@@ -82,6 +90,108 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    @action(detail=True, methods=["post"], url_path="price-variance")
+    def price_variance(self, request, pk=None):
+        """Agree, or refuse, the price quoted for one operation on this order.
+
+        The same decision as on a purchase order, taken by the same people —
+        it is the project's planned figure being passed either way.
+        """
+        from apps.procurement.variance import tell_the_buyer
+        from apps.procurement.views import PurchaseOrderViewSet
+
+        work_order = self.get_object()
+        item = work_order.items.filter(pk=request.data.get("item")).first()
+        if item is None:
+            return Response({"item": ["Pick the operation to decide."]}, status=400)
+        if item.variance_status != WorkOrderItem.VarianceStatus.PENDING:
+            return Response({"detail": (
+                f"That operation is already {item.get_variance_status_display().lower()}."
+            )}, status=400)
+
+        allowed = PurchaseOrderViewSet.VARIANCE_DECIDERS.get(item.variance_owner, ())
+        if getattr(request.user, "role", "") not in allowed:
+            return Response({"detail": (
+                f"This one is {item.get_variance_owner_display()}'s to agree, not yours."
+            )}, status=status.HTTP_403_FORBIDDEN)
+
+        approve = bool(request.data.get("approve"))
+        notes = (request.data.get("notes") or "").strip()
+        if not approve and not notes:
+            return Response(
+                {"notes": ["Say why the price is refused — the buyer has to act on it."]},
+                status=400,
+            )
+
+        item.variance_status = (
+            WorkOrderItem.VarianceStatus.APPROVED if approve
+            else WorkOrderItem.VarianceStatus.REJECTED
+        )
+        item.variance_notes = notes
+        item.variance_decided_by = request.user
+        item.variance_decided_at = timezone.now()
+        item.variance_decided_price = item.unit_price
+        item.save(update_fields=[
+            "variance_status", "variance_notes", "variance_decided_by",
+            "variance_decided_at", "variance_decided_price", "updated_at",
+        ])
+        tell_the_buyer(item, request.user, approve)
+
+        if not approve:
+            # The order cannot be placed at this price and nothing else can be
+            # done with it, so it is called off and its operations go back on
+            # the Work Requests queue — a fresh order can then be raised, at a
+            # price somebody will agree to or with another vendor.
+            from apps.assets.models import ProductionStep
+
+            with transaction.atomic():
+                work_order.status = WorkOrder.Status.CANCELLED
+                work_order.save(update_fields=["status", "updated_at"])
+                # Cancelling hands an operation back to the project as
+                # undecided; that decision was never in question here, only
+                # the price. They are asked for again instead.
+                back = []
+                for line in work_order.items.select_related("production_step"):
+                    step = line.production_step
+                    if step is None:
+                        continue
+                    step.refresh_from_db()
+                    if step.status in (
+                        ProductionStep.Status.COMPLETED, ProductionStep.Status.SKIPPED
+                    ):
+                        continue
+                    step.location = ProductionStep.Location.EXTERNAL
+                    step.work_order_requested_at = timezone.now()
+                    step.workshop = None
+                    step.workshop_name = ""
+                    step.status = ProductionStep.Status.PENDING
+                    step.save(update_fields=[
+                        "location", "work_order_requested_at", "workshop",
+                        "workshop_name", "status", "updated_at",
+                    ])
+                    back.append(step.name)
+
+            return Response({
+                "detail": (
+                    f"Price refused for '{item.description}'. {work_order.wo_number} is called off "
+                    + (
+                        f"and {len(back)} operation(s) are back on Work Requests to be raised again."
+                        if back else "."
+                    )
+                ),
+                "work_order_cancelled": True,
+                "back_on_requests": back,
+                "unagreed_lines": 0,
+                "can_submit": False,
+            })
+
+        left = work_order.unagreed_lines().count()
+        return Response({
+            "detail": f"Price agreed for '{item.description}'.",
+            "unagreed_lines": left,
+            "can_submit": left == 0,
+        })
 
     @action(detail=True, methods=["post"])
     def transition(self, request, pk=None):
@@ -101,6 +211,20 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
             )
         if new_status == WorkOrder.Status.APPROVED and role not in ("super_admin", "group_head"):
             return Response({"detail": "Work orders are approved by the Group Head."}, status=status.HTTP_403_FORBIDDEN)
+
+        # An order quoted above what the project planned does not reach the
+        # Group Head until Execution has agreed to pay it.
+        if new_status == WorkOrder.Status.PENDING_APPROVAL:
+            unagreed = list(work_order.unagreed_lines())
+            if unagreed:
+                waiting = ", ".join(
+                    f"{i.description} ({i.get_variance_owner_display()})" for i in unagreed[:4]
+                )
+                return Response({"detail": (
+                    f"{len(unagreed)} operation(s) are quoted above what the project planned and "
+                    f"have not been agreed: {waiting}. They go back for approval before this "
+                    f"order can go up for signature."
+                )}, status=status.HTTP_400_BAD_REQUEST)
         if new_status == WorkOrder.Status.COMPLETED:
             return Response(
                 {"detail": "Delivered work is completed by inspecting it — Work Orders › Work Receiving."},
@@ -314,8 +438,9 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
                 terms_conditions=(request.data.get("terms") or "").strip(),
                 created_by=request.user,
             )
+            reasons = request.data.get("variance_reasons") or {}
             for step in steps:
-                WorkOrderItem.objects.create(
+                line = WorkOrderItem.objects.create(
                     work_order=order,
                     asset_type=step.device.asset_type,
                     device_model=step.device.device_model,
@@ -324,7 +449,28 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
                     unit_price=amount_for(step),
                     production_step=step,
                 )
+                # What the operation was costed at in the project's plan. A
+                # vendor quoting above it is spending the project's money, so
+                # Execution agrees the figure before the order goes up.
+                if step.planned_cost is not None:
+                    line.reference_unit_price = step.planned_cost
+                    line.reference_label = "Planned for this operation"
+                    line.variance_owner = (
+                        WorkOrderItem.VarianceOwner.PROJECT if project is not None
+                        else WorkOrderItem.VarianceOwner.OPERATIONS
+                    )
+                    line.variance_reason = (reasons.get(str(step.pk)) or "").strip()
+                    line.save(update_fields=[
+                        "reference_unit_price", "reference_label", "variance_owner",
+                        "variance_reason", "unit_price", "updated_at",
+                    ])
             order.recalc_total()
+
+        flagged = list(order.unagreed_lines())
+        if flagged:
+            from apps.procurement.variance import tell_the_owner
+            tell_the_owner(flagged, raised_by=request.user)
+
         return Response(WorkOrderSerializer(order).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["post"], url_path="requests/send-back")

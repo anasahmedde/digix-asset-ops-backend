@@ -1,5 +1,7 @@
 """Work orders are the services we take from vendors: Execution asks, Work
 Orders raises, the Group Head approves, the operation follows the order."""
+from decimal import Decimal
+
 import pytest
 from rest_framework.test import APIClient
 
@@ -77,6 +79,15 @@ def test_execution_asks_work_orders_raises_group_head_approves(build):
         assert detail["work_order"]["wo_number"] == order.wo_number and detail["work_order_requested"] is False
     assert ops.get("/api/work-orders/requests/").json()["results"] == []
     assert ops.post("/api/work-orders/raise/", {"steps": [str(cut.id)], "supplier": str(build["vendor"].id)}, format="json").status_code == 400
+
+    # Painting was planned at 900 and is quoted at 1000, so the order waits on
+    # Execution before it can go up — the same rule a purchase order answers to.
+    held = ops.post(f"/api/work-orders/{order.id}/transition/", {"status": "pending_approval"}, format="json")
+    assert held.status_code == 400 and "quoted above what the project planned" in str(held.data)
+    over = order.items.get(description="Painting on Kiosk")
+    agreed = ops.post(f"/api/work-orders/{order.id}/price-variance/",
+                      {"item": str(over.id), "approve": True, "notes": "Rate accepted"}, format="json")
+    assert agreed.status_code == 200, agreed.content
 
     # The same sign-off as a purchase order.
     assert ops.post(f"/api/work-orders/{order.id}/transition/", {"status": "pending_approval"}, format="json").status_code == 200
@@ -230,9 +241,10 @@ def test_delivered_work_is_inspected_before_it_completes(build):
 
 
 @pytest.mark.django_db
-def test_an_operation_external_with_no_order_is_not_stranded(build):
-    """Marked external but nothing was ever raised for it: nothing is coming to
-    move it, so the floor can still run and close it."""
+def test_an_operation_sent_outside_is_not_closed_by_hand(build):
+    """Only in-house work is moved from the floor. Anything going to a
+    workshop follows its order, and says so rather than offering a button
+    that would claim work nobody did."""
     from apps.suppliers.models import Supplier
 
     ops, _ = _client("ops_manager", "ops7")
@@ -243,11 +255,11 @@ def test_an_operation_external_with_no_order_is_not_stranded(build):
     paint.refresh_from_db()
 
     assert paint.on_a_work_order is False
-    assert paint.hold_reason == ""
+    assert "work order" in paint.hold_reason
     detail = ops.get(f"/api/assets/production-steps/{paint.id}/").json()
-    assert detail["allowed_transitions"], "the operation has a way forward"
+    assert detail["allowed_transitions"] == []
     r = ops.post(f"/api/assets/production-steps/{paint.id}/transition/", {"status": "completed"}, format="json")
-    assert r.status_code == 200, r.content
+    assert r.status_code == 400, r.content
 
     # Once a real order covers it, it follows the order again.
     cut = build["steps"][0]
@@ -395,3 +407,164 @@ def test_a_requested_operation_is_not_taken_back_from_the_project(build):
     assert r.status_code == 200, r.content
     cut.refresh_from_db()
     assert cut.location == "in_house"
+
+
+# ---------------------------------------------------------------------------
+# A vendor quoting above the project's plan needs Execution's word
+# ---------------------------------------------------------------------------
+@pytest.mark.django_db
+def test_a_quote_over_the_plan_blocks_the_work_order(db):
+    from django.contrib.auth import get_user_model
+    from rest_framework.test import APIClient
+
+    from apps.assets.models import Brand, Device, DeviceModel, ProductionStep
+    from apps.suppliers.models import Supplier
+    from apps.teams.models import Project, ProjectScopeItem
+    from apps.workorders.models import WorkOrder, WorkOrderItem
+
+    User = get_user_model()
+    ops = User.objects.create_user(username="wo-ops", password="x", role="ops_manager")
+    execution = User.objects.create_user(username="wo-sup", password="x", role="supervisor")
+    client = APIClient()
+    client.force_authenticate(ops)
+
+    brand = Brand.objects.create(name="WO Variance Brand")
+    model = DeviceModel.objects.create(brand=brand, name="WV-1")
+    asset = Device.objects.create(device_model=model, serial_number="WV-SN-1", source="inhouse")
+    project = Project.objects.create(name="WO Variance Project")
+    ProjectScopeItem.objects.create(project=project, device=asset, quantity=1)
+    step = ProductionStep.objects.create(
+        device=asset, step_number=1, name="Painting",
+        location=ProductionStep.Location.EXTERNAL, planned_cost="5000.00",
+    )
+    workshop = Supplier.objects.create(name="WO Variance Workshop")
+
+    # The vendor wants 8,000 for an operation planned at 5,000.
+    r = client.post("/api/work-orders/raise/", {
+        "supplier": str(workshop.pk),
+        "steps": [str(step.pk)],
+        "amounts": {str(step.pk): "8000"},
+        "variance_reasons": {str(step.pk): "Only workshop free this month"},
+    }, format="json")
+    assert r.status_code == 201, r.content
+    order = WorkOrder.objects.get(pk=r.data["id"])
+    line = order.items.first()
+    assert line.reference_unit_price == Decimal("5000.00")
+    assert line.variance_status == WorkOrderItem.VarianceStatus.PENDING
+    assert line.variance_owner == WorkOrderItem.VarianceOwner.PROJECT
+    assert round(line.variance_percent) == 60
+
+    # It cannot go up for signature while nobody has agreed it.
+    blocked = client.post(f"/api/work-orders/{order.pk}/transition/",
+                          {"status": "pending_approval"}, format="json")
+    assert blocked.status_code == 400, blocked.content
+    assert "quoted above what the project planned" in str(blocked.data)
+
+    # It waits in the same queue as a purchase order's.
+    queue = APIClient()
+    queue.force_authenticate(execution)
+    rows = queue.get("/api/procurement/purchase-orders/price-variances/")
+    assert rows.status_code == 200, rows.content
+    mine = [x for x in rows.data["results"] if x["id"] == str(line.pk)]
+    assert mine and mine[0]["kind"] == "work" and mine[0]["order_number"] == order.wo_number
+
+    # Execution agrees, and the order moves.
+    said = queue.post(f"/api/work-orders/{order.pk}/price-variance/",
+                      {"item": str(line.pk), "approve": True, "notes": "Accepted"}, format="json")
+    assert said.status_code == 200, said.content
+    assert said.data["can_submit"] is True
+
+    moved = client.post(f"/api/work-orders/{order.pk}/transition/",
+                        {"status": "pending_approval"}, format="json")
+    assert moved.status_code == 200, moved.content
+
+
+@pytest.mark.django_db
+def test_a_quote_within_the_plan_needs_nobody(db):
+    from django.contrib.auth import get_user_model
+    from rest_framework.test import APIClient
+
+    from apps.assets.models import Brand, Device, DeviceModel, ProductionStep
+    from apps.suppliers.models import Supplier
+    from apps.teams.models import Project, ProjectScopeItem
+    from apps.workorders.models import WorkOrder, WorkOrderItem
+
+    User = get_user_model()
+    ops = User.objects.create_user(username="wo-ops2", password="x", role="ops_manager")
+    client = APIClient()
+    client.force_authenticate(ops)
+
+    brand = Brand.objects.create(name="WO Ok Brand")
+    model = DeviceModel.objects.create(brand=brand, name="WO-1")
+    asset = Device.objects.create(device_model=model, serial_number="WO-SN-2", source="inhouse")
+    project = Project.objects.create(name="WO Ok Project")
+    ProjectScopeItem.objects.create(project=project, device=asset, quantity=1)
+    step = ProductionStep.objects.create(
+        device=asset, step_number=1, name="Welding",
+        location=ProductionStep.Location.EXTERNAL, planned_cost="5000.00",
+    )
+    workshop = Supplier.objects.create(name="WO Ok Workshop")
+
+    r = client.post("/api/work-orders/raise/", {
+        "supplier": str(workshop.pk), "steps": [str(step.pk)],
+        "amounts": {str(step.pk): "4500"},
+    }, format="json")
+    assert r.status_code == 201, r.content
+    line = WorkOrder.objects.get(pk=r.data["id"]).items.first()
+    assert line.variance_status == WorkOrderItem.VarianceStatus.NOT_REQUIRED
+
+    moved = client.post(f"/api/work-orders/{r.data['id']}/transition/",
+                        {"status": "pending_approval"}, format="json")
+    assert moved.status_code == 200, moved.content
+
+
+@pytest.mark.django_db
+def test_a_refused_price_puts_the_work_back_on_the_queue(build):
+    """The decision to go outside stands; only the price was wrong, so the
+    operation is asked for again rather than handed back as undecided."""
+    from apps.assets.models import ProductionStep
+
+    ops, _ = _client("ops_manager", "ops-refuse")
+    execution, _ = _client("supervisor", "sup-refuse")
+    paint = build["steps"][1]                       # planned at 900
+    ops.post(f"/api/assets/production-steps/{paint.id}/decide/", {"location": "external"}, format="json")
+
+    r = ops.post("/api/work-orders/raise/", {
+        "steps": [str(paint.id)], "supplier": str(build["vendor"].id),
+        "amounts": {str(paint.id): "2000"},
+    }, format="json")
+    assert r.status_code == 201, r.content
+    order = WorkOrder.objects.get(pk=r.data["id"])
+    line = order.items.first()
+    assert line.variance_status == "pending"
+    assert ops.get("/api/work-orders/requests/").json()["results"] == [], "it left the queue"
+
+    refused = execution.post(f"/api/work-orders/{order.id}/price-variance/", {
+        "item": str(line.id), "approve": False, "notes": "Too dear — try Ali's",
+    }, format="json")
+    assert refused.status_code == 200, refused.content
+    assert refused.data["work_order_cancelled"] is True
+    assert refused.data["back_on_requests"] == ["Painting"]
+
+    order.refresh_from_db()
+    assert order.status == WorkOrder.Status.CANCELLED
+
+    # Back where it was: still going outside, still waiting for an order.
+    paint.refresh_from_db()
+    assert paint.location == ProductionStep.Location.EXTERNAL
+    assert paint.work_order_requested_at is not None
+    assert paint.status == ProductionStep.Status.PENDING
+    assert paint.workshop_id is None
+    queued = [row["operation"] for row in ops.get("/api/work-orders/requests/").json()["results"]]
+    assert "Painting" in queued, "it can be raised again"
+
+    # And a fresh order at an agreeable price goes up without a fight.
+    again = ops.post("/api/work-orders/raise/", {
+        "steps": [str(paint.id)], "supplier": str(build["vendor"].id),
+        "amounts": {str(paint.id): "850"},
+    }, format="json")
+    assert again.status_code == 201, again.content
+    assert again.data["items"][0]["variance_status"] == "not_required"
+    moved = ops.post(f"/api/work-orders/{again.data['id']}/transition/",
+                     {"status": "pending_approval"}, format="json")
+    assert moved.status_code == 200, moved.content

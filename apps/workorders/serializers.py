@@ -34,6 +34,25 @@ class WorkOrderItemSerializer(HidesMoney, serializers.ModelSerializer):
         user = obj.inspected_by
         return (user.get_full_name() or user.username) if user else None
 
+    # What the project costed this operation at, and whether paying the
+    # vendor more than that has been agreed.
+    variance_percent = serializers.SerializerMethodField()
+    variance_owner_display = serializers.CharField(
+        source="get_variance_owner_display", read_only=True
+    )
+    variance_status_display = serializers.CharField(
+        source="get_variance_status_display", read_only=True
+    )
+    variance_decided_by_name = serializers.SerializerMethodField()
+
+    def get_variance_percent(self, obj):
+        pct = obj.variance_percent
+        return None if pct is None else round(float(pct), 1)
+
+    def get_variance_decided_by_name(self, obj):
+        user = obj.variance_decided_by
+        return (user.get_full_name() or user.username) if user else None
+
     class Meta:
         model = WorkOrderItem
         fields = [
@@ -43,10 +62,19 @@ class WorkOrderItemSerializer(HidesMoney, serializers.ModelSerializer):
             "delivered_at", "inspected_at", "inspected_by_name",
             "inspection_result", "inspection_result_display", "inspection_notes",
             "line_state", "line_state_display",
+            "reference_unit_price", "reference_label", "variance_percent",
+            "variance_owner", "variance_owner_display",
+            "variance_status", "variance_status_display",
+            "variance_reason", "variance_notes",
+            "variance_decided_by_name", "variance_decided_at",
         ]
+        # The variance is settled through its own endpoint, where the right to
+        # settle it is checked; it is never a field somebody can simply write.
         read_only_fields = [
             "id", "line_total", "delivered_at", "inspected_at", "inspected_by_name",
             "inspection_result", "inspection_notes", "line_state",
+            "reference_unit_price", "reference_label", "variance_percent",
+            "variance_owner", "variance_status", "variance_notes", "variance_decided_at",
         ]
 
 

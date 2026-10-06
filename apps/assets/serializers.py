@@ -440,15 +440,23 @@ def _client_names(device):
     return names
 
 
-def _project_name(obj):
-    """An asset belongs to a project either directly or through one of the
-    project's scope lines, so both have to be looked at."""
+def _project_of(obj):
+    """The project an asset belongs to, directly or through a scope line.
+
+    Both have to be looked at: an order can name the asset on the project
+    itself, or list it among the project's scope.
+    """
     if obj.project_id:
-        return obj.project.name
+        return obj.project
     for item in obj.project_scope_items.all():
         if item.project_id:
-            return item.project.name
+            return item.project
     return None
+
+
+def _project_name(obj):
+    project = _project_of(obj)
+    return project.name if project is not None else None
 
 
 class DeviceListSerializer(serializers.ModelSerializer):
@@ -526,6 +534,22 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
     project_rental_end_date = serializers.DateField(
         source="project.rental_end_date", read_only=True, default=None
     )
+    # The sites this asset's project covers. An asset is installed at one of
+    # the places its own order is for — offering every site on the books
+    # invited it to be sent somewhere the project never mentioned.
+    project_sites = serializers.SerializerMethodField()
+
+    def get_project_sites(self, obj):
+        project = _project_of(obj)
+        if project is None:
+            return []
+        sites = list(project.sites.all())
+        if project.site_id and all(s.pk != project.site_id for s in sites):
+            sites.append(project.site)
+        return [
+            {"id": str(s.pk), "name": s.name, "city": getattr(s, "city", "") or ""}
+            for s in sites
+        ]
     components = AssetComponentSerializer(many=True, read_only=True)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     technician_name = serializers.CharField(source="assigned_technician.get_full_name", read_only=True, default=None)
@@ -631,7 +655,7 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
             "clients", "client_names",
-            "project", "project_name", "project_contract_type", "project_rental_end_date",
+            "project", "project_name", "project_contract_type", "project_rental_end_date", "project_sites",
             "components",
             "assigned_technician", "technician_name", "technician_employee_id",
             "technician_job_title", "technician_phone",

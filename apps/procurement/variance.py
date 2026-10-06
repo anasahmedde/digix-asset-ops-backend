@@ -43,7 +43,7 @@ def tell_the_owner(items, raised_by=None):
         roles = PurchaseOrderViewSet.VARIANCE_DECIDERS.get(owner, ())
         if not roles:
             continue
-        order = lines[0].purchase_order
+        order = lines[0].parent_order
         who = User.objects.filter(is_active=True, role__in=roles).exclude(
             pk=getattr(raised_by, "pk", None)
         )
@@ -57,14 +57,14 @@ def tell_the_owner(items, raised_by=None):
             note = Notification.objects.create(
                 recipient=user,
                 notification_type=Notification.Type.SYSTEM,
-                title=f"{order.po_number} is priced over plan",
+                title=f"{lines[0].order_number} is priced over plan",
                 message=(
-                    f"{len(lines)} line(s) on {order.po_number} cost more than was planned: "
+                    f"{len(lines)} line(s) on {lines[0].order_number} cost more than was planned: "
                     f"{detail}. The order cannot go up for signature until you agree them."
                 ),
                 data={
-                    "purchase_order": str(order.pk),
-                    "po_number": order.po_number,
+                    "order": str(order.pk),
+                    "order_number": lines[0].order_number,
                     "variance_owner": owner,
                     "items": [str(line.pk) for line in lines],
                 },
@@ -76,16 +76,16 @@ def tell_the_owner(items, raised_by=None):
 
 def tell_the_buyer(item, decider, approved):
     """Send the answer back to whoever raised the order."""
-    order = item.purchase_order
-    buyer = order.ordered_by
+    order = item.parent_order
+    buyer = item.order_raised_by
     if buyer is None or buyer.pk == getattr(decider, "pk", None):
         return None
     note = Notification.objects.create(
         recipient=buyer,
         notification_type=Notification.Type.SYSTEM,
         title=(
-            f"Price agreed on {order.po_number}" if approved
-            else f"Price refused on {order.po_number}"
+            f"Price agreed on {item.order_number}" if approved
+            else f"Price refused on {item.order_number}"
         ),
         message=(
             f"{decider.get_full_name() or decider.username} "
@@ -94,8 +94,8 @@ def tell_the_buyer(item, decider, approved):
             + (f" — {item.variance_notes}" if item.variance_notes else ".")
         ),
         data={
-            "purchase_order": str(order.pk),
-            "po_number": order.po_number,
+            "order": str(order.pk),
+            "order_number": item.order_number,
             "item": str(item.pk),
             "approved": approved,
         },

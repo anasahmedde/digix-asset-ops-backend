@@ -137,20 +137,33 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
             qty = line["quantity"]
             batch_number = line.get("batch_number", "")
 
-            # Goods stop at the door. Nothing is stocked and no asset is
-            # created here — the line waits for a technician's inspection,
-            # which routes the accepted quantity into generic stock or unique
-            # units (see inventory.services.stock_inspected_line).
+            # The delivery is checked against the order here, by the people
+            # who placed it, and the verdict is written onto the GRN as it is
+            # created. Nothing is stocked: the store receives it afterwards
+            # and counts it onto the shelf.
+            accepted = line.get("accepted_quantity", qty)
+            rejected = line.get("rejected_quantity", 0)
             receipt_lines.append(GoodsReceiptLine.objects.create(
                 receipt=receipt,
                 po_item=po_item,
                 quantity=qty,
                 batch_number=batch_number,
                 serial_numbers=line["serial_numbers"],
-                inspection_status=GoodsReceiptLine.Inspection.PENDING,
+                inspection_status=(
+                    GoodsReceiptLine.Inspection.PASSED if accepted
+                    else GoodsReceiptLine.Inspection.REJECTED
+                ),
+                accepted_quantity=accepted,
+                rejected_quantity=rejected,
+                inspection_notes=line.get("inspection_notes", ""),
+                inspected_by=user,
+                inspected_at=timezone.now(),
             ))
 
-            po_item.received_quantity += qty
+            # Only what was accepted counts against the order. What was turned
+            # away is still owed: the balance reopens and the supplier can
+            # deliver it again.
+            po_item.received_quantity += accepted
             po_item.save(update_fields=["received_quantity", "updated_at"])
 
             # A line that buys complete assets is not stock to inspect: the
@@ -185,12 +198,17 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
                             end_date=today + relativedelta(months=int(months)),
                             months=int(months),
                         )
+                # A complete asset goes straight onto the registry — there is
+                # no shelf for it to be received onto afterwards.
                 receipt_lines[-1].inspection_status = GoodsReceiptLine.Inspection.PASSED
                 receipt_lines[-1].inspection_notes = "Complete asset — entered the registry directly."
                 receipt_lines[-1].inspected_by = user
                 receipt_lines[-1].inspected_at = timezone.now()
+                receipt_lines[-1].stocked_at = timezone.now()
+                receipt_lines[-1].stocked_by = user
                 receipt_lines[-1].save(update_fields=[
-                    "inspection_status", "inspection_notes", "inspected_by", "inspected_at", "updated_at",
+                    "inspection_status", "inspection_notes", "inspected_by", "inspected_at",
+                    "stocked_at", "stocked_by", "updated_at",
                 ])
 
         # Auto-advance the PO — a system transition, not a user one: set the
@@ -223,7 +241,11 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
         "grn_number": receipt.grn_number,
         "purchase_order": str(purchase_order.pk),
         # Received goods are held for inspection — nothing is in stock yet.
-        "pending_inspection": len(receipt_lines),
+        "awaiting_stock": sum(1 for ln in receipt_lines if ln.awaiting_stock),
+        "rejected_lines": sum(
+            1 for ln in receipt_lines
+            if ln.inspection_status == GoodsReceiptLine.Inspection.REJECTED
+        ),
         "created_devices": [],
         "lines": GoodsReceiptLineSerializer(receipt_lines, many=True).data,
     }

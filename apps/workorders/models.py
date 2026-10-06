@@ -17,6 +17,7 @@ from django.db import models
 
 from common.codes import generate_code
 from common.models import TimeStampedModel
+from common.variance import PriceVariance
 
 
 class WorkOrder(TimeStampedModel):
@@ -149,6 +150,19 @@ class WorkOrder(TimeStampedModel):
     def can_transition_to(self, new_status: str) -> bool:
         return new_status in self.VALID_TRANSITIONS.get(self.status, ())
 
+    def unagreed_lines(self):
+        """Operations quoted above what the project planned, not yet agreed.
+
+        An order carrying one of these must not reach the Group Head: the
+        signature commits the company to a figure nobody budgeted for.
+        """
+        return self.items.filter(
+            variance_status__in=(
+                WorkOrderItem.VarianceStatus.PENDING,
+                WorkOrderItem.VarianceStatus.REJECTED,
+            )
+        )
+
     def recalc_total(self, save: bool = True):
         total = sum((item.line_total for item in self.items.all()), Decimal("0"))
         self.total_amount = total
@@ -157,7 +171,15 @@ class WorkOrder(TimeStampedModel):
         return total
 
 
-class WorkOrderItem(TimeStampedModel):
+class WorkOrderItem(PriceVariance, TimeStampedModel):
+    """One operation on an order, and whether its price has been agreed.
+
+    An operation sent to a workshop was costed in the project's plan. Paying
+    a vendor more than that is the project's money, so Execution agrees it
+    before the order goes up — the same rule purchases answer to, from the
+    same ``PriceVariance``.
+    """
+
     work_order = models.ForeignKey(WorkOrder, on_delete=models.CASCADE, related_name="items")
     asset_type = models.ForeignKey(
         "assets.AssetType", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_order_items"

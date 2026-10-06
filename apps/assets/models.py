@@ -645,11 +645,16 @@ class ProductionStep(TimeStampedModel):
 
     @property
     def manual_moves(self) -> tuple:
-        """What a person may move this step to right now."""
-        if self.location == self.Location.EXTERNAL and self.on_a_work_order:
-            return ()  # follows its work order
-        if self.location == self.Location.UNDECIDED and self.on_project:
-            return ()  # the project decides first
+        """What a person may move this step to right now.
+
+        Only an operation being done in-house is moved by hand. One sent
+        outside follows its work order, and one nobody has decided yet is
+        not being done at all — a status moved on it would be a claim about
+        work that has no home. The decision is the project's, taken in
+        Execution; until it is taken the row is read-only.
+        """
+        if self.location != self.Location.IN_HOUSE:
+            return ()
         if self.status not in (self.Status.COMPLETED, self.Status.SKIPPED) and self.materials_pending:
             return ()  # the parts are not here yet
         return self.VALID_TRANSITIONS.get(self.status, ())
@@ -658,12 +663,19 @@ class ProductionStep(TimeStampedModel):
     def hold_reason(self) -> str:
         if self.status in (self.Status.COMPLETED, self.Status.SKIPPED):
             return ""
-        if self.location == self.Location.EXTERNAL and self.on_a_work_order:
+        if self.location == self.Location.EXTERNAL:
             if self.work_order_requested:
                 return "Work order requested — raise it under Work Orders › Requests; the status then follows the order."
-            return "On a work order — its status follows the work order."
-        if self.location == self.Location.UNDECIDED and self.on_project:
-            return "Decide in the project's Execution tab whether this is done in-house or on a work order."
+            if self.on_a_work_order:
+                return "On a work order — its status follows the work order."
+            return "Going to an outside workshop — its status will follow the work order."
+        if self.location == self.Location.UNDECIDED:
+            if self.on_project:
+                return "Decide in the project's Execution tab whether this is done in-house or on a work order."
+            return (
+                "This asset is not on a project, so nobody has said how this operation is "
+                "done. Add it to a project's scope and decide there."
+            )
         waiting = self.materials_pending
         if waiting:
             named = ", ".join(waiting[:3]) + ("…" if len(waiting) > 3 else "")
