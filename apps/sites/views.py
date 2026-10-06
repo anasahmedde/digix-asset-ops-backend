@@ -699,6 +699,24 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
                     "A step can be skipped if it does not apply."
                 )})
 
+        # Work that was never started cannot be finished. The step was being
+        # ticked straight from Not Started to Completed, so "Completed" said
+        # the job was done without anybody having begun it — and the dates
+        # the card shows had nothing behind them.
+        if (
+            new_status == InstallationStep.StepStatus.COMPLETED
+            and step.status != new_status
+            and step.status != InstallationStep.StepStatus.IN_PROGRESS
+        ):
+            if step.status == InstallationStep.StepStatus.ON_HOLD:
+                raise _VE({"status": (
+                    "This step is on hold. Start it again before marking it complete."
+                )})
+            raise _VE({"status": (
+                "Start this step before completing it — a step that was never "
+                "started has no record of the work behind it."
+            )})
+
         extra = {}
         if new_status == InstallationStep.StepStatus.COMPLETED and step.status != new_status:
             extra["completed_by"] = self.request.user

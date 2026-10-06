@@ -125,16 +125,26 @@ class Project(TimeStampedModel):
             changed.append("phase")
         # Everything finished is the one status the work can declare on its
         # own; the rest are judgements somebody makes about how it is going.
+        # An order is not finished while a client is holding an asset nobody
+        # wrote a warranty against — that promise was made on handover, and
+        # the register has to be able to answer a claim on it.
         if (
             settled == self.MAIN_PHASE_ORDER[-1]
             and self.status != self.Status.COMPLETED
             and self.computed_progress() >= 100
+            and not self.assets_awaiting_client_warranty()
         ):
             self.status = self.Status.COMPLETED
             changed.append("status")
         if changed:
             self.save(update_fields=[*changed, "updated_at"])
         return settled
+
+    def assets_awaiting_client_warranty(self):
+        """Assets the client is holding with no cover recorded against them."""
+        from apps.teams.warranties import missing_client_warranties
+
+        return missing_client_warranties(self)
 
     def computed_progress(self):
         """How far the order has got, derived rather than hand-typed.

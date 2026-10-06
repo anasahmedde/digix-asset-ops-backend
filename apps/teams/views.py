@@ -162,6 +162,65 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             return ProjectListSerializer
         return ProjectDetailSerializer
 
+    @action(detail=True, methods=["get", "post"], url_path="client-warranties")
+    def client_warranties(self, request, pk=None):
+        """What cover the client has on each asset this order delivered.
+
+        GET lists every asset with the warranty recorded against it. POST
+        records one: ``{device, months}``, or ``{device, end_date}`` when the
+        paperwork states an expiry rather than a term. The project cannot
+        complete while an asset the client is holding has none.
+        """
+        from apps.assets.models import Device
+        from apps.assets.serializers import _upsert_asset_warranty
+
+        from .costing import project_devices
+        from .warranties import warranty_rows
+
+        project = self.get_object()
+
+        if request.method == "GET":
+            rows = warranty_rows(project)
+            return Response({
+                "count": len(rows),
+                "results": rows,
+                "awaiting": [r["asset_code"] for r in rows if r["handed_over"] and not r["warranty"]],
+            })
+
+        device_id = request.data.get("device")
+        device = next(
+            (d for d in project_devices(project) if str(d.pk) == str(device_id)), None
+        )
+        if device is None:
+            return Response({"device": ["That asset is not on this project."]}, status=400)
+
+        months = request.data.get("months")
+        end_date = request.data.get("end_date") or None
+        if not months and not end_date:
+            return Response(
+                {"months": ["Say how long the client is covered for."]}, status=400
+            )
+        try:
+            months = int(months) if months else None
+        except (TypeError, ValueError):
+            return Response({"months": ["Give the cover in whole months."]}, status=400)
+        if months is not None and months < 1:
+            return Response({"months": ["A warranty runs for at least a month."]}, status=400)
+
+        warranty = _upsert_asset_warranty(device, "client", end=end_date, months=months)
+        if warranty is None:
+            return Response({"months": ["Nothing to record."]}, status=400)
+
+        rows = warranty_rows(project)
+        return Response({
+            "detail": (
+                f"{device.asset_code} is covered for {warranty.months} month"
+                f"{'' if warranty.months == 1 else 's'}, to {warranty.end_date:%Y-%m-%d}."
+            ),
+            "results": rows,
+            "awaiting": [r["asset_code"] for r in rows if r["handed_over"] and not r["warranty"]],
+        }, status=drf_status.HTTP_201_CREATED)
+
     @action(detail=True, methods=["get"], url_path="bom-summary")
     def bom_summary(self, request, pk=None):
         """Per-line fulfilment figures + project-level totals for the BOM tab."""

@@ -1597,6 +1597,7 @@ def test_steps_are_done_in_order_and_say_who_did_them(ops, tech, installation):
     assert "before this one" in str(r.data["status"])
 
     first = steps[0]
+    _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json")
     r = _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json")
     assert r.status_code == 200, r.content
     assert r.data["completed_by_name"] == (tech.get_full_name() or tech.username)
@@ -1605,6 +1606,7 @@ def test_steps_are_done_in_order_and_say_who_did_them(ops, tech, installation):
     # Skipping is the way past a step that does not apply.
     r = _client(tech).patch(f"/api/sites/installation-steps/{steps[1].id}/", {"status": "skipped"}, format="json")
     assert r.status_code == 200, r.content
+    _client(tech).patch(f"/api/sites/installation-steps/{later.id}/", {"status": "in_progress"}, format="json")
     r = _client(tech).patch(f"/api/sites/installation-steps/{later.id}/", {"status": "completed"}, format="json")
     assert r.status_code == 200, r.content
 
@@ -1629,6 +1631,7 @@ def test_an_in_house_build_can_go_live_once_its_checklist_is_done(ops, tech, ins
     assert "Finish the installation steps" in str(early.data)
 
     for step in installation.steps.exclude(step_type="handover").order_by("step_number"):
+        _client(tech).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
         r = _client(tech).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "completed"}, format="json")
         assert r.status_code == 200, r.content
     device.refresh_from_db()
@@ -1699,3 +1702,55 @@ def test_the_site_s_headline_contact_follows_its_primary_poc(ops):
     second.delete()
     site.refresh_from_db()
     assert site.contact_person == "" and site.contact_phone == ""
+
+
+@pytest.mark.django_db
+def test_a_step_is_started_before_it_is_finished(db):
+    """Completed meant the work was done; it was being ticked from Not
+    Started, so the dates on the card had nothing behind them."""
+    from django.contrib.auth import get_user_model
+    from rest_framework.test import APIClient
+
+    from apps.assets.models import Brand, Device, DeviceModel
+    from apps.sites.models import DeviceInstallation, InstallationStep, Site
+
+    User = get_user_model()
+    fitter = User.objects.create_user(username="step-fit", password="x", role="technician")
+    client = APIClient()
+    client.force_authenticate(fitter)
+
+    brand = Brand.objects.create(name="Step Guard Brand")
+    model = DeviceModel.objects.create(brand=brand, name="SG-1")
+    asset = Device.objects.create(device_model=model, serial_number="SG-SN-1")
+    site = Site.objects.create(name="Step Guard Site")
+    job = DeviceInstallation.objects.create(
+        device=asset, site=site, installed_by=fitter, installed_at=timezone.now(),
+    )
+    # Creating an installation seeds its checklist; the first step is the one
+    # that can move, since a step waits on the ones before it.
+    step = job.steps.order_by("step_number").first()
+    assert step is not None and step.status == InstallationStep.StepStatus.NOT_STARTED
+
+    straight = client.patch(f"/api/sites/installation-steps/{step.pk}/",
+                            {"status": "completed"}, format="json")
+    assert straight.status_code == 400, straight.content
+    assert "Start this step before completing it" in str(straight.data)
+
+    # Held is not started either — it has to be picked up again first.
+    step.status = InstallationStep.StepStatus.ON_HOLD
+    step.save(update_fields=["status"])
+    held = client.patch(f"/api/sites/installation-steps/{step.pk}/",
+                        {"status": "completed"}, format="json")
+    assert held.status_code == 400, held.content
+    assert "on hold" in str(held.data).lower()
+
+    # Started, then finished.
+    begun = client.patch(f"/api/sites/installation-steps/{step.pk}/",
+                         {"status": "in_progress"}, format="json")
+    assert begun.status_code == 200, begun.content
+    done = client.patch(f"/api/sites/installation-steps/{step.pk}/",
+                        {"status": "completed"}, format="json")
+    assert done.status_code == 200, done.content
+    step.refresh_from_db()
+    assert step.status == InstallationStep.StepStatus.COMPLETED
+    assert step.started_at is not None and step.completed_at is not None
