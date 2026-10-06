@@ -1542,7 +1542,11 @@ def _store_issues(client, component, quantity=None):
     row = IssuanceRequest.objects.filter(asset_component=component).latest("created_at")
     return client.post(
         f"/api/inventory/issuance-requests/{row.id}/issue/",
-        {"quantity": quantity if quantity is not None else row.quantity_requested},
+        {
+            "quantity": quantity if quantity is not None else row.quantity_requested,
+            # Stock does not leave the store without somebody named against it.
+            "received_by": "Build team",
+        },
         format="json",
     )
 
@@ -1961,13 +1965,48 @@ def test_a_step_work_order_spawns_no_installation_project(admin_client, inhouse_
 
 @pytest.mark.django_db
 def test_the_step_flow_is_guarded(admin_client, inhouse_asset):
+    from apps.assets.models import ProductionStep
+
     step_id = _step(admin_client, inhouse_asset, 1, "Welding").data["id"]
-    # pending to returned makes no sense, it was never sent anywhere
+    step = ProductionStep.objects.get(pk=step_id)
+
+    # Nobody has said how this operation is done, so nothing can be moved
+    # on it at all — not even a move the status machine would allow.
+    r = admin_client.post(
+        f"/api/assets/production-steps/{step_id}/transition/", {"status": "in_progress"}, format="json",
+    )
+    assert r.status_code == 400, r.content
+    assert "not on a project" in r.data["detail"]
+
+    # Decided as in-house, the status machine is what guards it: pending to
+    # returned makes no sense, it was never sent anywhere.
+    step.location = ProductionStep.Location.IN_HOUSE
+    step.save(update_fields=["location"])
     r = admin_client.post(
         f"/api/assets/production-steps/{step_id}/transition/", {"status": "returned"}, format="json",
     )
     assert r.status_code == 400, r.content
     assert "Cannot move" in r.data["detail"]
+
+
+@pytest.mark.django_db
+def test_only_an_in_house_operation_is_moved_by_hand(admin_client, inhouse_asset):
+    """Outside work follows its order; an undecided one is not being done."""
+    from apps.assets.models import ProductionStep
+
+    step = ProductionStep.objects.get(pk=_step(admin_client, inhouse_asset, 1, "Cutting").data["id"])
+    assert step.location == ProductionStep.Location.UNDECIDED
+    assert step.manual_moves == ()
+
+    step.location = ProductionStep.Location.EXTERNAL
+    step.save(update_fields=["location"])
+    assert step.manual_moves == ()
+    assert "work order" in step.hold_reason
+
+    step.location = ProductionStep.Location.IN_HOUSE
+    step.save(update_fields=["location"])
+    assert ProductionStep.Status.IN_PROGRESS in step.manual_moves
+    assert step.hold_reason == ""
 
 
 # ---------------------------------------------------------------------------

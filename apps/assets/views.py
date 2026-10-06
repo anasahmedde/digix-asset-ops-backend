@@ -165,6 +165,13 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 .exclude(warranties__status="active")
                 .distinct()
             )
+
+        # ?unassigned=true — assets no project has claimed yet, for the scope
+        # picker. An asset belongs to a project by its own field or by a scope
+        # row, and a picker that honoured only the first went on offering
+        # assets the server then refused.
+        if self.request.query_params.get("unassigned") in ("1", "true", "True"):
+            qs = qs.filter(project__isnull=True, project_scope_items__isnull=True)
         return qs
 
     def get_serializer_class(self):
