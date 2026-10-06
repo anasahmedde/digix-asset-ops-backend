@@ -787,7 +787,9 @@ def test_actual_costs_are_recorded_against_the_approved_budget():
     assert r.status_code == 200, r.content
     row = IssuanceRequest.objects.filter(asset_component=component).latest("created_at")
     r = c.post(f"/api/inventory/issuance-requests/{row.id}/issue/",
-               {"quantity": row.quantity_requested}, format="json")
+               # Stock does not leave the store without somebody named.
+               {"quantity": row.quantity_requested, "received_by": "Build team"},
+               format="json")
     assert r.status_code == 200, r.content
 
     # The planned overhead came in dearer than planned.
@@ -1481,4 +1483,84 @@ def test_a_project_completes_itself_when_every_phase_is_done():
     assert project.computed_progress() == 100
     assert project.sync_phase() == Project.Phase.HANDOVER
     project.refresh_from_db()
+
+    # The work is done, but the client is holding an asset nobody wrote a
+    # warranty against — the order is not finished until they are told what
+    # cover they have.
+    assert [m["asset_code"] for m in project.assets_awaiting_client_warranty()] == [
+        device.asset_code
+    ]
+    assert project.status != Project.Status.COMPLETED
+
+    from apps.assets.serializers import _upsert_asset_warranty
+
+    _upsert_asset_warranty(device, "client", months=12)
+    assert project.assets_awaiting_client_warranty() == []
+    project.sync_phase()
+    project.refresh_from_db()
     assert project.status == Project.Status.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# A project is not finished until the client knows what cover they have
+# ---------------------------------------------------------------------------
+@pytest.mark.django_db
+def test_a_project_waits_on_the_warranty_it_promised_the_client(db):
+    from django.contrib.auth import get_user_model
+    from rest_framework.test import APIClient
+
+    from apps.assets.models import Brand, Device, DeviceModel
+    from apps.teams.models import Project, ProjectScopeItem
+
+    User = get_user_model()
+    ops = User.objects.create_user(username="cw-ops", password="x", role="ops_manager")
+    client = APIClient()
+    client.force_authenticate(ops)
+
+    brand = Brand.objects.create(name="CW Brand")
+    model = DeviceModel.objects.create(brand=brand, name="CW-1")
+    # One asset with the client, one still in stock.
+    live = Device.objects.create(
+        device_model=model, serial_number="CW-SN-1", status=Device.Status.ACTIVE,
+    )
+    waiting = Device.objects.create(
+        device_model=model, serial_number="CW-SN-2", status=Device.Status.IN_STOCK,
+    )
+    project = Project.objects.create(name="CW Project")
+    for d in (live, waiting):
+        ProjectScopeItem.objects.create(project=project, device=d, quantity=1)
+
+    r = client.get(f"/api/teams/projects/{project.pk}/client-warranties/")
+    assert r.status_code == 200, r.content
+    assert r.data["count"] == 2
+    # Only the one the client is holding holds the project open.
+    assert r.data["awaiting"] == [live.asset_code]
+    rows = {row["asset_code"]: row for row in r.data["results"]}
+    assert rows[live.asset_code]["handed_over"] is True
+    assert rows[waiting.asset_code]["handed_over"] is False
+
+    assert [m["asset_code"] for m in project.assets_awaiting_client_warranty()] == [
+        live.asset_code
+    ]
+
+    # A term has to be a real one.
+    bad = client.post(f"/api/teams/projects/{project.pk}/client-warranties/",
+                      {"device": str(live.pk)}, format="json")
+    assert bad.status_code == 400 and "months" in bad.data
+
+    given = client.post(f"/api/teams/projects/{project.pk}/client-warranties/",
+                        {"device": str(live.pk), "months": 12}, format="json")
+    assert given.status_code == 201, given.content
+    assert "12 months" in given.data["detail"]
+    assert given.data["awaiting"] == []
+    assert project.assets_awaiting_client_warranty() == []
+
+    # And it is the asset's own warranty, visible wherever warranties are read.
+    cover = live.warranties.get(warranty_type="client")
+    assert cover.months == 12 and cover.status == "active"
+
+    # An asset on another project cannot be covered through this one.
+    other = Device.objects.create(device_model=model, serial_number="CW-SN-3")
+    stray = client.post(f"/api/teams/projects/{project.pk}/client-warranties/",
+                        {"device": str(other.pk), "months": 6}, format="json")
+    assert stray.status_code == 400 and "not on this project" in str(stray.data)
