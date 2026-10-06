@@ -714,29 +714,79 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 variance_status=PurchaseOrderItem.VarianceStatus.PENDING,
                 variance_owner__in=owners,
             )
+            # A cancelled order is not waiting on anybody. Its lines were
+            # still being offered for agreement long after the order itself
+            # was called off, so the queue never emptied.
+            .exclude(purchase_order__status=PurchaseOrder.Status.CANCELLED)
             .select_related("purchase_order", "purchase_order__supplier")
             .order_by("-purchase_order__created_at")
         )
-        rows = [{
-            "id": str(i.pk),
-            "purchase_order": str(i.purchase_order_id),
-            "po_number": i.purchase_order.po_number,
-            "supplier_name": i.purchase_order.supplier.name if i.purchase_order.supplier_id else None,
-            "currency": i.purchase_order.currency,
-            "description": i.description,
-            "quantity": i.quantity,
-            "unit_price": i.unit_price,
-            "reference_unit_price": i.reference_unit_price,
-            "reference_label": i.reference_label,
-            "variance_percent": i.variance_percent,
-            "variance_owner": i.variance_owner,
-            "variance_owner_display": i.get_variance_owner_display(),
-            "variance_reason": i.variance_reason,
-            "raised_by": (
+        def row(line, *, kind, order, order_number, supplier, currency, raised_by):
+            return {
+                "id": str(line.pk),
+                # Which kind of order it sits on, so the decision goes to the
+                # right place. Buying a part and buying an operation are the
+                # same argument about the same kind of figure.
+                "kind": kind,
+                "order": str(order.pk),
+                "order_number": order_number,
+                # Kept for the screens written before work orders joined.
+                "purchase_order": str(order.pk) if kind == "purchase" else None,
+                "po_number": order_number,
+                "supplier_name": supplier,
+                "currency": currency,
+                "description": line.description,
+                "quantity": line.quantity,
+                "unit_price": line.unit_price,
+                "reference_unit_price": line.reference_unit_price,
+                "reference_label": line.reference_label,
+                # One decimal place: nobody argues a price over a millionth
+                # of a percent, and the raw Decimal printed 15 digits of it.
+                "variance_percent": (
+                    None if line.variance_percent is None
+                    else round(float(line.variance_percent), 1)
+                ),
+                "variance_owner": line.variance_owner,
+                "variance_owner_display": line.get_variance_owner_display(),
+                "variance_reason": line.variance_reason,
+                "raised_by": raised_by,
+            }
+
+        rows = [row(
+            i, kind="purchase", order=i.purchase_order,
+            order_number=i.purchase_order.po_number,
+            supplier=i.purchase_order.supplier.name if i.purchase_order.supplier_id else None,
+            currency=i.purchase_order.currency,
+            raised_by=(
                 i.purchase_order.ordered_by.get_full_name()
                 if i.purchase_order.ordered_by_id else None
             ),
-        } for i in items]
+        ) for i in items]
+
+        # Work orders answer to the same rule against the project's plan, and
+        # to the same people, so they wait in the same queue.
+        from apps.workorders.models import WorkOrder, WorkOrderItem
+
+        operations = (
+            WorkOrderItem.objects.filter(
+                variance_status=WorkOrderItem.VarianceStatus.PENDING,
+                variance_owner__in=owners,
+            )
+            .exclude(work_order__status=WorkOrder.Status.CANCELLED)
+            .select_related("work_order", "work_order__supplier", "work_order__created_by")
+            .order_by("-work_order__created_at")
+        )
+        rows += [row(
+            w, kind="work", order=w.work_order,
+            order_number=w.work_order.wo_number,
+            supplier=w.work_order.supplier.name if w.work_order.supplier_id else None,
+            currency=w.work_order.currency,
+            raised_by=(
+                w.work_order.created_by.get_full_name()
+                if w.work_order.created_by_id else None
+            ),
+        ) for w in operations]
+
         return Response({"count": len(rows), "results": rows})
 
     @action(detail=True, methods=["post"], url_path="price-variance")
