@@ -35,6 +35,7 @@ from .models import (
 from .serializers import (
     ReorderRequestSerializer,
     GoodsReceiptLineInspectSerializer,
+    GoodsReceiptLineReceiveSerializer,
     GoodsReceiptLineSerializer,
     GoodsReceiptSerializer,
     InventoryCategorySerializer,
@@ -424,6 +425,82 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
         if page is not None:
             return self.get_paginated_response(self.get_serializer(page, many=True).data)
         return Response(self.get_serializer(qs, many=True).data)
+
+    @action(detail=False, methods=["get"], url_path="awaiting-stock")
+    def awaiting_stock(self, request):
+        """Lines that passed inspection and are waiting at the warehouse door.
+
+        Procurement checks the delivery against the order and writes the GRN;
+        this is what the store then counts onto the shelf.
+        """
+        qs = self.filter_queryset(
+            self.get_queryset().filter(
+                inspection_status=GoodsReceiptLine.Inspection.PASSED,
+                stocked_at__isnull=True,
+            )
+        )
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            return self.get_paginated_response(self.get_serializer(page, many=True).data)
+        return Response(self.get_serializer(qs, many=True).data)
+
+    @action(detail=True, methods=["post"], url_path="receive")
+    def receive_into_stock(self, request, pk=None):
+        """Take a line that passed inspection onto the shelf.
+
+        No verdict here — that was given in Procurement. The store counts the
+        goods and corrects any serial that does not match what is in the box,
+        then the stock moves.
+        """
+        line = self.get_object()
+        if line.inspection_status != GoodsReceiptLine.Inspection.PASSED:
+            return Response({"detail": (
+                f"This line is {line.get_inspection_status_display().lower()} — "
+                "only goods that passed inspection are received."
+            )}, status=400)
+        if line.stocked_at is not None:
+            return Response(
+                {"detail": f"Already received into stock on {line.stocked_at:%Y-%m-%d}."},
+                status=400,
+            )
+
+        serializer = GoodsReceiptLineReceiveSerializer(
+            data=request.data, context={"line": line, "request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        with transaction.atomic():
+            # The verdict already on the line is what gets stocked; the store
+            # is counting, not re-judging.
+            result = stock_inspected_line(
+                line,
+                user=request.user,
+                route=data.get("route", ""),
+                accepted_quantity=line.accepted_quantity or 0,
+                rejected_quantity=line.rejected_quantity or 0,
+                notes=line.inspection_notes,
+                generic=data.get("generic"),
+                units=data.get("units"),
+            )
+            line.refresh_from_db()
+            line.stocked_at = timezone.now()
+            line.stocked_by = request.user
+            line.receiving_notes = data.get("notes", "")
+            line.save(update_fields=[
+                "stocked_at", "stocked_by", "receiving_notes", "updated_at",
+            ])
+
+        line.refresh_from_db()
+        return Response({
+            "line": GoodsReceiptLineSerializer(line).data,
+            "stocked_item": (
+                InventoryItemSerializer(result["inventory_item"]).data
+                if result["inventory_item"] else None
+            ),
+            "stocked_units": InventoryUnitSerializer(result["units"], many=True).data,
+            "ready_requests": result.get("ready_requests", []),
+        })
 
     @action(detail=True, methods=["post"])
     def inspect(self, request, pk=None):

@@ -575,8 +575,16 @@ def _receive(client, po_id, lines, **extra):
 
 
 def _inspect(client, line_id, **payload):
-    """Pass a received line through inspection — the only step that stocks it."""
-    return client.post(f"/api/inventory/receipt-lines/{line_id}/inspect/", payload, format="json")
+    """Take a received line onto the shelf.
+
+    Inspection now happens in Procurement, as the delivery is checked against
+    the order, so the GRN arrives already judged. What is left for the store
+    is counting it in — and correcting a serial that does not match the box.
+    The verdict arguments these tests pass are no longer part of it.
+    """
+    payload.pop("accepted_quantity", None)
+    payload.pop("rejected_quantity", None)
+    return client.post(f"/api/inventory/receipt-lines/{line_id}/receive/", payload, format="json")
 
 
 def _lines(body):
@@ -602,11 +610,12 @@ def test_receive_serialized_line_creates_devices(people, supplier, receivable_po
     assert body["grn_number"].startswith("GRN")
     assert body["purchase_order"] == str(po.pk)
     assert body["created_devices"] == []
-    assert body["pending_inspection"] == 1
+    assert body["awaiting_stock"] == 1
     assert len(body["lines"]) == 1
     assert body["lines"][0]["po_item"] == str(serialized.pk)
     assert body["lines"][0]["serial_numbers"] == ["GRN-SN-A", "GRN-SN-B", "GRN-SN-C"]
-    assert body["lines"][0]["inspection_status"] == "pending"
+    # Judged as it was checked against the order, not left for the store.
+    assert body["lines"][0]["inspection_status"] == "passed"
     assert not Device.objects.filter(serial_number__in=["GRN-SN-A", "GRN-SN-B", "GRN-SN-C"]).exists()
     assert not InventoryUnit.objects.filter(serial_number="GRN-SN-A").exists()
 
@@ -666,9 +675,14 @@ def test_receive_partial_then_full_advances_status(people, receivable_po):
     assert serialized.received_quantity == 3
     assert consumable.received_quantity == 10
     assert po.status == "received"
-    # Receipt drives the PO status; the goods are still awaiting inspection.
+    # Receipt drives the PO status, and the delivery is judged as it is
+    # checked against the order — but nothing is on a shelf until the store
+    # counts it in.
     assert not Device.objects.filter(serial_number__in=["PF-1", "PF-2", "PF-3"]).exists()
-    assert GoodsReceiptLine.objects.filter(inspection_status="pending").count() == 4
+    waiting = GoodsReceiptLine.objects.filter(
+        inspection_status="passed", stocked_at__isnull=True,
+    )
+    assert waiting.count() == 4
 
 
 @pytest.mark.django_db
@@ -809,7 +823,7 @@ def test_receive_mixed_po_single_call(people, receivable_po):
     body = r.json()
     assert body["created_devices"] == []
     assert len(body["lines"]) == 2
-    assert body["pending_inspection"] == 2
+    assert body["awaiting_stock"] == 2
 
     tech = _client(people["inspector"])
     by_item = _lines(body)
@@ -1603,3 +1617,22 @@ def test_a_stock_reorder_over_the_last_price_goes_to_inventory(people, supplier)
     assert _client(people["tech"]).get(
         "/api/procurement/purchase-orders/price-variances/"
     ).data["count"] == 0
+
+
+@pytest.mark.django_db
+def test_a_cancelled_order_stops_waiting_on_anybody(people, over_plan):
+    """Its lines leave the queue — nobody has to agree a price that is off."""
+    po = over_plan["po"]
+    queue = _client(people["inspector"]).get("/api/procurement/purchase-orders/price-variances/")
+    assert [row["id"] for row in queue.data["results"]] == [str(over_plan["item"].pk)]
+    # One decimal place, not fifteen.
+    assert queue.data["results"][0]["variance_percent"] == 60.0
+
+    r = _client(people["ops"]).post(
+        f"/api/procurement/purchase-orders/{po.pk}/transition/",
+        {"status": "cancelled"}, format="json",
+    )
+    assert r.status_code == 200, r.content
+
+    after = _client(people["inspector"]).get("/api/procurement/purchase-orders/price-variances/")
+    assert after.data["count"] == 0, after.data

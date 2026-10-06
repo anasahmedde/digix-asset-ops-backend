@@ -330,6 +330,32 @@ class PurchaseOrderReceiveLineSerializer(serializers.Serializer):
     )
     # Vendor warranty on a complete asset, in months from the day it arrives.
     warranty_months = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    # The verdict, given here: the delivery is checked against the order by
+    # the people who placed it, before the GRN is written. Left out, the whole
+    # quantity is taken as accepted.
+    accepted_quantity = serializers.IntegerField(required=False, allow_null=True, min_value=0)
+    rejected_quantity = serializers.IntegerField(required=False, min_value=0, default=0)
+    inspection_notes = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        qty = attrs["quantity"]
+        accepted = attrs.get("accepted_quantity")
+        rejected = attrs.get("rejected_quantity", 0)
+        if accepted is None:
+            accepted = qty - rejected
+            attrs["accepted_quantity"] = accepted
+        if accepted + rejected != qty:
+            raise serializers.ValidationError({
+                "accepted_quantity": (
+                    f"Accepted and rejected must add up to the {qty} delivered "
+                    f"({accepted} + {rejected})."
+                )
+            })
+        if rejected and not (attrs.get("inspection_notes") or "").strip():
+            raise serializers.ValidationError({
+                "inspection_notes": "Say what is wrong with the rejected goods.",
+            })
+        return attrs
 
 
 class PurchaseOrderReceiveSerializer(serializers.Serializer):

@@ -657,6 +657,35 @@ class InventoryUnitIntakeSerializer(serializers.Serializer):
     warranty_end = serializers.DateField(required=False, allow_null=True)
 
 
+class GoodsReceiptLineReceiveSerializer(serializers.Serializer):
+    """The store taking a passed line onto the shelf.
+
+    No verdict: that was given in Procurement, against the order. What the
+    store may change is a serial that does not match what is in the box —
+    a transposed digit on the delivery note is corrected here rather than
+    being carried into stock and chased later.
+    """
+
+    route = serializers.ChoiceField(choices=GoodsReceiptLine.Route.choices, required=False)
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    generic = serializers.DictField(required=False)
+    # One entry per accepted unit; the serial is the store's to correct.
+    units = InventoryUnitIntakeSerializer(many=True, required=False)
+
+    def validate(self, attrs):
+        line = self.context["line"]
+        units = attrs.get("units") or []
+        accepted = line.accepted_quantity or 0
+        if units and len(units) != accepted:
+            raise serializers.ValidationError({
+                "units": (
+                    f"{accepted} unit(s) passed inspection but {len(units)} serial(s) "
+                    "were given — they have to match what is in the box."
+                )
+            })
+        return attrs
+
+
 class GoodsReceiptLineInspectSerializer(serializers.Serializer):
     """A technician's inspection verdict on one received line."""
 
@@ -995,11 +1024,24 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
 
 
 class IssuanceRequestIssueSerializer(serializers.Serializer):
-    """One hand-over against a request; the balance stays on the queue."""
+    """One hand-over against a request; the balance stays on the queue.
+
+    Somebody takes the goods away, and who that was is the whole point of the
+    record: stock that left the store with nobody named against it cannot be
+    chased, returned or counted back.
+    """
 
     quantity = serializers.IntegerField(min_value=1)
-    received_by = serializers.CharField(required=False, allow_blank=True, default="")
+    # Blank is allowed through the field so the message below is the one
+    # the store reads, rather than DRF's "may not be blank".
+    received_by = serializers.CharField(max_length=200, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate_received_by(self, value):
+        name = (value or "").strip()
+        if not name:
+            raise serializers.ValidationError("Name who is taking the goods.")
+        return name
 
 
 class ReorderRequestSerializer(serializers.ModelSerializer):

@@ -929,7 +929,7 @@ def test_bought_goods_are_stocked_then_issued_against_the_request(inspector, ops
     # Before the delivery the store cannot issue: the request is on order.
     row = _client(ops).get(f"/api/inventory/issuance-requests/{req.id}/").json()
     assert row["awaiting_procurement"] is True and row["procured"] is True and row["po_received_quantity"] == 0
-    r = _client(ops).post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7}, format="json")
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7, "received_by": "Store collector"}, format="json")
     assert r.status_code == 400 and "nothing has been received into stock" in r.data["detail"], r.content
 
     r = _client(inspector).post(
@@ -979,7 +979,7 @@ def test_the_asset_starts_building_once_its_parts_are_issued(inspector, ops, ord
     assert device.status == Device.Status.PROCURED, "in stock is not yet in hand"
 
     assert _client(ops).post(
-        f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7}, format="json",
+        f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7, "received_by": "Store collector"}, format="json",
     ).status_code == 200
     device.refresh_from_db()
     # The parts were the whole build — this asset has no operations to run —
@@ -1001,9 +1001,9 @@ def test_a_short_delivery_only_lets_the_store_issue_what_arrived(inspector, ops,
     )
     assert r.status_code == 200, r.content
 
-    r = _client(ops).post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7}, format="json")
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 7, "received_by": "Store collector"}, format="json")
     assert r.status_code == 400, r.content
-    r = _client(ops).post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 4}, format="json")
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 4, "received_by": "Store collector"}, format="json")
     assert r.status_code == 200, r.content
 
     component.refresh_from_db()
@@ -1156,7 +1156,7 @@ def test_a_request_can_be_issued_in_part_and_the_balance_stays_owed(ops, items):
 
     # ...but only the warehouse hands it over.
     denied = tech_client.post(f"/api/inventory/issuance-requests/{request_id}/issue/",
-                              {"quantity": 6}, format="json")
+                              {"quantity": 6, "received_by": "Store collector"}, format="json")
     assert denied.status_code == 403
     item.refresh_from_db()
     assert item.quantity == 10, "a refused issue must not move stock"
@@ -1172,16 +1172,16 @@ def test_a_request_can_be_issued_in_part_and_the_balance_stays_owed(ops, items):
     item.refresh_from_db()
     assert item.quantity == 6
 
-    # The rest, once it can be covered.
+    # The rest, once it can be covered — collected by the same person.
     r = store.post(f"/api/inventory/issuance-requests/{request_id}/issue/",
-                   {"quantity": 2}, format="json")
+                   {"quantity": 2, "received_by": "Bilal (site inspector)"}, format="json")
     assert r.status_code == 200, r.content
     assert r.data["request"]["status"] == "fulfilled"
     assert r.data["request"]["outstanding_quantity"] == 0
 
     # Nothing more can be drawn against a request already met in full.
     over = store.post(f"/api/inventory/issuance-requests/{request_id}/issue/",
-                      {"quantity": 1}, format="json")
+                      {"quantity": 1, "received_by": "Store collector"}, format="json")
     assert over.status_code == 400
     assert "outstanding" in str(over.data)
 
@@ -1346,7 +1346,7 @@ def test_requests_follow_the_requirement_they_cover(ops):
     req3 = IssuanceRequest.objects.create(item=stand, quantity_requested=2, asset_component=comp3, source="project")
     comp3.issued_quantity = 1
     comp3.save(update_fields=["issued_quantity"])
-    r = _client(ops).post(f"/api/inventory/issuance-requests/{req3.id}/issue/", {"quantity": 2}, format="json")
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req3.id}/issue/", {"quantity": 2, "received_by": "Store collector"}, format="json")
     assert r.status_code == 400 and "Only 1" in str(r.data["quantity"]), r.content
     r = _client(ops).post(f"/api/inventory/issuance-requests/{req3.id}/issue/", {"quantity": 1, "received_by": "Site team"}, format="json")
     assert r.status_code == 200, r.content
@@ -1377,7 +1377,7 @@ def test_the_log_reads_a_request_by_its_own_number(ops):
     assert all(u["status"] == "issued" and u["unit_code"] for u in body["issued_units"])
 
     # The balance goes out later under the same number; the log shows all three.
-    r = c.post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 1}, format="json")
+    r = c.post(f"/api/inventory/issuance-requests/{req.id}/issue/", {"quantity": 1, "received_by": "Store collector"}, format="json")
     assert r.status_code == 200, r.content
     assert [u["serial_number"] for u in r.data["request"]["issued_units"]] == ["LP-1", "LP-2", "LP-3"]
     assert r.data["request"]["status"] == "fulfilled"
@@ -1734,3 +1734,116 @@ def test_an_unreadable_file_says_so_rather_than_failing(ops):
     empty = _sheet([("Serial number",)])
     r = c.post(url, {"file": empty}, format="multipart")
     assert r.status_code == 400 and "No serial numbers found" in str(r.data["file"])
+
+
+# ---------------------------------------------------------------------------
+# Procurement inspects, Inventory receives
+# ---------------------------------------------------------------------------
+@pytest.mark.django_db
+def test_rejected_goods_stay_owed_and_never_reach_the_store(db):
+    """The verdict is given against the order; the shelf only sees what passed."""
+    from django.contrib.auth import get_user_model
+    from rest_framework.test import APIClient
+
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import GoodsReceiptLine, InventoryItem
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.suppliers.models import Supplier
+
+    User = get_user_model()
+    buyer = User.objects.create_user(username="grn-ops", password="x", role="ops_manager")
+    client = APIClient()
+    client.force_authenticate(buyer)
+
+    material = MaterialType.objects.create(name="GRN Flow Cable", unit="meter")
+    stock = InventoryItem.objects.create(material_type=material, quantity=0, unit_cost=100)
+    supplier = Supplier.objects.create(name="GRN Flow Supplier")
+    po = PurchaseOrder.objects.create(
+        supplier=supplier, status=PurchaseOrder.Status.APPROVED, ordered_by=buyer,
+    )
+    item = PurchaseOrderItem.objects.create(
+        purchase_order=po, description="GRN Flow Cable", quantity=10,
+        unit_price=100, material_type=material, inventory_item=stock,
+    )
+
+    # Ten arrive, three are wrong.
+    r = client.post(f"/api/procurement/purchase-orders/{po.pk}/receive/", {
+        "lines": [{
+            "po_item": str(item.pk), "quantity": 10,
+            "accepted_quantity": 7, "rejected_quantity": 3,
+            "inspection_notes": "Three reels cut short.",
+        }],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["awaiting_stock"] == 1
+
+    item.refresh_from_db()
+    # The three turned away are still owed, so the order is not complete.
+    assert item.received_quantity == 7
+    po.refresh_from_db()
+    assert po.status == PurchaseOrder.Status.PARTIALLY_RECEIVED
+
+    line = GoodsReceiptLine.objects.get(po_item=item)
+    assert line.inspection_status == GoodsReceiptLine.Inspection.PASSED
+    assert line.inspected_by_id == buyer.pk
+    assert line.awaiting_stock and line.stocked_at is None
+    # Nothing is on the shelf yet — Procurement inspected, nobody received.
+    stock.refresh_from_db()
+    assert stock.quantity == 0
+
+    # The store counts it in.
+    store = User.objects.create_user(username="grn-store", password="x", role="warehouse")
+    r = APIClient()
+    r.force_authenticate(store)
+    got = r.post(f"/api/inventory/receipt-lines/{line.pk}/receive/",
+                 {"notes": "Counted against the delivery note"}, format="json")
+    assert got.status_code == 200, got.content
+
+    line.refresh_from_db()
+    stock.refresh_from_db()
+    assert line.stocked_at is not None and line.stocked_by_id == store.pk
+    assert stock.quantity == 7
+
+    # And it cannot be received twice.
+    again = r.post(f"/api/inventory/receipt-lines/{line.pk}/receive/", {}, format="json")
+    assert again.status_code == 400 and "Already received" in str(again.data)
+
+
+@pytest.mark.django_db
+def test_stock_cannot_leave_the_store_unaccounted_for(db):
+    """Who took the goods is the record; without it there is nobody to chase."""
+    from django.contrib.auth import get_user_model
+    from rest_framework.test import APIClient
+
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem, IssuanceRequest
+
+    User = get_user_model()
+    store = User.objects.create_user(username="iss-store", password="x", role="warehouse")
+    client = APIClient()
+    client.force_authenticate(store)
+
+    material = MaterialType.objects.create(name="Issue Guard Cable", unit="meter")
+    item = InventoryItem.objects.create(material_type=material, quantity=50, unit_cost=10)
+    req = IssuanceRequest.objects.create(item=item, quantity_requested=5, source="project")
+
+    bare = client.post(
+        f"/api/inventory/issuance-requests/{req.pk}/issue/", {"quantity": 2}, format="json",
+    )
+    assert bare.status_code == 400, bare.content
+    assert "received_by" in bare.data
+
+    blank = client.post(
+        f"/api/inventory/issuance-requests/{req.pk}/issue/",
+        {"quantity": 2, "received_by": "   "}, format="json",
+    )
+    assert blank.status_code == 400, blank.content
+    assert "Name who is taking the goods." in str(blank.data)
+
+    named = client.post(
+        f"/api/inventory/issuance-requests/{req.pk}/issue/",
+        {"quantity": 2, "received_by": "  Adeel  "}, format="json",
+    )
+    assert named.status_code in (200, 201), named.content
+    item.refresh_from_db()
+    assert item.quantity == 48

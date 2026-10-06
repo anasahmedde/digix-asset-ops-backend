@@ -428,6 +428,18 @@ class GoodsReceiptLine(TimeStampedModel):
     inspected_at = models.DateTimeField(null=True, blank=True)
     inspection_notes = models.TextField(blank=True)
 
+    # --- Receiving into the warehouse --------------------------------------
+    # Inspection and receiving are two different people's jobs in two
+    # different places: Procurement checks the delivery against the order and
+    # writes the GRN, the store then counts what arrives onto the shelf. A
+    # line that passed is not stock until this is stamped.
+    stocked_at = models.DateTimeField(null=True, blank=True)
+    stocked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="stocked_receipt_lines",
+    )
+    receiving_notes = models.TextField(blank=True)
+
     class Meta:
         ordering = ["created_at"]
         indexes = [models.Index(fields=["inspection_status", "created_at"])]
@@ -438,6 +450,15 @@ class GoodsReceiptLine(TimeStampedModel):
     @property
     def is_pending_inspection(self) -> bool:
         return self.inspection_status == self.Inspection.PENDING
+
+    @property
+    def awaiting_stock(self) -> bool:
+        """Passed inspection and sitting at the warehouse door."""
+        return (
+            self.inspection_status == self.Inspection.PASSED
+            and self.stocked_at is None
+            and (self.accepted_quantity or 0) > 0
+        )
 
 
 class Issuance(TimeStampedModel):
