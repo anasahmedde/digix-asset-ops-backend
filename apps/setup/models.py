@@ -73,6 +73,10 @@ class NumberingScheme(TimeStampedModel):
         INVENTORY_ITEM = "inventory_item", "Inventory Item (SKU)"
         INVENTORY_UNIT = "inventory_unit", "Inventory Unit (Unique Item)"
         INVENTORY_UNIT_TYPE = "inventory_unit_type", "Inventory Product (Unique Item Type)"
+        CLIENT_WARRANTY = "client_warranty", "Client Warranty"
+        VENDOR_WARRANTY = "vendor_warranty", "Vendor Warranty"
+        COMPONENT_WARRANTY = "component_warranty", "Component Warranty"
+        WARRANTY_CLAIM = "warranty_claim", "Warranty Claim"
 
     entity = models.CharField(max_length=30, choices=Entity.choices, unique=True)
     prefix = models.CharField(max_length=12)

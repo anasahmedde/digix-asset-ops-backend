@@ -46,7 +46,7 @@ def _validate_lines(purchase_order, lines):
         # Money on the order is not goods at the door.
         if po_item.is_charge:
             raise serializers.ValidationError({
-                label: f"'{po_item.description}' is a charge, not goods — there is nothing to receive."
+                label: f"'{po_item.description}' is a free-text line, not goods — there is nothing to receive."
             })
 
         remaining = po_item.quantity - po_item.received_quantity
@@ -158,6 +158,7 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
                 inspection_notes=line.get("inspection_notes", ""),
                 inspected_by=user,
                 inspected_at=timezone.now(),
+                warranty_months=line.get("warranty_months"),
             ))
 
             # Only what was accepted counts against the order. What was turned
@@ -226,7 +227,8 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
         purchase_order.status = new_status
         stamp = timezone.localtime().strftime("%Y-%m-%d %H:%M")
         line = (
-            f"[{stamp}] [GRN {receipt.grn_number}] "
+            # The receipt number already says GRN; saying it twice read as a typo.
+            f"[{stamp}] [{receipt.grn_number}] "
             f"{old_display} → {purchase_order.get_status_display()}"
         )
         purchase_order.notes = (
@@ -235,6 +237,17 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
         purchase_order.save(update_fields=["status", "notes", "updated_at"])
 
     from apps.inventory.serializers import GoodsReceiptLineSerializer
+    from apps.notifications import service as notices
+
+    waiting = [ln for ln in receipt_lines if ln.awaiting_stock]
+    if waiting:
+        notices.ask(
+            "receive_goods", exclude=[user], kind="request_raised",
+            title=f"{receipt.grn_number} is ready to receive into stock",
+            message=f"{len(waiting)} line(s) from {purchase_order.po_number} · {purchase_order.supplier.name}",
+            link="/inventory?tab=inspection", ref=f"grn:{receipt.pk}",
+            data={"grn": str(receipt.pk), "po": str(purchase_order.pk)},
+        )
 
     return {
         "id": str(receipt.pk),

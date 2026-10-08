@@ -1,8 +1,10 @@
 """Work orders are the services we take from vendors: Execution asks, Work
 Orders raises, the Group Head approves, the operation follows the order."""
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User
@@ -61,7 +63,7 @@ def test_execution_asks_work_orders_raises_group_head_approves(build):
     # One draft order to one vendor, a line per operation, priced from the plan unless overtyped.
     r = ops.post("/api/work-orders/raise/", {
         "steps": [str(cut.id), str(paint.id)], "supplier": str(build["vendor"].id),
-        "amounts": {str(paint.id): "1000"}, "expected_delivery": "2026-10-05", "terms": "Net 15", "notes": "Collect Monday",
+        "amounts": {str(paint.id): "1000"}, "expected_delivery": (timezone.localdate() + timedelta(days=30)).isoformat(), "terms": "Net 15", "notes": "Collect Monday",
     }, format="json")
     assert r.status_code == 201, r.content
     order = WorkOrder.objects.get(pk=r.data["id"])

@@ -869,7 +869,7 @@ class Command(BaseCommand):
                     "start_date": start,
                     "end_date": end,
                     "coverage_details": f"Covers hardware defects for {(end - start).days // 365} year(s).",
-                    "reference_number": f"WRN-PK-{2026}-{i+1:04d}",
+                    "vendor_reference": f"WRN-PK-{2026}-{i+1:04d}",
                 },
             )
             if created:

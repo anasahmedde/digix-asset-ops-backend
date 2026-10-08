@@ -83,6 +83,12 @@ class WorkOrder(TimeStampedModel):
     payment_terms = models.ForeignKey(
         "setup.PaymentTerms", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_orders"
     )
+    # A deal with its own terms — "30% on order, balance on commissioning" —
+    # is written here rather than squeezed into the catalogue, so one-off
+    # arrangements do not pile up as entries everybody else has to scroll
+    # past. Printed on the order the vendor receives, where no catalogue term
+    # is picked.
+    payment_terms_note = models.CharField(max_length=200, blank=True)
     terms_template = models.ForeignKey(
         "setup.TermsTemplate", on_delete=models.SET_NULL, null=True, blank=True, related_name="work_orders"
     )

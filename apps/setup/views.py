@@ -2,7 +2,7 @@ from rest_framework import status, viewsets
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 
-from common.permissions import CommercialWriteElseRead, IsAdminOrManager
+from common.permissions import CapabilityGate
 
 from .models import (
     EscalationPolicy,
@@ -27,7 +27,8 @@ from .serializers import (
 class CompanyViewSet(viewsets.ModelViewSet):
     queryset = Company.objects.all()
     serializer_class = CompanySerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_setup"
     search_fields = ["name", "legal_name"]
 
 
@@ -36,14 +37,16 @@ class NumberingSchemeViewSet(viewsets.ModelViewSet):
 
     queryset = NumberingScheme.objects.all()
     serializer_class = NumberingSchemeSerializer
-    permission_classes = [IsAuthenticated, IsAdminOrManager]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_setup"
     filterset_fields = ["entity", "is_active"]
 
 
 class PaymentTermsViewSet(viewsets.ModelViewSet):
     queryset = PaymentTerms.objects.all()
     serializer_class = PaymentTermsSerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_setup"
     filterset_fields = ["is_active"]
     search_fields = ["name", "code"]
     ordering_fields = ["days", "name", "created_at"]
@@ -56,7 +59,8 @@ class UnitOfMeasureViewSet(viewsets.ModelViewSet):
 
     queryset = UnitOfMeasure.objects.all()
     serializer_class = UnitOfMeasureSerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_setup"
     filterset_fields = ["is_active"]
     search_fields = ["name", "symbol"]
     ordering_fields = ["name", "created_at"]
@@ -75,7 +79,8 @@ class UnitOfMeasureViewSet(viewsets.ModelViewSet):
 class TermsTemplateViewSet(viewsets.ModelViewSet):
     queryset = TermsTemplate.objects.all()
     serializer_class = TermsTemplateSerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_setup"
     filterset_fields = ["category", "is_active", "is_default"]
     search_fields = ["name", "body"]
 
@@ -83,7 +88,8 @@ class TermsTemplateViewSet(viewsets.ModelViewSet):
 class WarrantyPeriodPresetViewSet(viewsets.ModelViewSet):
     queryset = WarrantyPeriodPreset.objects.all()
     serializer_class = WarrantyPeriodPresetSerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_setup"
     filterset_fields = ["is_active"]
     ordering_fields = ["months", "label"]
 
@@ -91,5 +97,6 @@ class WarrantyPeriodPresetViewSet(viewsets.ModelViewSet):
 class EscalationPolicyViewSet(viewsets.ModelViewSet):
     queryset = EscalationPolicy.objects.all()
     serializer_class = EscalationPolicySerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_setup"
     filterset_fields = ["is_active", "trigger", "scope", "stage"]

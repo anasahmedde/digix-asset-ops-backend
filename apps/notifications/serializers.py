@@ -26,7 +26,7 @@ class NotificationSerializer(serializers.ModelSerializer):
             "alert",
             "ticket",
             "installation",
-            "data",
+            "data", "link", "ref",
             "is_read",
             "read_at",
             "is_actionable",

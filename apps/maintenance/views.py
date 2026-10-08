@@ -42,16 +42,22 @@ def _as_date(value, field):
     """
     from rest_framework.fields import DateField
 
+    from common.dates import refuse_past
+
     if value in (None, ""):
         return None
     try:
-        return DateField().to_internal_value(value)
+        day = DateField().to_internal_value(value)
     except Exception:
         raise drf_serializers.ValidationError(
             {field: ["Use a date like 2026-10-31."]}
         )
+    # Every date read here is a deadline — a visit due, the next one due.
+    return refuse_past(day, field)
 
-from common.permissions import MANAGER_ROLES, CapabilityGate, TechnicianCanCreate
+
+from apps.notifications import service as notices
+from common.permissions import CapabilityGate, TechnicianCanCreate, can, can_any, decides_for
 
 from .models import (
     MaintenancePartRequest,
@@ -70,35 +76,22 @@ from .serializers import (
     MaintenanceVisitSerializer,
 )
 
-# Who may answer a technician's request for parts. Raising one is the
-# technician's job; releasing stock against it is not.
-DECIDING_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
-# Who may raise or withdraw one: the people who actually attend the job, and
-# the managers above them.
-ASKING_ROLES = DECIDING_ROLES + ("technician",)
-
-
 def _answers_for(user, line) -> bool:
     """May this person answer this particular line?
 
     Being a supervisor is not the same as being *their* supervisor. The
     organogram already records who answers to whom, so a line is answered by
-    the asker's own reporting line and nobody else's; Operations answers for
-    everyone, which is what makes them Operations.
+    the asker's own reporting line and nobody else's; whoever acts across
+    teams answers for everyone.
     """
-    if getattr(user, "is_superuser", False) or getattr(user, "role", None) in MANAGER_ROLES:
-        return True
-    asker = line.requested_by
-    return asker is not None and user.manages(asker)
+    return decides_for(user, line.requested_by, "review_maintenance")
 
 
 def _may_withdraw(user, line) -> bool:
     """The person who asked, or somebody above them."""
-    if getattr(user, "is_superuser", False) or getattr(user, "role", None) in MANAGER_ROLES:
-        return True
     if line.requested_by_id == user.pk:
         return True
-    return line.requested_by is not None and user.manages(line.requested_by)
+    return _answers_for(user, line)
 
 
 class CanAskOrAnswerForParts(BasePermission):
@@ -115,10 +108,9 @@ class CanAskOrAnswerForParts(BasePermission):
             return False
         if request.method in SAFE_METHODS:
             return True
-        role = getattr(user, "role", None)
         if view.action == "decide":
-            return role in DECIDING_ROLES
-        return role in ASKING_ROLES
+            return can(user, "review_maintenance")
+        return can_any(user, "work_maintenance", "review_maintenance")
 
 
 class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
@@ -138,9 +130,19 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
         # A line is asked for on a round, and the round being planned is the
         # one it is for.
         schedule = serializer.validated_data.get("schedule")
-        serializer.save(
+        line = serializer.save(
             requested_by=self.request.user,
             visit=schedule.open_visit() if schedule is not None else None,
+        )
+        # The asker's own supervisor hears about it; so does anyone who
+        # answers for every team.
+        notices.ask(
+            "review_maintenance", exclude=[self.request.user], scope_to=self.request.user,
+            kind="request_raised",
+            title=f"Parts requested: {line.what}",
+            message=f"{line.quantity_requested} {line.unit} for {schedule.title if schedule else 'a job'}",
+            link=f"/maintenance?schedule={schedule.pk}" if schedule else "/maintenance",
+            ref=f"part:{line.pk}", data={"part_request": str(line.pk)},
         )
 
     def perform_destroy(self, instance):
@@ -167,6 +169,7 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
         instance.save(update_fields=[
             "status", "decided_by", "decided_at", "decision_note", "updated_at",
         ])
+        notices.resolve(f"part:{instance.pk}")
 
     @action(detail=True, methods=["post"])
     def decide(self, request, pk=None):
@@ -177,7 +180,7 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
         """
         from .parts import decide as decide_line
 
-        if getattr(request.user, "role", None) not in DECIDING_ROLES:
+        if not can(request.user, "review_maintenance"):
             return Response(
                 {"detail": "Only a supervisor or above can answer a request for parts."},
                 status=drf_status.HTTP_403_FORBIDDEN,
@@ -208,12 +211,30 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
             quantity=ser.validated_data.get("quantity"),
             note=ser.validated_data.get("note", ""),
         )
+        notices.resolve(f"part:{line.pk}")
+        approved = ser.validated_data["approve"]
+        if line.requested_by_id:
+            notices.tell(
+                [line.requested_by], exclude=[request.user], kind="request_answered",
+                title=f"Parts {'approved' if approved else 'turned down'}: {line.what}",
+                message=(f"{line.quantity_approved} released to the store's queue" if approved else (line.decision_note or "")),
+                link=f"/maintenance?schedule={line.schedule_id}", data={"part_request": str(line.pk)},
+            )
+        if approved and line.issuance_request_id:
+            req = line.issuance_request
+            notices.ask(
+                "issue_stock", exclude=[request.user], kind="request_raised",
+                title=f"Material requested: {req.what}",
+                message=f"{req.quantity_requested} · {req.request_number} · {req.purpose}",
+                link="/inventory?tab=requests", ref=f"issue:{req.pk}", data={"request": str(req.pk)},
+            )
         return Response(self.get_serializer(line).data)
 
 
 class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # Reading this is a permission, not just a menu entry.
-    read_capability = "view_tickets"
+    read_capability = "view_maintenance"
+    action_capabilities = {"assign": "assign_maintenance", "cancel": "manage_maintenance", "map_data": "view_maintenance"}
     # Newest first, by the day the work began — which is a different date
     # depending on what kind of job it is. A breakdown began when somebody
     # reported it; a schedule began on the day its rounds start. Ordering
@@ -253,7 +274,7 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         if self.request.method in SAFE_METHODS:
             return obj
         user = self.request.user
-        if getattr(user, "role", None) == "technician" and not user.is_superuser:
+        if not can(user, "manage_maintenance"):
             if obj.assigned_to_id not in (user.pk, None):
                 raise PermissionDenied("This round is not yours to change.")
         return obj
@@ -342,9 +363,9 @@ class CanPlanOrStartARound(BasePermission):
         if request.method in SAFE_METHODS:
             return True
         if view.action == "start":
-            return getattr(request.user, "role", None) in ASKING_ROLES
+            return can_any(request.user, "work_maintenance", "review_maintenance")
         if view.action in ("update", "partial_update"):
-            return getattr(request.user, "role", None) in DECIDING_ROLES
+            return can(request.user, "manage_maintenance")
         # The corrective moves carry their own, finer rules — only the
         # technician this visit was given to may photograph or finish it,
         # only the office may review it — and those need the visit itself
@@ -432,6 +453,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 remarks=request.data.get("remarks", "") or "",
                 settlement=request.data.get("parts_settlement") or None,
             )
+            self._ask_for_review(visit, request.user)
             body = self.get_serializer(visit).data
             body["return_grn"] = getattr(visit, "return_grn", None)
             return Response(body)
@@ -447,7 +469,27 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         # Where the leftovers went, so the technician is told rather than
         # left wondering whether the store has them.
         body["return_grn"] = getattr(visit, "return_grn", None)
+        self._ask_for_review(visit, request.user)
         return Response(body)
+
+    def _ask_for_review(self, visit, actor):
+        job = visit.schedule
+        notices.ask(
+            "review_maintenance", exclude=[actor], scope_to=actor,
+            title=f"Review needed: {job.title}",
+            message=(f"{job.device.asset_code} · " if job.device_id else "") + f"finished by {notices.who(actor)}",
+            link=f"/maintenance?schedule={job.pk}", ref=f"visit:{visit.pk}", data={"schedule": str(job.pk)},
+        )
+
+    def _answer_review(self, visit, actor, accepted, note=""):
+        job = visit.schedule
+        notices.resolve(f"visit:{visit.pk}")
+        if visit.assigned_to_id:
+            notices.tell(
+                [visit.assigned_to], exclude=[actor], kind="approval_decided",
+                title=f"{job.title}: {'accepted' if accepted else 'another visit needed'}",
+                message=note or "", link=f"/maintenance?schedule={job.pk}", data={"schedule": str(job.pk)},
+            )
 
     @action(detail=True, methods=["post"])
     def review(self, request, pk=None):
@@ -455,6 +497,11 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         from apps.accounts.models import User
 
         visit = self.get_object()
+        if not decides_for(request.user, visit.assigned_to, "review_maintenance"):
+            return Response(
+                {"detail": "This visit is reviewed by the technician's own supervisor, or by whoever acts across teams."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
         if not self._corrective(visit):
             # A round is reviewed the same way a breakdown is: accepted, or
             # sent back for another visit with a reason on the record.
@@ -468,6 +515,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                     next_due=_as_date(request.data.get("next_due"), "next_due"),
                     note=request.data.get("note", "") or "",
                 )
+                self._answer_review(visit, request.user, False, request.data.get("reason") or "")
                 return Response(self.get_serializer(nxt).data)
             if call != MaintenanceVisit.Review.ACCEPTED:
                 return Response(
@@ -480,6 +528,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 cost_lines=request.data.get("cost_lines") or None,
                 component_prices=request.data.get("component_prices") or None,
             )
+            self._answer_review(visit, request.user, True, request.data.get("note", "") or "")
             return Response(self.get_serializer(visit).data)
         decision = request.data.get("decision")
         if decision == MaintenanceVisit.Review.ACCEPTED:
@@ -488,6 +537,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 cost_lines=request.data.get("cost_lines") or None,
                 component_prices=request.data.get("component_prices") or None,
             )
+            self._answer_review(visit, request.user, True, request.data.get("note", "") or "")
             return Response(self.get_serializer(visit).data)
         if decision == MaintenanceVisit.Review.UNRESOLVED:
             tech = User.objects.filter(pk=request.data.get("technician")).first()
@@ -498,6 +548,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 next_due=_as_date(request.data.get("next_due"), "next_due"),
                 note=request.data.get("note", "") or "",
             )
+            self._answer_review(visit, request.user, False, request.data.get("reason") or "")
             return Response(self.get_serializer(nxt).data)
         return Response(
             {"decision": ["Say 'accepted' or 'unresolved'."]},

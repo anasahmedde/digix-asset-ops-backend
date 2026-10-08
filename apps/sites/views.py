@@ -10,7 +10,8 @@ from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
-from common.permissions import ADMIN_ROLES, AdminManagerWriteElseRead, CommercialWriteElseRead
+from apps.notifications import service as notices
+from common.permissions import CapabilityGate, can, can_for_project
 
 
 def may_advance_installation(user, installation) -> bool:
@@ -29,7 +30,7 @@ def may_advance_installation(user, installation) -> bool:
     if not getattr(user, "is_authenticated", False):
         return False
     role = getattr(user, "role", None)
-    if role in ADMIN_ROLES:
+    if can(user, "edit_installation") and can(user, "act_across_teams"):
         return True
     if installation.installed_by_id == user.id:
         return True
@@ -83,7 +84,8 @@ from .serializers import (
 
 
 class SiteViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_sites"
     filterset_fields = ["client", "city", "state_province", "country", "is_active"]
     search_fields = ["name", "address", "city", "state_province"]
     ordering_fields = ["name", "created_at"]
@@ -108,7 +110,8 @@ class SiteViewSet(viewsets.ModelViewSet):
 class SiteContactViewSet(viewsets.ModelViewSet):
     queryset = SiteContact.objects.select_related("site").all()
     serializer_class = SiteContactSerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_sites"
     filterset_fields = ["site", "is_primary"]
     search_fields = ["name", "email", "phone"]
 
@@ -116,7 +119,8 @@ class SiteContactViewSet(viewsets.ModelViewSet):
 class SiteZoneViewSet(viewsets.ModelViewSet):
     queryset = SiteZone.objects.select_related("site").all()
     serializer_class = SiteZoneSerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_sites"
     filterset_fields = ["site"]
     search_fields = ["name"]
 
@@ -153,7 +157,18 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         .prefetch_related("photos", "steps", "delays", "device__clients")
         .all()
     )
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_installations"
+    # Opening a job and saying who does it is assignment; the checklist and
+    # its templates are the installer's work; going live and handing over
+    # are checked inside, against the installer and the capability.
+    write_capability = "assign_installation"
+    action_capabilities = {
+        "activate": None, "handover": None,
+        "export": "view_installations", "handover_document": "view_installations",
+        "reorder_steps": "edit_installation",
+        "save_step_template": "manage_setup", "apply_step_template": "edit_installation",
+    }
     filterset_fields = ["device", "site", "installed_by", "device__assigned_client", "device__project"]
 
     search_fields = [
@@ -276,15 +291,6 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             return DeviceInstallationListSerializer
         return DeviceInstallationDetailSerializer
 
-    def get_permissions(self):
-        # The handover action carries its own gate (assigned installer or
-        # HANDOVER_ROLES) — the viewset's manager-write permission would
-        # otherwise reject the installer/supervisor before it ever runs.
-        if self.action in ("handover", "activate"):
-            return [IsAuthenticated()]
-        return super().get_permissions()
-
-    HANDOVER_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
 
     @action(detail=False, methods=["get"], url_path="export")
     def export(self, request):
@@ -417,10 +423,11 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         """
         installation = self.get_object()
         user = request.user
-        if (
-            getattr(user, "role", None) not in self.HANDOVER_ROLES
-            and installation.installed_by_id != user.id
-            and installation.device.assigned_technician_id != user.id
+        mine = user.id in (installation.installed_by_id, installation.device.assigned_technician_id)
+        if not (mine and can(user, "activate_asset")) and not (
+            can(user, "activate_asset") and can(user, "act_across_teams")
+        ) and not (
+            installation.installed_by_id and user.manages(installation.installed_by) and can(user, "activate_asset")
         ):
             return Response(
                 {"detail": "Only the assigned installer or operations management can activate this asset."},
@@ -493,13 +500,32 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             device.save(update_fields=["status", "updated_at"])
 
             # What we promise the client is a commercial commitment, not
-            # something the technician on site settles. Client warranties are
-            # raised by the supervisor under Warranties.
+            # something the technician on site settles: it is recorded on
+            # the project, and dated from this moment.
 
         installation.refresh_from_db()
         installation._prefetched_objects_cache = {}
+        self._tell_the_project(installation, user, f"{device.asset_code} is live")
         return Response(
             DeviceInstallationDetailSerializer(installation, context=self.get_serializer_context()).data
+        )
+
+    def _tell_the_project(self, installation, actor, title):
+        """The project running this asset hears it moved."""
+        from apps.assets.serializers import _project_of
+
+        device = installation.device
+        project = _project_of(device)
+        people = []
+        if project is not None and project.manager_id:
+            people.append(project.manager)
+        people += notices.holders_of("record_client_warranty") if project is None else []
+        notices.tell(
+            people, exclude=[actor],
+            title=title,
+            message=f"{device.display_name or ''} at {installation.site.name}" + (f" · {project.name}" if project else ""),
+            link=(f"/projects?project={project.pk}&tab=execution" if project else f"/assets?device={device.pk}"),
+            data={"installation": str(installation.pk)},
         )
 
     @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
@@ -508,10 +534,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         the asset, complete the handover step and move the asset to Active."""
         installation = self.get_object()
         user = request.user
-        if (
-            getattr(user, "role", None) not in self.HANDOVER_ROLES
-            and installation.installed_by_id != user.id
-        ):
+        if not can(user, "close_installation") and installation.installed_by_id != user.id:
             return Response(
                 {"detail": "Only the assigned installer or operations management can hand over."},
                 status=drf_status.HTTP_403_FORBIDDEN,
@@ -619,6 +642,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 device.status = "active"
                 device.save(update_fields=["status", "updated_at"])
 
+        self._tell_the_project(installation, user, f"{installation.device.asset_code} handed over to the client")
         installation.refresh_from_db()
         installation._prefetched_objects_cache = {}
         return Response(
@@ -734,12 +758,17 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
             instance.delete()
             renumber_steps(installation_id)
 
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_installations"
+    # Steps are added and removed by whoever assigns the job; advancing one
+    # is the installer's, checked against the installation itself.
+    write_capability = "assign_installation"
+    action_capabilities = {"update": None, "partial_update": None}
+
     def get_permissions(self):
-        # Only the assigned installer (mobile) or a super admin (desktop) may
-        # advance a step; only managers add/remove steps.
         if self.action in ("update", "partial_update"):
             return [IsAuthenticated(), IsSuperAdminOrAssignedInstaller()]
-        return [IsAuthenticated(), AdminManagerWriteElseRead()]
+        return super().get_permissions()
 
 
 class InstallationDelayViewSet(viewsets.ModelViewSet):
@@ -750,12 +779,12 @@ class InstallationDelayViewSet(viewsets.ModelViewSet):
     filterset_fields = ["installation", "step", "cause"]
     ordering_fields = ["created_at"]
 
-    def get_permissions(self):
-        # Delays are logged by the assigned installer or a super admin;
-        # managers can edit/resolve/remove them.
-        if self.action == "create":
-            return [IsAuthenticated()]
-        return [IsAuthenticated(), AdminManagerWriteElseRead()]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_installations"
+    write_capability = "assign_installation"
+    # Delays are logged by the installer (checked against the job inside);
+    # whoever assigns installations edits and resolves them.
+    action_capabilities = {"create": None}
 
     def perform_create(self, serializer):
         installation = serializer.validated_data["installation"]
@@ -764,7 +793,13 @@ class InstallationDelayViewSet(viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
 
             raise PermissionDenied("This installation is not yours to flag a delay on.")
-        serializer.save(reported_by=user)
+        delay = serializer.save(reported_by=user)
+        notices.tell(
+            notices.holders_of("assign_installation", exclude=[user]),
+            title=f"Delay flagged: {installation.device.asset_code}",
+            message=f"{delay.get_cause_display()} at {installation.site.name}" + (f" — {delay.description}" if getattr(delay, "description", "") else ""),
+            link=f"/installation-tracker?installation={installation.pk}", data={"installation": str(installation.pk)},
+        )
 
 
 class InstallationPhotoViewSet(viewsets.ModelViewSet):
@@ -772,11 +807,11 @@ class InstallationPhotoViewSet(viewsets.ModelViewSet):
     serializer_class = InstallationPhotoSerializer
     filterset_fields = ["installation", "photo_type"]
 
-    def get_permissions(self):
-        # Field techs may attach installation photos; managers can also edit/remove.
-        if self.action == "create":
-            return [IsAuthenticated()]
-        return [IsAuthenticated(), AdminManagerWriteElseRead()]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_installations"
+    write_capability = "edit_installation"
+    # Field techs and vendors attach photos to their own jobs (checked inside).
+    action_capabilities = {"create": None}
 
     def perform_create(self, serializer):
         user = self.request.user

@@ -83,10 +83,9 @@ def create_notifications_for_alert(sender, instance: Alert, created: bool, **kwa
     if not created:
         return
 
-    recipients = User.objects.filter(
-        is_active=True,
-        role__in=("super_admin", "group_head", "ops_manager"),
-    )
+    from .service import holders_of
+
+    recipients = holders_of("receive_alerts")
 
     alert_data = {
         "severity": instance.severity,
@@ -210,12 +209,15 @@ def capture_ticket_previous_state(sender, instance: Ticket, **kwargs):
         try:
             old = Ticket.objects.get(pk=instance.pk)
             instance._prev_assigned_to_id = old.assigned_to_id
+            instance._prev_vendor_id = old.assigned_vendor_id
             instance._prev_status = old.status
         except Ticket.DoesNotExist:
             instance._prev_assigned_to_id = None
+            instance._prev_vendor_id = None
             instance._prev_status = None
     else:
         instance._prev_assigned_to_id = None
+        instance._prev_vendor_id = None
         instance._prev_status = None
 
 
@@ -227,20 +229,50 @@ def handle_ticket_notifications(sender, instance: Ticket, created: bool, **kwarg
     if instance.assigned_to_id and (created or prev_assigned != instance.assigned_to_id):
         _create_ticket_assignment_notification(instance)
 
-    # New unassigned ticket: park centrally and route to Operations for assignment.
+    # New unassigned ticket: park centrally and route to whoever assigns.
     if created and not instance.assigned_to_id:
-        for ops in User.objects.filter(role__in=("super_admin", "group_head", "ops_manager"), is_active=True):
-            notification = Notification.objects.create(
-                recipient=ops,
-                notification_type=Notification.Type.TICKET_UPDATE,
-                title=f"New ticket awaiting assignment: {instance.ticket_number}",
-                message=instance.title,
-                ticket=instance,
-                is_actionable=True,
-            )
-            _push_ws(notification)
+        from .service import ask
+
+        ask(
+            "assign_ticket", exclude=[instance.reported_by_id], kind=Notification.Type.TICKET_UPDATE,
+            title=f"New ticket awaiting assignment: {instance.ticket_number}",
+            message=instance.title, link=f"/tickets?open={instance.pk}", ref=f"ticket-assign:{instance.pk}",
+            ticket=instance, email=False,
+        )
+    if not created and instance.assigned_to_id and prev_assigned != instance.assigned_to_id:
+        from .service import resolve
+
+        resolve(f"ticket-assign:{instance.pk}")
+    # A vendor given the ticket hears it on their portal login.
+    if instance.assigned_vendor_id and (created or getattr(instance, "_prev_vendor_id", None) != instance.assigned_vendor_id):
+        from .service import tell
+
+        tell(
+            User.objects.filter(is_active=True, role="vendor", supplier_id=instance.assigned_vendor_id),
+            kind=Notification.Type.TICKET_ASSIGNED,
+            title=f"Ticket assigned to your company: {instance.ticket_number}",
+            message=instance.title, link=f"/tickets?open={instance.pk}", ticket=instance, email=True,
+        )
 
     if not created and prev_status != instance.status:
+        from .service import ask, resolve
+
+        if prev_status in (Ticket.Status.PENDING_OPS_APPROVAL, Ticket.Status.PENDING_CLIENT_APPROVAL):
+            resolve(f"ticket-approval:{instance.pk}")
+        if instance.status == Ticket.Status.PENDING_OPS_APPROVAL:
+            ask(
+                "approve_ticket_cost", exclude=[instance.assigned_to_id],
+                title=f"Approval needed on {instance.ticket_number}",
+                message=instance.title, link=f"/tickets?open={instance.pk}",
+                ref=f"ticket-approval:{instance.pk}", ticket=instance,
+            )
+        elif instance.status == Ticket.Status.PENDING_CLIENT_APPROVAL:
+            ask(
+                "relay_client_decision", exclude=[instance.assigned_to_id],
+                title=f"Client's decision needed on {instance.ticket_number}",
+                message=instance.title, link=f"/tickets?open={instance.pk}",
+                ref=f"ticket-approval:{instance.pk}", ticket=instance,
+            )
         if instance.status == Ticket.Status.PENDING_REVIEW:
             _create_review_request_notification(instance)
         elif instance.status == Ticket.Status.APPROVED:
@@ -305,15 +337,17 @@ def _create_ticket_status_notification(ticket: Ticket):
 
 def _create_review_request_notification(ticket: Ticket):
     """Notify the reporter / supervisors that work is submitted for review."""
+    from .service import holders_of
+
     recipients = []
     if ticket.reported_by_id:
         recipients.append(ticket.reported_by_id)
 
-    admins = User.objects.filter(
-        is_active=True,
-        role__in=("super_admin", "group_head", "ops_manager"),
-    ).exclude(id__in=recipients).values_list("id", flat=True)
-    recipients.extend(admins)
+    # The worker's own supervisor, and whoever reviews across teams.
+    worker = ticket.completed_by or ticket.assigned_to
+    for user in holders_of("review_tickets", scope_to=worker, exclude=recipients):
+        if user.pk not in recipients and user.pk != getattr(worker, "pk", None):
+            recipients.append(user.pk)
 
     data = _build_ticket_data(ticket)
     data["submitted_by"] = str(ticket.completed_by_id) if ticket.completed_by_id else None
@@ -325,6 +359,7 @@ def _create_review_request_notification(ticket: Ticket):
             title=f"Review requested: {ticket.title}",
             message=f"Ticket #{str(ticket.id)[:8]} has been submitted for your review.",
             ticket=ticket,
+            link=f"/tickets?open={ticket.pk}",
             is_actionable=True,
             data=data,
         )

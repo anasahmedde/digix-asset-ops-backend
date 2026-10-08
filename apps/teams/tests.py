@@ -1,4 +1,5 @@
 # Tests will be added alongside model implementations.
+from datetime import timedelta
 import pytest
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -52,7 +53,8 @@ def test_project_scope_and_milestones():
     assert r.status_code == 400
 
     r = c.post("/api/teams/milestones/", {
-        "project": str(project.pk), "title": "Structures ready", "due_date": "2026-09-15", "order": 1,
+        "project": str(project.pk), "title": "Structures ready", "order": 1,
+        "due_date": (timezone.localdate() + timedelta(days=30)).isoformat(),
     }, format="json")
     assert r.status_code == 201, r.content
 
@@ -1551,7 +1553,7 @@ def test_a_project_waits_on_the_warranty_it_promised_the_client(db):
     given = client.post(f"/api/teams/projects/{project.pk}/client-warranties/",
                         {"device": str(live.pk), "months": 12}, format="json")
     assert given.status_code == 201, given.content
-    assert "12 months" in given.data["detail"]
+    assert "Client Warranty" in given.data["detail"] and "1 Year" in given.data["detail"]
     assert given.data["awaiting"] == []
     assert project.assets_awaiting_client_warranty() == []
 
@@ -1564,3 +1566,98 @@ def test_a_project_waits_on_the_warranty_it_promised_the_client(db):
     stray = client.post(f"/api/teams/projects/{project.pk}/client-warranties/",
                         {"device": str(other.pk), "months": 6}, format="json")
     assert stray.status_code == 400 and "not on this project" in str(stray.data)
+
+
+@pytest.mark.django_db
+def test_the_contract_term_covers_every_asset_without_typing_each(db):
+    """Set once on the project: assets with the client get it now, the rest on install."""
+    from django.contrib.auth import get_user_model
+    from django.utils import timezone
+    from rest_framework.test import APIClient
+
+    from apps.assets.models import Brand, Device, DeviceModel
+    from apps.sites.models import DeviceInstallation, Site
+    from apps.sites.signals import _anchor_client_warranties
+    from apps.teams.models import Project, ProjectScopeItem
+
+    User = get_user_model()
+    ops = User.objects.create_user(username="term-ops", password="x", role="ops_manager")
+    client = APIClient()
+    client.force_authenticate(ops)
+
+    model = DeviceModel.objects.create(brand=Brand.objects.create(name="Term Brand"), name="T-1")
+    live = Device.objects.create(device_model=model, serial_number="TERM-1", status=Device.Status.ACTIVE)
+    later = Device.objects.create(device_model=model, serial_number="TERM-2", status=Device.Status.IN_STOCK)
+    project = Project.objects.create(name="Term Project")
+    for d in (live, later):
+        ProjectScopeItem.objects.create(project=project, device=d, quantity=1)
+
+    r = client.post(f"/api/teams/projects/{project.pk}/client-warranties/",
+                    {"default_months": 12}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["default_months"] == 12 and r.data["awaiting"] == []
+    assert live.warranties.get(warranty_type="client").months == 12
+    # Not with the client yet, so no cover yet.
+    assert not later.warranties.filter(warranty_type="client").exists()
+
+    # Installed, but not live: still no cover.
+    installation = DeviceInstallation.objects.create(
+        device=later, site=Site.objects.create(name="Term Site"), installed_at=timezone.now(),
+    )
+    _anchor_client_warranties(installation)
+    assert not later.warranties.filter(warranty_type="client").exists()
+
+    # Live: it picks up the project's term, dated from going live.
+    later.status = Device.Status.ACTIVE
+    later.save()
+    cover = later.warranties.get(warranty_type="client")
+    assert cover.months == 12 and cover.start_date == timezone.localdate()
+
+    # A term has to be a real one.
+    bad = client.post(f"/api/teams/projects/{project.pk}/client-warranties/",
+                      {"default_months": 0}, format="json")
+    assert bad.status_code == 400
+
+
+@pytest.mark.django_db
+def test_health_follows_the_dates_the_work_and_the_blockers(db):
+    """Health is judged, not typed: a passed target date reads Delayed at once."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.teams.models import Project, ProjectBottleneck
+
+    today = timezone.localdate()
+    project = Project.objects.create(
+        name="Health Project", phase=Project.Phase.PROCUREMENT, status=Project.Status.ON_TRACK,
+        start_date=today - timedelta(days=10), target_date=today + timedelta(days=60),
+    )
+    # Barely started, plenty of time left: on track.
+    assert project.health(progress=10) == Project.Status.ON_TRACK
+    # The target was moved into the past: delayed, without anybody saying so.
+    project.target_date = today - timedelta(days=2)
+    project.save()
+    project.sync_phase()
+    project.refresh_from_db()
+    assert project.status == Project.Status.DELAYED
+
+    # (No work is booked on this project, so syncing read it back as planning;
+    # the rest is judged as if procurement had begun.)
+    project.phase = Project.Phase.PROCUREMENT
+    # A week to go and far from done: at risk.
+    project.target_date = today + timedelta(days=5)
+    assert project.health(progress=40) == Project.Status.AT_RISK
+    # Half the time gone, a fifth of the work done: at risk.
+    project.start_date, project.target_date = today - timedelta(days=50), today + timedelta(days=50)
+    assert project.health(progress=20) == Project.Status.AT_RISK
+    assert project.health(progress=45) == Project.Status.ON_TRACK
+    # An open bottleneck: at risk; resolved, back on track.
+    blocker = ProjectBottleneck.objects.create(project=project, title="Panels held at customs")
+    assert project.health(progress=45) == Project.Status.AT_RISK
+    blocker.is_resolved = True
+    blocker.save()
+    assert project.health(progress=45) == Project.Status.ON_TRACK
+    # On hold says so.
+    project.phase = Project.Phase.ON_HOLD
+    assert project.health(progress=45) == Project.Status.ON_HOLD

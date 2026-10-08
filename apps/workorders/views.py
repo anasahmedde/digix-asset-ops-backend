@@ -1,12 +1,14 @@
 from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
+from common.dates import refuse_past
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import CapabilityGate, AdminManagerWriteElseRead
+from common.permissions import CapabilityGate, can, can_for_project
+from apps.notifications import service as notices
 
 from .models import WorkOrder, WorkOrderItem
 from .pdf import build_work_order_pdf
@@ -58,7 +60,20 @@ def _status_from_lines(work_order) -> str:
 
 class WorkOrderViewSet(viewsets.ModelViewSet):
     # Reading this is a permission, not just a menu entry.
-    read_capability = "view_projects"
+    read_capability = "view_work_orders"
+    write_capability = "raise_work_order"
+    action_capabilities = {
+        "requests": "view_work_orders",
+        "receiving": "view_work_orders",
+        "print_pdf": "view_work_orders",
+        "inspect": "inspect_work",
+        # Agreeing a price is deliberately not a work-order right: the point
+        # is that somebody outside says yes. Who exactly is checked against
+        # the line's own owner, inside the action.
+        "price_variance": None,
+        # Approving is checked inside, per the move asked for.
+        "transition": ("raise_work_order", "approve_work_order"),
+    }
     queryset = (
         WorkOrder.objects.select_related(
             "supplier", "client", "site", "payment_terms", "terms_template",
@@ -70,15 +85,7 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         )
         .all()
     )
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead, CapabilityGate]
-
-    def get_permissions(self):
-        # Agreeing a price is deliberately not a work-order right: the point
-        # is that somebody outside says yes. Who exactly is checked against
-        # the line's own owner, inside the action.
-        if getattr(self, "action", None) == "price_variance":
-            return [IsAuthenticated()]
-        return super().get_permissions()
+    permission_classes = [IsAuthenticated, CapabilityGate]
     filterset_fields = ["status", "order_type", "supplier", "client", "site"]
     search_fields = ["wo_number", "title", "description"]
     ordering_fields = ["created_at", "expected_delivery", "total_amount"]
@@ -110,8 +117,7 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
                 f"That operation is already {item.get_variance_status_display().lower()}."
             )}, status=400)
 
-        allowed = PurchaseOrderViewSet.VARIANCE_DECIDERS.get(item.variance_owner, ())
-        if getattr(request.user, "role", "") not in allowed:
+        if not PurchaseOrderViewSet.may_agree(request.user, item):
             return Response({"detail": (
                 f"This one is {item.get_variance_owner_display()}'s to agree, not yours."
             )}, status=status.HTTP_403_FORBIDDEN)
@@ -201,16 +207,13 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         new_status = ser.validated_data["status"]
         now = timezone.now()
 
-        # The same sign-off as a purchase order: the Group Head approves;
-        # Operations move the order everywhere else.
-        role = getattr(request.user, "role", "")
-        if role == "group_head" and new_status not in (WorkOrder.Status.APPROVED, WorkOrder.Status.DRAFT):
-            return Response(
-                {"detail": "The Group Head signs work orders off; Operations move them otherwise."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-        if new_status == WorkOrder.Status.APPROVED and role not in ("super_admin", "group_head"):
-            return Response({"detail": "Work orders are approved by the Group Head."}, status=status.HTTP_403_FORBIDDEN)
+        # The same sign-off as a purchase order: approving is its own right;
+        # every other move is raising and running the order.
+        if new_status == WorkOrder.Status.APPROVED:
+            if not can(request.user, "approve_work_order"):
+                return Response({"detail": "Work orders are approved by the Group Head."}, status=status.HTTP_403_FORBIDDEN)
+        elif not can(request.user, "raise_work_order"):
+            return Response({"detail": "Operations raise and move work orders."}, status=status.HTTP_403_FORBIDDEN)
 
         # An order quoted above what the project planned does not reach the
         # Group Head until Execution has agreed to pay it.
@@ -298,8 +301,44 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
 
         if new_status == WorkOrder.Status.APPROVED:
             _spawn_project_if_needed(work_order)
+        self._tell_about(work_order, new_status, request.user)
 
         return Response(WorkOrderSerializer(work_order).data)
+
+    def _tell_about(self, wo, new_status, actor):
+        """Approvers when it goes up; the raiser when it is decided; the
+        receiving desk when the vendor delivers."""
+        link = f"/work-orders?wo={wo.pk}"
+        ref = f"wo:{wo.pk}"
+        money = f"{wo.currency} {wo.total_amount:,.0f}"
+        S = WorkOrder.Status
+        if new_status == S.PENDING_APPROVAL:
+            notices.ask(
+                "approve_work_order", exclude=[actor],
+                title=f"{wo.wo_number} needs your approval",
+                message=f"{wo.supplier.name if wo.supplier_id else 'vendor'} · {money} · raised by {notices.who(wo.created_by)}",
+                link=link, ref=ref, data={"wo": str(wo.pk)},
+            )
+            return
+        if new_status in (S.APPROVED, S.DRAFT, S.CANCELLED):
+            notices.resolve(ref)
+            if wo.created_by_id:
+                said = {
+                    S.APPROVED: f"{wo.wo_number} approved",
+                    S.DRAFT: f"{wo.wo_number} sent back to draft",
+                    S.CANCELLED: f"{wo.wo_number} cancelled",
+                }[new_status]
+                notices.tell(
+                    [wo.created_by], exclude=[actor], kind="approval_decided",
+                    title=said, message=f"by {notices.who(actor)}", link=link, data={"wo": str(wo.pk)},
+                )
+        if new_status in (S.DELIVERED, S.PARTIALLY_DELIVERED):
+            notices.ask(
+                "inspect_work", exclude=[actor], kind="request_raised",
+                title=f"{wo.wo_number} delivered — inspect the work",
+                message=f"{wo.title} · {wo.supplier.name if wo.supplier_id else 'vendor'}",
+                link="/work-orders?tab=receiving", ref=f"wo-receive:{wo.pk}", data={"wo": str(wo.pk)},
+            )
 
     # ── Requests from Execution, and the orders raised from them ──────────
 
@@ -434,7 +473,9 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
                 project=project,
                 device=device,
                 production_step=steps[0] if len(steps) == 1 else None,
-                expected_delivery=request.data.get("expected_delivery") or None,
+                expected_delivery=refuse_past(request.data.get("expected_delivery"), "expected_delivery"),
+                payment_terms_id=request.data.get("payment_terms") or None,
+                payment_terms_note=(request.data.get("payment_terms_note") or "").strip()[:200],
                 terms_conditions=(request.data.get("terms") or "").strip(),
                 created_by=request.user,
             )
@@ -470,6 +511,8 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         if flagged:
             from apps.procurement.variance import tell_the_owner
             tell_the_owner(flagged, raised_by=request.user)
+        for step in steps:
+            notices.resolve(f"wo-request:{step.pk}")
 
         return Response(WorkOrderSerializer(order).data, status=status.HTTP_201_CREATED)
 
@@ -499,6 +542,18 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
                 description=f"Work order request for '{step.name}' sent back by Work Orders: {reason}",
                 performed_by=request.user,
                 metadata={"step": str(step.pk), "sent_back": True, "reason": reason},
+            )
+        notices.resolve(f"wo-request:{step.pk}")
+        from apps.assets.serializers import _project_of
+
+        project = _project_of(step.device)
+        if project is not None:
+            notices.tell(
+                notices.holders_of("decide_requirements", project=project, exclude=[request.user]),
+                kind="request_answered",
+                title=f"Work order request sent back: {step.name}",
+                message=f"{step.device.asset_code} · {reason}",
+                link=f"/projects?project={project.pk}&tab=execution", data={"step": str(step.pk)},
             )
         return Response({"detail": f"'{step.name}' on {step.device.asset_code} is back with the project to decide.", "step": str(step.pk)})
 
@@ -566,6 +621,15 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
                 "inspected_by", "inspected_at", "inspection_result", "inspection_notes", "status", "updated_at",
             ])
         work_order.refresh_from_db()
+        if work_order.status not in (WorkOrder.Status.DELIVERED, WorkOrder.Status.PARTIALLY_DELIVERED):
+            notices.resolve(f"wo-receive:{work_order.pk}")
+        if work_order.created_by_id:
+            accepted = result == WorkOrder.InspectionResult.ACCEPTED
+            notices.tell(
+                [work_order.created_by], exclude=[request.user],
+                title=f"{work_order.wo_number}: work {'accepted' if accepted else 'sent back for rework'}",
+                message=notes or "", link=f"/work-orders?wo={work_order.pk}", data={"wo": str(work_order.pk)},
+            )
         return Response(WorkOrderSerializer(work_order).data)
 
     @action(detail=False, methods=["get"], url_path="receiving")

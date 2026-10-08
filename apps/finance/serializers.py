@@ -3,6 +3,7 @@ from rest_framework import serializers
 from common.money import HidesMoney
 
 from .models import Invoice, Payment
+from common.dates import DateOrder
 
 
 class PaymentSerializer(HidesMoney, serializers.ModelSerializer):
@@ -16,7 +17,8 @@ class PaymentSerializer(HidesMoney, serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
-class InvoiceSerializer(HidesMoney, serializers.ModelSerializer):
+class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
+    date_order = (("due_date", "issue_date", "the issue date"),)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)

@@ -44,6 +44,19 @@ class PurchaseOrder(TimeStampedModel):
     # Printed on the order the supplier receives. Seeded from the house
     # standard, then edited per order when a deal says something different.
     terms = models.TextField(blank=True)
+    # How the supplier is paid — all on delivery, in advance, or split at a
+    # milestone. Work orders already carried this; an order for goods is the
+    # same promise, and the supplier reads it off the printed order.
+    payment_terms = models.ForeignKey(
+        "setup.PaymentTerms", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="purchase_orders",
+    )
+    # A deal with its own terms — "30% on order, balance on commissioning" —
+    # is written here rather than squeezed into the catalogue, so one-off
+    # arrangements do not pile up as entries everybody else has to scroll
+    # past. Printed on the order the supplier receives, where no catalogue term
+    # is picked.
+    payment_terms_note = models.CharField(max_length=200, blank=True)
     ordered_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="purchase_orders"
     )

@@ -101,7 +101,10 @@ def build_work_order_pdf(work_order) -> bytes:
         return [Paragraph(label.upper(), s["label"]), Paragraph(value or "—", s["body"])]
 
     warranty = f"{work_order.warranty_months} months" if work_order.warranty_months else "—"
-    payment = work_order.payment_terms.name if work_order.payment_terms_id else "—"
+    payment = (
+        work_order.payment_terms.name if work_order.payment_terms_id
+        else work_order.payment_terms_note or "—"
+    )
     facts_rows = [
         field("WO Number", work_order.wo_number) + field("Status", work_order.get_status_display()),
         field("Order Date", work_order.order_date.isoformat() if work_order.order_date else "—")

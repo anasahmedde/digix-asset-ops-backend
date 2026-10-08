@@ -79,10 +79,9 @@ TERMINAL = (Ticket.Status.CLOSED, Ticket.Status.CANCELLED)
 
 
 def is_office(user) -> bool:
-    return bool(
-        getattr(user, "is_superuser", False)
-        or getattr(user, "role", None) in OFFICE_ROLES
-    )
+    from common.permissions import can_any
+
+    return can_any(user, "review_maintenance", "assign_maintenance", "manage_maintenance")
 
 
 def is_admin(user) -> bool:

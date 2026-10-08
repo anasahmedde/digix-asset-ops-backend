@@ -1796,17 +1796,68 @@ def test_rejected_goods_stay_owed_and_never_reach_the_store(db):
     r = APIClient()
     r.force_authenticate(store)
     got = r.post(f"/api/inventory/receipt-lines/{line.pk}/receive/",
-                 {"notes": "Counted against the delivery note"}, format="json")
+                 {"notes": "Counted against the delivery note", "storage_location": "Rack A3"},
+                 format="json")
     assert got.status_code == 200, got.content
 
     line.refresh_from_db()
     stock.refresh_from_db()
     assert line.stocked_at is not None and line.stocked_by_id == store.pk
     assert stock.quantity == 7
+    # Where it was put is on the stock row, for whoever has to find it.
+    assert stock.storage_location == "Rack A3"
 
     # And it cannot be received twice.
     again = r.post(f"/api/inventory/receipt-lines/{line.pk}/receive/", {}, format="json")
     assert again.status_code == 400 and "Already received" in str(again.data)
+
+
+@pytest.mark.django_db
+def test_units_received_carry_the_warranty_given_at_inspection(db):
+    """Procurement types the vendor's cover once; the store does not retype it."""
+    from django.contrib.auth import get_user_model
+    from rest_framework.test import APIClient
+
+    from apps.inventory.models import GoodsReceiptLine, InventoryUnit, InventoryUnitType
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.suppliers.models import Supplier
+
+    User = get_user_model()
+    buyer = User.objects.create_user(username="wty-ops", password="x", role="ops_manager")
+    client = APIClient()
+    client.force_authenticate(buyer)
+    product = InventoryUnitType.objects.create(name="Warranty Player", model_name="WP-1")
+    po = PurchaseOrder.objects.create(
+        supplier=Supplier.objects.create(name="Warranty Supplier"),
+        status=PurchaseOrder.Status.APPROVED, ordered_by=buyer,
+    )
+    item = PurchaseOrderItem.objects.create(
+        purchase_order=po, description="Warranty Player", quantity=2,
+        unit_price=500, inventory_unit_type=product,
+    )
+    r = client.post(f"/api/procurement/purchase-orders/{po.pk}/receive/", {
+        "lines": [{
+            "po_item": str(item.pk), "quantity": 2, "warranty_months": 12,
+            "serial_numbers": ["WTY-1", "WTY-2"],
+        }],
+    }, format="json")
+    assert r.status_code == 201, r.content
+    line = GoodsReceiptLine.objects.get(po_item=item)
+
+    # Without a place to put them, the store cannot take them in.
+    units = [{"serial_number": "WTY-1"}, {"serial_number": "WTY-2"}]
+    nowhere = client.post(f"/api/inventory/receipt-lines/{line.pk}/receive/",
+                          {"route": "unique", "units": units}, format="json")
+    assert nowhere.status_code == 400 and "storage_location" in nowhere.data
+
+    got = client.post(f"/api/inventory/receipt-lines/{line.pk}/receive/",
+                      {"route": "unique", "units": units, "storage_location": "Bin 7"},
+                      format="json")
+    assert got.status_code == 200, got.content
+    for unit in InventoryUnit.objects.filter(goods_receipt_line=line):
+        assert unit.has_warranty and unit.warranty_months == 12
+        assert unit.warranty_type == "supplier" and unit.warranty_end is not None
+        assert unit.storage_location == "Bin 7"
 
 
 @pytest.mark.django_db
@@ -1847,3 +1898,51 @@ def test_stock_cannot_leave_the_store_unaccounted_for(db):
     assert named.status_code in (200, 201), named.content
     item.refresh_from_db()
     assert item.quantity == 48
+
+
+@pytest.mark.django_db
+def test_the_store_takes_a_return_in_whole_and_turns_nothing_away(db):
+    """The store counts; it does not judge. A part back from a job never met an
+    inspector and is received as it stands. What Procurement turned away never
+    reaches the shelf at all."""
+    from django.contrib.auth import get_user_model
+    from rest_framework.test import APIClient
+
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine, InventoryItem
+
+    User = get_user_model()
+    store = User.objects.create_user(username="ret-store", password="x", role="warehouse")
+    client = APIClient()
+    client.force_authenticate(store)
+
+    material = MaterialType.objects.create(name="Return Guard Bracket", unit="piece")
+    stock = InventoryItem.objects.create(material_type=material, quantity=3, unit_cost=50)
+    receipt = GoodsReceipt.objects.create(received_by=store, notes="back from a job")
+    came_back = GoodsReceiptLine.objects.create(
+        receipt=receipt, inventory_item=stock, quantity=4,
+        inspection_status=GoodsReceiptLine.Inspection.PENDING,
+    )
+
+    r = client.post(f"/api/inventory/receipt-lines/{came_back.pk}/receive/",
+                    {"route": "generic", "storage_location": "Rack B1"}, format="json")
+    assert r.status_code == 200, r.content
+    came_back.refresh_from_db()
+    stock.refresh_from_db()
+    # The whole four went on the shelf — nobody here decided otherwise.
+    assert came_back.accepted_quantity == 4 and came_back.rejected_quantity == 0
+    assert came_back.stocked_at is not None and came_back.stocked_by_id == store.pk
+    assert stock.quantity == 7
+
+    # A line Procurement rejected is not the store's to receive.
+    refused = GoodsReceiptLine.objects.create(
+        receipt=receipt, inventory_item=stock, quantity=2,
+        inspection_status=GoodsReceiptLine.Inspection.REJECTED,
+        accepted_quantity=0, rejected_quantity=2, inspection_notes="bent",
+    )
+    r = client.post(f"/api/inventory/receipt-lines/{refused.pk}/receive/",
+                    {"route": "generic"}, format="json")
+    assert r.status_code == 400, r.content
+    assert "turned this line away" in str(r.data)
+    stock.refresh_from_db()
+    assert stock.quantity == 7, "a refused line must not move stock"

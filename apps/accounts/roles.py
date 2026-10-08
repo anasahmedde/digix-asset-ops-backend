@@ -79,11 +79,13 @@ def capability_map() -> dict[str, frozenset[str]]:
     from .capabilities import ROLE_DEFAULTS
     from .models import RoleDefinition
 
+    from .capabilities import expand
+
     rows = dict(RoleDefinition.objects.values_list("key", "capabilities"))
     # The code defaults are the floor: a database that has not been seeded
     # yet still behaves, and a role added in code appears without a step.
     merged = {key: frozenset(caps) for key, caps in ROLE_DEFAULTS.items()}
-    merged.update({key: frozenset(caps or ()) for key, caps in rows.items()})
+    merged.update({key: expand(caps) for key, caps in rows.items()})
     cache.set(CACHE_KEY, merged, CACHE_SECONDS)
     return merged
 

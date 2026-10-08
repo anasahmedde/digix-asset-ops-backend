@@ -50,6 +50,10 @@ _FALLBACK_PREFIXES = {
     "inventory_item": "ITM",
     "inventory_unit": "IVU",
     "inventory_unit_type": "IVT",
+    "client_warranty": "CLW",
+    "vendor_warranty": "VNW",
+    "component_warranty": "CPW",
+    "warranty_claim": "WCL",
 }
 
 

@@ -136,3 +136,88 @@ def send_webhook_delivery(self, webhook_id: str, event: str, payload: dict):
             self.retry()
         except self.MaxRetriesExceededError:
             logger.error("Max retries exceeded for webhook %s", webhook.name)
+
+
+# ── What is still waiting on people ────────────────────────────────────
+
+@shared_task
+def remind_pending_work():
+    """Once a day, one line per person: how much is still waiting on them.
+
+    Every approval and request that is waiting is an actionable notification
+    with no ``resolved_at``. One that has sat unread for a day gets a nudge;
+    the nudge itself is never nudged, and nobody is nudged twice a day.
+    """
+    from datetime import timedelta
+
+    from django.db.models import Count
+
+    from .models import Notification
+    from .service import notify
+
+    now = timezone.now()
+    day_ago = now - timedelta(hours=24)
+    waiting = (
+        Notification.objects.filter(
+            is_actionable=True, resolved_at__isnull=True, is_read=False, created_at__lt=day_ago,
+        )
+        .exclude(notification_type=Notification.Type.DIGEST)
+        .values("recipient_id")
+        .annotate(n=Count("id"))
+    )
+    nudged = 0
+    for row in waiting:
+        already = Notification.objects.filter(
+            recipient_id=row["recipient_id"], notification_type=Notification.Type.DIGEST,
+            created_at__gte=day_ago,
+        ).exists()
+        if already:
+            continue
+        n = row["n"]
+        notify(
+            [row["recipient_id"]], kind=Notification.Type.DIGEST,
+            title=f"{n} item{'s' if n != 1 else ''} waiting on you",
+            message="Approvals and requests that have been with you for more than a day.",
+            link="/alerts", email=True,
+        )
+        nudged += 1
+    return nudged
+
+
+@shared_task
+def warn_expiring_warranties():
+    """Cover that ends within 30 days: told once, to whoever records warranties."""
+    from datetime import timedelta
+
+    from apps.inventory.models import InventoryUnit
+    from apps.warranties.models import Warranty
+
+    from .models import Notification
+    from .service import ask
+
+    today = timezone.localdate()
+    soon = today + timedelta(days=30)
+    told = 0
+    for w in Warranty.objects.filter(status="active", end_date__gte=today, end_date__lte=soon).select_related("device"):
+        ref = f"warranty-expiring:{w.pk}"
+        if Notification.objects.filter(ref=ref).exists():
+            continue
+        ask(
+            "manage_warranties", kind=Notification.Type.WORKFLOW_UPDATE, email=False,
+            title=f"{w.get_warranty_type_display()} on {w.device.asset_code} ends {w.end_date:%d %b}",
+            message=f"{w.reference_number} · {(w.end_date - today).days} days left",
+            link="/warranties", ref=ref, data={"warranty": str(w.pk)},
+        )
+        told += 1
+    for u in InventoryUnit.objects.filter(has_warranty=True, warranty_end__gte=today, warranty_end__lte=soon):
+        ref = f"part-warranty-expiring:{u.pk}"
+        if Notification.objects.filter(ref=ref).exists():
+            continue
+        ask(
+            "manage_warranties", kind=Notification.Type.WORKFLOW_UPDATE, email=False,
+            title=f"Component warranty on {u.serial_number} ends {u.warranty_end:%d %b}",
+            message=f"{u.warranty_reference} · {(u.warranty_end - today).days} days left",
+            link="/warranties?tab=components", ref=ref, data={"unit": str(u.pk)},
+        )
+        told += 1
+    return told

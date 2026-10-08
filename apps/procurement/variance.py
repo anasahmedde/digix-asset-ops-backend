@@ -29,7 +29,7 @@ def tell_the_owner(items, raised_by=None):
     ``items`` are the flagged lines of one order. Grouped by owner so a buyer
     adding six lines does not post six notifications to the same desk.
     """
-    from django.contrib.auth import get_user_model
+    from apps.notifications.service import holders_of
 
     from .views import PurchaseOrderViewSet  # the one list of who may decide
 
@@ -37,16 +37,16 @@ def tell_the_owner(items, raised_by=None):
     for item in items:
         by_owner.setdefault(item.variance_owner, []).append(item)
 
-    User = get_user_model()
     sent = []
     for owner, lines in by_owner.items():
-        roles = PurchaseOrderViewSet.VARIANCE_DECIDERS.get(owner, ())
-        if not roles:
+        caps = PurchaseOrderViewSet.VARIANCE_DECIDERS.get(owner, ())
+        caps = (caps,) if isinstance(caps, str) else tuple(caps)
+        if not caps:
             continue
         order = lines[0].parent_order
-        who = User.objects.filter(is_active=True, role__in=roles).exclude(
-            pk=getattr(raised_by, "pk", None)
-        )
+        # The project's manager is told about their project's lines too.
+        project = getattr(lines[0], "project_of_line", None)
+        who = holders_of(*caps, exclude=[raised_by], project=project)
         first = lines[0]
         detail = (
             f"{first.description} at {_money(first.unit_price, order.currency)} "
@@ -58,6 +58,14 @@ def tell_the_owner(items, raised_by=None):
                 recipient=user,
                 notification_type=Notification.Type.SYSTEM,
                 title=f"{lines[0].order_number} is priced over plan",
+                link=(
+                    f"/procurement?po={order.pk}" if hasattr(order, "po_number")
+                    else f"/work-orders?wo={order.pk}"
+                ),
+                ref=(
+                    f"po-variance:{order.pk}" if hasattr(order, "po_number")
+                    else f"wo-variance:{order.pk}"
+                ),
                 message=(
                     f"{len(lines)} line(s) on {lines[0].order_number} cost more than was planned: "
                     f"{detail}. The order cannot go up for signature until you agree them."
@@ -86,6 +94,10 @@ def tell_the_buyer(item, decider, approved):
         title=(
             f"Price agreed on {item.order_number}" if approved
             else f"Price refused on {item.order_number}"
+        ),
+        link=(
+            f"/procurement?po={order.pk}" if hasattr(order, "po_number")
+            else f"/work-orders?wo={order.pk}"
         ),
         message=(
             f"{decider.get_full_name() or decider.username} "

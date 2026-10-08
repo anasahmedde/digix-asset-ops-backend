@@ -85,14 +85,16 @@ class User(AbstractUser):
         An override is absolute — granted means granted even if the role
         would not, withdrawn means withdrawn even if it would.
         """
+        from .capabilities import RENAMED
         from .roles import defaults_for
 
         allowed = set(defaults_for(self.role))
         for row in self.capability_overrides.all():
+            keys = RENAMED.get(row.capability, (row.capability,))
             if row.allowed:
-                allowed.add(row.capability)
+                allowed.update(keys)
             else:
-                allowed.discard(row.capability)
+                allowed.difference_update(keys)
         return frozenset(allowed)
 
     def can(self, capability: str) -> bool:
