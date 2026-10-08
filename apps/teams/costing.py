@@ -517,6 +517,11 @@ def build_actuals(project):
     return {
         "project": str(project.pk),
         "budget_status": plan.status if plan else None,
+        # Whether the plan can still be changed. A line the budget was signed
+        # off on is revised, not quietly edited underneath the signature; one
+        # added during execution was never in it, so it stays the team's to
+        # correct or drop. The screen needs to know which it is looking at.
+        "budget_is_editable": plan.is_editable if plan else True,
         "approved_total": approved,
         "estimate_total": estimate["total"],
         "assets": assets,

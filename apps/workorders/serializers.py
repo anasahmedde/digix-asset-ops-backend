@@ -3,6 +3,7 @@ from rest_framework import serializers
 from common.money import HidesMoney
 
 from .models import WorkOrder, WorkOrderItem
+from common.dates import DateOrder
 
 
 LINE_STATE_LABELS = {
@@ -139,12 +140,19 @@ class WorkOrderListSerializer(HidesMoney, serializers.ModelSerializer):
         return sum(1 for i in obj.items.all() if i.with_vendor)
 
 
-class WorkOrderSerializer(HidesMoney, serializers.ModelSerializer):
+class WorkOrderSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
+    future_dates = ("expected_delivery",)
+    date_order = (("expected_delivery", "order_date", "the order date"),)
     items = WorkOrderItemSerializer(many=True, required=False)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     payment_terms_name = serializers.CharField(source="payment_terms.name", read_only=True, default=None)
+    # The catalogue term, or the terms typed for this deal when none fits.
+    payment_terms_display = serializers.SerializerMethodField()
+
+    def get_payment_terms_display(self, obj):
+        return obj.payment_terms.name if obj.payment_terms_id else (obj.payment_terms_note or None)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     order_type_display = serializers.CharField(source="get_order_type_display", read_only=True)
     # Names fall back to the login when no full name is on file.
@@ -194,7 +202,8 @@ class WorkOrderSerializer(HidesMoney, serializers.ModelSerializer):
             "status", "status_display",
             "supplier", "supplier_name", "client", "client_name", "site", "site_name",
             "project", "project_name", "device", "device_code", "production_step", "production_step_name",
-            "payment_terms", "payment_terms_name", "terms_template", "terms_conditions",
+            "payment_terms", "payment_terms_name", "payment_terms_note", "payment_terms_display",
+            "terms_template", "terms_conditions",
             "safety_instructions", "warranty_months",
             "currency", "order_date", "expected_delivery", "total_amount", "notes",
             "items", "created_by", "created_by_name", "approved_by", "approved_by_name",

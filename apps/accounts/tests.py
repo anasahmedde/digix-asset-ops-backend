@@ -295,6 +295,7 @@ def test_operations_raise_purchase_orders_and_the_group_head_signs_them(group_he
         "supplier": str(supplier.id),
         # An order leaving draft says when the goods are needed by.
         "expected_delivery": (timezone.now().date() + timedelta(days=14)).isoformat(),
+        "payment_terms_note": "100% on delivery",
         "items": [{"description": "Cable", "quantity": 2, "unit_price": "100.00"}],
     }
     # The Group Head does not raise orders…
@@ -406,8 +407,11 @@ def test_the_reporting_line_stays_a_tree_and_is_moved_by_managers():
     r = _client(other).patch(f"/api/accounts/users/{tech.pk}/", {"reports_to": str(other.pk)}, format="json")
     assert r.status_code == 403, r.content
     # Somebody who does hold it is still scoped to the people under them.
-    ops = User.objects.create_user(username="org-ops-elsewhere", password="x", role="ops_manager")
-    r = _client(ops).patch(f"/api/accounts/users/{tech.pk}/", {"reports_to": str(ops.pk)}, format="json")
+    # Given the right to manage people, the other lead still moves only
+    # their own team - everybody's chart needs ``act_across_teams``.
+    from .models import UserCapability
+    UserCapability.objects.create(user=other, capability="manage_team", allowed=True)
+    r = _client(other).patch(f"/api/accounts/users/{tech.pk}/", {"reports_to": str(other.pk)}, format="json")
     assert r.status_code == 400, r.content
     assert "report to you" in str(r.data["reports_to"])
     # The head moves anyone.

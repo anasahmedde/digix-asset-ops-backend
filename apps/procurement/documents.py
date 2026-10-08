@@ -30,7 +30,7 @@ COMPANY_NAME = "DIGIX Asset Management"
 DEFAULT_TERMS = """1. This purchase order number must be quoted on all invoices, packing notes and correspondence.
 2. Goods are received subject to inspection. Anything rejected on inspection is returned at the supplier's cost.
 3. Delivery is to be completed by the required delivery date stated above.
-4. Payment terms are 30 days from receipt of a correct invoice and acceptance of the goods.
+4. Payment is on the terms stated above; where none are stated, 30 days from receipt of a correct invoice and acceptance of the goods.
 5. Prices are fixed for the duration of this order and include all applicable taxes and duties unless stated otherwise.
 6. The supplier warrants the goods against defects in material and workmanship for the agreed warranty period.
 7. Partial deliveries are accepted only where agreed in writing beforehand."""
@@ -160,6 +160,24 @@ def render_purchase_order_pdf(purchase_order, *, show_prices: bool = True) -> by
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
 
+    # When the supplier gets paid is part of the order, not a conversation
+    # held separately from it. It takes a row of its own because a term
+    # reads as a phrase — in a date-width column it was clipped mid-sentence.
+    pay = Table(
+        [field(
+            "Payment Terms",
+            purchase_order.payment_terms.name if purchase_order.payment_terms_id
+            else purchase_order.payment_terms_note or "—",
+        )],
+        colWidths=[24 * mm, 80 * mm],
+    )
+    pay.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+
     supplier_box = Table(
         [[Paragraph("SUPPLIER", s["label"])],
          _address_block(purchase_order.supplier, s, purchase_order.supplier_details)],
@@ -175,7 +193,18 @@ def render_purchase_order_pdf(purchase_order, *, show_prices: bool = True) -> by
         ("BACKGROUND", (0, 0), (-1, -1), BAND),
     ]))
 
-    header = Table([[facts, supplier_box]], colWidths=[110 * mm, 64 * mm])
+    # The facts and the payment row stack in the left column, beside the
+    # supplier's box.
+    left = Table([[facts], [pay]], colWidths=[110 * mm])
+    left.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+
+    header = Table([[left, supplier_box]], colWidths=[110 * mm, 64 * mm])
     header.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),

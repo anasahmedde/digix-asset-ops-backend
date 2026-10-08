@@ -3,6 +3,7 @@ from rest_framework import serializers
 from common.money import HidesMoney
 
 from .models import Quotation, QuotationItem
+from common.dates import DateOrder
 
 
 class QuotationItemSerializer(HidesMoney, serializers.ModelSerializer):
@@ -34,7 +35,8 @@ class QuotationItemSerializer(HidesMoney, serializers.ModelSerializer):
         return value
 
 
-class QuotationSerializer(HidesMoney, serializers.ModelSerializer):
+class QuotationSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
+    future_dates = ("valid_until",)
     items = QuotationItemSerializer(many=True, required=False)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)

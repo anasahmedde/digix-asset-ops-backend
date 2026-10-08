@@ -6,6 +6,7 @@ from apps.suppliers.models import Supplier
 from apps.teams.models import Project
 
 from .models import PurchaseOrder, PurchaseOrderItem
+from common.dates import DateOrder
 
 
 def _buy_asset_on(item, device_id):
@@ -158,20 +159,28 @@ class PurchaseOrderItemDetailSerializer(PurchaseOrderItemSerializer):
         fields = PurchaseOrderItemSerializer.Meta.fields + ["purchase_order"]
 
 
-# Who may see prices on a purchase order. The store receives against the
-# order and needs quantities, not what was paid.
-PRICE_VIEW_ROLES = ("super_admin", "group_head", "ops_manager", "finance", "marketing_head")
-
-
 def _can_see_prices(context) -> bool:
-    request = context.get("request")
-    user = getattr(request, "user", None)
-    if user is None or not user.is_authenticated:
-        return False
-    return getattr(user, "role", "") in PRICE_VIEW_ROLES
+    """Who may see prices on a purchase order. The store receives against the
+    order and needs quantities, not what was paid."""
+    from common.money import viewer_sees_prices
+
+    return viewer_sees_prices(context)
 
 
-class PurchaseOrderSerializer(HidesMoney, serializers.ModelSerializer):
+class PurchaseOrderSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
+    future_dates = ("expected_delivery",)
+    date_order = (("expected_delivery", "order_date", "the order date"),)
+    # How the supplier is paid, read off the Setup catalogue so the list is
+    # the client's to extend.
+    payment_terms_name = serializers.CharField(
+        source="payment_terms.name", read_only=True, default=None
+    )
+    # What the order actually says about payment: the catalogue term, or
+    # the terms typed for this deal when no catalogue term fits.
+    payment_terms_display = serializers.SerializerMethodField()
+
+    def get_payment_terms_display(self, obj):
+        return obj.payment_terms.name if obj.payment_terms_id else (obj.payment_terms_note or None)
     items = PurchaseOrderItemSerializer(many=True, required=False)
 
     def to_representation(self, instance):
@@ -211,6 +220,7 @@ class PurchaseOrderSerializer(HidesMoney, serializers.ModelSerializer):
             "id", "po_number", "supplier", "supplier_name",
             "status", "status_display", "currency", "order_date", "expected_delivery",
             "total_amount", "notes", "supplier_details", "terms", "effective_terms", "raised_for",
+            "payment_terms", "payment_terms_name", "payment_terms_note", "payment_terms_display",
             "ordered_by", "ordered_by_name", "approved_by", "approved_by_name",
             "items", "created_at", "updated_at",
         ]

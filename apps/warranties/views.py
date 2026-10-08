@@ -7,10 +7,11 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
-from common.permissions import CapabilityGate, CommercialWriteElseRead
+from apps.notifications import service as notices
+from common.permissions import CapabilityGate
 
-from .models import Warranty
-from .serializers import WarrantySerializer
+from .models import Warranty, WarrantyClaim
+from .serializers import WarrantyClaimSerializer, WarrantySerializer
 
 REISSUE_TERMS = (3, 6, 12)
 
@@ -25,14 +26,25 @@ SUPPLIER_SIDE_ROLES = ("ops_manager", "supervisor", "technician", "warehouse")
 class WarrantyViewSet(viewsets.ModelViewSet):
     # Warranty cover is read across the business — the field needs to
     # know what an asset is covered for. Writing is the gated half.
-    queryset = Warranty.objects.select_related("device", "supplier", "component").all()
+    queryset = Warranty.objects.select_related(
+        "device", "device__current_site", "device__assigned_client", "supplier", "component",
+    ).all()
     serializer_class = WarrantySerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead, CapabilityGate]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_warranties"
+    write_capability = "manage_warranties"
     filterset_fields = ["status", "warranty_type", "device", "supplier"]
-    search_fields = ["reference_number", "coverage_details", "device__asset_code", "device__display_name"]
+    search_fields = [
+        "reference_number", "vendor_reference", "coverage_details", "device__asset_code", "device__display_name",
+    ]
     ordering_fields = ["end_date", "start_date"]
 
     def get_queryset(self):
+        from .services import expire_lapsed
+
+        # Lapsed cover reads as completed the moment it lapses, not when the
+        # background job next gets round to it.
+        expire_lapsed()
         qs = super().get_queryset()
         role = getattr(self.request.user, "role", None)
         if role in CLIENT_SIDE_ROLES:
@@ -115,67 +127,30 @@ class WarrantyViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def extend(self, request, pk=None):
-        """Push a warranty's expiry later — an extension the vendor granted.
+        """Push a warranty's expiry later: the client's cover or the vendor's.
 
         The warranty keeps its identity and its start date; only the end moves.
         The change is written onto the warranty and journalled on the asset, so
         the history of extensions is never lost behind the current date.
         """
-        from django.utils.dateparse import parse_date
-
         from apps.assets.models import DeviceLifecycleEvent
 
+        from .services import extended_expiry, extension_entry, term_months
+
         warranty = self.get_object()
-        if warranty.warranty_type == Warranty.WarrantyType.CLIENT:
-            return Response(
-                {"detail": "Client warranties are reissued, not extended — use Reissue."},
-                status=http_status.HTTP_400_BAD_REQUEST,
-            )
         if warranty.status in (Warranty.Status.VOID, Warranty.Status.REISSUED):
             return Response(
                 {"detail": f"A {warranty.get_status_display().lower()} warranty cannot be extended."},
                 status=http_status.HTTP_400_BAD_REQUEST,
             )
-
-        raw_end, raw_months = request.data.get("end_date"), request.data.get("months")
-        if raw_end:
-            new_end = parse_date(str(raw_end))
-            if new_end is None:
-                return Response({"end_date": ["Use a real date."]}, status=http_status.HTTP_400_BAD_REQUEST)
-        elif raw_months not in (None, ""):
-            try:
-                months = int(raw_months)
-            except (TypeError, ValueError):
-                return Response({"months": ["Must be a whole number."]}, status=http_status.HTTP_400_BAD_REQUEST)
-            if months < 1:
-                return Response({"months": ["Add at least one month."]}, status=http_status.HTTP_400_BAD_REQUEST)
-            new_end = warranty.end_date + relativedelta(months=months)
-        else:
-            return Response(
-                {"detail": "Give the new expiry date, or how many months to add."},
-                status=http_status.HTTP_400_BAD_REQUEST,
-            )
-        if new_end <= warranty.end_date:
-            return Response(
-                {"end_date": [f"An extension has to move the expiry later than {warranty.end_date:%d %b %Y}."]},
-                status=http_status.HTTP_400_BAD_REQUEST,
-            )
-
         old_end = warranty.end_date
-        reference = (request.data.get("reference_number") or "").strip()
-        notes = (request.data.get("notes") or "").strip()
-        who = request.user.get_full_name() or request.user.username
+        new_end = extended_expiry(old_end, request.data)
 
         warranty.end_date = new_end
-        delta = relativedelta(new_end, warranty.start_date)
-        warranty.months = max(1, delta.years * 12 + delta.months + (1 if delta.days else 0))
+        warranty.months = term_months(warranty.start_date, new_end)
         if warranty.status == Warranty.Status.EXPIRED and new_end > timezone.now().date():
             warranty.status = Warranty.Status.ACTIVE
-        entry = f"Extended {old_end:%d %b %Y} → {new_end:%d %b %Y} by {who}"
-        if reference:
-            entry += f" — ref {reference}"
-        if notes:
-            entry += f" — {notes}"
+        entry = extension_entry(old_end, new_end, request.user, request.data)
         warranty.notes = f"{warranty.notes}\n{entry}" if warranty.notes else entry
         warranty.save(update_fields=["end_date", "months", "status", "notes", "updated_at"])
 
@@ -187,3 +162,109 @@ class WarrantyViewSet(viewsets.ModelViewSet):
             metadata={"warranty": str(warranty.pk), "from": str(old_end), "to": str(new_end)},
         )
         return Response(WarrantySerializer(warranty).data)
+
+
+class WarrantyClaimViewSet(viewsets.ModelViewSet):
+    """Claims on vendor and component warranties: raise, send, decide, settle."""
+
+    queryset = WarrantyClaim.objects.select_related(
+        "warranty", "inventory_unit", "inventory_unit__unit_type", "device", "supplier", "raised_by",
+    ).all()
+    serializer_class = WarrantyClaimSerializer
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_warranties"
+    write_capability = "decide_claim"
+    action_capabilities = {"create": "raise_claim", "transition": "decide_claim"}
+    filterset_fields = ["status", "supplier", "device", "warranty", "inventory_unit"]
+    search_fields = ["claim_number", "vendor_reference", "fault", "device__asset_code", "inventory_unit__serial_number"]
+    ordering_fields = ["created_at", "failure_date", "status", "claim_number"]
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def perform_create(self, serializer):
+        claim = serializer.save(raised_by=self.request.user)
+        self._journal(claim, f"Raised: {claim.fault}")
+        notices.ask(
+            "decide_claim", exclude=[self.request.user], kind="request_raised",
+            title=f"Warranty claim raised: {claim.claim_number}",
+            message=f"{claim.fault} · {claim.supplier.name if claim.supplier_id else 'vendor'}",
+            link="/warranties?tab=claims", ref=f"claim:{claim.pk}", data={"claim": str(claim.pk)},
+        )
+
+    def _journal(self, claim, line):
+        from apps.assets.models import DeviceLifecycleEvent
+
+        who = self.request.user.get_full_name() or self.request.user.username
+        stamp = timezone.localtime().strftime("%Y-%m-%d %H:%M")
+        entry = f"[{stamp}] {line} - {who}"
+        claim.history = f"{claim.history}\n{entry}" if claim.history else entry
+        claim.save(update_fields=["history", "updated_at"])
+        if claim.device_id:
+            DeviceLifecycleEvent.objects.create(
+                device=claim.device,
+                event_type=DeviceLifecycleEvent.EventType.NOTE,
+                description=f"Warranty claim {claim.claim_number}: {line}",
+                performed_by=self.request.user,
+                metadata={"warranty_claim": str(claim.pk)},
+            )
+
+    @action(detail=True, methods=["post"])
+    def transition(self, request, pk=None):
+        """Move a claim on: send it, record the vendor's decision, settle it.
+
+        ``{status, notes?, vendor_reference?, resolution?, recovered_amount?}``
+        """
+        from decimal import Decimal, InvalidOperation
+
+        claim = self.get_object()
+        new = request.data.get("status")
+        notes = (request.data.get("notes") or "").strip()
+        if new not in WarrantyClaim.NEXT.get(claim.status, ()):
+            return Response(
+                {"status": [f"A claim that is {claim.get_status_display().lower()} cannot move to that step."]},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        now = timezone.now()
+        S = WarrantyClaim.Status
+        if new == S.SUBMITTED:
+            claim.vendor_reference = (request.data.get("vendor_reference") or claim.vendor_reference).strip()[:200]
+            claim.submitted_at = now
+        elif new in (S.APPROVED, S.REJECTED):
+            if new == S.REJECTED and not notes:
+                return Response({"notes": ["Say why the vendor rejected it."]}, status=http_status.HTTP_400_BAD_REQUEST)
+            claim.decided_at = now
+        elif new == S.CLOSED:
+            resolution = request.data.get("resolution")
+            if resolution not in WarrantyClaim.Resolution.values:
+                return Response({"resolution": ["Say how the vendor settled it."]}, status=http_status.HTTP_400_BAD_REQUEST)
+            claim.resolution = resolution
+            raw = request.data.get("recovered_amount")
+            if raw not in (None, ""):
+                try:
+                    claim.recovered_amount = Decimal(str(raw))
+                except InvalidOperation:
+                    return Response({"recovered_amount": ["Give an amount."]}, status=http_status.HTTP_400_BAD_REQUEST)
+            claim.closed_at = now
+        elif new == S.WITHDRAWN and not notes:
+            return Response({"notes": ["Say why the claim is withdrawn."]}, status=http_status.HTTP_400_BAD_REQUEST)
+        claim.status = new
+        claim.save()
+        line = claim.get_status_display()
+        if new == S.SUBMITTED and claim.vendor_reference:
+            line += f" (vendor ref {claim.vendor_reference})"
+        if new == S.CLOSED:
+            line += f": {claim.get_resolution_display()}"
+            if claim.recovered_amount is not None:
+                line += f", {claim.recovered_amount} recovered"
+        if notes:
+            line += f" - {notes}"
+        self._journal(claim, line)
+        claim.refresh_from_db()
+        if claim.status in (S.CLOSED, S.REJECTED, S.WITHDRAWN):
+            notices.resolve(f"claim:{claim.pk}")
+        if claim.raised_by_id:
+            notices.tell(
+                [claim.raised_by], exclude=[request.user], kind="request_answered",
+                title=f"{claim.claim_number}: {claim.get_status_display()}",
+                message=line, link="/warranties?tab=claims", data={"claim": str(claim.pk)},
+            )
+        return Response(WarrantyClaimSerializer(claim, context={"request": request}).data)

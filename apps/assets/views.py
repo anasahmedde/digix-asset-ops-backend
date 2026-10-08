@@ -12,7 +12,10 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
+from apps.notifications import service as notices
 from common.permissions import (
+    can,
+    can_for_project,
     MANAGER_ROLES,
     CapabilityGate,
     AdminManagerWriteElseRead,
@@ -52,12 +55,18 @@ from .serializers import (
     MaterialTypeSerializer,
     ProductionStepSerializer,
     ProductionStepTransitionSerializer,
+    _project_of,
     assignee_label,
 )
 
 # Who may move assets through the status machine: oversight roles plus the
 # warehouse team (who receive stock, dispatch and process RMAs).
-DEVICE_TRANSITION_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor", "warehouse")
+# Which capability moves an asset to each status. Anything not named here
+# is a lifecycle move (handing over, decommissioning, writing off).
+TRANSITION_CAPABILITIES = {
+    "assigned": "assign_installation",
+    "under_maintenance": "manage_maintenance",
+}
 
 # Hard cap on a bulk label print — one PDF page per device.
 LABEL_BATCH_MAX = 200
@@ -128,7 +137,16 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     ).prefetch_related(
         "images", "warranties", "clients", "project_scope_items__project",
     ).all()
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead, CapabilityGate]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "edit_assets"
+    action_capabilities = {
+        "destroy": "delete_assets",
+        "export": "view_assets", "bom": "view_assets",
+        # Printing a label registers the code on the asset, so it is a write.
+        "label": "edit_assets", "labels": "edit_assets",
+        # Checked inside against the status asked for and the project.
+        "transition": None, "reassign": None,
+    }
     filterset_fields = [
         "status", "source", "asset_type", "device_model", "current_site",
         "assigned_client", "assigned_technician", "project",
@@ -179,13 +197,6 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             return DeviceListSerializer
         return DeviceDetailSerializer
 
-    def get_permissions(self):
-        # These actions carry their own role gate (supervisor and warehouse may
-        # transition/reassign but are read-only elsewhere).
-        if self.action in ("transition", "reassign"):
-            return [IsAuthenticated()]
-        return super().get_permissions()
-
     # ── Status transition (guarded state machine) ─────────────────────
 
     @action(detail=True, methods=["post"], url_path="transition")
@@ -196,34 +207,36 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         and the audit trail alongside who performed the change.
         """
         device = self.get_object()
-        role = getattr(request.user, "role", "")
-        # The field technician who owns this asset closes out their own
-        # installation (installed → active); everything else stays with the
-        # oversight roles.
-        owns_installation = request.user.id in (
-            device.assigned_technician_id, device.installed_by_id,
-        )
-        if role not in DEVICE_TRANSITION_ROLES and not (role == "technician" and owns_installation):
+        ser = DeviceTransitionSerializer(data=request.data, context={"device": device})
+
+        # Each move is its own right - assigning for installation, taking out
+        # of service, or moving the lifecycle - and a project's manager holds
+        # the assignment for their own project's assets. The right is checked
+        # before the move is validated: somebody with no say gets "not yours",
+        # not a lecture on which moves are legal.
+        new_status = request.data.get("status")
+        needed = TRANSITION_CAPABILITIES.get(new_status, "move_asset_stage")
+        if not can_for_project(request.user, _project_of(device), needed):
+            owns_installation = request.user.id in (
+                device.assigned_technician_id, device.installed_by_id,
+            )
+            if owns_installation:
+                # The installer's own asset: Installed and Active are recorded
+                # in the Installation Tracker with the work and photo, and
+                # every other move is the office's.
+                return Response(
+                    {"detail": (
+                        "Installation progress is recorded in the Installation Tracker, not in "
+                        "the registry. Ask operations for any other status change."
+                    )},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
             return Response(
                 {"detail": "You do not have permission to change asset status."},
                 status=status.HTTP_403_FORBIDDEN,
             )
-
-        ser = DeviceTransitionSerializer(data=request.data, context={"device": device})
         ser.is_valid(raise_exception=True)
-
         new_status = ser.validated_data["status"]
-
-        if role not in DEVICE_TRANSITION_ROLES:
-            # Installed and Active are the technician's to record, but they are
-            # recorded in the Installation Tracker with the site work and photo.
-            return Response(
-                {"detail": (
-                    "Installation progress is recorded in the Installation Tracker, not in "
-                    "the registry. Ask operations for any other status change."
-                )},
-                status=status.HTTP_403_FORBIDDEN,
-            )
         update_fields = ["status", "updated_at"]
         reason = ser.validated_data["reason"]
 
@@ -288,7 +301,7 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         transition target from ``assigned``). Journalled as a Reassignment.
         """
         device = self.get_object()
-        if getattr(request.user, "role", "") not in DEVICE_TRANSITION_ROLES:
+        if not can_for_project(request.user, _project_of(device), "assign_installation"):
             return Response(
                 {"detail": "You do not have permission to reassign assets."},
                 status=status.HTTP_403_FORBIDDEN,
@@ -843,7 +856,18 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         .all()
     )
     serializer_class = AssetComponentSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_assets"
+    write_capability = "edit_assets"
+    action_capabilities = {
+        # Asking for more is not the same as being granted it. The people who
+        # meet the shortfall on site are the ones who know about it, so anyone
+        # may raise the request; deciding it is checked inside.
+        "increase_quantity": None, "approve_increase": None, "reject_increase": None,
+        # How a requirement is met is the project's call: checked inside,
+        # where the project is known, so its manager's word counts.
+        "fulfil_from_stock": None, "mark_for_procurement": None, "reset_fulfilment": None,
+    }
     filterset_fields = ["device", "component_type", "inventory_item", "inventory_unit", "inventory_unit_type"]
     search_fields = ["name", "serial_number"]
 
@@ -851,13 +875,13 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
     # never moves stock. The warehouse is touched only by the fulfilment
     # actions below, which the project screen drives.
 
-    def get_permissions(self):
-        # Asking for more is not the same as being granted it. The people who
-        # meet the shortfall on site are the ones who know about it, so anyone
-        # may raise the request; only a manager decides it.
-        if self.action == "increase_quantity":
-            return [IsAuthenticated()]
-        return super().get_permissions()
+    def _require(self, request, component, capability):
+        if can_for_project(request.user, _project_of(component.device), capability):
+            return None
+        return Response(
+            {"detail": "That is for the project's manager or whoever decides how requirements are met."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     # 10: once the project is executing, the build definition is frozen. The
     # budget approved this parts list and this route; only status moves now.
@@ -892,6 +916,9 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="fulfil-from-stock")
     def fulfil_from_stock(self, request, pk=None):
+        denied = self._require(request, self.get_object(), "decide_requirements")
+        if denied is not None:
+            return denied
         """Ask the store to cover this requirement (or part of it) from stock.
 
         Stock leaves the warehouse from one desk only, so deciding to use
@@ -958,6 +985,14 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             )
 
         component.refresh_from_db()
+        # The store has a request on its queue from this moment.
+        notices.ask(
+            "issue_stock", exclude=[request.user], kind="request_raised",
+            title=f"Material requested: {component.name}",
+            message=f"{quantity} for {component.device.asset_code} · {issuance_request.request_number}",
+            link="/inventory?tab=requests", ref=f"issue:{issuance_request.pk}",
+            data={"request": str(issuance_request.pk)},
+        )
         return Response({
             "component": AssetComponentSerializer(component).data,
             "requested": quantity,
@@ -972,6 +1007,9 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         consume stock or buy new is the user's call, not the system's.
         """
         component = self.get_object()
+        denied = self._require(request, component, "decide_requirements")
+        if denied is not None:
+            return denied
         blocked = _budget_block_response(component)
         if blocked is not None:
             return blocked
@@ -1020,6 +1058,13 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             ),
             performed_by=request.user,
             metadata={"component": str(component.pk)},
+        )
+        project = _project_of(component.device)
+        notices.ask(
+            "raise_po", exclude=[request.user], kind="request_raised",
+            title=f"To procure: {component.name}",
+            message=f"{quantity} for {component.device.asset_code}" + (f" · {project.name}" if project else ""),
+            link="/procurement?tab=requisitions", ref=f"procure:{component.pk}", data={"component": str(component.pk)},
         )
         return Response(AssetComponentSerializer(component).data)
 
@@ -1072,6 +1117,14 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         ])
 
         label = self.INCREASE_REASONS[reason]
+        project = _project_of(component.device)
+        notices.ask(
+            "approve_quantity_increase", exclude=[request.user], project=project,
+            title=f"Quantity increase needs approval: {component.name}",
+            message=f"+{additional} on {component.device.asset_code} · {label}" + (f" — {notes}" if notes else ""),
+            link=(f"/projects?project={project.pk}&tab=execution" if project else f"/assets?device={component.device_id}"),
+            ref=f"increase:{component.pk}", data={"component": str(component.pk)},
+        )
         DeviceLifecycleEvent.objects.create(
             device=component.device,
             event_type=DeviceLifecycleEvent.EventType.NOTE,
@@ -1089,9 +1142,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
 
     def _increase_decision(self, request, component):
         """Guard shared by the two decisions on a requested increase."""
-        from common.permissions import CapabilityGate, MANAGER_ROLES
-
-        if getattr(request.user, "role", "") not in MANAGER_ROLES:
+        if not can_for_project(request.user, _project_of(component.device), "approve_quantity_increase"):
             return Response(
                 {"detail": "Only a manager can decide a quantity increase."}, status=403
             )
@@ -1100,6 +1151,17 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
                 {"detail": "Nothing is waiting for approval on this line."}, status=400
             )
         return None
+
+    def _tell_the_asker(self, component, asked_by, approved, additional, notes=""):
+        notices.resolve(f"increase:{component.pk}")
+        project = _project_of(component.device)
+        notices.tell(
+            [asked_by], exclude=[self.request.user], kind="approval_decided",
+            title=f"Increase {'approved' if approved else 'turned down'}: {component.name}",
+            message=f"+{additional} on {component.device.asset_code}" + (f" — {notes}" if notes else ""),
+            link=(f"/projects?project={project.pk}&tab=execution" if project else f"/assets?device={component.device_id}"),
+            data={"component": str(component.pk)},
+        )
 
     CLEARED_INCREASE_FIELDS = [
         "pending_increase", "increase_reason", "increase_notes",
@@ -1150,6 +1212,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             },
         )
         component.refresh_from_db()
+        self._tell_the_asker(component, asked_by, True, additional)
         return Response(AssetComponentSerializer(component).data)
 
     @action(detail=True, methods=["post"], url_path="reject-increase")
@@ -1161,6 +1224,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             return denied
 
         additional = component.pending_increase
+        asked_by = component.increase_requested_by
         decision_notes = (request.data.get("notes") or "").strip()
         self._clear_increase(component)
         component.save(update_fields=self.CLEARED_INCREASE_FIELDS)
@@ -1176,6 +1240,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             metadata={"component": str(component.pk), "additional": additional},
         )
         component.refresh_from_db()
+        self._tell_the_asker(component, asked_by, False, additional, decision_notes)
         return Response(AssetComponentSerializer(component).data)
 
     @action(detail=True, methods=["post"], url_path="reset-fulfilment")
@@ -1185,6 +1250,12 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         from apps.inventory.services import return_stock_for_component
 
         component = self.get_object()
+        denied = self._require(request, component, "decide_requirements")
+        if denied is not None:
+            return denied
+        notices.resolve(f"procure:{component.pk}")
+        for req in component.issuance_requests.all():
+            notices.resolve(f"issue:{req.pk}")
         with transaction.atomic():
             # Anything still queued with the store is no longer wanted.
             component.issuance_requests.exclude(
@@ -1213,7 +1284,14 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
         "device", "workshop", "assigned_to"
     ).all()
     serializer_class = ProductionStepSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_assets"
+    write_capability = "edit_assets"
+    action_capabilities = {
+        # The floor advances steps; the project decides where each is done.
+        # Both are checked inside, against the step and its project.
+        "transition": None, "decide": None, "send_back": None,
+    }
 
     # 10: once the project is executing, the build definition is frozen. The
     # budget approved this parts list and this route; only status moves now.
@@ -1263,12 +1341,6 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
     filterset_fields = ["device", "status", "location"]
     search_fields = ["name", "workshop_name", "device__asset_code"]
     ordering_fields = ["step_number", "created_at"]
-
-    def get_permissions(self):
-        # The technician running the build advances its steps.
-        if self.action == "transition":
-            return [IsAuthenticated()]
-        return super().get_permissions()
 
     @action(detail=True, methods=["post"])
     def move(self, request, pk=None):
@@ -1325,6 +1397,11 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
         vendor. 'external' asks for a work order — the request lands under
         Work Orders › Requests, where the vendor is chosen and the order raised."""
         step = self.get_object()
+        if not can_for_project(request.user, _project_of(step.device), "decide_requirements"):
+            return Response(
+                {"detail": "Where an operation is done is the project's call — its manager or whoever decides requirements."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         if step.live_work_orders().exists():
             return Response(
                 {"detail": f"'{step.name}' is on a work order — cancel that first to change the decision."},
@@ -1357,6 +1434,17 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
         step.workshop = None
         step.workshop_name = ""
         step.save(update_fields=["location", "workshop", "workshop_name", "work_order_requested_at", "updated_at"])
+        if where == ProductionStep.Location.EXTERNAL:
+            # Work Orders has a request on its desk from this moment.
+            project = _project_of(step.device)
+            notices.ask(
+                "raise_work_order", exclude=[request.user], kind="request_raised",
+                title=f"Work order requested: {step.name}",
+                message=f"{step.device.asset_code}" + (f" · {project.name}" if project else ""),
+                link="/work-orders?tab=requests", ref=f"wo-request:{step.pk}", data={"step": str(step.pk)},
+            )
+        else:
+            notices.resolve(f"wo-request:{step.pk}")
         return Response(ProductionStepSerializer(step).data)
 
     @action(detail=True, methods=["post"], url_path="send-back")
@@ -1369,6 +1457,12 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
         the project's Execution tab chooses afresh.
         """
         step = self.get_object()
+        if not can_for_project(request.user, _project_of(step.device), "decide_requirements"):
+            return Response(
+                {"detail": "Where an operation is done is the project's call — its manager or whoever decides requirements."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        notices.resolve(f"wo-request:{step.pk}")
         if step.live_work_orders().exists():
             return Response(
                 {"detail": f"'{step.name}' is on a work order — cancel that first."},
@@ -1404,9 +1498,9 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
     def transition(self, request, pk=None):
         """Advance one step, stamping the time that matters for that move."""
         step = self.get_object()
-        role = getattr(request.user, "role", "")
         owns = request.user.id in (step.assigned_to_id, step.device.assigned_technician_id)
-        if role not in DEVICE_TRANSITION_ROLES and not (role == "technician" and owns):
+        # The floor works its own build; whoever runs production works any.
+        if not (owns and can(request.user, "work_production")) and not can(request.user, "edit_assets"):
             return Response(
                 {"detail": "You do not have permission to advance this production step."},
                 status=status.HTTP_403_FORBIDDEN,
@@ -1463,24 +1557,21 @@ class ProductionStepViewSet(viewsets.ModelViewSet):
 class DeviceImageViewSet(viewsets.ModelViewSet):
     queryset = DeviceImage.objects.select_related("device").all()
     serializer_class = DeviceImageSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_assets"
+    write_capability = "edit_assets"
+    # Field technicians photograph the assets they installed; the object
+    # level check in perform_create keeps that to their own assets.
+    action_capabilities = {"create": None}
     filterset_fields = ["device", "is_primary"]
-
-    def get_permissions(self):
-        # Field technicians photograph the assets they installed; the object
-        # level check in perform_create keeps that to their own assets.
-        if self.action == "create":
-            return [IsAuthenticated()]
-        return super().get_permissions()
 
     def perform_create(self, serializer):
         device = serializer.validated_data.get("device")
         user = self.request.user
-        role = getattr(user, "role", "")
         owns_installation = device is not None and user.id in (
             device.assigned_technician_id, device.installed_by_id,
         )
-        if role not in MANAGER_ROLES and not owns_installation:
+        if not can(user, "edit_assets") and not (owns_installation and can(user, "edit_installation")):
             raise PermissionDenied("You can only add photos to assets assigned to you.")
         serializer.save()
 
@@ -1488,7 +1579,9 @@ class DeviceImageViewSet(viewsets.ModelViewSet):
 class DeviceLifecycleEventViewSet(viewsets.ModelViewSet):
     queryset = DeviceLifecycleEvent.objects.select_related("device", "performed_by").all()
     serializer_class = DeviceLifecycleEventSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_assets"
+    write_capability = "edit_assets"
     filterset_fields = ["device", "event_type"]
     ordering_fields = ["created_at"]
 
@@ -1496,5 +1589,7 @@ class DeviceLifecycleEventViewSet(viewsets.ModelViewSet):
 class AssetCodeViewSet(viewsets.ModelViewSet):
     queryset = AssetCode.objects.select_related("device").all()
     serializer_class = AssetCodeSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_assets"
+    write_capability = "edit_assets"
     filterset_fields = ["device", "format", "is_current"]

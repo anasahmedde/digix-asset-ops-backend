@@ -74,6 +74,8 @@ class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
     # Opened at zero and filled by goods receipt, so the count is derived.
     # Uses the list queryset's annotation when present, else the model property.
     in_stock_count = serializers.SerializerMethodField()
+    # Where its units on the shelf are kept (list queryset only).
+    storage_locations = serializers.SerializerMethodField()
     # Stock already on the shelf when the product is first opened. Serialized
     # items need a serial each, typed here — one per unit, all different, none
     # already in inventory. Opening at zero needs none.
@@ -94,13 +96,16 @@ class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
             "unit_cost", "min_stock_level", "is_high_value",
             "default_has_warranty", "default_warranty_type", "default_warranty_months",
             "supplier", "supplier_name",
-            "in_stock_count", "opening_quantity", "opening_serials", "notes", "is_active",
-            "created_at", "updated_at",
+            "in_stock_count", "storage_locations", "opening_quantity", "opening_serials", "notes",
+            "is_active", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "type_code", "created_at", "updated_at"]
 
     def get_in_stock_count(self, obj):
         return getattr(obj, "stock_count", None) or obj.in_stock_count
+
+    def get_storage_locations(self, obj):
+        return getattr(obj, "shelf_places", None) or []
 
     def _validate_category(self, attrs):
         """A unique component is filed under something.
@@ -246,15 +251,16 @@ class InventoryUnitSerializer(HidesMoney, serializers.ModelSerializer):
             "unit_type", "unit_type_name", "unit_type_code",
             "material_type", "material_name", "category", "category_name",
             "brand", "brand_name", "model_name",
-            "status", "location", "installed_in_code", "installed_in_name",
+            "status", "location", "storage_location", "installed_in_code", "installed_in_name",
             "supplier", "supplier_name", "purchase_date", "purchase_price", "batch_number",
             "goods_receipt_line", "grn_number", "po_number",
             "has_warranty", "warranty_type", "warranty_start", "warranty_months", "warranty_end",
-            "warranty_state", "is_under_warranty",
+            "warranty_reference", "warranty_vendor_reference", "warranty_state", "is_under_warranty",
             "converted_device", "converted_device_code", "fitted_to", "fitted_to_asset",
             "notes", "created_at", "updated_at",
         ]
         read_only_fields = [
+            "warranty_reference",
             "id", "unit_code", "status", "converted_device", "goods_receipt_line",
             "created_at", "updated_at",
         ]
@@ -311,9 +317,9 @@ class InventoryUnitSerializer(HidesMoney, serializers.ModelSerializer):
                     {"warranty_end": "Provide an end date or a term in months."}
                 )
             start, end = current("warranty_start"), current("warranty_end")
-            if start and end and end < start:
+            if start and end and end <= start:
                 raise serializers.ValidationError(
-                    {"warranty_end": "Warranty end date cannot be before the start date."}
+                    {"warranty_end": "The end date has to come after the start date."}
                 )
         return attrs
 
@@ -617,7 +623,7 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             "inventory_item", "inventory_item_name",
             "quantity", "unit", "batch_number", "serial_numbers",
             "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
-            "inspected_by", "inspected_by_name", "inspected_at", "inspection_notes",
+            "inspected_by", "inspected_by_name", "inspected_at", "inspection_notes", "warranty_months",
             "stocked_unit_count", "kind", "known_component", "component_code", "created_at",
             "source", "source_display", "reference", "received_at", "received_by_name",
             "routed_to_display", "inspection_status_display", "stocked_item_sku", "storage_location", "stocked_units",
@@ -668,6 +674,14 @@ class GoodsReceiptLineReceiveSerializer(serializers.Serializer):
 
     route = serializers.ChoiceField(choices=GoodsReceiptLine.Route.choices, required=False)
     notes = serializers.CharField(required=False, allow_blank=True, default="")
+    # Where the goods are put. Stock nobody can find is stock nobody issues.
+    storage_location = serializers.CharField(
+        max_length=200,
+        error_messages={
+            "required": "Say where the goods are stored — a rack, bin or room.",
+            "blank": "Say where the goods are stored — a rack, bin or room.",
+        },
+    )
     generic = serializers.DictField(required=False)
     # One entry per accepted unit; the serial is the store's to correct.
     units = InventoryUnitIntakeSerializer(many=True, required=False)
@@ -675,7 +689,13 @@ class GoodsReceiptLineReceiveSerializer(serializers.Serializer):
     def validate(self, attrs):
         line = self.context["line"]
         units = attrs.get("units") or []
-        accepted = line.accepted_quantity or 0
+        # A judged line is received as judged; an unjudged one is received
+        # whole. Either way the serials have to match what goes on the shelf.
+        accepted = (
+            line.accepted_quantity or 0
+            if line.inspection_status == GoodsReceiptLine.Inspection.PASSED
+            else line.quantity
+        )
         if units and len(units) != accepted:
             raise serializers.ValidationError({
                 "units": (
@@ -1032,16 +1052,13 @@ class IssuanceRequestIssueSerializer(serializers.Serializer):
     """
 
     quantity = serializers.IntegerField(min_value=1)
-    # Blank is allowed through the field so the message below is the one
-    # the store reads, rather than DRF's "may not be blank".
-    received_by = serializers.CharField(max_length=200, allow_blank=True)
+    # Required in substance, checked in the service: a maintenance job names
+    # its own technician, so a blank here is only refused when nobody is.
+    received_by = serializers.CharField(max_length=200, required=False, allow_blank=True, default="")
     notes = serializers.CharField(required=False, allow_blank=True, default="")
 
     def validate_received_by(self, value):
-        name = (value or "").strip()
-        if not name:
-            raise serializers.ValidationError("Name who is taking the goods.")
-        return name
+        return (value or "").strip()
 
 
 class ReorderRequestSerializer(serializers.ModelSerializer):

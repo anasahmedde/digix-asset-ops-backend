@@ -189,7 +189,7 @@ class UserViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         # Nobody may hand out what they do not hold themselves: that is how
         # a scoped lead would quietly become an unscoped one.
         mine = request.user.capabilities
-        if request.user.role not in ("super_admin", "group_head"):
+        if not request.user.can("act_across_teams"):
             overreach = sorted({r["capability"] for r in rows if r["allowed"]} - mine)
             if overreach:
                 return Response(
@@ -299,9 +299,9 @@ def may_set_capabilities(actor, subject) -> tuple[bool, str]:
         return False, "Nobody changes their own permissions — ask someone above you."
     if not actor.can("manage_permissions"):
         return False, "You cannot change what other people may do."
-    # Above that gate, a team lead is scoped to their own team; the roles
-    # that run the company are not.
-    if actor.role in ("super_admin", "group_head"):
+    # Above that gate, a team lead is scoped to their own team; whoever acts
+    # across teams is not.
+    if actor.is_superuser or actor.can("act_across_teams"):
         return True, ""
     if actor.manages(subject):
         return True, ""
@@ -352,7 +352,7 @@ class RoleDefinitionViewSet(viewsets.ModelViewSet):
         # Nobody hands out through a role what they could not hand out
         # directly — the same rule as setting one person's capabilities.
         actor = self.request.user
-        if actor.role not in ("super_admin", "group_head"):
+        if not (actor.is_superuser or actor.can("act_across_teams")):
             wanted = set(serializer.validated_data.get("capabilities", role.capabilities))
             overreach = sorted(wanted - set(role.capabilities) - actor.capabilities)
             if overreach:

@@ -1,3 +1,4 @@
+from common.dates import DateOrder
 from rest_framework import serializers
 
 from apps.clients.models import Client
@@ -328,7 +329,9 @@ def _asset_name(installation):
     )
 
 
-class DeviceInstallationListSerializer(_InstallationCommonMixin, serializers.ModelSerializer):
+class DeviceInstallationListSerializer(DateOrder, _InstallationCommonMixin, serializers.ModelSerializer):
+    future_dates = ("due_date",)
+    past_dates = ("installed_at",)
     class Meta:
         model = DeviceInstallation
         fields = [
@@ -344,7 +347,10 @@ class DeviceInstallationListSerializer(_InstallationCommonMixin, serializers.Mod
         read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
 
 
-class HandoverRecordSerializer(serializers.ModelSerializer):
+class HandoverRecordSerializer(DateOrder, serializers.ModelSerializer):
+    # Handed over once it is installed, and not before today has happened.
+    past_dates = ("handover_date",)
+    date_order = (("handover_date", "installation.installed_at", "the installation date"),)
     client_name = serializers.CharField(source="client.name", read_only=True)
     site_name = serializers.CharField(source="site.name", read_only=True)
     performed_by_name = serializers.SerializerMethodField()
@@ -383,7 +389,9 @@ class HandoverCreateSerializer(serializers.Serializer):
     )
 
 
-class DeviceInstallationDetailSerializer(_InstallationCommonMixin, serializers.ModelSerializer):
+class DeviceInstallationDetailSerializer(DateOrder, _InstallationCommonMixin, serializers.ModelSerializer):
+    future_dates = ("due_date",)
+    past_dates = ("installed_at",)
     handover = HandoverRecordSerializer(read_only=True)
     photos = InstallationPhotoSerializer(many=True, read_only=True)
     steps = InstallationStepSerializer(many=True, read_only=True)

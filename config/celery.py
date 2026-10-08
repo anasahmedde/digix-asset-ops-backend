@@ -26,6 +26,14 @@ app.conf.beat_schedule = {
         "task": "apps.warranties.tasks.complete_expired_warranties",
         "schedule": 21600.0,  # every 6 hours
     },
+    "remind-pending-work": {
+        "task": "apps.notifications.tasks.remind_pending_work",
+        "schedule": 86400.0,  # daily
+    },
+    "warn-expiring-warranties": {
+        "task": "apps.notifications.tasks.warn_expiring_warranties",
+        "schedule": 86400.0,  # daily
+    },
     "deactivate-left-employees": {
         "task": "apps.accounts.tasks.deactivate_left_employees",
         "schedule": 86400.0,  # daily

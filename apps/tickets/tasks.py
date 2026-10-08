@@ -48,7 +48,9 @@ def _recipients(policy):
     roles = {policy.escalate_to_role}
     if policy.also_notify_role:
         roles.add(policy.also_notify_role)
-    # super_admin always stays in the loop
+    # super_admin always stays in the loop. Deliberately not every holder of
+    # ``receive_alerts``: the stages are the escalation matrix, configured
+    # in Setup, and widening stage 1 would reach stage 2's people early.
     roles.add("super_admin")
     return list(User.objects.filter(role__in=roles, is_active=True))
 

@@ -1,30 +1,34 @@
 from django.utils import timezone
 from rest_framework import viewsets
 from rest_framework.decorators import action
-from common.permissions import CapabilityGate
+from common.permissions import CapabilityGate, can
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .models import AttendanceRecord
 from .serializers import AttendanceRecordSerializer
 
-MANAGER_ROLES = ("super_admin", "group_head", "ops_manager", "supervisor")
-
-
 class AttendanceRecordViewSet(viewsets.ModelViewSet):
     # Reading this is a permission, not just a menu entry.
     read_capability = "view_attendance"
     serializer_class = AttendanceRecordSerializer
     permission_classes = [IsAuthenticated, CapabilityGate]
+    # Anyone may clock themselves in; correcting other people's records is
+    # manage_attendance.
+    action_capabilities = {"create": None}
+    write_capability = "manage_attendance"
     filterset_fields = ["user", "check_type", "site"]
     ordering_fields = ["created_at"]
 
     def get_queryset(self):
         qs = AttendanceRecord.objects.select_related("user", "site")
-        role = getattr(self.request.user, "role", "")
-        if role in MANAGER_ROLES or self.request.user.is_superuser:
+        user = self.request.user
+        if user.is_superuser or can(user, "manage_attendance") or can(user, "act_across_teams"):
             return qs.all()
-        return qs.filter(user=self.request.user)
+        # A lead sees their own line's register; everybody sees their own.
+        from django.db.models import Q
+
+        return qs.filter(Q(user=user) | Q(user__reports_to=user))
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)

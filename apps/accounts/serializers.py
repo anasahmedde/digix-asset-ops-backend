@@ -4,6 +4,7 @@ from rest_framework import serializers
 from common.permissions import ADMIN_ROLES
 
 from .models import AuditLog, RoleDefinition
+from common.dates import DateOrder
 
 User = get_user_model()
 
@@ -16,11 +17,23 @@ def _is_super_admin(user):
     )
 
 
-class UserSerializer(serializers.ModelSerializer):
+class UserSerializer(DateOrder, serializers.ModelSerializer):
+    date_order = (("leaving_date", "join_date", "the joining date"),)
     full_name = serializers.SerializerMethodField()
     supplier_name = serializers.CharField(source="supplier.name", read_only=True)
     reports_to_name = serializers.SerializerMethodField()
     direct_report_count = serializers.SerializerMethodField()
+    # The role as the screen names it. Roles are records now, so a key the
+    # frontend has never heard of (a custom role) still reads as a name.
+    role_label = serializers.SerializerMethodField()
+
+    def get_role_label(self, obj):
+        labels = self.context.get("_role_labels")
+        if labels is None:
+            from .models import RoleDefinition
+            labels = dict(RoleDefinition.objects.values_list("key", "label"))
+            self.context["_role_labels"] = labels
+        return labels.get(obj.role) or obj.role.replace("_", " ").title()
 
     def validate_reports_to(self, boss):
         """The chart is a tree, and moving somebody on it is a manager's call.
@@ -46,7 +59,7 @@ class UserSerializer(serializers.ModelSerializer):
         actor = getattr(request, "user", None)
         if actor is not None and person is not None and not (
             actor.is_superuser
-            or actor.role in ("super_admin", "group_head")
+            or actor.can("act_across_teams")
             or actor.manages(person)
         ):
             raise serializers.ValidationError(
@@ -80,7 +93,7 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             "id", "username", "email", "first_name", "last_name",
-            "full_name", "role", "job_title", "phone", "avatar", "is_field_staff",
+            "full_name", "role", "role_label", "job_title", "phone", "avatar", "is_field_staff",
             "employee_id", "cnic", "join_date", "leaving_date",
             "reports_to", "reports_to_name", "direct_report_count", "capabilities",
             "supplier", "supplier_name",
@@ -135,7 +148,8 @@ class UserSerializer(serializers.ModelSerializer):
         return obj.get_full_name()
 
 
-class UserCreateSerializer(serializers.ModelSerializer):
+class UserCreateSerializer(DateOrder, serializers.ModelSerializer):
+    date_order = (("leaving_date", "join_date", "the joining date"),)
     password = serializers.CharField(write_only=True, min_length=8)
 
     class Meta:
