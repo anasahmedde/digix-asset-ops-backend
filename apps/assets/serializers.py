@@ -156,8 +156,15 @@ def _upsert_asset_warranty(device, kind, *, end=None, months=None):
     if kind == "vendor" and device.source == Device.Source.INHOUSE:
         return None
 
-    start = device.installation_date or device.purchase_date or timezone.now().date()
+    if kind == "client":
+        from apps.teams.warranties import activation_date
+
+        start = activation_date(device) or timezone.now().date()
+    else:
+        start = device.installation_date or device.purchase_date or timezone.now().date()
     if end:
+        if end <= start:
+            raise serializers.ValidationError({"end_date": "The end date has to come after the start date."})
         delta = relativedelta(end, start)
         months = max(1, delta.years * 12 + delta.months + (1 if delta.days else 0))
     else:
@@ -982,6 +989,12 @@ class DeviceTransitionSerializer(serializers.Serializer):
                         f"Project section. Still outstanding: {names}."
                     )
                 })
+
+        # The date an installation must be done by is ahead of us, not behind.
+        if attrs.get("installation_date") and attrs["installation_date"] < timezone.localdate():
+            raise serializers.ValidationError(
+                {"installation_date": "That date has passed — pick today or later."}
+            )
 
         if target == Device.Status.UNDER_MAINTENANCE:
             errors = {}

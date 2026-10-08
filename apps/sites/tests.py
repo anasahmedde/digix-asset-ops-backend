@@ -80,12 +80,21 @@ def test_search_by_client_and_installer(ops, installation):
 
 @pytest.mark.django_db
 def test_due_date_writable_by_manager(ops, installation):
+    from datetime import timedelta
+
+    due = (timezone.localdate() + timedelta(days=30)).isoformat()
     r = _client(ops).patch(
-        f"/api/sites/installations/{installation.id}/", {"due_date": "2026-09-15"}, format="json"
+        f"/api/sites/installations/{installation.id}/", {"due_date": due}, format="json"
     )
     assert r.status_code == 200, r.content
     installation.refresh_from_db()
-    assert str(installation.due_date) == "2026-09-15"
+    assert str(installation.due_date) == due
+
+    # A deadline already gone is refused.
+    late = _client(ops).patch(
+        f"/api/sites/installations/{installation.id}/", {"due_date": "2020-01-01"}, format="json"
+    )
+    assert late.status_code == 400 and "due_date" in late.data
 
 
 @pytest.mark.django_db
@@ -181,9 +190,13 @@ def test_installer_phone_exposed(ops, tech, installation):
 def test_step_update_restricted_to_installer_or_super_admin(ops, tech, installation):
     step = installation.steps.first()
     # A manager who is not over this installer may NOT advance steps: marking
-    # one done is a claim about work on site.
-    r = _client(ops).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
+    # one done is a claim about work on site. (The Operations Head acts for
+    # every team, so the stranger here is another supervisor.)
+    stranger = User.objects.create_user(username="site-stranger", password="x", role="supervisor")
+    r = _client(stranger).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
     assert r.status_code == 403
+    r = _client(ops).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 200, r.content
     # The installer's own supervisor may — that is what the organogram is for.
     boss = User.objects.create_user(username="site-boss", password="x", role="supervisor")
     tech.reports_to = boss
@@ -203,7 +216,8 @@ def test_step_update_restricted_to_installer_or_super_admin(ops, tech, installat
 
 @pytest.mark.django_db
 def test_delay_create_restricted(ops, tech, installation):
-    r = _client(ops).post("/api/sites/installation-delays/", {
+    stranger = User.objects.create_user(username="delay-stranger", password="x", role="supervisor")
+    r = _client(stranger).post("/api/sites/installation-delays/", {
         "installation": str(installation.id), "cause": "client",
     }, format="json")
     assert r.status_code == 403
@@ -446,7 +460,7 @@ def test_assigned_installer_and_supervisor_can_handover(installation, tech):
     assert r2.status_code == 201, r2.content
 
 
-def test_handover_reanchors_warranty_even_when_steps_already_done(installation, ops):
+def test_handover_dates_cover_from_go_live_even_when_steps_already_done(installation, ops):
     from datetime import timedelta as td
 
     from apps.warranties.models import Warranty
@@ -472,7 +486,9 @@ def test_handover_reanchors_warranty_even_when_steps_already_done(installation, 
     )
     assert r.status_code == 201, r.content
     warranty.refresh_from_db()
-    assert str(warranty.start_date) == paper_date
+    # The handover puts the asset live today, and the client's cover runs
+    # from going live, not from the date on the paper.
+    assert warranty.start_date == today
 
 
 # ── Wave 4: installation due-date escalation (ES-05) ──────────────────
@@ -1290,9 +1306,9 @@ def test_installation_health_reports_the_thing_to_act_on(db):
 
 
 @pytest.mark.django_db
-def test_client_warranty_runs_from_the_installation_date(installation, ops):
-    """The term may be typed days after the job; the cover still starts on the
-    day the asset was installed — the date the asset shows."""
+def test_client_warranty_runs_from_the_activation_date(installation, ops):
+    """Installed is not enough: the client's cover starts the day the asset
+    goes live, whenever its term was typed."""
     from datetime import timedelta as td
 
     from apps.sites.signals import _anchor_client_warranties, installation_date_for
@@ -1306,10 +1322,20 @@ def test_client_warranty_runs_from_the_installation_date(installation, ops):
         device=installation.device, warranty_type="client", status="active",
         start_date=today, end_date=today + td(days=365), months=12,
     )
+    provisional = warranty.start_date
+    # Finished but not live: nothing is dated yet.
     _anchor_client_warranties(installation)
     warranty.refresh_from_db()
-    assert warranty.start_date == installation_date_for(installation) == timezone.localdate(installed)
-    assert (warranty.end_date.year, warranty.end_date.month) == ((warranty.start_date.year + 1), warranty.start_date.month)
+    assert warranty.start_date == provisional
+    assert installation_date_for(installation) == timezone.localdate(installed)
+
+    # Live today: the cover runs from today, for its full term.
+    device = installation.device
+    device.status = "active"
+    device.save()
+    warranty.refresh_from_db()
+    assert warranty.start_date == today
+    assert (warranty.end_date.year, warranty.end_date.month) == ((today.year + 1), today.month)
 
 
 @pytest.fixture

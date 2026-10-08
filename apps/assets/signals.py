@@ -80,6 +80,12 @@ def log_device_status_change(sender, instance: Device, created: bool, **kwargs):
         detail={"from": old_status, "to": instance.status, "reason": reason},
     )
 
+    # The client's cover starts the day the asset goes live.
+    if instance.status == Device.Status.ACTIVE:
+        from apps.teams.warranties import cover_from_activation
+
+        cover_from_activation(instance)
+
 
 # ── A finished build puts itself into stock ──────────────────────────
 

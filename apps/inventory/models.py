@@ -215,6 +215,9 @@ class InventoryUnit(TimeStampedModel):
     location = models.CharField(
         max_length=15, choices=InventoryItem.Location.choices, default=InventoryItem.Location.WAREHOUSE
     )
+    # Where in the store the unit is put — a rack, a bin, a room. Asked for
+    # when it is received, so it can be found again without a search.
+    storage_location = models.CharField(max_length=200, blank=True)
 
     supplier = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True, related_name="inventory_units"
@@ -234,6 +237,10 @@ class InventoryUnit(TimeStampedModel):
         null=True, blank=True, help_text="Months from start; end date is derived when not given directly"
     )
     warranty_end = models.DateField(null=True, blank=True)
+    # Ours, from the component-warranty series, handed out when the part is
+    # given cover; the vendor's own number is kept beside it.
+    warranty_reference = models.CharField(max_length=200, blank=True, db_index=True)
+    warranty_vendor_reference = models.CharField(max_length=200, blank=True)
 
     converted_device = models.OneToOneField(
         "assets.Device", on_delete=models.SET_NULL, null=True, blank=True, related_name="source_inventory_unit"
@@ -292,6 +299,12 @@ class InventoryUnit(TimeStampedModel):
             self.warranty_start = None
             self.warranty_months = None
             self.warranty_end = None
+        elif not self.warranty_reference:
+            self.warranty_reference = generate_code(
+                "component_warranty", model=type(self), field="warranty_reference",
+            )
+            if kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = [*kwargs["update_fields"], "warranty_reference"]
         super().save(*args, **kwargs)
 
     def can_transition_to(self, new_status) -> bool:
@@ -427,6 +440,9 @@ class GoodsReceiptLine(TimeStampedModel):
     )
     inspected_at = models.DateTimeField(null=True, blank=True)
     inspection_notes = models.TextField(blank=True)
+    # The vendor's cover, typed by Procurement at inspection, in months from
+    # that day. The store does not retype it: the units it receives carry it.
+    warranty_months = models.PositiveSmallIntegerField(null=True, blank=True)
 
     # --- Receiving into the warehouse --------------------------------------
     # Inspection and receiving are two different people's jobs in two

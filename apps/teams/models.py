@@ -53,6 +53,10 @@ class Project(TimeStampedModel):
         help_text="Whether the project is sold outright or rented",
     )
     rental_end_date = models.DateField(null=True, blank=True)
+    # The cover the contract promises the client on every asset, in months
+    # from the day each one is installed. Set once; each asset picks it up
+    # as it is handed over instead of being typed in one by one.
+    client_warranty_months = models.PositiveSmallIntegerField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PLANNING)
     progress = models.PositiveSmallIntegerField(default=0, help_text="Percentage 0-100")
     start_date = models.DateField(null=True, blank=True)
@@ -110,6 +114,54 @@ class Project(TimeStampedModel):
                 return phase
         return delivered
 
+    # When a project reads At Risk rather than On Track: this close to its
+    # target date and short of done, or this far behind the calendar.
+    AT_RISK_DAYS_LEFT = 7
+    AT_RISK_PROGRESS_BELOW = 90
+    BEHIND_SCHEDULE_POINTS = 15
+
+    def health(self, progress=None) -> str:
+        """How the order is going, judged from its own dates, work and blockers.
+
+        Health used to be a label set once (On Track, when the budget was
+        signed) and never looked at again, so a project kept reading On Track
+        while its target date went by. It is worked out instead:
+
+        - Completed: all the work is done (set by sync_phase).
+        - On Hold: the project is on hold.
+        - Delayed: the target date has passed and the work is not done.
+        - Planning: still being planned, and not yet late.
+        - At Risk: an unresolved bottleneck; or the target is a week or less
+          away with under 90% done; or progress trails the time used by 15
+          points or more (half the time gone, a third of the work done).
+        - On Track: everything else.
+        """
+        from django.utils import timezone
+
+        if self.status == self.Status.COMPLETED:
+            return self.Status.COMPLETED
+        if self.phase == self.Phase.ON_HOLD:
+            return self.Status.ON_HOLD
+        if self.phase == self.Phase.LOST:
+            # An order that was lost is not running late or early: leave it be.
+            return self.status
+        today = timezone.localdate()
+        if self.target_date and today > self.target_date:
+            return self.Status.DELAYED
+        if self.phase == self.Phase.PLANNING:
+            return self.Status.PLANNING
+        if self.bottlenecks.filter(is_resolved=False).exists():
+            return self.Status.AT_RISK
+        if self.target_date:
+            progress = self.computed_progress() if progress is None else progress
+            if (self.target_date - today).days <= self.AT_RISK_DAYS_LEFT and progress < self.AT_RISK_PROGRESS_BELOW:
+                return self.Status.AT_RISK
+            if self.start_date and self.start_date < today and self.start_date < self.target_date:
+                elapsed = (today - self.start_date).days / (self.target_date - self.start_date).days * 100
+                if elapsed - progress >= self.BEHIND_SCHEDULE_POINTS:
+                    return self.Status.AT_RISK
+        return self.Status.ON_TRACK
+
     def sync_phase(self):
         """Put the stored phase back in step with the work, and say what it is.
 
@@ -119,6 +171,7 @@ class Project(TimeStampedModel):
         where the work has actually moved on.
         """
         settled = self.phase_from_work()
+        progress = self.computed_progress()
         changed = []
         if settled != self.phase:
             self.phase = settled
@@ -131,11 +184,18 @@ class Project(TimeStampedModel):
         if (
             settled == self.MAIN_PHASE_ORDER[-1]
             and self.status != self.Status.COMPLETED
-            and self.computed_progress() >= 100
+            and progress >= 100
             and not self.assets_awaiting_client_warranty()
         ):
             self.status = self.Status.COMPLETED
             changed.append("status")
+        # How it is going is read off its dates, work and blockers every time
+        # it is looked at, so editing a date or letting one pass shows at once.
+        judged = self.health(progress)
+        if judged != self.status:
+            self.status = judged
+            if "status" not in changed:
+                changed.append("status")
         if changed:
             self.save(update_fields=[*changed, "updated_at"])
         return settled

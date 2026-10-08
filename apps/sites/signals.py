@@ -184,20 +184,11 @@ def _mark_device_installed(installation: DeviceInstallation) -> None:
 
 
 def _anchor_client_warranties(installation: DeviceInstallation) -> None:
-    """Client warranties run from the installation date: re-anchor active
-    term-based ones to it — the same date the asset shows as installed."""
-    from django.utils import timezone
+    """Client warranties run from the day the asset goes live, not from the
+    installation: this dates them once it has, and waits otherwise."""
+    from apps.teams.warranties import cover_from_activation
 
-    from dateutil.relativedelta import relativedelta
-
-    handover = installation_date_for(installation) or timezone.localdate()
-    warranties = installation.device.warranties.filter(
-        warranty_type="client", status="active", months__isnull=False
-    )
-    for warranty in warranties:
-        warranty.start_date = handover
-        warranty.end_date = handover + relativedelta(months=warranty.months)
-        warranty.save(update_fields=["start_date", "end_date", "updated_at"])
+    cover_from_activation(installation.device)
 
 
 @receiver(post_save, sender=SiteContact)

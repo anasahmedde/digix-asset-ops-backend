@@ -3,8 +3,8 @@ from rest_framework import serializers
 from common.money import HidesMoney
 
 from .models import Ticket, TicketAttachment, TicketComment, TicketIssueType
+from common.dates import DateOrder
 
-MANAGER_ROLES = ("super_admin", "group_head", "ops_manager")
 
 
 class TicketIssueTypeSerializer(serializers.ModelSerializer):
@@ -57,15 +57,23 @@ class _AssignmentGuardMixin:
     def validate(self, attrs):
         request = self.context.get("request")
         if request and ("assigned_to" in attrs or "assigned_vendor" in attrs):
-            role = getattr(request.user, "role", "")
-            if role not in MANAGER_ROLES:
+            from common.permissions import can
+
+            if not can(request.user, "assign_ticket"):
                 raise serializers.ValidationError(
                     {"assigned_to": "Only Operations can assign tickets."}
                 )
         return super().validate(attrs)
 
 
-class TicketSerializer(HidesMoney, _AssignmentGuardMixin, serializers.ModelSerializer):
+class TicketSerializer(DateOrder, HidesMoney, _AssignmentGuardMixin, serializers.ModelSerializer):
+    # A ticket cannot fall due before it was raised, or before the asset it
+    # is about was even installed.
+    future_dates = ("due_date",)
+    date_order = (
+        ("due_date", "created_at", "the day the ticket was raised"),
+        ("due_date", "device.installation_date", "the asset's installation date"),
+    )
 
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)

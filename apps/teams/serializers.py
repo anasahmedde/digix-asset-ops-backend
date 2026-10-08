@@ -1,3 +1,4 @@
+from common.dates import DateOrder
 from rest_framework import serializers
 
 from common.money import HidesMoney
@@ -122,7 +123,9 @@ class ProjectScopeItemSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class ProjectMilestoneSerializer(serializers.ModelSerializer):
+class ProjectMilestoneSerializer(DateOrder, serializers.ModelSerializer):
+    future_dates = ("due_date",)
+    date_order = (("due_date", "project.start_date", "the project's start date"),)
     class Meta:
         model = ProjectMilestone
         fields = ["id", "project", "title", "due_date", "completed_at", "order", "created_at"]
@@ -143,7 +146,11 @@ class _PhaseFollowsTheWorkMixin:
         return super().to_representation(instance)
 
 
-class ProjectListSerializer(HidesMoney, _PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
+class ProjectListSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
+    date_order = (
+        ("target_date", "start_date", "the start date"),
+        ("rental_end_date", "start_date", "the start date"),
+    )
     assets_count = serializers.IntegerField(source="devices.count", read_only=True)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
@@ -183,7 +190,11 @@ class ProjectListSerializer(HidesMoney, _PhaseFollowsTheWorkMixin, serializers.M
         return obj.computed_progress()
 
 
-class ProjectDetailSerializer(HidesMoney, _PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
+class ProjectDetailSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
+    date_order = (
+        ("target_date", "start_date", "the start date"),
+        ("rental_end_date", "start_date", "the start date"),
+    )
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     # Who the work is for, with the contact the team will actually ring.
     client_contact_person = serializers.CharField(

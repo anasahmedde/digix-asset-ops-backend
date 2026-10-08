@@ -11,7 +11,8 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import CapabilityGate, AdminManagerWriteElseRead, WarehouseWriteElseRead
+from common.permissions import CapabilityGate, can, can_for_project, is_project_manager
+from apps.notifications import service as notices
 
 from .costing import project_devices
 from .models import (
@@ -91,8 +92,58 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # Reading this is a permission, not just a menu entry.
     read_capability = "view_projects"
     write_capability = "edit_projects"
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead, CapabilityGate]
+    # Every move on a project is a capability, and the project's own manager
+    # holds the planning and execution ones for their project (checked
+    # inside each action, where the project is known).
+    action_capabilities = {
+        "update": None, "partial_update": None, "destroy": "edit_projects",
+        "client_warranties": None, "plan": None, "submit_budget": None, "revise_budget": None,
+        "approve_budget": "approve_budget", "reject_budget": "approve_budget",
+        "procure_asset": None, "raise_work_order": None,
+        "bom_summary": "view_projects", "actuals": "view_projects", "boq": "view_projects",
+        "actuals_document": "view_projects", "plan_document": "view_projects", "boq_document": "view_projects",
+        "dashboard_stats": "view_projects",
+    }
+    permission_classes = [IsAuthenticated, CapabilityGate]
     filterset_fields = ["status", "phase", "contract_type", "client", "site", "manager"]
+
+    def _require(self, request, project, capability):
+        """Hold it, or be this project's manager and it is a manager's call."""
+        if can_for_project(request.user, project, capability):
+            return None
+        from apps.accounts.capabilities import BY_KEY
+
+        label = BY_KEY[capability].label.lower()
+        return Response(
+            {"detail": f"You cannot {label} here — that is for the project's manager or whoever holds the right."},
+            status=drf_status.HTTP_403_FORBIDDEN,
+        )
+
+    def perform_create(self, serializer):
+        project = serializer.save()
+        self._tell_the_manager(project, None)
+
+    def perform_update(self, serializer):
+        before = serializer.instance.manager_id
+        project = serializer.save()
+        if project.manager_id != before:
+            self._tell_the_manager(project, before)
+
+    def update(self, request, *args, **kwargs):
+        denied = self._require(request, self.get_object(), "edit_projects")
+        return denied if denied is not None else super().update(request, *args, **kwargs)
+
+    def _tell_the_manager(self, project, before):
+        """A project given to somebody is work on their desk from that moment."""
+        if project.manager_id and project.manager_id != before:
+            notices.tell(
+                [project.manager], exclude=[self.request.user], kind="work_assigned",
+                title=f"You run {project.name}",
+                message=(
+                    f"Client: {project.client.name}" if project.client_id else "No client set"
+                ) + (f" · target {project.target_date}" if project.target_date else ""),
+                link=f"/projects?project={project.pk}&tab=execution", data={"project": str(project.pk)},
+            )
     search_fields = ["name", "location", "description", "client__name", "site__name", "sites__name"]
     ordering_fields = ["created_at", "start_date", "target_date", "progress"]
 
@@ -175,14 +226,49 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         from apps.assets.serializers import _upsert_asset_warranty
 
         from .costing import project_devices
-        from .warranties import warranty_rows
+        from .warranties import term_label, warranty_rows
 
         project = self.get_object()
+        if request.method == "POST":
+            denied = self._require(request, project, "record_client_warranty")
+            if denied is not None:
+                return denied
 
         if request.method == "GET":
             rows = warranty_rows(project)
             return Response({
                 "count": len(rows),
+                "default_months": project.client_warranty_months,
+                "results": rows,
+                "awaiting": [r["asset_code"] for r in rows if r["handed_over"] and not r["warranty"]],
+            })
+
+        # The contract's term for the whole order: kept on the project, and
+        # given now to every asset already with the client and still without.
+        # The rest take it the day they go live.
+        if "default_months" in request.data:
+            from .warranties import cover_from_activation, give_project_cover, handed_over
+
+            try:
+                term = int(request.data.get("default_months") or 0)
+            except (TypeError, ValueError):
+                term = 0
+            if term < 1:
+                return Response({"default_months": ["Give the cover in whole months."]}, status=400)
+            project.client_warranty_months = term
+            project.save(update_fields=["client_warranty_months", "updated_at"])
+            covered = 0
+            for device in project_devices(project):
+                if handed_over(device) and give_project_cover(device):
+                    cover_from_activation(device)
+                    covered += 1
+            rows = warranty_rows(project)
+            return Response({
+                "detail": (
+                    f"Client Warranty of {term_label(term)} from activation set for every asset"
+                    + (f" — {covered} already handed over now carry it." if covered else ".")
+                ),
+                "default_months": term,
                 "results": rows,
                 "awaiting": [r["asset_code"] for r in rows if r["handed_over"] and not r["warranty"]],
             })
@@ -214,8 +300,8 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         rows = warranty_rows(project)
         return Response({
             "detail": (
-                f"{device.asset_code} is covered for {warranty.months} month"
-                f"{'' if warranty.months == 1 else 's'}, to {warranty.end_date:%Y-%m-%d}."
+                f"Client Warranty on {device.asset_code}: {term_label(warranty.months)}, "
+                f"valid till {warranty.end_date:%b %d, %Y}."
             ),
             "results": rows,
             "awaiting": [r["asset_code"] for r in rows if r["handed_over"] and not r["warranty"]],
@@ -378,6 +464,9 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         from apps.assets.models import Device
 
         project = self.get_object()
+        denied = self._require(request, project, "decide_requirements")
+        if denied is not None:
+            return denied
         blocked = self._execution_blocked(project)
         if blocked is not None:
             return blocked
@@ -393,20 +482,29 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         if request.data.get("undo"):
             device.procurement_requested_at = None
             detail = f"{device.asset_code} taken back from Procurement."
+            notices.resolve(f"procure-asset:{device.pk}")
         else:
             device.procurement_requested_at = timezone.now()
             detail = f"{device.asset_code} sent to Procurement — raise the purchase order from To Procure."
+            notices.ask(
+                "raise_po", exclude=[request.user], kind="request_raised",
+                title=f"To procure: {device.asset_code}",
+                message=f"{device.display_name or device.get_source_display()} for {project.name}",
+                link="/procurement?tab=requisitions", ref=f"procure-asset:{device.pk}",
+                data={"device": str(device.pk), "project": str(project.pk)},
+            )
         device.save(update_fields=["procurement_requested_at", "updated_at"])
         return Response({"detail": detail, "procurement_requested_at": device.procurement_requested_at})
-
-    # Who signs a budget off. Kept apart from who writes it: an estimate should
-    # not be approved by the person who produced it (super admins excepted).
-    BUDGET_APPROVER_ROLES = ("super_admin", "group_head", "finance")
 
     @action(detail=True, methods=["get", "patch"], url_path="plan")
     def plan(self, request, pk=None):
         """The project's cost plan; PATCH sets the contingency percentage."""
         from common.money import COSTING_TOTALS, scrub
+
+        if request.method == "PATCH":
+            denied = self._require(request, self.get_object(), "plan_budget")
+            if denied is not None:
+                return denied
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -492,6 +590,9 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         from apps.workorders.models import WorkOrder, WorkOrderItem
 
         project = self.get_object()
+        denied = self._require(request, project, "decide_requirements")
+        if denied is not None:
+            return denied
         blocked = self._execution_blocked(project)
         if blocked is not None:
             return blocked
@@ -609,6 +710,9 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
+        denied = self._require(request, project, "plan_budget")
+        if denied is not None:
+            return denied
         plan = get_or_create_plan(project)
         if not plan.is_editable:
             return Response(
@@ -624,6 +728,13 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         plan.submitted_at = timezone.now()
         plan.decision_notes = ""
         plan.save(update_fields=["status", "submitted_by", "submitted_at", "decision_notes", "updated_at"])
+        notices.ask(
+            "approve_budget", exclude=[request.user],
+            title=f"Budget for {project.name} needs your approval",
+            message=f"PKR {summary['total']:,.0f} · submitted by {notices.who(request.user)}",
+            link=f"/projects?project={project.pk}&tab=planning", ref=f"budget:{project.pk}",
+            data={"project": str(project.pk)},
+        )
         return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["post"], url_path="approve-budget")
@@ -640,15 +751,11 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
         project = self.get_object()
         plan = get_or_create_plan(project)
-        role = getattr(request.user, "role", "")
-        if role not in self.BUDGET_APPROVER_ROLES:
-            return Response(
-                {"detail": "Budgets are approved by the group head, finance or a super admin."},
-                status=drf_status.HTTP_403_FORBIDDEN,
-            )
         if plan.status != ProjectBudget.Status.SUBMITTED:
             return Response({"detail": "Only a budget awaiting approval can be decided."}, status=400)
-        if plan.submitted_by_id == request.user.id and role != "super_admin":
+        # Four eyes: whoever submitted it does not sign it (a superuser
+        # account is the one exception, by instruction).
+        if plan.submitted_by_id == request.user.id and not request.user.is_superuser:
             return Response(
                 {"detail": "You submitted this budget — someone else has to approve it."},
                 status=drf_status.HTTP_403_FORBIDDEN,
@@ -679,6 +786,13 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 moved.append("status")
             project.save(update_fields=moved)
         plan.save(update_fields=update)
+        notices.resolve(f"budget:{project.pk}")
+        notices.tell(
+            [plan.submitted_by, project.manager], exclude=[request.user], kind="approval_decided",
+            title=f"Budget for {project.name} {'approved' if approve else 'sent back'}",
+            message=(f"PKR {summary['total']:,.0f} signed off" if approve else notes) + f" — {notices.who(request.user)}",
+            link=f"/projects?project={project.pk}&tab=planning", data={"project": str(project.pk)},
+        )
         return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=True, methods=["post"], url_path="revise-budget")
@@ -691,9 +805,13 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
+        denied = self._require(request, project, "plan_budget")
+        if denied is not None:
+            return denied
         plan = get_or_create_plan(project)
         if plan.is_editable:
             return Response({"detail": "The budget is already open for changes."}, status=400)
+        notices.resolve(f"budget:{project.pk}")
         plan.status = ProjectBudget.Status.DRAFT
         # Reopening withdraws the approval. The figure that was signed off
         # stayed on the plan, so a budget being rewritten still read as
@@ -714,6 +832,10 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def dashboard_stats(self, request):
+        # ponytail: judges every open project on each call; fine for dozens of
+        # projects, move to a nightly job if this grows to thousands.
+        for project in Project.objects.exclude(status=Project.Status.COMPLETED):
+            project.sync_phase()
         qs = Project.objects.all()
         total = qs.count()
         by_status = dict(qs.values_list("status").annotate(c=Count("id")).values_list("status", "c"))
@@ -749,33 +871,62 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         })
 
 
-class ProjectBottleneckViewSet(viewsets.ModelViewSet):
+class _ProjectSideTable(viewsets.ModelViewSet):
+    """A table that belongs to a project: read with the project, written by
+    whoever may run it - including the project's own manager."""
+
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_projects"
+    write_capability = None
+    project_capability = "edit_projects"
+
+    def _project_of(self, serializer=None, instance=None):
+        if serializer is not None and "project" in serializer.validated_data:
+            return serializer.validated_data["project"]
+        return getattr(instance, "project", None)
+
+    def _check(self, project):
+        if not can_for_project(self.request.user, project, self.project_capability):
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied("That is for the project's manager or whoever runs projects.")
+
+    def perform_create(self, serializer):
+        self._check(self._project_of(serializer))
+        super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        self._check(self._project_of(serializer, serializer.instance))
+        super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        self._check(self._project_of(instance=instance))
+        super().perform_destroy(instance)
+
+
+class ProjectBottleneckViewSet(_ProjectSideTable):
     queryset = ProjectBottleneck.objects.select_related("project").all()
     serializer_class = ProjectBottleneckSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["project", "severity", "is_resolved"]
 
 
-class ProjectMemberViewSet(viewsets.ModelViewSet):
+class ProjectMemberViewSet(_ProjectSideTable):
     queryset = ProjectMember.objects.select_related("project", "user").all()
     serializer_class = ProjectMemberSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["project", "user", "role"]
 
 
-class ProjectScopeItemViewSet(viewsets.ModelViewSet):
+class ProjectScopeItemViewSet(_ProjectSideTable):
     queryset = ProjectScopeItem.objects.select_related(
         "project", "device", "component", "site"
     ).all()
     serializer_class = ProjectScopeItemSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["project", "device", "site"]
 
 
-class ProjectMilestoneViewSet(viewsets.ModelViewSet):
+class ProjectMilestoneViewSet(_ProjectSideTable):
     queryset = ProjectMilestone.objects.select_related("project").all()
     serializer_class = ProjectMilestoneSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
     filterset_fields = ["project"]
     ordering_fields = ["order", "due_date"]
 
@@ -794,7 +945,9 @@ class ProjectBOMLineViewSet(viewsets.ModelViewSet):
         .all()
     )
     serializer_class = ProjectBOMLineSerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_projects"
+    write_capability = ("issue_stock", "decide_requirements")
     filterset_fields = ["project"]
     search_fields = ["description"]
     ordering_fields = ["created_at"]
@@ -946,17 +1099,18 @@ class ProjectBOMLineViewSet(viewsets.ModelViewSet):
         return self._line_response(line.pk)
 
 
-class ProjectCostLineViewSet(viewsets.ModelViewSet):
+class ProjectCostLineViewSet(_ProjectSideTable):
     """Overheads on a project cost plan (travel, labour, transport, ...)."""
 
     queryset = ProjectCostLine.objects.select_related("project").all()
     serializer_class = ProjectCostLineSerializer
-    permission_classes = [IsAuthenticated, AdminManagerWriteElseRead]
+    project_capability = "plan_budget"
     filterset_fields = ["project"]
 
     def perform_create(self, serializer):
         from .costing import get_or_create_plan
 
+        self._check(self._project_of(serializer))
         line = serializer.save()
         get_or_create_plan(line.project)
 
@@ -969,11 +1123,13 @@ class ProjectCostLineViewSet(viewsets.ModelViewSet):
         # held to the same rule as removing a line: a signed-off budget is
         # revised, not quietly edited underneath the signature. Writing
         # the actuals against it is not that, and goes through.
+        self._check(serializer.instance.project)
         if any(f in serializer.validated_data for f in self.PLANNED):
             self._refuse_if_signed_off(serializer.instance)
         serializer.save()
 
     def perform_destroy(self, instance):
+        self._check(instance.project)
         self._refuse_if_signed_off(instance)
         instance.delete()
 

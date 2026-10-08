@@ -1,3 +1,4 @@
+from django.contrib.postgres.aggregates import ArrayAgg
 from django.db import transaction
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
@@ -12,13 +13,8 @@ from rest_framework.views import APIView
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from common.money import scrub
-from common.permissions import (
-    CapabilityGate,
-    ISSUING_ROLES,
-    MANAGER_ROLES,
-    InspectionWriteElseRead,
-    WarehouseWriteElseRead,
-)
+from apps.notifications import service as notices
+from common.permissions import CapabilityGate, can, can_any, can_for_project
 
 from .models import (
     ReorderRequest,
@@ -55,7 +51,9 @@ from .services import apply_issuance_stock_out, issue_against_request, stock_ins
 class InventoryCategoryViewSet(viewsets.ModelViewSet):
     queryset = InventoryCategory.objects.all()
     serializer_class = InventoryCategorySerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    write_capability = "manage_stock"
     filterset_fields = ["is_active"]
     search_fields = ["name"]
 
@@ -79,7 +77,8 @@ class InventoryItemViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         .all()
     )
     serializer_class = InventoryItemSerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead, CapabilityGate]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    write_capability = "manage_stock"
     filterset_fields = ["location", "category", "material_type", "watch_on_dashboard"]
     search_fields = ["sku", "material_type__name", "category__name"]
 
@@ -176,10 +175,18 @@ class InventoryUnitTypeViewSet(viewsets.ModelViewSet):
     queryset = InventoryUnitType.objects.select_related(
         "material_type", "category", "brand", "supplier"
     ).annotate(
-        stock_count=Count("units", filter=Q(units__status=InventoryUnit.Status.IN_STOCK))
+        stock_count=Count("units", filter=Q(units__status=InventoryUnit.Status.IN_STOCK)),
+        # Where its units on the shelf are kept, so the list can say without
+        # opening every product.
+        shelf_places=ArrayAgg(
+            "units__storage_location", distinct=True,
+            filter=Q(units__status=InventoryUnit.Status.IN_STOCK) & ~Q(units__storage_location=""),
+        ),
     ).all()
     serializer_class = InventoryUnitTypeSerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    write_capability = "manage_stock"
     filterset_fields = [
         "is_active", "category", "material_type", "brand", "supplier", "is_high_value",
     ]
@@ -254,7 +261,10 @@ class InventoryUnitViewSet(viewsets.ModelViewSet):
         "asset_component__device",
     ).all()
     serializer_class = InventoryUnitSerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    write_capability = "manage_stock"
+    action_capabilities = {"set_warranty": "manage_warranties", "extend_warranty": "manage_warranties"}
     filterset_fields = ["status", "location", "category", "material_type", "brand", "supplier", "has_warranty", "unit_type"]
     search_fields = ["unit_code", "serial_number", "model_name", "batch_number", "material_type__name", "brand__name"]
     ordering_fields = ["created_at", "serial_number", "purchase_date", "warranty_end"]
@@ -286,6 +296,57 @@ class InventoryUnitViewSet(viewsets.ModelViewSet):
             {"created": len(units), "units": InventoryUnitSerializer(units, many=True).data},
             status=201,
         )
+
+    @action(detail=True, methods=["post"], url_path="warranty")
+    def set_warranty(self, request, pk=None):
+        """Record the vendor's cover on one part by hand.
+
+        Cover is normally typed at inspection in Procurement; this is for a
+        part whose paperwork came later. It is the same component warranty,
+        listed and extended with the others.
+        """
+        from dateutil.relativedelta import relativedelta
+        from django.utils.dateparse import parse_date
+
+        from apps.warranties.services import term_months
+
+        unit = self.get_object()
+        start = parse_date(str(request.data.get("start_date") or "")) or unit.purchase_date or timezone.localdate()
+        raw_end, raw_months = request.data.get("end_date"), request.data.get("months")
+        try:
+            end = (parse_date(str(raw_end)) if raw_end
+                   else start + relativedelta(months=int(raw_months)) if raw_months else None)
+        except (TypeError, ValueError):
+            end = None
+        if end is None or end <= start:
+            return Response({"detail": "Give the cover in months, or an end date after its start."}, status=400)
+        unit.has_warranty = True
+        unit.warranty_type = "supplier"
+        unit.warranty_start = start
+        unit.warranty_end = end
+        unit.warranty_months = term_months(start, end)
+        unit.warranty_vendor_reference = (request.data.get("vendor_reference") or "").strip()[:200]
+        if request.data.get("supplier"):
+            unit.supplier_id = request.data["supplier"]
+        unit.save()
+        return Response(InventoryUnitSerializer(unit).data)
+
+    @action(detail=True, methods=["post"], url_path="extend-warranty")
+    def extend_warranty(self, request, pk=None):
+        """The vendor extended a part's cover: a later expiry, on record."""
+        from apps.warranties.services import extended_expiry, extension_entry, term_months
+
+        unit = self.get_object()
+        if not (unit.has_warranty and unit.warranty_end):
+            return Response({"detail": "This part has no warranty to extend — record its cover first."}, status=400)
+        old_end = unit.warranty_end
+        new_end = extended_expiry(old_end, request.data)
+        unit.warranty_end = new_end
+        unit.warranty_months = term_months(unit.warranty_start or old_end, new_end)
+        entry = extension_entry(old_end, new_end, request.user, request.data)
+        unit.notes = f"{unit.notes}\n{entry}" if unit.notes else entry
+        unit.save(update_fields=["warranty_end", "warranty_months", "notes", "updated_at"])
+        return Response(InventoryUnitSerializer(unit).data)
 
     @action(detail=True, methods=["post"])
     def transition(self, request, pk=None):
@@ -375,7 +436,9 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
         .all()
     )
     serializer_class = GoodsReceiptLineSerializer
-    permission_classes = [IsAuthenticated, InspectionWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    action_capabilities = {"receive_into_stock": "receive_goods", "inspect": "inspect_goods"}
     filterset_fields = ["inspection_status", "routed_to", "receipt", "po_item"]
     search_fields = [
         "batch_number", "receipt__grn_number", "po_item__description",
@@ -446,17 +509,19 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="receive")
     def receive_into_stock(self, request, pk=None):
-        """Take a line that passed inspection onto the shelf.
+        """Take a line onto the shelf.
 
-        No verdict here — that was given in Procurement. The store counts the
-        goods and corrects any serial that does not match what is in the box,
-        then the stock moves.
+        The store does not judge goods. A purchase delivery was judged in
+        Procurement and arrives with its verdict; anything else — a part back
+        from a job, a leftover off a project — is simply taken in, the whole
+        of it. The only thing the store changes is a serial number that does
+        not match what is in the box.
         """
         line = self.get_object()
-        if line.inspection_status != GoodsReceiptLine.Inspection.PASSED:
+        if line.inspection_status == GoodsReceiptLine.Inspection.REJECTED:
             return Response({"detail": (
-                f"This line is {line.get_inspection_status_display().lower()} — "
-                "only goods that passed inspection are received."
+                "Procurement turned this line away — it goes back to the supplier, "
+                "not onto the shelf."
             )}, status=400)
         if line.stocked_at is not None:
             return Response(
@@ -471,17 +536,33 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
         data = serializer.validated_data
 
         with transaction.atomic():
-            # The verdict already on the line is what gets stocked; the store
-            # is counting, not re-judging.
+            # What was judged in Procurement is stocked as judged. What never
+            # met an inspector is taken in whole — the store counts, it does
+            # not decide.
+            if line.inspection_status == GoodsReceiptLine.Inspection.PASSED:
+                kept, turned_away = line.accepted_quantity or 0, line.rejected_quantity or 0
+            else:
+                kept, turned_away = line.quantity, 0
             result = stock_inspected_line(
                 line,
                 user=request.user,
                 route=data.get("route", ""),
-                accepted_quantity=line.accepted_quantity or 0,
-                rejected_quantity=line.rejected_quantity or 0,
+                accepted_quantity=kept,
+                rejected_quantity=turned_away,
                 notes=line.inspection_notes,
                 generic=data.get("generic"),
                 units=data.get("units"),
+            )
+            # The place the store put it: on the stock row for counted goods,
+            # on each unit for serialised ones.
+            where = data["storage_location"].strip()
+            if result["inventory_item"]:
+                result["inventory_item"].storage_location = where
+                result["inventory_item"].save(update_fields=["storage_location", "updated_at"])
+            for unit in result["units"]:
+                unit.storage_location = where
+            InventoryUnit.objects.filter(pk__in=[u.pk for u in result["units"]]).update(
+                storage_location=where,
             )
             line.refresh_from_db()
             line.stocked_at = timezone.now()
@@ -492,6 +573,11 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
             ])
 
         line.refresh_from_db()
+        if not line.receipt.lines.filter(stocked_at__isnull=True).exclude(
+            inspection_status=GoodsReceiptLine.Inspection.REJECTED
+        ).exists():
+            notices.resolve(f"grn:{line.receipt_id}")
+        self._tell_who_was_waiting(line, request.user)
         return Response({
             "line": GoodsReceiptLineSerializer(line).data,
             "stocked_item": (
@@ -501,6 +587,38 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
             "stocked_units": InventoryUnitSerializer(result["units"], many=True).data,
             "ready_requests": result.get("ready_requests", []),
         })
+
+    def _tell_who_was_waiting(self, line, actor):
+        """Goods on the shelf: the project or store that asked for them hears so."""
+        po_item = line.po_item
+        if po_item is None:
+            return
+        from apps.assets.serializers import _project_of
+
+        people, projects = [], {}
+        for component in po_item.asset_components.select_related("device"):
+            project = _project_of(component.device)
+            if project is not None and project.manager_id:
+                projects[project.pk] = project
+        for rr in po_item.reorder_requests.select_related("requested_by"):
+            if rr.requested_by_id:
+                people.append(rr.requested_by)
+        what = po_item.description
+        taken = line.accepted_quantity or line.quantity
+        for project in projects.values():
+            notices.tell(
+                [project.manager], exclude=[actor],
+                title=f"Received into stock: {what}",
+                message=f"{taken} for {project.name} · {line.receipt.grn_number}",
+                link=f"/projects?project={project.pk}&tab=execution", data={"grn": str(line.receipt_id)},
+            )
+        if people:
+            notices.tell(
+                people, exclude=[actor],
+                title=f"Received into stock: {what}",
+                message=f"{taken} · {line.receipt.grn_number}",
+                link="/inventory", data={"grn": str(line.receipt_id)},
+            )
 
     @action(detail=True, methods=["post"])
     def inspect(self, request, pk=None):
@@ -542,7 +660,9 @@ class StockMovementViewSet(viewsets.ModelViewSet):
         "item", "performed_by", "goods_receipt_line__receipt__purchase_order__supplier",
     ).all()
     serializer_class = StockMovementSerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    write_capability = "adjust_stock"
     filterset_fields = ["item", "movement_type"]
     ordering_fields = ["created_at"]
 
@@ -554,7 +674,9 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
         .all()
     )
     serializer_class = GoodsReceiptSerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    write_capability = "receive_goods"
     filterset_fields = ["item", "work_order", "purchase_order", "source"]
     ordering_fields = ["created_at"]
 
@@ -605,7 +727,9 @@ class IssuanceViewSet(viewsets.ModelViewSet):
         "issued_to_project", "issued_to_user", "issued_by",
     ).all()
     serializer_class = IssuanceSerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    write_capability = "issue_stock"
     filterset_fields = [
         "item", "issued_to_site", "issued_to_work_order", "issued_to_project",
         "issued_to_user", "bom_line",
@@ -631,7 +755,14 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         "maintenance_schedule", "requested_by", "issued_by",
     ).all()
     serializer_class = IssuanceRequestSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    action_capabilities = {
+        "issue": "issue_stock", "send_back": "issue_stock",
+        "destroy": "cancel_material_request", "cancel": "cancel_material_request",
+        # Who may put a line on the store's queue is checked inside.
+        "create": None,
+    }
     filterset_fields = ["status", "source", "project", "item", "unit_type", "asset_component"]
     search_fields = ["request_number", "purpose", "item__sku", "unit_type__name"]
     ordering_fields = ["created_at", "status"]
@@ -644,7 +775,7 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         decision, which is the whole of the approval, was simply skipped.
         """
         user = request.user
-        if getattr(user, "role", "") == "technician" and not user.is_superuser:
+        if not can_any(user, "decide_requirements", "review_maintenance", "issue_stock", "manage_stock"):
             return Response(
                 {"detail": (
                     "Ask for the part on the job. Your supervisor's approval "
@@ -660,9 +791,6 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         DELETE was open to anyone signed in, and it took the request's history
         with it. Cancelling says the same thing and leaves the record.
         """
-        denied = self._management_only(request)
-        if denied is not None:
-            return denied
         if self.get_object().quantity_issued:
             return Response(
                 {"detail": "Stock has already gone out against this — cancel it so the issue stays on record."},
@@ -671,23 +799,20 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
     def perform_create(self, serializer):
-        serializer.save(requested_by=self.request.user)
+        req = serializer.save(requested_by=self.request.user)
+        notices.ask(
+            "issue_stock", exclude=[self.request.user], kind="request_raised",
+            title=f"Material requested: {req.what}",
+            message=f"{req.quantity_requested} · {req.request_number}"
+                    + (f" · {req.project.name}" if req.project_id else ""),
+            link="/inventory?tab=requests", ref=f"issue:{req.pk}", data={"request": str(req.pk)},
+        )
 
     def _store_only(self, request):
         # Approval gate 3: the store hands material over; management may too.
-        if getattr(request.user, "role", "") not in ISSUING_ROLES:
+        if not can(request.user, "issue_stock"):
             return Response(
                 {"detail": "Only the warehouse can issue material."}, status=403
-            )
-        return None
-
-    def _management_only(self, request):
-        # Client decision 8: withdrawing a request needs the Operations Head or
-        # the Group Head, after written approval.
-        if getattr(request.user, "role", "") not in MANAGER_ROLES:
-            return Response(
-                {"detail": "Only the Operations Head or Group Head can cancel a request."},
-                status=403,
             )
         return None
 
@@ -712,6 +837,16 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
             )
 
         issuance_request.refresh_from_db()
+        if issuance_request.status in (IssuanceRequest.Status.FULFILLED, IssuanceRequest.Status.CANCELLED):
+            notices.resolve(f"issue:{issuance_request.pk}")
+        if issuance_request.requested_by_id:
+            notices.tell(
+                [issuance_request.requested_by], exclude=[request.user], kind="request_answered",
+                title=f"Issued: {issuance_request.what}",
+                message=f"{result['quantity']} handed over by {notices.who(request.user)}"
+                        + (f" to {result.get('received_by') or ''}" if result.get("received_by") else ""),
+                link="/inventory?tab=requests", data={"request": str(issuance_request.pk)},
+            )
         return Response({
             "request": IssuanceRequestSerializer(issuance_request).data,
             "issued": result["quantity"],
@@ -825,13 +960,17 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
         """Close a request that is no longer needed; issued stock is untouched."""
-        denied = self._management_only(request)
-        if denied is not None:
-            return denied
-
         issuance_request = self.get_object()
         issuance_request.status = IssuanceRequest.Status.CANCELLED
         issuance_request.save(update_fields=["status", "updated_at"])
+        notices.resolve(f"issue:{issuance_request.pk}")
+        if issuance_request.requested_by_id:
+            notices.tell(
+                [issuance_request.requested_by], exclude=[request.user], kind="request_answered",
+                title=f"Sent back by the store: {issuance_request.what}",
+                message=note or "The store could not fill this request.",
+                link="/inventory?tab=requests", data={"request": str(issuance_request.pk)},
+            )
         return Response(IssuanceRequestSerializer(issuance_request).data)
 
     @action(detail=False, methods=["get"], url_path="export")
@@ -975,12 +1114,20 @@ class ReorderRequestViewSet(viewsets.ModelViewSet):
         "item__material_type", "unit_type", "purchase_order_item__purchase_order", "requested_by",
     ).all()
     serializer_class = ReorderRequestSerializer
-    permission_classes = [IsAuthenticated, WarehouseWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    write_capability = "manage_stock"
     filterset_fields = ["status", "item", "unit_type"]
     http_method_names = ["get", "post", "head", "options"]
 
     def perform_create(self, serializer):
-        serializer.save(requested_by=self.request.user)
+        req = serializer.save(requested_by=self.request.user)
+        notices.ask(
+            "raise_po", exclude=[self.request.user], kind="request_raised",
+            title=f"Reorder requested: {req.name}",
+            message=f"{req.quantity} {req.unit} · on hand {req.on_hand}, reorder level {req.reorder_level} · {req.request_number}",
+            link="/procurement?tab=requisitions", ref=f"reorder:{req.pk}", data={"request": str(req.pk)},
+        )
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
@@ -993,4 +1140,5 @@ class ReorderRequestViewSet(viewsets.ModelViewSet):
         req.status = ReorderRequest.Status.CANCELLED
         req.notes = (req.notes + "\n" if req.notes else "") + (request.data.get("reason") or "Withdrawn.").strip()
         req.save(update_fields=["status", "notes", "updated_at"])
+        notices.resolve(f"reorder:{req.pk}")
         return Response(ReorderRequestSerializer(req).data)

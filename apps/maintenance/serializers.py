@@ -1,3 +1,4 @@
+from common.dates import DateOrder
 from rest_framework import serializers
 
 from common.money import HidesMoney
@@ -12,7 +13,8 @@ from .models import (
 )
 
 
-class MaintenanceScheduleSerializer(serializers.ModelSerializer):
+class MaintenanceScheduleSerializer(DateOrder, serializers.ModelSerializer):
+    future_dates = ("start_date",)
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
     device_name = serializers.CharField(source="device.display_name", read_only=True, default=None)
     device_status = serializers.CharField(source="device.status", read_only=True, default=None)
@@ -248,8 +250,9 @@ class MaintenanceVisitPhotoSerializer(serializers.ModelSerializer):
         return (who.get_full_name() or who.username) if who else None
 
 
-class MaintenanceVisitSerializer(HidesMoney, serializers.ModelSerializer):
+class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
     """One round of a schedule — when it is due and who is going."""
+    future_dates = ("due_date",)
 
     assigned_to_name = serializers.SerializerMethodField()
     status_display = serializers.CharField(source="get_status_display", read_only=True)

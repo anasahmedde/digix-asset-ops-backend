@@ -441,6 +441,15 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
                     raise serializers.ValidationError(
                         {"units": "Each unit needs an inventory product, a material type or a model name."}
                     )
+                # The term Procurement typed at inspection, running from that
+                # day, unless the store was given another for this unit.
+                months = payload.get("warranty_months") or line.warranty_months
+                covered = bool(months) or bool(payload.get("has_warranty"))
+                cover_from = payload.get("warranty_start") or (
+                    timezone.localdate(line.inspected_at)
+                    if not payload.get("warranty_months") and line.warranty_months and line.inspected_at
+                    else timezone.localdate()
+                )
                 created_units.append(InventoryUnit.objects.create(
                     serial_number=str(payload["serial_number"]).strip(),
                     unit_type_id=unit_type_id,
@@ -457,19 +466,11 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
                     # Batch + receipt link: this is the trace back to the PO.
                     batch_number=batch,
                     goods_receipt_line=line,
-                    # Item 23: the storekeeper types the term; the start is the
-                    # day the part arrived and the vendor gave the cover.
-                    has_warranty=bool(payload.get("warranty_months")) or bool(payload.get("has_warranty")),
+                    has_warranty=covered,
                     # A part is received from its supplier: that is whose cover it carries.
-                    warranty_type=(
-                        "supplier"
-                        if (payload.get("warranty_months") or payload.get("has_warranty")) else ""
-                    ),
-                    warranty_start=(
-                        (payload.get("warranty_start") or timezone.localdate())
-                        if (payload.get("warranty_months") or payload.get("has_warranty")) else None
-                    ),
-                    warranty_months=payload.get("warranty_months"),
+                    warranty_type="supplier" if covered else "",
+                    warranty_start=cover_from if covered else None,
+                    warranty_months=months,
                     warranty_end=payload.get("warranty_end"),
                     notes=f"Received on {trace}",
                 ))
@@ -579,6 +580,10 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
                 f"{job.title} is {on_the_job}'s job — the parts for it are collected by them."
             )})
         received_by = on_the_job
+    # Somebody takes the goods away; stock that left with nobody named
+    # against it cannot be chased. A job's technician is named above.
+    if not (received_by or "").strip():
+        raise serializers.ValidationError({"received_by": "Name who is taking the goods."})
 
     serials = []
 

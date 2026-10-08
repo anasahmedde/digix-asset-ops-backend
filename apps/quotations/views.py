@@ -6,7 +6,8 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import CapabilityGate, CommercialWriteElseRead
+from apps.notifications import service as notices
+from common.permissions import CapabilityGate
 
 from .models import Quotation
 from .pdf import build_quotation_pdf
@@ -53,7 +54,10 @@ class QuotationViewSet(viewsets.ModelViewSet):
         .all()
     )
     serializer_class = QuotationSerializer
-    permission_classes = [IsAuthenticated, CommercialWriteElseRead, CapabilityGate]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_quotations"
+    write_capability = "manage_quotations"
+    action_capabilities = {"print_pdf": "view_quotations"}
     filterset_fields = ["status", "client", "site", "currency"]
     search_fields = ["quote_number", "title", "description"]
     ordering_fields = ["created_at", "valid_until", "total_amount"]
@@ -86,6 +90,17 @@ class QuotationViewSet(viewsets.ModelViewSet):
             # get_object() prefetched spawned_projects before the spawn —
             # drop the stale cache so the response carries the new project.
             quotation._prefetched_objects_cache = {}
+            # An accepted quote is a project somebody now has to run.
+            project = quotation.spawned_projects.first() if hasattr(quotation, "spawned_projects") else None
+            notices.tell(
+                notices.holders_of("edit_projects", exclude=[request.user]),
+                kind="work_assigned",
+                title=f"Quotation {quotation.quote_number} accepted",
+                message=f"{quotation.client.name if quotation.client_id else ''} · {quotation.title}"
+                        + (" — project opened, assign its manager" if project else ""),
+                link=(f"/projects?project={project.pk}" if project else "/projects"),
+                data={"quotation": str(quotation.pk)},
+            )
 
         return Response(QuotationSerializer(quotation).data)
 

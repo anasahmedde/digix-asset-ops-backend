@@ -5,13 +5,15 @@ from django.db.models import Q
 from django.http import HttpResponse
 from django.utils import timezone
 from common.noops import RefusesSilentNoOps
+from common.dates import refuse_past
 from rest_framework import status as drf_status
 from rest_framework import serializers, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from common.permissions import CapabilityGate, FinanceWriteElseRead, PurchaseOrderActionElseRead
+from common.permissions import CapabilityGate, can, can_for_project
+from apps.notifications import service as notices
 
 from .lines import describe_asset, describe_component, line_text
 from .models import PurchaseOrder, PurchaseOrderItem
@@ -38,13 +40,38 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         .all()
     )
     serializer_class = PurchaseOrderSerializer
-    permission_classes = [IsAuthenticated, FinanceWriteElseRead, CapabilityGate]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    # Reading an order is open to anyone who may see procurement; the money
+    # on it is masked separately by view_prices. Every move is a capability.
+    read_capability = "view_procurement"
+    write_capability = "raise_po"
+    action_capabilities = {
+        # A delivery is booked in by whoever raised the order or runs the
+        # store; checking it over is the inspector's step, in Inventory.
+        "receive": ("raise_po", "receive_goods"),
+        "requisitions": "view_procurement",
+        "send_back_requisition": "raise_po",
+        # Agreeing a price is deliberately not a procurement right: the whole
+        # point is that somebody outside Procurement says yes. Who exactly is
+        # checked against the line's own owner, inside the action.
+        "price_variance": None,
+        "price_variances": None,
+        # Approving and cancelling are checked inside, per the move asked for.
+        "transition": ("raise_po", "approve_po", "cancel_po"),
+    }
     filterset_fields = ["status", "supplier"]
     search_fields = ["po_number"]
     ordering_fields = ["created_at", "order_date", "total_amount"]
 
     def perform_create(self, serializer):
         serializer.save(ordered_by=self.request.user)
+
+    @action(detail=False, methods=["get"], url_path="default-terms")
+    def default_terms(self, request):
+        """The house standard terms, shown on a new order for editing."""
+        from .documents import DEFAULT_TERMS
+
+        return Response({"terms": DEFAULT_TERMS})
 
     @action(detail=True, methods=["get"], url_path="document")
     def document(self, request, pk=None):
@@ -608,7 +635,9 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 supplier_id=supplier_id,
                 currency=request.data.get("currency") or PurchaseOrder.Currency.PKR,
                 supplier_details=(request.data.get("supplier_details") or "").strip(),
-                expected_delivery=request.data.get("expected_delivery") or None,
+                payment_terms_id=request.data.get("payment_terms") or None,
+                payment_terms_note=(request.data.get("payment_terms_note") or "").strip()[:200],
+                expected_delivery=refuse_past(request.data.get("expected_delivery"), "expected_delivery"),
                 terms=(request.data.get("terms") or "").strip() or DEFAULT_TERMS,
                 notes=(request.data.get("notes") or "").strip(),
                 ordered_by=request.user,
@@ -677,6 +706,14 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 _buy_asset_on(line, device_id)
             purchase_order.recalc_total()
 
+        # The requests this order covers are no longer waiting on anybody.
+        for component in components:
+            notices.resolve(f"procure:{component.pk}")
+        for rr in reorders:
+            notices.resolve(f"reorder:{rr.pk}")
+        for device in devices:
+            notices.resolve(f"procure-asset:{device.pk}")
+
         # Anything priced over plan goes straight to the desk that has to
         # agree it, rather than waiting to be noticed.
         flagged = list(purchase_order.unagreed_lines())
@@ -689,14 +726,20 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         )
 
     # Who may agree to pay over the odds, by whose figure was exceeded.
+    # Which capability agrees a line priced over its reference, by whose
+    # figure was passed. A project's manager agrees their own project's.
     VARIANCE_DECIDERS = {
-        PurchaseOrderItem.VarianceOwner.PROJECT:
-            ("super_admin", "group_head", "ops_manager", "supervisor"),
-        PurchaseOrderItem.VarianceOwner.INVENTORY:
-            ("super_admin", "ops_manager", "warehouse"),
-        PurchaseOrderItem.VarianceOwner.OPERATIONS:
-            ("super_admin", "group_head", "ops_manager"),
+        PurchaseOrderItem.VarianceOwner.PROJECT: "agree_project_variance",
+        PurchaseOrderItem.VarianceOwner.INVENTORY: "agree_stock_variance",
+        PurchaseOrderItem.VarianceOwner.OPERATIONS: ("agree_project_variance", "agree_stock_variance"),
     }
+
+    @classmethod
+    def may_agree(cls, user, item) -> bool:
+        needed = cls.VARIANCE_DECIDERS.get(item.variance_owner, ())
+        needed = (needed,) if isinstance(needed, str) else tuple(needed)
+        project = getattr(item, "project_of_line", None)
+        return any(can_for_project(user, project, c) for c in needed)
 
     @action(detail=False, methods=["get"], url_path="price-variances")
     def price_variances(self, request):
@@ -705,10 +748,14 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         Procurement cannot decide its own variance — that is the whole point
         — so the queue is served to whoever owns the figure that was passed.
         """
-        role = getattr(request.user, "role", "")
         owners = [
-            owner for owner, roles in self.VARIANCE_DECIDERS.items() if role in roles
+            owner for owner, caps in self.VARIANCE_DECIDERS.items()
+            if any(can(request.user, c) for c in ((caps,) if isinstance(caps, str) else caps))
         ]
+        # A project's manager sees their own project's lines whatever else
+        # they hold; the per-line check below keeps it to those.
+        if PurchaseOrderItem.VarianceOwner.PROJECT not in owners and request.user.managed_projects.exists():
+            owners.append(PurchaseOrderItem.VarianceOwner.PROJECT)
         items = (
             PurchaseOrderItem.objects.filter(
                 variance_status=PurchaseOrderItem.VarianceStatus.PENDING,
@@ -804,8 +851,7 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 f"That line is already {item.get_variance_status_display().lower()}."
             )}, status=400)
 
-        allowed = self.VARIANCE_DECIDERS.get(item.variance_owner, ())
-        if getattr(request.user, "role", "") not in allowed:
+        if not self.may_agree(request.user, item):
             return Response({"detail": (
                 f"This one is {item.get_variance_owner_display()}'s to agree, not yours."
             )}, status=drf_status.HTTP_403_FORBIDDEN)
@@ -832,6 +878,8 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         ])
         from .variance import tell_the_buyer
         tell_the_buyer(item, request.user, approve)
+        if not purchase_order.unagreed_lines().exists():
+            notices.resolve(f"po-variance:{purchase_order.pk}")
 
         left = purchase_order.unagreed_lines().count()
         return Response({
@@ -843,23 +891,29 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             "can_submit": left == 0,
         })
 
-    def get_permissions(self):
-        action = getattr(self, "action", None)
-        if action == "transition":
-            return [IsAuthenticated(), PurchaseOrderActionElseRead()]
-        # Agreeing a price is deliberately not a procurement right: the whole
-        # point is that somebody outside Procurement says yes. Who exactly is
-        # checked against the line's own owner, inside the action.
-        if action in ("price_variance", "price_variances"):
-            return [IsAuthenticated()]
-        return super().get_permissions()
-
     @action(detail=True, methods=["post"])
     def transition(self, request, pk=None):
         purchase_order = self.get_object()
-        if getattr(request.user, "role", "") == "group_head" and request.data.get("status") != "approved":
+        wanted = request.data.get("status")
+        # Each move is its own right: raising and placing, signing off,
+        # and cancelling an order that was already approved.
+        if wanted == PurchaseOrder.Status.APPROVED:
+            if not can(request.user, "approve_po"):
+                return Response(
+                    {"detail": "Purchase orders are approved by the Group Head."},
+                    status=drf_status.HTTP_403_FORBIDDEN,
+                )
+        elif wanted == PurchaseOrder.Status.CANCELLED and purchase_order.status not in (
+            PurchaseOrder.Status.DRAFT, PurchaseOrder.Status.PENDING_APPROVAL,
+        ):
+            if not can(request.user, "cancel_po"):
+                return Response(
+                    {"detail": "Cancelling an approved order needs the right to cancel orders."},
+                    status=drf_status.HTTP_403_FORBIDDEN,
+                )
+        elif not can(request.user, "raise_po"):
             return Response(
-                {"detail": "The Group Head signs purchase orders off; Operations move them otherwise."},
+                {"detail": "Operations raise and move purchase orders."},
                 status=drf_status.HTTP_403_FORBIDDEN,
             )
         ser = PurchaseOrderTransitionSerializer(
@@ -885,7 +939,7 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
         # The date can arrive with the move: an order written without one
         # is given it here, at the moment it matters.
-        given_delivery = ser.validated_data.get("expected_delivery")
+        given_delivery = refuse_past(ser.validated_data.get("expected_delivery"), "expected_delivery")
         if given_delivery and not purchase_order.expected_delivery:
             purchase_order.expected_delivery = given_delivery
 
@@ -900,15 +954,16 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 {"expected_delivery": ["Say when the goods are needed by before sending this order on."]},
                 status=drf_status.HTTP_400_BAD_REQUEST,
             )
-
-        # Placing an order commits money: Operations raise it, the Group Head
-        # signs it off (or the Super Admin).
-        if new_status == PurchaseOrder.Status.APPROVED and getattr(
-            request.user, "role", ""
-        ) not in ("super_admin", "group_head"):
+        # ...and how the supplier is paid: the order is the promise, and the
+        # supplier reads the terms off it.
+        if (
+            new_status not in (PurchaseOrder.Status.DRAFT, PurchaseOrder.Status.CANCELLED)
+            and not purchase_order.payment_terms_id
+            and not purchase_order.payment_terms_note.strip()
+        ):
             return Response(
-                {"detail": "Purchase orders are approved by the Group Head."},
-                status=drf_status.HTTP_403_FORBIDDEN,
+                {"payment_terms": ["Set the payment terms before sending this order on."]},
+                status=drf_status.HTTP_400_BAD_REQUEST,
             )
 
         update_fields = ["status", "updated_at"]
@@ -963,8 +1018,46 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             update_fields += ["notes"]
 
         purchase_order.save(update_fields=update_fields)
+        self._tell_about(purchase_order, new_status, request.user, notes)
 
         return Response(PurchaseOrderSerializer(purchase_order, context={"request": request}).data)
+
+    def _tell_about(self, po, new_status, actor, notes=""):
+        """Who hears about a move: the approvers when it goes up, the buyer
+        when it is decided, the store when goods are coming."""
+        link = f"/procurement?po={po.pk}"
+        ref = f"po:{po.pk}"
+        money = f"{po.currency} {po.total_amount:,.0f}"
+        S = PurchaseOrder.Status
+        if new_status == S.PENDING_APPROVAL:
+            notices.ask(
+                "approve_po", exclude=[actor],
+                title=f"{po.po_number} needs your approval",
+                message=f"{po.supplier.name} · {money} · raised by {notices.who(po.ordered_by)}",
+                link=link, ref=ref, data={"po": str(po.pk)},
+            )
+            return
+        notices.resolve(ref)
+        if new_status in (S.APPROVED, S.DRAFT, S.CANCELLED) and po.ordered_by_id:
+            said = {
+                S.APPROVED: f"{po.po_number} approved",
+                S.DRAFT: f"{po.po_number} sent back to draft",
+                S.CANCELLED: f"{po.po_number} cancelled",
+            }[new_status]
+            notices.tell(
+                [po.ordered_by], exclude=[actor], kind="approval_decided",
+                title=said,
+                message=f"by {notices.who(actor)}" + (f" — {notes}" if notes else ""),
+                link=link, data={"po": str(po.pk)},
+            )
+        if new_status == S.APPROVED:
+            # The order is placed: the store will have goods to receive.
+            notices.tell(
+                notices.holders_of("inspect_goods", exclude=[actor]),
+                title=f"{po.po_number} placed with {po.supplier.name}",
+                message=f"{money} · delivery by {po.expected_delivery or 'date not set'}",
+                link=link, data={"po": str(po.pk)},
+            )
 
 
 class PurchaseOrderItemViewSet(viewsets.ModelViewSet):
@@ -972,7 +1065,9 @@ class PurchaseOrderItemViewSet(viewsets.ModelViewSet):
         "purchase_order", "asset_type", "device_model", "material_type"
     ).all()
     serializer_class = PurchaseOrderItemDetailSerializer
-    permission_classes = [IsAuthenticated, FinanceWriteElseRead]
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_procurement"
+    write_capability = "raise_po"
     filterset_fields = ["purchase_order"]
 
     EDITABLE = ("draft", "pending_approval")

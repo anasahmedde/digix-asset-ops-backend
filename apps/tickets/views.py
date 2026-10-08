@@ -11,7 +11,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
-from common.permissions import CapabilityGate, MANAGER_ROLES, AdminManagerWriteElseRead, TechnicianCanCreate
+from apps.notifications import service as notices
+from common.permissions import CapabilityGate, AdminManagerWriteElseRead, TechnicianCanCreate, can, can_any, decides_for
 
 from .models import Ticket, TicketAttachment, TicketComment, TicketIssueType
 from .serializers import (
@@ -65,6 +66,12 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         "reported_by", "completed_by", "reviewed_by",
     ).prefetch_related("attachments", "comments", "devices").all()
     permission_classes = [IsAuthenticated, TechnicianCanCreate, CapabilityGate]
+    action_capabilities = {
+        "create": "raise_ticket", "assign": "assign_ticket", "destroy": "delete_records",
+        "export": "view_tickets",
+        # Checked inside, against the ticket and the move asked for.
+        "transition": None, "review": None, "submit_completion": None, "update": None, "partial_update": None,
+    }
     filterset_fields = [
         "status", "priority", "category", "issue_type", "assigned_to",
         "assigned_vendor", "site", "escalated", "is_billable",
@@ -118,7 +125,12 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             qs = qs.filter(status=Ticket.Status.PENDING_REVIEW)
         user = self.request.user
         role = getattr(user, "role", "")
-        if role == "technician" and not user.is_superuser:
+        # Whoever only works tickets sees their own; anyone who assigns,
+        # reviews or closes them sees the queue.
+        if not user.is_superuser and role != "vendor" and not can_any(
+            user, "assign_ticket", "review_tickets", "close_ticket", "approve_ticket_cost",
+            "relay_client_decision", "act_across_teams",
+        ):
             return qs.filter(Q(assigned_to=user) | Q(reported_by=user))
         if role == "vendor" and not user.is_superuser:
             # Vendor scope (XC-04): only tickets assigned to their supplier;
@@ -211,11 +223,6 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="assign")
     def assign(self, request, pk=None):
         """Assign the ticket to an employee and/or a vendor (in-warranty assets)."""
-        if getattr(request.user, "role", "") not in MANAGER_ROLES:
-            return Response(
-                {"detail": "Only Operations can assign tickets."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
         ticket = self.get_object()
         stop = self._refuse_if_owned_by_maintenance(ticket, "Assigning a technician")
         if stop is not None:
@@ -274,11 +281,11 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         if stop is not None:
             return stop
         user = request.user
-        role = getattr(user, "role", "")
         # A vendor-portal user counts as the assignee on tickets assigned to
         # their supplier (XC-04) — same workflow powers, same restrictions.
         is_assignee = ticket.assigned_to_id == user.id or _is_assigned_vendor(user, ticket)
-        is_manager = role in MANAGER_ROLES
+        # "Operations" here is whoever may assign tickets: they run the queue.
+        is_manager = can(user, "assign_ticket")
 
         ser = TicketTransitionSerializer(data=request.data, context={"ticket": ticket})
         ser.is_valid(raise_exception=True)
@@ -287,16 +294,16 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         new_status = ser.validated_data["status"]
         notes = ser.validated_data.get("notes", "")
 
-        is_marketing = role in ("marketing", "marketing_head")
+        is_marketing = can(user, "relay_client_decision")
         is_reporter = ticket.reported_by_id == user.id
 
         # Decisions OUT of an approval stage belong to the approver, not the assignee.
-        if old_status == Ticket.Status.PENDING_OPS_APPROVAL and not is_manager:
+        if old_status == Ticket.Status.PENDING_OPS_APPROVAL and not can(user, "approve_ticket_cost"):
             return Response(
                 {"detail": "Only Operations can decide on this approval request."},
                 status=status.HTTP_403_FORBIDDEN,
             )
-        if old_status == Ticket.Status.PENDING_CLIENT_APPROVAL and not (is_manager or is_marketing):
+        if old_status == Ticket.Status.PENDING_CLIENT_APPROVAL and not is_marketing:
             return Response(
                 {"detail": "Only Marketing or Operations can relay the client's decision."},
                 status=status.HTTP_403_FORBIDDEN,
@@ -367,14 +374,17 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        if new_status in (Ticket.Status.APPROVED, Ticket.Status.REJECTED) and not is_manager and not is_reporter:
+        if new_status in (Ticket.Status.APPROVED, Ticket.Status.REJECTED) and not (
+            is_reporter or decides_for(user, ticket.assigned_to, "review_tickets")
+        ):
             return Response(
                 {"detail": "Only the reporter or a manager can perform this action."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # Closing is the final client sign-off: Marketing, a manager, or the reporter.
-        if new_status == Ticket.Status.CLOSED and not (is_manager or is_marketing or is_reporter):
+        # Closing is the final client sign-off: whoever closes tickets, relays
+        # the client's word, or raised it.
+        if new_status == Ticket.Status.CLOSED and not (can(user, "close_ticket") or is_marketing or is_reporter):
             return Response(
                 {"detail": "Only Marketing, Operations or the reporter can close a ticket."},
                 status=status.HTTP_403_FORBIDDEN,
@@ -544,9 +554,8 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         if stop is not None:
             return stop
         user = request.user
-        role = getattr(user, "role", "")
         is_reporter = ticket.reported_by_id == user.id
-        is_manager = role in MANAGER_ROLES
+        is_manager = decides_for(user, ticket.assigned_to, "review_tickets")
 
         if not is_reporter and not is_manager:
             return Response(

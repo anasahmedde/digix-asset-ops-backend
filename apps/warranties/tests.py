@@ -57,7 +57,7 @@ def test_auto_complete_after_term(device):
     assert complete_expired_warranties() == 1
     w.refresh_from_db()
     assert w.status == "expired"
-    assert w.get_status_display() == "Warranty Completed"
+    assert w.get_status_display() == "Expired"
     # one-shot
     assert complete_expired_warranties() == 0
 
@@ -173,7 +173,7 @@ def test_supplier_warranty_anchors_to_purchase_date(ops):
 
 
 @pytest.mark.django_db
-def test_client_warranty_reanchors_on_handover(device):
+def test_client_warranty_runs_from_going_live(device):
     from apps.sites.models import DeviceInstallation, InstallationStep, Site
 
     w = Warranty.objects.create(
@@ -189,9 +189,14 @@ def test_client_warranty_reanchors_on_handover(device):
     inst.refresh_from_db()
     assert inst.completed_at is not None
     w.refresh_from_db()
-    # The cover runs from the installation date — the local day the job was
-    # finished, not the UTC date of the stamp.
-    assert w.start_date == timezone.localdate(inst.completed_at)
+    # Installed is not live: the cover is not re-dated yet.
+    assert w.start_date == timezone.now().date() - timedelta(days=90)
+
+    device.status = "active"
+    device.save()
+    w.refresh_from_db()
+    # Live: the cover runs from today, the local day it went live.
+    assert w.start_date == timezone.localdate()
     assert (w.end_date - w.start_date).days >= 180
 
 
@@ -372,10 +377,59 @@ def test_vendor_warranty_can_be_extended_and_keeps_its_history():
     w.refresh_from_db()
     assert w.status == _W.Status.ACTIVE
 
-    # Client cover is reissued, not extended.
+    # The client's cover is extended the same way.
     client_w = _W.objects.create(device=device, warranty_type="client", start_date=today,
                                  end_date=today + timedelta(days=90), months=3)
-    r = c.post(f"/api/warranties/{client_w.id}/extend/", {"months": 3}, format="json")
+    r = c.post(f"/api/warranties/{client_w.id}/extend/", {"months": 3, "notes": "Goodwill"}, format="json")
+    assert r.status_code == 200, r.content
+    client_w.refresh_from_db()
+    assert client_w.end_date == today + timedelta(days=90) + relativedelta(months=3)
+    assert "Goodwill" in client_w.notes
+
+    # ...but it is not raised here: it comes from the project.
+    r = c.post("/api/warranties/", {"device": str(device.id), "warranty_type": "client", "months": 12},
+               format="json")
+    assert r.status_code == 400 and "project" in str(r.data["warranty_type"])
+
+
+@pytest.mark.django_db
+def test_a_parts_cover_is_recorded_and_extended_by_hand():
+    """A part's paperwork came late: record its cover, then the vendor extends it."""
+    from datetime import timedelta
+
+    from django.utils import timezone as _tz
+    from rest_framework.test import APIClient as _C
+
+    from apps.accounts.models import User as _U
+    from apps.inventory.models import InventoryUnit
+
+    ops = _U.objects.create_user(username="part-ops", password="x", role="super_admin")
+    c = _C()
+    c.force_authenticate(ops)
+    unit = InventoryUnit.objects.create(serial_number="PART-1", model_name="Player")
+    today = _tz.localdate()
+
+    r = c.post(f"/api/inventory/units/{unit.id}/warranty/",
+               {"start_date": today.isoformat(), "months": 12, "vendor_reference": "VW-77"}, format="json")
+    assert r.status_code == 200, r.content
+    unit.refresh_from_db()
+    assert unit.has_warranty and unit.warranty_months == 12 and unit.warranty_vendor_reference == "VW-77"
+    # Our own number, from the component series.
+    assert unit.warranty_reference.startswith("CPW-")
+    first_end = unit.warranty_end
+
+    from dateutil.relativedelta import relativedelta
+
+    r = c.post(f"/api/inventory/units/{unit.id}/extend-warranty/",
+               {"months": 6, "reference_number": "EXT-1"}, format="json")
+    assert r.status_code == 200, r.content
+    unit.refresh_from_db()
+    assert unit.warranty_end == first_end + relativedelta(months=6)
+    assert "EXT-1" in unit.notes
+
+    # An extension never shortens cover.
+    r = c.post(f"/api/inventory/units/{unit.id}/extend-warranty/",
+               {"end_date": (today + timedelta(days=1)).isoformat()}, format="json")
     assert r.status_code == 400
 
 
@@ -432,3 +486,134 @@ def test_asset_level_outside_cover_is_always_a_vendor_warranty():
     assert r.status_code == 201, r.content
     # A part's cover is its supplier's — the one kind there is on a component.
     assert r.data["warranty_type"] == "supplier"
+
+
+@pytest.mark.django_db
+def test_every_warranty_is_numbered_from_its_own_series(device):
+    """Ours is handed out, never typed; the vendor's number is kept beside it."""
+    from apps.assets.models import AssetComponent
+
+    admin = User.objects.create_user(username="ref-admin", password="x", role="super_admin")
+    c = APIClient()
+    c.force_authenticate(admin)
+    today = timezone.localdate()
+    r = c.post("/api/warranties/", {
+        "device": str(device.id), "warranty_type": "supplier", "months": 12,
+        "reference_number": "TYPED-1", "vendor_reference": "LAMPRO-CERT-9",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["reference_number"].startswith("VNW-")
+    assert r.data["vendor_reference"] == "LAMPRO-CERT-9"
+
+    client_w = Warranty.objects.create(device=device, warranty_type="client", start_date=today,
+                                       end_date=today + timedelta(days=365), months=12)
+    assert client_w.reference_number.startswith("CLW-")
+    assert client_w.reference_number != r.data["reference_number"]
+
+
+@pytest.mark.django_db
+def test_a_warranty_past_its_end_date_never_reads_active(device):
+    """BUG-07: ended 2025-12-10, still shown 'Active'. Reading it ends it."""
+    from apps.warranties.services import get_active_client_warranty
+
+    admin = User.objects.create_user(username="lapse-admin", password="x", role="super_admin")
+    c = APIClient()
+    c.force_authenticate(admin)
+    lapsed = Warranty.objects.create(
+        device=device, warranty_type="client", status="active", months=None,
+        start_date=timezone.localdate() - timedelta(days=300),
+        end_date=timezone.localdate() - timedelta(days=1),
+    )
+    # Billing never treats it as cover, whatever the stored status says.
+    assert get_active_client_warranty(device) is None
+
+    r = c.get("/api/warranties/", {"warranty_type": "client"})
+    row = next(w for w in r.data["results"] if w["id"] == str(lapsed.id))
+    assert row["status"] == "expired"
+
+    # An edit cannot put it back to Active while its end date is past.
+    r = c.patch(f"/api/warranties/{lapsed.id}/", {"status": "active", "notes": "x"}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["status"] == "expired"
+
+
+@pytest.mark.django_db
+def test_a_warranty_has_to_end_after_it_starts(device):
+    """BUG-06: start and end both 2025-12-05 was accepted. Cover lasts at least a day."""
+    from apps.inventory.models import InventoryUnit
+
+    admin = User.objects.create_user(username="span-admin", password="x", role="super_admin")
+    c = APIClient()
+    c.force_authenticate(admin)
+    day = (timezone.localdate() + timedelta(days=10)).isoformat()
+    r = c.post("/api/warranties/", {"device": str(device.id), "warranty_type": "supplier",
+                                    "start_date": day, "end_date": day}, format="json")
+    assert r.status_code == 400 and "end_date" in r.data
+
+    ok = c.post("/api/warranties/", {"device": str(device.id), "warranty_type": "supplier",
+                                     "start_date": day, "months": 12}, format="json")
+    assert ok.status_code == 201, ok.content
+    r = c.patch(f"/api/warranties/{ok.data['id']}/", {"end_date": day}, format="json")
+    assert r.status_code == 400 and "end_date" in r.data
+
+    # A part's cover is held to the same rule.
+    unit = InventoryUnit.objects.create(serial_number="SPAN-1", model_name="Player")
+    r = c.post(f"/api/inventory/units/{unit.id}/warranty/", {"start_date": day, "end_date": day}, format="json")
+    assert r.status_code == 400
+
+
+@pytest.mark.django_db
+def test_a_warranty_claim_runs_raise_send_decide_settle(device):
+    """BUG-08: Raise Claim failed outright. A claim is its own record now,
+    and goes through the standard steps."""
+    from apps.inventory.models import InventoryUnit
+    from apps.suppliers.models import Supplier
+
+    admin = User.objects.create_user(username="claim-admin", password="x", role="super_admin")
+    c = APIClient()
+    c.force_authenticate(admin)
+    vendor = Supplier.objects.create(name="Claim Vendor")
+    today = timezone.localdate()
+    cover = Warranty.objects.create(device=device, supplier=vendor, warranty_type="supplier",
+                                    start_date=today - timedelta(days=60), end_date=today + timedelta(days=300))
+
+    # Raised against the vendor's cover on the asset.
+    r = c.post("/api/warranties/claims/", {
+        "warranty": str(cover.id), "fault": "Panel dead", "failure_date": today.isoformat(),
+        "expected_cost": "15000",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    claim = r.data
+    assert claim["claim_number"].startswith("WCL-") and claim["status"] == "raised"
+    assert str(claim["supplier"]) == str(vendor.id) and claim["covered"] == device.asset_code
+
+    def move(status, **extra):
+        return c.post(f"/api/warranties/claims/{claim['id']}/transition/", {"status": status, **extra}, format="json")
+
+    # Cannot be settled before the vendor has seen it.
+    assert move("closed", resolution="replaced").status_code == 400
+    assert move("submitted", vendor_reference="RMA-881").status_code == 200
+    assert move("rejected").status_code == 400                 # a rejection needs a reason
+    assert move("approved", notes="Replacement agreed").status_code == 200
+    assert move("closed").status_code == 400                   # settled how?
+    r = move("closed", resolution="replaced", recovered_amount="15000")
+    assert r.status_code == 200, r.content
+    assert r.data["status"] == "closed" and r.data["vendor_reference"] == "RMA-881"
+    assert "Sent to Vendor" in r.data["history"] and "Replaced" in r.data["history"]
+
+    # A fault outside the cover is refused, as the vendor would refuse it.
+    r = c.post("/api/warranties/claims/", {
+        "warranty": str(cover.id), "fault": "Old fault",
+        "failure_date": (today - timedelta(days=90)).isoformat(),
+    }, format="json")
+    assert r.status_code == 400 and "failure_date" in r.data
+
+    # A part's own cover is claimed the same way.
+    part = InventoryUnit.objects.create(serial_number="CLM-1", model_name="Player", supplier=vendor,
+                                        has_warranty=True, warranty_start=today - timedelta(days=5),
+                                        warranty_months=12)
+    r = c.post("/api/warranties/claims/", {
+        "inventory_unit": str(part.id), "fault": "No signal", "failure_date": today.isoformat(),
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["kind"] == "Component" and r.data["covered"] == "CLM-1"

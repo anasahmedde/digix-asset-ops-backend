@@ -157,7 +157,7 @@ def test_schedule_supports_multiple_vendors(ops):
     v2 = Supplier.objects.create(name="Vendor B")
     r = _client(ops).post("/api/maintenance/schedules/", {
         "title": "Deep clean",
-        "start_date": str(timezone.now().date()),
+        "start_date": str(timezone.localdate()),
         "vendors": [str(v1.pk), str(v2.pk)],
     }, format="json")
     assert r.status_code == 201, r.content
@@ -168,7 +168,7 @@ def test_schedule_supports_multiple_vendors(ops):
 def test_required_components_roundtrip(ops):
     r = _client(ops).post("/api/maintenance/schedules/", {
         "title": "Panel swap",
-        "start_date": str(timezone.now().date()),
+        "start_date": str(timezone.localdate()),
         "required_components": [
             {"name": "SMD Module P3.9", "quantity": 6},
             {"name": "Silicone sealant", "quantity": 2},
@@ -181,7 +181,7 @@ def test_required_components_roundtrip(ops):
     ]
     # malformed rows rejected
     bad = _client(ops).post("/api/maintenance/schedules/", {
-        "title": "Bad", "start_date": str(timezone.now().date()),
+        "title": "Bad", "start_date": str(timezone.localdate()),
         "required_components": [{"quantity": 3}],
     }, format="json")
     assert bad.status_code == 400

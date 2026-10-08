@@ -76,6 +76,38 @@ class PriceVariance(models.Model):
         return getattr(order, "ordered_by", None) or getattr(order, "created_by", None)
 
     @property
+    def project_of_line(self):
+        """The project whose money this line spends, where there is one.
+
+        A purchase line points at it through the requirement it was raised
+        for; a work-order line through the operation, or the order itself.
+        The project's manager agrees their own project's variances.
+        """
+        from apps.assets.serializers import _project_of
+
+        order = self.parent_order
+        if getattr(order, "project_id", None):
+            return order.project
+        bom = getattr(self, "bom_line", None)
+        if bom is not None and bom.project_id:
+            return bom.project
+        step = getattr(self, "production_step", None)
+        if step is not None and step.device_id:
+            return _project_of(step.device)
+        for rel in ("asset_components", "procured_devices"):
+            manager = getattr(self, rel, None)
+            if manager is None:
+                continue
+            first = manager.all().first()
+            if first is None:
+                continue
+            device = getattr(first, "device", first)
+            project = _project_of(device)
+            if project is not None:
+                return project
+        return None
+
+    @property
     def over_reference(self) -> bool:
         """Is this line priced above what it was expected to cost?"""
         return (

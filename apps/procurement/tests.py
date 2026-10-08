@@ -23,6 +23,8 @@ def people(db):
         "tech": User.objects.create_user(username="po-tech", password="x", role="technician"),
         # Deliveries are checked by a supervisor; the Group Head signs orders off.
         "inspector": User.objects.create_user(username="po-insp", password="x", role="supervisor"),
+        # Counting goods onto the shelf is the store's.
+        "store": User.objects.create_user(username="po-store", password="x", role="warehouse"),
         "group_head": User.objects.create_user(username="po-gh", password="x", role="group_head"),
     }
 
@@ -36,7 +38,7 @@ def _create_po(client, supplier, **extra):
     payload = {
         "supplier": str(supplier.id),
         # An order says when the goods are wanted, as a real one would.
-        "expected_delivery": str(timezone.localdate()),
+        "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "items": [
             {"description": "P6 LED module", "quantity": 2, "unit_price": "100.00"},
             {"description": "Cat6 cable", "quantity": 3, "unit_price": "10.50"},
@@ -215,8 +217,16 @@ def test_item_writes_rejected_after_approval(people, supplier):
     assert po.items.first().description == "Still editable"
 
     # non-item fields remain editable
-    r = c.patch(f"/api/procurement/orders/{pid}/", {"expected_delivery": "2026-09-15"}, format="json")
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    later = (timezone.localdate() + timedelta(days=30)).isoformat()
+    r = c.patch(f"/api/procurement/orders/{pid}/", {"expected_delivery": later}, format="json")
     assert r.status_code == 200, r.content
+    # ...but a delivery before the order was placed is not.
+    r = c.patch(f"/api/procurement/orders/{pid}/", {"expected_delivery": "2020-01-01"}, format="json")
+    assert r.status_code == 400 and "expected_delivery" in r.data
 
 
 @pytest.mark.django_db
@@ -259,7 +269,8 @@ def test_full_transition_flow_and_approved_by_stamp(people, supplier):
     assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "partially_received"}, format="json").status_code == 200
     assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "received"}, format="json").status_code == 200
     # received is terminal
-    assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "cancelled"}, format="json").status_code == 400
+    # Cancelling a received order is refused for what it is, not for who asks.
+    assert c_ops.post(f"/api/procurement/orders/{pid}/transition/", {"status": "cancelled"}, format="json").status_code == 400
 
 
 @pytest.mark.django_db
@@ -584,6 +595,7 @@ def _inspect(client, line_id, **payload):
     """
     payload.pop("accepted_quantity", None)
     payload.pop("rejected_quantity", None)
+    payload.setdefault("storage_location", "Rack A1")
     return client.post(f"/api/inventory/receipt-lines/{line_id}/receive/", payload, format="json")
 
 
@@ -621,8 +633,7 @@ def test_receive_serialized_line_creates_devices(people, supplier, receivable_po
 
     # A technician inspects and routes them into unique inventory.
     line_id = body["lines"][0]["id"]
-    ins = _inspect(
-        _client(people["inspector"]), line_id, route="unique", accepted_quantity=3,
+    ins = _inspect(_client(people["store"]), line_id, route="unique", accepted_quantity=3,
         units=[{"serial_number": sn} for sn in ["GRN-SN-A", "GRN-SN-B", "GRN-SN-C"]],
     )
     assert ins.status_code == 200, ins.content
@@ -643,7 +654,8 @@ def test_receive_serialized_line_creates_devices(people, supplier, receivable_po
     assert serialized.received_quantity == 3
     po.refresh_from_db()
     assert po.status == "partially_received"  # consumable line still outstanding
-    assert f"[GRN {body['grn_number']}]" in po.notes
+    # The receipt number already says GRN, so the stamp says it once.
+    assert f"[{body['grn_number']}]" in po.notes
 
 
 @pytest.mark.django_db
@@ -755,8 +767,7 @@ def test_receive_consumable_updates_stock_and_movement(people, receivable_po):
     stock.refresh_from_db()
     assert stock.quantity == 5
 
-    ins = _inspect(
-        _client(people["inspector"]), body["lines"][0]["id"],
+    ins = _inspect(_client(people["store"]), body["lines"][0]["id"],
         route="generic", accepted_quantity=10,
     )
     assert ins.status_code == 200, ins.content
@@ -794,8 +805,7 @@ def test_receive_consumable_creates_inventory_item_when_missing(people, receivab
     assert r.status_code == 201, r.content
     assert not InventoryItem.objects.filter(material_type=material).exists()
 
-    ins = _inspect(
-        _client(people["inspector"]), r.json()["lines"][0]["id"],
+    ins = _inspect(_client(people["store"]), r.json()["lines"][0]["id"],
         route="generic", accepted_quantity=7,
     )
     assert ins.status_code == 200, ins.content
@@ -825,7 +835,7 @@ def test_receive_mixed_po_single_call(people, receivable_po):
     assert len(body["lines"]) == 2
     assert body["awaiting_stock"] == 2
 
-    tech = _client(people["inspector"])
+    tech = _client(people["store"])
     by_item = _lines(body)
     ok = _inspect(tech, by_item[str(serialized.pk)], route="unique", accepted_quantity=3,
                   units=[{"serial_number": sn} for sn in ["MX-A", "MX-B", "MX-C"]])
@@ -929,7 +939,7 @@ def test_receive_bom_line_sets_project_and_allocation(people, receivable_po):
     # Allocation happens once the goods pass inspection, not at the door.
     assert not BOMAllocation.objects.filter(bom_line=bom_line).exists()
 
-    tech_user = people["inspector"]
+    tech_user = people["store"]
     ins = _inspect(
         _client(tech_user), r.json()["lines"][0]["id"], route="unique", accepted_quantity=2,
         units=[{"serial_number": sn} for sn in ["BOM-1", "BOM-2"]],
@@ -1010,7 +1020,7 @@ def test_flagged_requirements_appear_as_requisitions(people, requisitions):
 def test_raise_a_po_from_requisitions(people, requisitions, supplier):
     c = _client(people["finance"])
     r = c.post("/api/procurement/purchase-orders/raise-po/", {
-            "expected_delivery": str(timezone.localdate()),
+            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier": str(supplier.pk),
         "components": [str(requisitions["generic"].pk), str(requisitions["unique"].pk)],
     }, format="json")
@@ -1036,7 +1046,7 @@ def test_raise_a_po_from_requisitions(people, requisitions, supplier):
 def test_requisitions_can_be_filtered_to_unordered(people, requisitions, supplier):
     c = _client(people["finance"])
     c.post("/api/procurement/purchase-orders/raise-po/", {
-            "expected_delivery": str(timezone.localdate()),
+            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier": str(supplier.pk), "components": [str(requisitions["generic"].pk)],
     }, format="json")
 
@@ -1071,7 +1081,7 @@ def test_receiving_a_product_line_only_needs_serials(people, requisitions, suppl
 
     c = _client(people["finance"])
     po_resp = c.post("/api/procurement/purchase-orders/raise-po/", {
-            "expected_delivery": str(timezone.localdate()),
+            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier": str(supplier.pk), "components": [str(requisitions["unique"].pk)],
     }, format="json")
     assert po_resp.status_code == 201, po_resp.content
@@ -1092,8 +1102,7 @@ def test_receiving_a_product_line_only_needs_serials(people, requisitions, suppl
 
     line_id = received.json()["lines"][0]["id"]
     # Serial only — the opened product on the PO line supplies the rest.
-    ins = _inspect(
-        _client(people["inspector"]), line_id, route="unique", accepted_quantity=3,
+    ins = _inspect(_client(people["store"]), line_id, route="unique", accepted_quantity=3,
         units=[{"serial_number": s} for s in ["RQ-1", "RQ-2", "RQ-3"]],
     )
     assert ins.status_code == 200, ins.content
@@ -1137,7 +1146,7 @@ def test_clearing_a_decision_lets_it_be_procured_again(people, requisitions, sup
     component = requisitions["generic"]
     c = _client(people["finance"])
     assert c.post("/api/procurement/purchase-orders/raise-po/", {
-            "expected_delivery": str(timezone.localdate()),
+            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier": str(supplier.pk), "components": [str(component.pk)],
     }, format="json").status_code == 201
     component.refresh_from_db()
@@ -1197,7 +1206,7 @@ def test_approval_stamps_the_order_date_and_lines_say_what_they_buy(people, supp
                                    serial_number="PO-LINE-1", diagonal_inches="55.0")
     c = _client(people["ops"])
     r = c.post("/api/procurement/purchase-orders/raise-po/", {
-            "expected_delivery": str(timezone.localdate()),"supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)], "prices": {}}, format="json")
+            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery","supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)], "prices": {}}, format="json")
     assert r.status_code == 201, r.content
     line = r.data["items"][0]
     assert line["description"].startswith("Lobby Wall (PO Line Display")
@@ -1254,7 +1263,7 @@ def test_procurement_can_send_a_line_back_to_the_project():
     c.post(f"/api/assets/components/{comp.id}/mark-for-procurement/", {"quantity": 2}, format="json")
     supplier = Supplier.objects.create(name="SB Supplier")
     r = c.post("/api/procurement/purchase-orders/raise-po/", {
-            "expected_delivery": str(timezone.localdate()),"supplier": str(supplier.id), "components": [str(comp.id)], "devices": []}, format="json")
+            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery","supplier": str(supplier.id), "components": [str(comp.id)], "devices": []}, format="json")
     assert r.status_code == 201, r.content
     r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"component": str(comp.id), "reason": "no"}, format="json")
     assert r.status_code == 400 and "cancel that order first" in r.data["detail"]
@@ -1288,7 +1297,7 @@ def test_receiving_a_complete_asset_asks_for_no_serial_number(people, supplier):
 
     ops = _client(people["ops"])
     r = ops.post("/api/procurement/purchase-orders/raise-po/", {
-            "expected_delivery": str(timezone.localdate()),
+            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)],
         "prices": {str(device.pk): "9000.00"},
     }, format="json")
@@ -1366,7 +1375,7 @@ def test_a_charge_on_an_order_is_not_goods_to_receive():
 
     r = c.post("/api/procurement/purchase-orders/", {
         "supplier": str(supplier.id), "currency": "PKR",
-        "expected_delivery": str(timezone.localdate()),
+        "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier_details": "Quote Q-118 · deliver to the Multan store",
         "items": [
             {"description": "Charge Cable", "quantity": 10, "unit_price": "50.00",
@@ -1381,7 +1390,7 @@ def test_a_charge_on_an_order_is_not_goods_to_receive():
     charge = po.items.get(is_charge=True)
     goods = po.items.get(is_charge=False)
     charge_row = next(i for i in r.data["items"] if i["is_charge"])
-    assert charge_row["line_detail"] == "charge, not goods"
+    assert charge_row["line_detail"] == "free text, not goods"
 
     for who, status in ((c, "pending_approval"), (head, "approved")):
         r = who.post(f"/api/procurement/purchase-orders/{po.id}/transition/", {"status": status}, format="json")
@@ -1426,7 +1435,7 @@ def test_an_order_can_buy_an_asset_already_registered():
 
     r = c.post("/api/procurement/purchase-orders/", {
         "supplier": str(supplier.id), "currency": "PKR",
-        "expected_delivery": str(timezone.localdate()),
+        "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "items": [{"description": "Standee, complete", "quantity": 1, "unit_price": "90000.00",
                    "device": str(device.id)}],
     }, format="json")
@@ -1440,7 +1449,7 @@ def test_an_order_can_buy_an_asset_already_registered():
     # One asset is bought once.
     r = c.post("/api/procurement/purchase-orders/", {
         "supplier": str(supplier.id), "currency": "PKR",
-        "expected_delivery": str(timezone.localdate()),
+        "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "items": [{"description": "Standee again", "quantity": 1, "unit_price": "1.00",
                    "device": str(device.id)}],
     }, format="json")
@@ -1457,7 +1466,7 @@ def over_plan(db, people, supplier, requisitions):
     c = _client(people["finance"])
     r = c.post("/api/procurement/purchase-orders/raise-po/", {
         "supplier": str(supplier.pk),
-        "expected_delivery": str(timezone.localdate()),
+        "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "components": [str(requisitions["generic"].pk)],
         # The plan priced it from the inventory opening cost of 25.
         "prices": {str(requisitions["generic"].pk): "40"},
@@ -1484,7 +1493,7 @@ def test_a_line_within_the_plan_needs_nobody(people, supplier, requisitions):
     c = _client(people["finance"])
     r = c.post("/api/procurement/purchase-orders/raise-po/", {
         "supplier": str(supplier.pk),
-        "expected_delivery": str(timezone.localdate()),
+        "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "components": [str(requisitions["generic"].pk)],
         "prices": {str(requisitions["generic"].pk): "22"},
     }, format="json")
@@ -1600,7 +1609,7 @@ def test_a_stock_reorder_over_the_last_price_goes_to_inventory(people, supplier)
 
     r = _client(people["finance"]).post("/api/procurement/purchase-orders/raise-po/", {
         "supplier": str(supplier.pk),
-        "expected_delivery": str(timezone.localdate()),
+        "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "reorders": [str(rr.pk)],
         "prices": {str(rr.pk): "600"},
     }, format="json")
@@ -1636,3 +1645,40 @@ def test_a_cancelled_order_stops_waiting_on_anybody(people, over_plan):
 
     after = _client(people["inspector"]).get("/api/procurement/purchase-orders/price-variances/")
     assert after.data["count"] == 0, after.data
+
+
+@pytest.mark.django_db
+def test_terms_typed_for_a_deal_reach_the_order_and_the_page(people, supplier, requisitions):
+    """No catalogue term fits every deal. Terms typed for this one travel with
+    the order and print on it; a catalogue pick, when made, wins."""
+    import io
+
+    from pypdf import PdfReader
+
+    from apps.procurement.documents import render_purchase_order_pdf
+    from apps.setup.models import PaymentTerms
+
+    c = _client(people["finance"])
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+        "supplier": str(supplier.pk),
+        "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
+        "components": [str(requisitions["generic"].pk)],
+        "payment_terms_note": "  30% on order, balance on commissioning  ",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["payment_terms"] is None
+    assert r.data["payment_terms_note"] == "30% on order, balance on commissioning"
+    assert r.data["payment_terms_display"] == "30% on order, balance on commissioning"
+
+    po = PurchaseOrder.objects.get(pk=r.data["id"])
+    text = " ".join(" ".join(
+        p.extract_text() or "" for p in PdfReader(io.BytesIO(render_purchase_order_pdf(po))).pages
+    ).split())
+    assert "30% on order, balance on commissioning" in text
+
+    # A catalogue term, once picked, is what the order says.
+    term = PaymentTerms.objects.create(name="Net 45", code="NET45", days=45)
+    po.payment_terms = term
+    po.save(update_fields=["payment_terms"])
+    detail = c.get(f"/api/procurement/purchase-orders/{po.pk}/")
+    assert detail.data["payment_terms_display"] == "Net 45"

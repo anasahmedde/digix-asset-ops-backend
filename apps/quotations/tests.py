@@ -228,7 +228,8 @@ def test_technician_is_read_only(people, customer):
     body = _create_quotation(ops_api, customer)
 
     tech_api = _client(people["tech"])
-    assert tech_api.get("/api/quotations/quotations/").status_code == 200
+    # Quotations are commercial: a technician has no view of them at all.
+    assert tech_api.get("/api/quotations/quotations/").status_code == 403
     assert tech_api.post("/api/quotations/quotations/", {
         "title": "Nope", "client": str(customer.id),
     }, format="json").status_code == 403

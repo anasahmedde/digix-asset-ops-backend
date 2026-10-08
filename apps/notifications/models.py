@@ -18,6 +18,15 @@ class Notification(TimeStampedModel):
         INSTALLATION_ESCALATED = "installation_escalated", "Installation Escalated"
         MAINTENANCE_REMINDER = "maintenance_reminder", "Maintenance Reminder"
         SYSTEM = "system", "System"
+        # The workflow kinds: something is waiting on you, or something you
+        # raised has moved. Every module uses these five.
+        APPROVAL_REQUESTED = "approval_requested", "Approval Requested"
+        APPROVAL_DECIDED = "approval_decided", "Approval Decided"
+        REQUEST_RAISED = "request_raised", "Request Raised"
+        REQUEST_ANSWERED = "request_answered", "Request Answered"
+        WORK_ASSIGNED = "work_assigned", "Work Assigned"
+        WORKFLOW_UPDATE = "workflow_update", "Workflow Update"
+        DIGEST = "digest", "Daily Summary"
 
     recipient = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -49,6 +58,12 @@ class Notification(TimeStampedModel):
         related_name="notifications",
     )
     data = models.JSONField(default=dict, blank=True)
+    # Where clicking it goes, as an app path ("/procurement?po=…"). One
+    # field instead of a routing table that had to know every type.
+    link = models.CharField(max_length=300, blank=True)
+    # What it is about, "po:<id>" / "budget:<project id>", so the whole set
+    # of notifications waiting on one thing can be resolved when it moves.
+    ref = models.CharField(max_length=120, blank=True, db_index=True)
     is_read = models.BooleanField(default=False)
     read_at = models.DateTimeField(null=True, blank=True)
     is_actionable = models.BooleanField(
