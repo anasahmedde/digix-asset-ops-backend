@@ -116,6 +116,15 @@ def _acts_for_everyone(user) -> bool:
     return can_any(user, "review_maintenance", "manage_maintenance", "assign_maintenance", "act_across_teams")
 
 
+def _from_the_site(user, schedule):
+    """The field acts from the site it is clocked in at; the office from a desk."""
+    from apps.attendance.presence import require_on_site
+
+    if _acts_for_everyone(user):
+        return
+    require_on_site(user, schedule.site)
+
+
 def _own_job_only(user, schedule, doing: str):
     """A technician works the jobs given to them, not a colleague's."""
     if schedule is None or _acts_for_everyone(user):
@@ -497,6 +506,8 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         )
         if not images:
             return Response({"images": ["Attach at least one photo."]}, status=400)
+        if is_record:
+            _from_the_site(request.user, visit.schedule)
         # An After photo that is the Before photo again shows nothing changed:
         # the same bytes under any name are refused.
         if kind == MaintenanceVisitPhoto.Kind.AFTER:
@@ -529,6 +540,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
     def complete_visit(self, request, pk=None):
         """The technician is done, and says whether the fault is fixed."""
         visit = self.get_object()
+        _from_the_site(request.user, visit.schedule)
         if not self._corrective(visit):
             # A round has no ticket to move, but it is handed in and
             # accepted exactly as a breakdown is.
@@ -652,6 +664,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 {"detail": "You can only start a round assigned to you."},
                 status=403,
             )
+        _from_the_site(request.user, visit.schedule)
         # Where the phone says it is. Offered, never demanded: a basement
         # with no signal is still a place work gets done.
         where = _where_from(request.data)

@@ -6,6 +6,7 @@ from common.scoping import for_client
 from rest_framework import status as drf_status
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
@@ -445,6 +446,11 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 status=drf_status.HTTP_403_FORBIDDEN,
             )
 
+        if mine and not (can(user, "act_across_teams") or can(user, "assign_installation")):
+            from apps.attendance.presence import require_on_site
+
+            require_on_site(user, installation.site)
+
         device = installation.device
         if device.status == "active":
             return Response({"detail": "This asset is already active."}, status=drf_status.HTTP_400_BAD_REQUEST)
@@ -555,6 +561,10 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 {"detail": "This installation has already been handed over."},
                 status=drf_status.HTTP_400_BAD_REQUEST,
             )
+        if not can(user, "close_installation"):
+            from apps.attendance.presence import require_on_site
+
+            require_on_site(user, installation.site)
         pending = [
             step.custom_label or step.get_step_type_display()
             for step in installation.steps.exclude(step_type=InstallationStep.StepType.HANDOVER)
@@ -686,8 +696,18 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
     filterset_fields = ["installation", "step_type", "status"]
     ordering_fields = ["step_number"]
 
+    def _from_the_site(self, installation):
+        """The installer works the checklist from the site; who else may edit
+        it (the office, their supervisor) is decided further down."""
+        from apps.attendance.presence import require_on_site
+
+        user = self.request.user
+        if installation.installed_by_id == user.id and not can(user, "act_across_teams"):
+            require_on_site(user, installation.site)
+
     def perform_create(self, serializer):
         refuse_if_closed_out(serializer.validated_data["installation"])
+        self._from_the_site(serializer.validated_data["installation"])
         serializer.save()
 
     def perform_update(self, serializer):
@@ -696,6 +716,7 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
 
         step = serializer.instance
         refuse_if_closed_out(step.installation)
+        self._from_the_site(step.installation)
 
         new_status = serializer.validated_data.get("status", step.status)
         moving_on = new_status in (
@@ -801,8 +822,6 @@ class InstallationDelayViewSet(viewsets.ModelViewSet):
         installation = serializer.validated_data["installation"]
         user = self.request.user
         if not may_advance_installation(user, installation):
-            from rest_framework.exceptions import PermissionDenied
-
             raise PermissionDenied("This installation is not yours to flag a delay on.")
         delay = serializer.save(reported_by=user)
         notices.tell(
@@ -830,7 +849,5 @@ class InstallationPhotoViewSet(viewsets.ModelViewSet):
             # Vendor-portal users may only photograph their own installations.
             installation = serializer.validated_data["installation"]
             if not user.supplier_id or installation.vendor_id != user.supplier_id:
-                from rest_framework.exceptions import PermissionDenied
-
                 raise PermissionDenied("Vendors can only add photos to their own installations.")
         serializer.save(taken_by=user)
