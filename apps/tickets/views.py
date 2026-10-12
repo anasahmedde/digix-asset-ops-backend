@@ -131,7 +131,11 @@ class TicketViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             user, "assign_ticket", "review_tickets", "close_ticket", "approve_ticket_cost",
             "relay_client_decision", "act_across_teams",
         ):
-            return qs.filter(Q(assigned_to=user) | Q(reported_by=user))
+            # Their own tickets: assigned to them, raised by them, or whose
+            # corrective job is theirs to attend.
+            return qs.filter(
+                Q(assigned_to=user) | Q(reported_by=user) | Q(maintenance_jobs__assigned_to=user)
+            ).distinct()
         if role == "vendor" and not user.is_superuser:
             # Vendor scope (XC-04): only tickets assigned to their supplier;
             # a vendor login without a supplier link sees nothing.

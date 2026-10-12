@@ -156,7 +156,8 @@ def test_a_cancelled_order_hands_every_operation_back(build):
         ops.post(f"/api/assets/production-steps/{step.id}/decide/", {"location": "external"}, format="json")
     r = ops.post("/api/work-orders/raise/", {"steps": [str(cut.id), str(paint.id)], "supplier": str(build["vendor"].id)}, format="json")
     assert r.status_code == 201, r.content
-    assert ops.post(f"/api/work-orders/{r.data['id']}/transition/", {"status": "cancelled"}, format="json").status_code == 200
+    assert ops.post(f"/api/work-orders/{r.data['id']}/transition/", {"status": "cancelled"}, format="json").status_code == 400
+    assert ops.post(f"/api/work-orders/{r.data['id']}/transition/", {"status": "cancelled", "notes": "Called off."}, format="json").status_code == 200
     for step in (cut, paint):
         step.refresh_from_db()
         assert step.location == "undecided" and step.status == "pending" and step.workshop is None

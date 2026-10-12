@@ -89,7 +89,7 @@ class MaintenanceScheduleSerializer(DateOrder, serializers.ModelSerializer):
         done = (
             MaintenanceRecord.objects
             .filter(schedule__device_id=obj.device_id, performed_by__isnull=False)
-            .select_related("performed_by")
+            .select_related("performed_by", "schedule")
             .order_by("-performed_at")
             .first()
         )
@@ -98,6 +98,9 @@ class MaintenanceScheduleSerializer(DateOrder, serializers.ModelSerializer):
             return {
                 "name": who.get_full_name() or who.username,
                 "when": done.performed_at,
+                # Which job that was: the asset may have several, and the
+                # last visit on this one is not always the last on the asset.
+                "job": None if done.schedule_id == obj.id else done.schedule.title,
             }
         # Nothing finished yet — the last person who was sent is the best
         # answer there is.
@@ -481,6 +484,20 @@ class MaintenancePartRequestSerializer(serializers.ModelSerializer):
     schedule_title = serializers.CharField(source="schedule.title", read_only=True)
     requested_by_name = serializers.SerializerMethodField()
     decided_by_name = serializers.SerializerMethodField()
+    # Whether the reader answers this line: the asker's own reporting line,
+    # or somebody who acts for every team - the same rule the decide action
+    # enforces, so the screen offers Approve only where it would be accepted.
+    decidable_by_me = serializers.SerializerMethodField()
+
+    def get_decidable_by_me(self, obj):
+        from common.permissions import decides_for
+
+        user = getattr(self.context.get("request"), "user", None)
+        if user is None or not user.is_authenticated or obj.requested_by_id is None:
+            return False
+        if obj.requested_by_id == user.pk and not user.is_superuser:
+            return False
+        return decides_for(user, obj.requested_by, "review_maintenance")
     # Where the store has got to with it, once the line became a request.
     issue_status = serializers.CharField(
         source="issuance_request.status", read_only=True, default=None,
@@ -502,7 +519,7 @@ class MaintenancePartRequestSerializer(serializers.ModelSerializer):
             "id", "schedule", "schedule_title", "item", "unit_type", "name",
             "what", "unit", "quantity_requested", "quantity_approved",
             "status", "status_display", "reason",
-            "requested_by", "requested_by_name",
+            "requested_by", "requested_by_name", "decidable_by_me",
             "decided_by", "decided_by_name", "decided_at", "decision_note",
             "issuance_request", "issue_status", "issue_number", "quantity_issued",
             "issued_serials", "visit", "quantity_used", "quantity_returned", "return_reference",

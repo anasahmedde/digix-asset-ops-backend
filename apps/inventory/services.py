@@ -350,12 +350,18 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
             elif (generic.get("storage_location") or "").strip():
                 # Stock put somewhere new on this delivery: record where.
                 inventory_item.storage_location = generic["storage_location"].strip()
+            # The batch keeps its own bin, whatever later deliveries do.
+            line.storage_location = (generic.get("storage_location") or "").strip() or inventory_item.storage_location
+            # The item's rate is the latest paid; each batch keeps what it cost.
+            if po_item is not None and po_item.unit_price is not None:
+                inventory_item.unit_cost = po_item.unit_price
             inventory_item.quantity += accepted_quantity
-            inventory_item.save(update_fields=["quantity", "storage_location", "updated_at"])
+            inventory_item.save(update_fields=["quantity", "storage_location", "unit_cost", "updated_at"])
             StockMovement.objects.create(
                 item=inventory_item,
                 movement_type=StockMovement.MovementType.IN,
                 quantity=accepted_quantity,
+                unit_cost=po_item.unit_price if po_item is not None else inventory_item.unit_cost,
                 reference=grn,
                 batch_number=batch,
                 goods_receipt_line=line,
@@ -517,7 +523,7 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
     line.inspection_notes = notes
     line.save(update_fields=[
         "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
-        "inspected_by", "inspected_at", "inspection_notes", "inventory_item", "updated_at",
+        "inspected_by", "inspected_at", "inspection_notes", "inventory_item", "storage_location", "updated_at",
     ])
     return {"inventory_item": inventory_item, "units": created_units, "ready_requests": ready_requests}
 
@@ -529,12 +535,21 @@ def _requests_ready_to_issue(po_item, accepted_quantity, trace):
 
     from .models import IssuanceRequest
 
-    rows = (
-        IssuanceRequest.objects.select_for_update()
-        .filter(asset_component__purchase_order_item=po_item, awaiting_procurement=True)
+    from django.db.models import Q
+
+    # Postgres will not lock a DISTINCT set, so the join finds the ids and
+    # the lock is taken on the plain rows.
+    ids = list(
+        IssuanceRequest.objects
+        .filter(
+            Q(asset_component__purchase_order_item=po_item) | Q(reorders__purchase_order_item=po_item),
+            awaiting_procurement=True,
+        )
         .exclude(status__in=[IssuanceRequest.Status.CANCELLED, IssuanceRequest.Status.FULFILLED])
-        .order_by("created_at")
+        .values_list("pk", flat=True)
+        .distinct()
     )
+    rows = IssuanceRequest.objects.select_for_update().filter(pk__in=ids).order_by("created_at")
     stamp = timezone.localtime().strftime("%d %b %Y %H:%M")
     numbers = []
     for req in rows:
@@ -687,3 +702,70 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
         "status", "updated_at",
     ])
     return {"quantity": quantity, "serials": serials}
+
+
+def batches_for(item):
+    """What is on the shelf, batch by batch, and where each batch sits.
+
+    Every delivery (and the opening count) is a batch. Issues are not tied
+    to a batch, so what remains is read first-in, first-out: the oldest
+    batch is drawn down first, the way the store takes from the shelf. Each
+    batch reports its bin and what it cost, so the value on hand is the
+    real purchase cost and not one averaged figure.
+    """
+    from .models import StockMovement
+
+    moves = list(
+        item.movements.select_related(
+            "goods_receipt_line__receipt__purchase_order__supplier",
+            "goods_receipt_line__po_item",
+        ).order_by("created_at", "batch_number")
+    )
+    batches = []
+    consumed = 0
+    for m in moves:
+        qty = m.quantity or 0
+        incoming = m.movement_type in (StockMovement.MovementType.IN, StockMovement.MovementType.OPENING) or (
+            m.movement_type == StockMovement.MovementType.ADJUSTMENT and qty > 0
+        )
+        if incoming and qty > 0:
+            line = m.goods_receipt_line
+            po_item = line.po_item if line is not None else None
+            receipt = line.receipt if line is not None else None
+            po = receipt.purchase_order if receipt is not None else None
+            # The movement's own cost first; older rows fall back to the PO line, then the item.
+            unit_cost = m.unit_cost
+            if unit_cost is None:
+                unit_cost = (
+                    po_item.unit_price if po_item is not None and po_item.unit_price is not None
+                    else item.unit_cost
+                )
+            batches.append({
+                "id": str(m.pk),
+                "batch_number": m.batch_number or (line.batch_number if line is not None else "") or
+                    ("Opening stock" if m.movement_type == StockMovement.MovementType.OPENING else "Adjustment"
+                     if m.movement_type == StockMovement.MovementType.ADJUSTMENT else ""),
+                "kind": m.movement_type,
+                "received_at": m.created_at,
+                "grn_number": receipt.grn_number if receipt is not None else None,
+                "po_number": po.po_number if po is not None else None,
+                "supplier_name": po.supplier.name if po is not None and po.supplier_id else None,
+                "storage_location": (line.storage_location if line is not None and line.storage_location else "")
+                    or item.storage_location,
+                "quantity_in": qty,
+                "unit_cost": unit_cost,
+                "remaining": qty,
+            })
+        else:
+            consumed += abs(qty)
+    # First in, first out.
+    for batch in batches:
+        take = min(batch["remaining"], consumed)
+        batch["remaining"] -= take
+        consumed -= take
+        if consumed <= 0:
+            break
+    for batch in batches:
+        cost = batch["unit_cost"]
+        batch["value"] = float(cost) * batch["remaining"] if cost is not None else None
+    return batches

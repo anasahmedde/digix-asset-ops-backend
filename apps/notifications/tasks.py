@@ -221,3 +221,53 @@ def warn_expiring_warranties():
         )
         told += 1
     return told
+
+
+@shared_task
+def remind_calendar_dates():
+    """The calendar's reminders: planned events the set days ahead, and
+    project deliveries three days out, each told once (the ref remembers)."""
+    from datetime import timedelta
+
+    from django.utils import timezone as _tz
+
+    from apps.teams.models import Project
+
+    from .models import CalendarEvent, Notification
+    from .service import tell
+
+    today = _tz.localdate()
+    sent = 0
+    for event in CalendarEvent.objects.filter(date__gte=today).select_related("owner", "project"):
+        if event.date - timedelta(days=event.remind_days_before) > today:
+            continue
+        ref = f"calendar:{event.pk}"
+        if Notification.objects.filter(ref=ref).exists():
+            continue
+        when = "today" if event.date == today else f"on {event.date:%d %b}"
+        at = f" at {event.time:%H:%M}" if event.time else ""
+        people = [event.owner]
+        if event.project_id and event.project.manager_id and event.project.manager_id != event.owner_id:
+            people.append(event.project.manager)
+        tell(
+            people, kind=Notification.Type.SYSTEM, ref=ref, link=f"/?date={event.date}",
+            title=f"Reminder: {event.title} {when}{at}",
+            message=(event.project.name + ". " if event.project_id else "") + event.notes[:200],
+        )
+        sent += 1
+
+    soon = today + timedelta(days=3)
+    for project in Project.objects.filter(
+        target_date__range=(today, soon), manager__isnull=False
+    ).exclude(status__in=["completed", "on_hold"]).select_related("manager"):
+        ref = f"project-due:{project.pk}:{project.target_date}"
+        if Notification.objects.filter(ref=ref).exists():
+            continue
+        left = (project.target_date - today).days
+        tell(
+            [project.manager], kind=Notification.Type.SYSTEM, ref=ref, link=f"/?date={project.target_date}",
+            title=f"{project.name} is due {'today' if left == 0 else f'in {left} day' + ('s' if left != 1 else '')}",
+            message=f"Delivery date {project.target_date:%d %b %Y}.",
+        )
+        sent += 1
+    return sent

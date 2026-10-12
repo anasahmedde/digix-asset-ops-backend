@@ -1,3 +1,4 @@
+from apps.notifications.service import inform_line, who as _who
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
@@ -64,7 +65,13 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     ordering_fields = ["created_at", "order_date", "total_amount"]
 
     def perform_create(self, serializer):
-        serializer.save(ordered_by=self.request.user)
+        po = serializer.save(ordered_by=self.request.user)
+        inform_line(
+            self.request.user,
+            title=f"Purchase order raised: {po.po_number}",
+            message=f"{po.supplier.name if po.supplier_id else ''} - by {_who(self.request.user)}".strip(" -"),
+            link=f"/procurement?po={po.pk}", ref=f"fyi-po:{po.pk}",
+        )
 
     @action(detail=False, methods=["get"], url_path="default-terms")
     def default_terms(self, request):
@@ -922,6 +929,9 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         ser.is_valid(raise_exception=True)
         new_status = ser.validated_data["status"]
         notes = ser.validated_data.get("notes", "").strip()
+        going_back = new_status == PurchaseOrder.Status.DRAFT and purchase_order.status != PurchaseOrder.Status.DRAFT
+        if (going_back or new_status == PurchaseOrder.Status.CANCELLED) and not notes:
+            return Response({"notes": ["Say why it is going back."]}, status=drf_status.HTTP_400_BAD_REQUEST)
 
         # An order priced over what anybody planned for does not reach the
         # Group Head until the side whose figure was exceeded has said yes.
@@ -987,6 +997,12 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             if not purchase_order.order_date:
                 purchase_order.order_date = timezone.localdate()
                 update_fields += ["order_date"]
+
+        # A turnkey asset on the order now knows its vendor.
+        if new_status in (PurchaseOrder.Status.APPROVED, PurchaseOrder.Status.ORDERED):
+            from .services import vendor_from_order
+
+            vendor_from_order(purchase_order)
 
         # An order that somehow reached placement without approval on record
         # still gets a date the day it is placed.

@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     NotificationViewSet,
     PushTokenViewSet,
+    CalendarEventViewSet,
     StickyNoteViewSet,
     WebhookEndpointViewSet,
 )
@@ -13,6 +14,7 @@ router = DefaultRouter()
 router.register("notifications", NotificationViewSet, basename="notification")
 router.register("push-tokens", PushTokenViewSet, basename="push-token")
 router.register("sticky-notes", StickyNoteViewSet, basename="sticky-note")
+router.register("calendar", CalendarEventViewSet, basename="calendar-event")
 router.register("webhooks", WebhookEndpointViewSet)
 
 urlpatterns = [

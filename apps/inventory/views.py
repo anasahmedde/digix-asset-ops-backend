@@ -97,6 +97,7 @@ class InventoryItemViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 item=item,
                 movement_type=StockMovement.MovementType.OPENING,
                 quantity=item.quantity,
+                unit_cost=item.unit_cost,
                 reference="Opening stock",
                 notes=f"Opening balance of {item.quantity} {unit}{rate}.",
                 performed_by=self.request.user,
@@ -116,6 +117,13 @@ class InventoryItemViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             elif value in ("false", "0"):
                 qs = qs.filter(quantity__gt=F("min_stock_level"))
         return qs
+
+    @action(detail=True, methods=["get"])
+    def batches(self, request, pk=None):
+        """Every batch on the shelf for this component, with its bin and cost."""
+        from .services import batches_for
+
+        return Response(batches_for(self.get_object()))
 
     @action(detail=False, methods=["get"], url_path="export")
     def export(self, request):
@@ -240,10 +248,12 @@ class InventoryUnitTypeViewSet(viewsets.ModelViewSet):
         if status:
             qs = qs.filter(status__in=[s.strip() for s in status.split(",") if s.strip()])
         qs = qs.order_by("-created_at")
+        # With the request in the context the reader's right to see prices applies.
+        ctx = self.get_serializer_context()
         page = self.paginate_queryset(qs)
         if page is not None:
-            return self.get_paginated_response(InventoryUnitSerializer(page, many=True).data)
-        return Response(InventoryUnitSerializer(qs, many=True).data)
+            return self.get_paginated_response(InventoryUnitSerializer(page, many=True, context=ctx).data)
+        return Response(InventoryUnitSerializer(qs, many=True, context=ctx).data)
 
 
 # Statuses that mean the unit is no longer on the shelf. Each one is a way of
@@ -293,7 +303,7 @@ class InventoryUnitViewSet(viewsets.ModelViewSet):
         with transaction.atomic():
             units = serializer.save()
         return Response(
-            {"created": len(units), "units": InventoryUnitSerializer(units, many=True).data},
+            {"created": len(units), "units": InventoryUnitSerializer(units, many=True, context=self.get_serializer_context()).data},
             status=201,
         )
 
@@ -311,7 +321,12 @@ class InventoryUnitViewSet(viewsets.ModelViewSet):
         from apps.warranties.services import term_months
 
         unit = self.get_object()
-        start = parse_date(str(request.data.get("start_date") or "")) or unit.purchase_date or timezone.localdate()
+        # The cover runs from the delivery inspection, never from a typed date.
+        line = unit.goods_receipt_line
+        start = (
+            timezone.localdate(line.inspected_at) if line is not None and line.inspected_at
+            else unit.purchase_date or timezone.localdate()
+        )
         raw_end, raw_months = request.data.get("end_date"), request.data.get("months")
         try:
             end = (parse_date(str(raw_end)) if raw_end
@@ -584,7 +599,7 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
                 InventoryItemSerializer(result["inventory_item"]).data
                 if result["inventory_item"] else None
             ),
-            "stocked_units": InventoryUnitSerializer(result["units"], many=True).data,
+            "stocked_units": InventoryUnitSerializer(result["units"], many=True, context=self.get_serializer_context()).data,
             "ready_requests": result.get("ready_requests", []),
         })
 
@@ -649,7 +664,7 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
                 InventoryItemSerializer(result["inventory_item"]).data
                 if result["inventory_item"] else None
             ),
-            "stocked_units": InventoryUnitSerializer(result["units"], many=True).data,
+            "stocked_units": InventoryUnitSerializer(result["units"], many=True, context=self.get_serializer_context()).data,
             # Material requests waiting on this line: the store issues against them.
             "ready_requests": result.get("ready_requests", []),
         })
@@ -715,6 +730,7 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
                 item=item,
                 movement_type=StockMovement.MovementType.IN,
                 quantity=receipt.quantity,
+                unit_cost=item.unit_cost,
                 reference=receipt.grn_number,
                 performed_by=self.request.user,
                 notes=f"Goods receipt {receipt.grn_number}",
@@ -753,13 +769,15 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         "item", "item__material_type", "unit_type", "project",
         "asset_component", "asset_component__device",
         "maintenance_schedule", "requested_by", "issued_by",
-    ).all()
+    ).prefetch_related("reorders__purchase_order_item__purchase_order").all()
     serializer_class = IssuanceRequestSerializer
     permission_classes = [IsAuthenticated, CapabilityGate]
     read_capability = "view_stock"
     action_capabilities = {
         "issue": "issue_stock", "send_back": "issue_stock",
         "destroy": "cancel_material_request", "cancel": "cancel_material_request",
+        # The store, or whoever decides requirements, sends a short line to be bought.
+        "procure": ("manage_stock", "request_material", "decide_requirements", "review_maintenance"),
         # Who may put a line on the store's queue is checked inside.
         "create": None,
     }
@@ -807,6 +825,49 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
                     + (f" · {req.project.name}" if req.project_id else ""),
             link="/inventory?tab=requests", ref=f"issue:{req.pk}", data={"request": str(req.pk)},
         )
+
+    @action(detail=True, methods=["post"])
+    def procure(self, request, pk=None):
+        """The shelf cannot cover this ask: buy the shortfall for it.
+
+        Raises a reorder request for what is missing, tied to this line, and
+        marks the line as on order. It then follows the usual road - a
+        purchase order, delivery, inspection, into stock - and the moment the
+        goods are stocked the line is back on the store's queue to issue.
+        """
+        from .models import ReorderRequest
+
+        row = self.get_object()
+        if row.status in (IssuanceRequest.Status.FULFILLED, IssuanceRequest.Status.CANCELLED):
+            return Response({"detail": "This request is settled."}, status=400)
+        if row.awaiting_procurement:
+            return Response({"detail": "Already on order for this request."}, status=400)
+        try:
+            wanted = int(request.data.get("quantity") or 0)
+        except (TypeError, ValueError):
+            wanted = 0
+        available = row.available_quantity or 0
+        shortfall = max(row.outstanding_quantity - available, 0)
+        quantity = wanted or shortfall
+        if quantity < 1:
+            return Response(
+                {"detail": "The shelf covers this request - issue it instead of buying more."},
+                status=400,
+            )
+        reorder = ReorderRequest.objects.create(
+            item=row.item, unit_type=row.unit_type, quantity=quantity,
+            reason=f"For {row.request_number}" + (f" - {row.purpose}" if row.purpose else ""),
+            issuance_request=row, requested_by=request.user,
+        )
+        row.awaiting_procurement = True
+        row.save(update_fields=["awaiting_procurement", "updated_at"])
+        notices.ask(
+            "raise_po", exclude=[request.user], kind="request_raised",
+            title=f"Procurement needed: {row.what}",
+            message=f"{quantity} {reorder.unit} short for {row.request_number} · {reorder.request_number}",
+            link="/procurement?tab=requisitions", ref=f"reorder:{reorder.pk}", data={"request": str(reorder.pk)},
+        )
+        return Response(self.get_serializer(row).data)
 
     def _store_only(self, request):
         # Approval gate 3: the store hands material over; management may too.
@@ -882,6 +943,8 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
             )
 
         note = (request.data.get("note") or "").strip()
+        if not note:
+            return Response({"note": ["Say why it is going back."]}, status=400)
         part = getattr(issuance_request, "maintenance_part_request", None)
         component = issuance_request.asset_component
 
@@ -961,6 +1024,7 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
     def cancel(self, request, pk=None):
         """Close a request that is no longer needed; issued stock is untouched."""
         issuance_request = self.get_object()
+        note = (request.data.get("reason") or "").strip()
         issuance_request.status = IssuanceRequest.Status.CANCELLED
         issuance_request.save(update_fields=["status", "updated_at"])
         notices.resolve(f"issue:{issuance_request.pk}")

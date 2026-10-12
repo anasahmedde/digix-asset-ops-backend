@@ -1,3 +1,4 @@
+from apps.notifications.service import inform_line, who as _who
 from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
@@ -96,7 +97,13 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         return WorkOrderSerializer
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        wo = serializer.save(created_by=self.request.user)
+        inform_line(
+            self.request.user,
+            title=f"Work order raised: {wo.wo_number}",
+            message=f"{wo.title} - by {_who(self.request.user)}",
+            link=f"/work-orders?wo={wo.pk}", ref=f"fyi-wo:{wo.pk}",
+        )
 
     @action(detail=True, methods=["post"], url_path="price-variance")
     def price_variance(self, request, pk=None):
@@ -205,6 +212,9 @@ class WorkOrderViewSet(viewsets.ModelViewSet):
         ser = WorkOrderTransitionSerializer(data=request.data, context={"work_order": work_order})
         ser.is_valid(raise_exception=True)
         new_status = ser.validated_data["status"]
+        going_back = new_status == WorkOrder.Status.DRAFT and work_order.status != WorkOrder.Status.DRAFT
+        if (going_back or new_status == WorkOrder.Status.CANCELLED) and not (ser.validated_data.get("notes") or "").strip():
+            return Response({"notes": ["Say why it is going back."]}, status=status.HTTP_400_BAD_REQUEST)
         now = timezone.now()
 
         # The same sign-off as a purchase order: approving is its own right;

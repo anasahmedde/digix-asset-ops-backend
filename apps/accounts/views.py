@@ -197,7 +197,16 @@ class UserViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
+        from .capabilities import SUPER_ADMIN_ONLY
         from .roles import defaults_for
+
+        if subject.role != "super_admin":
+            locked = sorted({r["capability"] for r in rows if r["allowed"]} & SUPER_ADMIN_ONLY)
+            if locked:
+                return Response(
+                    {"detail": f"Only the Administrator may hold: {', '.join(locked)}."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
 
         defaults = defaults_for(subject.role)
         with transaction.atomic():

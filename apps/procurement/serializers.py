@@ -251,14 +251,23 @@ class PurchaseOrderSerializer(DateOrder, HidesMoney, serializers.ModelSerializer
     def update(self, instance, validated_data):
         items = validated_data.pop("items", None)
 
-        if items is not None and instance.status not in self.ITEM_WRITE_STATUSES:
-            raise serializers.ValidationError({
-                "items": (
-                    f"Line items cannot be modified while the purchase order is "
-                    f"'{instance.get_status_display()}'. Items are only editable in "
-                    f"Draft or Pending Approval."
-                )
-            })
+        # An order that has left Draft is a record of what was agreed: the
+        # supplier, the terms, the lines and the dates stay as signed. Only
+        # the notes may grow. To change the rest, send it back to Draft.
+        if instance.status != PurchaseOrder.Status.DRAFT:
+            changed = {
+                k for k, v in validated_data.items()
+                if k != "notes" and getattr(instance, k, None) != v
+            }
+            if items is not None:
+                changed.add("items")
+            if changed:
+                raise serializers.ValidationError({
+                    "detail": (
+                        f"This order is {instance.get_status_display()}; only its notes can "
+                        "change now. Send it back to Draft to edit it."
+                    )
+                })
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)

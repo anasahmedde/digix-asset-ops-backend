@@ -40,7 +40,21 @@ class WarrantySerializer(DateOrder, serializers.ModelSerializer):
         client = obj.device.client_for
         return client.name if client is not None else None
 
+    def to_representation(self, instance):
+        # The status a reader sees is derived (dates and the asset's own
+        # state); the stored word only records reissues, voids and claims.
+        data = super().to_representation(instance)
+        data["status"] = instance.state
+        data["status_display"] = instance.state_display
+        data["is_expired"] = instance.state in ("expired", "ended")
+        return data
+
     def validate(self, attrs):
+        # The start is never typed: the client's cover runs from the day the
+        # asset went active, the vendor's from the delivery inspection (the
+        # asset's purchase date is stamped at receipt). Anything sent is
+        # dropped, and the anchoring below dates a new warranty.
+        attrs.pop("start_date", None)
         # The client's cover is given where the order is run, against the
         # project's own term, and starts the day the asset goes live.
         if self.instance is None and attrs.get("warranty_type") == Warranty.WarrantyType.CLIENT:
@@ -72,18 +86,17 @@ class WarrantySerializer(DateOrder, serializers.ModelSerializer):
             ):
                 attrs["warranty_type"] = Warranty.WarrantyType.SUPPLIER
 
-            # Anchoring defaults: supplier-side warranties start at the
-            # procurement/delivery date, client warranties at handover (today
-            # until the installation handover re-anchors them).
+            # Anchoring: supplier-side warranties start at the delivery
+            # inspection (stamped on the asset as its purchase date), client
+            # warranties at activation (today until the tracker re-anchors them).
             from dateutil.relativedelta import relativedelta
             from django.utils import timezone
 
             warranty_type = attrs.get("warranty_type") or Warranty.WarrantyType.MANUFACTURER
-            if not attrs.get("start_date"):
-                if warranty_type == Warranty.WarrantyType.CLIENT:
-                    attrs["start_date"] = timezone.now().date()
-                else:
-                    attrs["start_date"] = (device.purchase_date if device else None) or timezone.now().date()
+            if warranty_type == Warranty.WarrantyType.CLIENT:
+                attrs["start_date"] = timezone.now().date()
+            else:
+                attrs["start_date"] = (device.purchase_date if device else None) or timezone.now().date()
             if not attrs.get("end_date"):
                 months = attrs.get("months")
                 if not months:
@@ -94,6 +107,18 @@ class WarrantySerializer(DateOrder, serializers.ModelSerializer):
         end = attrs.get("end_date") or getattr(self.instance, "end_date", None)
         if start and end and end <= start:
             raise serializers.ValidationError({"end_date": "The end date has to come after the start date."})
+
+        # The term and the dates are one fact told two ways, so an edit to
+        # either keeps the other true: a new term moves the end date, a moved
+        # date re-reads the term (whole months, or none when it is not one).
+        if self.instance is not None and start and end:
+            from dateutil.relativedelta import relativedelta
+
+            if attrs.get("months") and attrs["months"] != self.instance.months:
+                attrs["end_date"] = start + relativedelta(months=attrs["months"])
+            elif start != self.instance.start_date or end != self.instance.end_date:
+                span = relativedelta(end, start)
+                attrs["months"] = (span.years * 12 + span.months) if span.days == 0 else None
         return attrs
 
     def update(self, instance, validated_data):

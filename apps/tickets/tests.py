@@ -1081,3 +1081,28 @@ def test_a_ticket_says_what_it_is_about(people):
     }, format="json")
     assert r.status_code == 201, r.content
     assert str(r.data["device"]) == str(d1.pk)
+
+
+@pytest.mark.django_db
+def test_a_typed_comment_is_kept_with_or_without_a_photo(people, warranty_device):
+    """A comment's text was dropped on the way in (the field was read-only),
+    so a photo with a caption was refused as empty and text alone saved blank."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from apps.tickets.models import TicketIssueType
+    kind, _ = TicketIssueType.objects.get_or_create(name="General Fault")
+    c = _client(people["ops"])
+    r = c.post("/api/tickets/", {"title": "Comment check", "device": str(warranty_device.pk), "issue_type": str(kind.id),
+                                 "priority": "high", "category": "repair", "description": "x"}, format="json")
+    assert r.status_code == 201, r.content
+    tid = r.data["id"]
+    r = c.post(f"/api/tickets/{tid}/comments/", {"content": "Why is this not solved yet?"}, format="json")
+    assert r.status_code == 201 and r.data["content"] == "Why is this not solved yet?", r.content
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4), "red").save(buf, format="PNG")
+    png = SimpleUploadedFile("shot.png", buf.getvalue(), content_type="image/png")
+    r = c.post(f"/api/tickets/{tid}/comments/", {"content": "see photo", "image": png}, format="multipart")
+    assert r.status_code == 201 and r.data["content"] == "see photo" and r.data["image"], r.content
+    r = c.post(f"/api/tickets/{tid}/comments/", {"content": ""}, format="json")
+    assert r.status_code == 400

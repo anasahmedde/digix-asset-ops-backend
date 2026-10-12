@@ -163,6 +163,8 @@ class StickyNote(TimeStampedModel):
     mentions = models.ManyToManyField(
         settings.AUTH_USER_MODEL, blank=True, related_name="sticky_note_mentions"
     )
+    # Dealt with: ticked off on the board, and when.
+    done_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -170,3 +172,37 @@ class StickyNote(TimeStampedModel):
 
     def __str__(self):
         return f"{self.get_scope_display()} · {self.body[:40]}"
+
+
+class CalendarEvent(TimeStampedModel):
+    """A date somebody wants to see coming: a delivery, a visit, a meeting.
+
+    Project deliveries and milestones appear on the calendar by themselves;
+    this is for everything else, and for pinning a note to a project's
+    timeline. A reminder lands in Notifications the set number of days
+    before. Private by default; a team event is on everybody's calendar.
+    """
+
+    class Scope(models.TextChoices):
+        SELF = "self", "Only me"
+        TEAM = "team", "Team"
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="calendar_events"
+    )
+    scope = models.CharField(max_length=5, choices=Scope.choices, default=Scope.SELF)
+    title = models.CharField(max_length=200)
+    date = models.DateField(db_index=True)
+    time = models.TimeField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    project = models.ForeignKey(
+        "teams.Project", on_delete=models.SET_NULL, null=True, blank=True, related_name="calendar_events"
+    )
+    # 0 is the day itself.
+    remind_days_before = models.PositiveSmallIntegerField(default=1)
+
+    class Meta:
+        ordering = ["date", "time", "created_at"]
+
+    def __str__(self):
+        return f"{self.date} {self.title}"

@@ -97,9 +97,9 @@ class UserSerializer(DateOrder, serializers.ModelSerializer):
             "employee_id", "cnic", "join_date", "leaving_date",
             "reports_to", "reports_to_name", "direct_report_count", "capabilities",
             "supplier", "supplier_name",
-            "is_active", "date_joined",
+            "is_active", "date_joined", "last_login",
         ]
-        read_only_fields = ["id", "date_joined"]
+        read_only_fields = ["id", "date_joined", "last_login"]
 
     def get_fields(self):
         fields = super().get_fields()
@@ -109,6 +109,9 @@ class UserSerializer(DateOrder, serializers.ModelSerializer):
         # record, not just their own profile fields.
         can = getattr(actor, "can", None)
         may_manage = _is_super_admin(actor) or (callable(can) and can("manage_team"))
+        # The login itself - its name, address and whether it works - is
+        # account administration, which is the Super Admin's alone.
+        may_admin_logins = _is_super_admin(actor) or (callable(can) and can("manage_logins"))
 
         # Nobody rewrites their own authority. The rule was enforced on the
         # capabilities endpoint but not here, so a super_admin could PATCH
@@ -129,6 +132,10 @@ class UserSerializer(DateOrder, serializers.ModelSerializer):
             for name, field in fields.items():
                 if name not in self.SELF_WRITABLE_FIELDS:
                     field.read_only = True
+        elif not may_admin_logins and not editing_self:
+            for name in ("username", "email", "is_active"):
+                if name in fields:
+                    fields[name].read_only = True
         return fields
 
     def to_representation(self, instance):
@@ -234,6 +241,17 @@ class RoleDefinitionSerializer(serializers.ModelSerializer):
         if unknown:
             raise serializers.ValidationError(f"No such capability: {', '.join(unknown)}.")
         return sorted(set(value))
+
+    def validate(self, attrs):
+        from .capabilities import SUPER_ADMIN_ONLY
+
+        key = attrs.get("key") or getattr(self.instance, "key", None)
+        held = set(attrs.get("capabilities", []))
+        if key != "super_admin" and held & SUPER_ADMIN_ONLY:
+            raise serializers.ValidationError({
+                "capabilities": [f"Only the Administrator role may hold: {', '.join(sorted(held & SUPER_ADMIN_ONLY))}."],
+            })
+        return attrs
 
     def validate_key(self, value):
         # The key is what every account stores, so it is fixed once set.

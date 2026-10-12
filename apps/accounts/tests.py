@@ -342,17 +342,20 @@ def test_group_head_approves_a_budget_someone_else_submitted(group_head):
 
 @pytest.mark.django_db
 def test_four_eyes_rule_still_applies_to_the_group_head(group_head):
-    """Complete rights are not a licence to approve your own submission."""
+    """Complete rights are not a licence to approve your own submission - and
+    whoever signs budgets does not submit one for their own signature."""
     from apps.teams.models import Project, ProjectCostLine
 
     project = Project.objects.create(name="Self Approval Project")
     ProjectCostLine.objects.create(project=project, cost_type="Travelling", quantity=1, unit_cost=1000)
     c = _client(group_head)
-    assert c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json").status_code == 200
+    r = c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json")
+    assert r.status_code == 403 and "approve budgets" in str(r.data)
 
-    r = c.post(f"/api/teams/projects/{project.id}/approve-budget/", {"notes": "mine"}, format="json")
+    ops = User.objects.create_user(username="acc-ops-4eyes", password="x", role="ops_manager")
+    assert _client(ops).post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json").status_code == 200
+    r = _client(ops).post(f"/api/teams/projects/{project.id}/approve-budget/", {"notes": "mine"}, format="json")
     assert r.status_code == 403
-    assert "someone else has to approve" in str(r.data)
 
 
 
@@ -423,3 +426,44 @@ def test_the_reporting_line_stays_a_tree_and_is_moved_by_managers():
     r = _client(tech).patch(f"/api/accounts/users/{tech.pk}/", {"reports_to": str(head.pk)}, format="json")
     tech.refresh_from_db()
     assert tech.reports_to_id == other.pk
+
+
+@pytest.mark.django_db
+def test_account_administration_stays_with_the_super_admin(group_head, technician):
+    """Nobody but the Super Admin switches a login on or off, renames it, or
+    resets its password; and manage_logins cannot be handed out through a
+    role or an adjustment."""
+    from apps.accounts.models import RoleDefinition
+    from apps.accounts.roles import ensure_seeded
+
+    c = _client(group_head)
+    # The Group Head manages people, but the login itself does not move.
+    r = c.patch(f"/api/accounts/users/{technician.pk}/", {"is_active": False, "username": "renamed"}, format="json")
+    technician.refresh_from_db()
+    assert technician.is_active and technician.username == "acc-tech", r.content
+    r = c.post(f"/api/accounts/users/{technician.pk}/reset-password/", {"new_password": "Str0ng-Pass!23"}, format="json")
+    assert r.status_code == 403
+
+    # Not through a role...
+    ensure_seeded()
+    role = RoleDefinition.objects.get(key="group_head")
+    r = c.patch(f"/api/accounts/roles/{role.pk}/", {"capabilities": sorted(set(role.capabilities) | {"manage_logins"})}, format="json")
+    assert r.status_code == 400 and "Administrator" in str(r.content)
+    # ...nor through an adjustment.
+    r = c.put(f"/api/accounts/users/{technician.pk}/capabilities/", {
+        "overrides": [{"capability": "manage_logins", "allowed": True, "reason": "try"}],
+    }, format="json")
+    assert r.status_code == 403
+    assert not technician.capability_overrides.filter(capability="manage_logins").exists()
+
+    admin = User.objects.create_user(username="acc-sa2", password="x", role="super_admin")
+    a = _client(admin)
+    r = a.patch(f"/api/accounts/users/{technician.pk}/", {"is_active": False, "username": "renamed"}, format="json")
+    assert r.status_code == 200, r.content
+    technician.refresh_from_db()
+    assert not technician.is_active and technician.username == "renamed"
+    r = a.post(f"/api/accounts/users/{technician.pk}/reset-password/", {"new_password": "Str0ng-Pass!23"}, format="json")
+    assert r.status_code == 200
+    technician.refresh_from_db()
+    assert technician.check_password("Str0ng-Pass!23")
+    assert "last_login" in a.get(f"/api/accounts/users/{technician.pk}/").data

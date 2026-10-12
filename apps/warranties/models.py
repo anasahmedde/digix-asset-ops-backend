@@ -77,7 +77,45 @@ class Warranty(TimeStampedModel):
     @property
     def is_expired(self):
         from django.utils import timezone
-        return self.end_date < timezone.now().date()
+        return self.end_date < timezone.localdate()
+
+    # What the cover is worth today, read from the dates and from the asset
+    # itself rather than from a stored word. Reissued and void are records
+    # of what was done to it and stay as written.
+    STATE_LABELS = {
+        "active": "Active", "expired": "Expired", "not_started": "Not started",
+        "ended": "Ended", "claimed": "Pending", "reissued": "Reissued", "void": "Void",
+    }
+
+    @property
+    def state(self) -> str:
+        from django.utils import timezone
+
+        from apps.assets.models import Device
+
+        if self.status in (self.Status.REISSUED, self.Status.VOID, self.Status.CLAIMED):
+            return self.status
+        device = self.device
+        if device.status in (Device.Status.DECOMMISSIONED, Device.Status.LOST_STOLEN):
+            return "ended"
+        if device.status == Device.Status.RMA and self.warranty_type != self.WarrantyType.CLIENT:
+            return "claimed"
+        today = timezone.localdate()
+        if today > self.end_date:
+            return "expired"
+        if today < self.start_date:
+            return "not_started"
+        # The client's cover runs from the day the asset goes live with them.
+        if self.warranty_type == self.WarrantyType.CLIENT and device.status in (
+            Device.Status.PROCURED, Device.Status.IN_PRODUCTION, Device.Status.IN_STOCK,
+            Device.Status.ASSIGNED, Device.Status.IN_TRANSIT,
+        ):
+            return "not_started"
+        return "active"
+
+    @property
+    def state_display(self) -> str:
+        return self.STATE_LABELS.get(self.state, self.state)
 
 
 class WarrantyClaim(TimeStampedModel):

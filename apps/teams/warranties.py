@@ -121,7 +121,8 @@ def warranty_rows(project):
                 "months": cover.months,
                 "start_date": cover.start_date,
                 "end_date": cover.end_date,
-                "status": cover.status,
+                "status": cover.state,
+                "status_display": cover.state_display,
             },
         })
     return rows

@@ -55,7 +55,7 @@ class Ticket(TimeStampedModel):
         ALIGNMENT_PENDING = "alignment_pending", "Alignment Pending"
         PENDING_OPS_APPROVAL = "pending_ops_approval", "Pending Ops Approval"
         PENDING_CLIENT_APPROVAL = "pending_client_approval", "Pending Client Approval"
-        PENDING_REVIEW = "pending_review", "Pending Review"
+        PENDING_REVIEW = "pending_review", "In Review"
         APPROVED = "approved", "Resolved (Ops Approved)"
         REJECTED = "rejected", "Rejected"
         CLOSED = "closed", "Closed"
