@@ -23,6 +23,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from common.branding import letterhead
+
 # Printed as the buyer. One place to change it when the letterhead changes.
 COMPANY_NAME = "DIGIX Asset Management"
 
@@ -118,7 +120,7 @@ def render_purchase_order_pdf(purchase_order, *, show_prices: bool = True) -> by
         author=COMPANY_NAME,
     )
     currency = purchase_order.currency
-    story: list = []
+    story: list = [letterhead()]
 
     # --- Masthead -------------------------------------------------------
     masthead = Table(

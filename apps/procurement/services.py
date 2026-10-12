@@ -262,3 +262,27 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
         "created_devices": [],
         "lines": GoodsReceiptLineSerializer(receipt_lines, many=True).data,
     }
+
+
+def vendor_from_order(purchase_order) -> int:
+    """A vendor-supplied-and-installed asset takes its vendor from the order
+    that bought it, the moment that order is approved or placed. Nobody knew
+    the vendor when the asset was registered; the order is where it is known.
+    """
+    from apps.assets.models import Device
+
+    supplier = purchase_order.supplier
+    if supplier is None:
+        return 0
+    contact = " · ".join(p for p in (supplier.contact_person, getattr(supplier, "contact_phone", "")) if p)
+    n = 0
+    for device in Device.objects.filter(
+        procurement_item__purchase_order=purchase_order, source="vendor_turnkey"
+    ).exclude(assigned_vendor=supplier):
+        device.assigned_vendor = supplier
+        device.assigned_vendor_name = supplier.name
+        if not device.assigned_vendor_contact:
+            device.assigned_vendor_contact = contact
+        device.save(update_fields=["assigned_vendor", "assigned_vendor_name", "assigned_vendor_contact", "updated_at"])
+        n += 1
+    return n

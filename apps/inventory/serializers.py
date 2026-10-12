@@ -29,21 +29,59 @@ class InventoryItemSerializer(HidesMoney, serializers.ModelSerializer):
     unit = serializers.CharField(source="material_type.unit", read_only=True, default=None)
     is_low_stock = serializers.BooleanField(read_only=True)
     total_value = serializers.SerializerMethodField()
+    # Every bin that still holds some of this component (one batch each).
+    storage_locations = serializers.SerializerMethodField()
+
+    def _batches(self, obj):
+        from .services import batches_for
+
+        cache = self.context.setdefault("_batches", {})
+        if obj.pk not in cache:
+            cache[obj.pk] = batches_for(obj)
+        return cache[obj.pk]
+
+    def get_storage_locations(self, obj):
+        seen = []
+        for batch in self._batches(obj):
+            place = batch["storage_location"]
+            if batch["remaining"] > 0 and place and place not in seen:
+                seen.append(place)
+        return seen
+
+    # What the last delivery cost; the item's own rate when none is recorded.
+    latest_cost = serializers.SerializerMethodField()
+
+    def get_latest_cost(self, obj):
+        for batch in reversed(self._batches(obj)):
+            if batch["unit_cost"] is not None:
+                return batch["unit_cost"]
+        return obj.unit_cost
 
     class Meta:
         model = InventoryItem
         fields = [
             "id", "material_type", "material_name", "category", "category_name",
-            "sku", "quantity", "min_stock_level", "unit", "location", "storage_location",
+            "sku", "quantity", "min_stock_level", "unit", "location", "storage_location", "storage_locations", "latest_cost",
             "unit_cost", "total_value", "watch_on_dashboard", "notes", "is_low_stock",
             "created_at", "updated_at",
         ]
         read_only_fields = ["id", "sku", "created_at", "updated_at"]
 
     def get_total_value(self, obj):
-        if obj.unit_cost is None:
-            return None
-        return obj.quantity * obj.unit_cost
+        """Worth what was paid for each batch, not one rate for all of it.
+
+        Deliveries come in at different prices. Stock that predates batch
+        records is valued at the item's own rate.
+        """
+        priced = [b for b in self._batches(obj) if b["remaining"] > 0]
+        traced = sum(b["remaining"] for b in priced)
+        value = sum(b["value"] for b in priced if b["value"] is not None)
+        rest = obj.quantity - traced
+        if rest > 0 or not priced:
+            if obj.unit_cost is None:
+                return None if not priced else value
+            value += rest * float(obj.unit_cost)
+        return value
 
     def validate_material_type(self, value):
         """One stock record per material.
@@ -76,6 +114,13 @@ class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
     in_stock_count = serializers.SerializerMethodField()
     # Where its units on the shelf are kept (list queryset only).
     storage_locations = serializers.SerializerMethodField()
+    # What the last unit received cost; the product's own rate when none has.
+    latest_cost = serializers.SerializerMethodField()
+
+    def get_latest_cost(self, obj):
+        # ponytail: one query per product row; annotate with a Subquery if the list grows slow
+        last = obj.units.exclude(purchase_price=None).order_by("-created_at").values_list("purchase_price", flat=True).first()
+        return last if last is not None else obj.unit_cost
     # Stock already on the shelf when the product is first opened. Serialized
     # items need a serial each, typed here — one per unit, all different, none
     # already in inventory. Opening at zero needs none.
@@ -96,7 +141,7 @@ class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
             "unit_cost", "min_stock_level", "is_high_value",
             "default_has_warranty", "default_warranty_type", "default_warranty_months",
             "supplier", "supplier_name",
-            "in_stock_count", "storage_locations", "opening_quantity", "opening_serials", "notes",
+            "in_stock_count", "storage_locations", "latest_cost", "opening_quantity", "opening_serials", "notes",
             "is_active", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "type_code", "created_at", "updated_at"]
@@ -114,6 +159,11 @@ class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
         shelf of uncategorised units is a shelf nobody can find anything
         on. Asked for on the way in, not chased afterwards.
         """
+        # An older record without one is not chased on an unrelated edit
+        # (watching it on the dashboard, say); only a change that touches the
+        # category, or a new product, has to answer.
+        if self.instance is not None and "category" not in attrs:
+            return
         category = attrs.get("category", getattr(self.instance, "category", None))
         if category is None:
             raise serializers.ValidationError(
@@ -243,6 +293,7 @@ class InventoryUnitSerializer(HidesMoney, serializers.ModelSerializer):
     # Where the unit physically is: fitted into an asset, or still on the shelf.
     installed_in_code = serializers.SerializerMethodField()
     installed_in_name = serializers.SerializerMethodField()
+    installed_in_site = serializers.SerializerMethodField()
 
     class Meta:
         model = InventoryUnit
@@ -251,7 +302,7 @@ class InventoryUnitSerializer(HidesMoney, serializers.ModelSerializer):
             "unit_type", "unit_type_name", "unit_type_code",
             "material_type", "material_name", "category", "category_name",
             "brand", "brand_name", "model_name",
-            "status", "location", "storage_location", "installed_in_code", "installed_in_name",
+            "status", "location", "storage_location", "installed_in_code", "installed_in_name", "installed_in_site",
             "supplier", "supplier_name", "purchase_date", "purchase_price", "batch_number",
             "goods_receipt_line", "grn_number", "po_number",
             "has_warranty", "warranty_type", "warranty_start", "warranty_months", "warranty_end",
@@ -269,8 +320,9 @@ class InventoryUnitSerializer(HidesMoney, serializers.ModelSerializer):
         return str(obj.unit_type) if obj.unit_type_id else None
 
     def _installed_device(self, obj):
-        """The asset this unit was fitted into, if it has been."""
-        component = getattr(obj, "asset_component", None)
+        """The asset this unit was fitted into, if it has been: the build line
+        that names it, or the requirement it was issued against."""
+        component = getattr(obj, "asset_component", None) or obj.fitted_to
         return getattr(component, "device", None) if component else None
 
     def get_installed_in_code(self, obj):
@@ -280,6 +332,12 @@ class InventoryUnitSerializer(HidesMoney, serializers.ModelSerializer):
     def get_installed_in_name(self, obj):
         device = self._installed_device(obj)
         return (device.display_name or "") if device else None
+
+    def get_installed_in_site(self, obj):
+        """Where that asset stands, so the part can be found."""
+        device = self._installed_device(obj)
+        site = getattr(device, "current_site", None) if device else None
+        return site.name if site else None
 
     def validate_serial_number(self, value):
         value = (value or "").strip()
@@ -974,7 +1032,13 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
 
     def _po_line(self, obj):
         component = obj.asset_component
-        return component.purchase_order_item if component is not None else None
+        if component is not None and component.purchase_order_item_id:
+            return component.purchase_order_item
+        # Bought for by the store: the reorder it raised carries the line.
+        for reorder in obj.reorders.all():
+            if reorder.purchase_order_item_id:
+                return reorder.purchase_order_item
+        return None
 
     def get_awaiting_procurement(self, obj):
         """True while the store cannot issue: the goods are still being bought."""
@@ -989,10 +1053,8 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         return line.stocked_quantity if line is not None else 0
 
     def get_po_number(self, obj):
-        component = obj.asset_component
-        if component is None or component.purchase_order_item_id is None:
-            return None
-        return component.purchase_order_item.purchase_order.po_number
+        line = self._po_line(obj)
+        return line.purchase_order.po_number if line is not None else None
 
     class Meta:
         model = IssuanceRequest

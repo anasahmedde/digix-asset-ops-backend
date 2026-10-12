@@ -35,17 +35,15 @@ def get_active_client_warranty(device):
     """Newest live client-type warranty covering ``device``, or None."""
     if device is None:
         return None
-    from django.utils import timezone
-
-    # A lapsed date ends cover whatever the stored status still says.
-    return (
-        device.warranties.filter(
-            warranty_type=Warranty.WarrantyType.CLIENT, status__in=LIVE_STATUSES,
-            end_date__gte=timezone.localdate(),
-        )
+    # One rule for "covered", the same one every screen shows: the derived
+    # state, which reads the dates and the asset itself (not started until
+    # the asset is live with the client, ended once it is gone).
+    live = [
+        w for w in device.warranties.filter(warranty_type=Warranty.WarrantyType.CLIENT)
         .order_by("-end_date", "-created_at")
-        .first()
-    )
+        if w.state in ("active", "claimed")
+    ]
+    return live[0] if live else None
 
 
 def get_active_supplier_warranty(device):

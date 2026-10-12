@@ -10,7 +10,7 @@ from common.models import TimeStampedModel
 
 class User(AbstractUser):
     class Role(models.TextChoices):
-        SUPER_ADMIN = "super_admin", "Super Admin"
+        SUPER_ADMIN = "super_admin", "Administrator"
         GROUP_HEAD = "group_head", "Group Head"
         OPS_MANAGER = "ops_manager", "Operations Head"
         MARKETING_HEAD = "marketing_head", "Marketing Head"

@@ -195,7 +195,8 @@ def test_record_billability_defaults_from_warranty(ops):
 
     brand = Brand.objects.create(name="MB-Brand")
     dm = DeviceModel.objects.create(brand=brand, name="MB-1")
-    covered = Device.objects.create(device_model=dm, asset_code="AST-MB-1", serial_number="MB-1")
+    # Live with the client: the client's cover runs only once the asset is.
+    covered = Device.objects.create(device_model=dm, asset_code="AST-MB-1", serial_number="MB-1", status="active")
     uncovered = Device.objects.create(device_model=dm, asset_code="AST-MB-2", serial_number="MB-2")
     today = timezone.localdate()
     Warranty.objects.create(
@@ -1227,9 +1228,9 @@ def test_every_round_is_planned_on_its_own(parts_job):
     nxt = schedule.visits.exclude(pk=visit.pk).get()
     assert nxt.status == MaintenanceVisit.Status.PLANNED
     assert nxt.due_date == schedule.next_due > visit.due_date
-    assert nxt.assigned_to_id is None, (
-        "a fresh round goes out to nobody — the supervisor decides again, "
-        "rather than the last technician being volunteered by default"
+    assert nxt.assigned_to_id == schedule.assigned_to_id, (
+        "a fresh round goes to the standing technician — theirs unless a "
+        "supervisor or head reassigns it"
     )
 
 

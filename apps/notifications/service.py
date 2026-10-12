@@ -170,5 +170,29 @@ def resolve(ref):
     )
 
 
+def line_above(user):
+    """Everyone the person answers to, nearest first: their manager, that
+    manager's manager, and so on to the top of the organogram."""
+    seen, out = set(), []
+    boss = getattr(user, "reports_to", None)
+    while boss is not None and boss.pk not in seen:
+        seen.add(boss.pk)
+        out.append(boss)
+        boss = boss.reports_to
+    return out
+
+
+def inform_line(actor, *, title, message="", link="", ref="", data=None):
+    """Something important was opened by this person: the people above them
+    hear of it, for information. Nothing is asked of them."""
+    people = line_above(actor)
+    if not people:
+        return 0
+    return notify(
+        people, kind=Notification.Type.SYSTEM, title=title, message=message,
+        link=link, ref=ref, data=data, actionable=False, email=False,
+    )
+
+
 def who(user) -> str:
     return (user.get_full_name() or user.username) if user else "Someone"

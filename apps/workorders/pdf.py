@@ -20,6 +20,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from common.branding import letterhead
+
 from apps.procurement.documents import (
     BAND,
     COMPANY_NAME,
@@ -76,7 +78,7 @@ def build_work_order_pdf(work_order) -> bytes:
         author=COMPANY_NAME,
     )
     currency = work_order.currency
-    story: list = []
+    story: list = [letterhead()]
 
     # --- Masthead -------------------------------------------------------
     masthead = Table(

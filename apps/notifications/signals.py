@@ -123,15 +123,23 @@ def capture_installation_previous_state(sender, instance: DeviceInstallation, **
         try:
             old = DeviceInstallation.objects.get(pk=instance.pk)
             instance._prev_installed_by_id = old.installed_by_id
+            instance._prev_inst_status = getattr(old, "status", None)
         except DeviceInstallation.DoesNotExist:
             instance._prev_installed_by_id = None
+            instance._prev_inst_status = None
     else:
         instance._prev_installed_by_id = None
+        instance._prev_inst_status = None
 
 
 @receiver(post_save, sender=DeviceInstallation)
 def notify_installer_on_assignment(sender, instance: DeviceInstallation, created: bool, **kwargs):
     prev = getattr(instance, "_prev_installed_by_id", None)
+    status_now = getattr(instance, "status", None)
+    if not created and getattr(instance, "_prev_inst_status", None) != status_now and status_now not in (None, "not_started", "pending"):
+        from .service import resolve
+
+        resolve(f"installation-assign:{instance.pk}")
     if not instance.installed_by_id or (not created and prev == instance.installed_by_id):
         return
     try:
@@ -150,6 +158,8 @@ def notify_installer_on_assignment(sender, instance: DeviceInstallation, created
                 f"{instance.device.asset_code} at {instance.site.name}"
                 + (f" — due {instance.due_date}" if instance.due_date else "")
             ),
+            link=f"/installation-tracker?installation={instance.pk}",
+            ref=f"installation-assign:{instance.pk}",
             data=data,
             is_actionable=True,
         )
@@ -167,17 +177,36 @@ def capture_schedule_previous_state(sender, instance: MaintenanceSchedule, **kwa
         try:
             old = MaintenanceSchedule.objects.get(pk=instance.pk)
             instance._prev_assigned_to_id = old.assigned_to_id
+            instance._prev_status = old.status
         except MaintenanceSchedule.DoesNotExist:
             instance._prev_assigned_to_id = None
+            instance._prev_status = None
     else:
         instance._prev_assigned_to_id = None
+        instance._prev_status = None
 
 
 @receiver(post_save, sender=MaintenanceSchedule)
 def notify_maintenance_assignee(sender, instance: MaintenanceSchedule, created: bool, **kwargs):
+    from .service import resolve
+
     prev = getattr(instance, "_prev_assigned_to_id", None)
+    # Once the job moves off pending, the "assigned to you" notice is answered.
+    if not created and getattr(instance, "_prev_status", None) != instance.status and instance.status != "pending":
+        resolve(f"maintenance-assign:{instance.pk}")
     if not instance.assigned_to_id or (not created and prev == instance.assigned_to_id):
         return
+    # A corrective job is the ticket's work: the ticket carries the same
+    # technician - the ticket then tells them itself, with its own link -
+    # so the ticket list and every screen reading it agree.
+    ticket = instance.ticket if instance.ticket_id else None
+    if ticket is not None and ticket.assigned_to_id != instance.assigned_to_id:
+        ticket.assigned_to_id = instance.assigned_to_id
+        if not ticket.assigned_at:
+            ticket.assigned_at = timezone.now()
+        # The job's notice below is the one they get; the ticket stays quiet.
+        ticket._assigned_via_job = True
+        ticket.save(update_fields=["assigned_to", "assigned_at", "updated_at"])
     try:
         data = {"schedule_id": str(instance.id), "priority": instance.priority}
         if instance.device_id:
@@ -193,6 +222,9 @@ def notify_maintenance_assignee(sender, instance: MaintenanceSchedule, created: 
                 + (f" — {instance.device.asset_code}" if instance.device_id else "")
                 + (f" · due {instance.next_due}" if instance.next_due else "")
             ),
+            # Opens the job itself; stays until the job is started or acknowledged.
+            link=f"/maintenance?schedule={instance.pk}",
+            ref=f"maintenance-assign:{instance.pk}",
             data=data,
             is_actionable=True,
         )
@@ -227,7 +259,9 @@ def handle_ticket_notifications(sender, instance: Ticket, created: bool, **kwarg
     prev_status = getattr(instance, "_prev_status", None)
 
     if instance.assigned_to_id and (created or prev_assigned != instance.assigned_to_id):
-        _create_ticket_assignment_notification(instance)
+        # Assigned through its corrective job: that job already said so.
+        if not getattr(instance, "_assigned_via_job", False):
+            _create_ticket_assignment_notification(instance)
 
     # New unassigned ticket: park centrally and route to whoever assigns.
     if created and not instance.assigned_to_id:
@@ -255,6 +289,9 @@ def handle_ticket_notifications(sender, instance: Ticket, created: bool, **kwarg
         )
 
     if not created and prev_status != instance.status:
+        from .service import resolve as _resolve
+
+        _resolve(f"ticket-work:{instance.pk}")
         from .service import ask, resolve
 
         if prev_status in (Ticket.Status.PENDING_OPS_APPROVAL, Ticket.Status.PENDING_CLIENT_APPROVAL):
@@ -314,6 +351,8 @@ def _create_ticket_assignment_notification(ticket: Ticket):
         message=message,
         ticket=ticket,
         is_actionable=True,
+        link=f"/tickets?open={ticket.pk}",
+        ref=f"ticket-work:{ticket.pk}",
         data=_build_ticket_data(ticket),
     )
     _push_ws(notif)

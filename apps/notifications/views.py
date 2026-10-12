@@ -12,8 +12,9 @@ from common.permissions import IsSuperAdmin
 
 from rest_framework.exceptions import PermissionDenied
 
-from .models import Notification, PushToken, StickyNote, WebhookEndpoint
+from .models import CalendarEvent, Notification, PushToken, StickyNote, WebhookEndpoint
 from .serializers import (
+    CalendarEventSerializer,
     NotificationSerializer,
     PushTokenSerializer,
     StickyNoteSerializer,
@@ -61,6 +62,41 @@ class NotificationViewSet(viewsets.ModelViewSet):
         qs = Notification.objects.filter(recipient=self.request.user)
         qs = qs.exclude(is_actionable=True, resolved_at__isnull=False)
         return qs
+
+    @action(detail=False, methods=["get"], url_path="waiting-on")
+    def waiting_on(self, request):
+        """Whose desk something is on: everyone still holding an unanswered
+        request filed under ``?ref=``. Empty once it is answered, or when
+        nobody was asked."""
+        ref = (request.query_params.get("ref") or "").strip()
+        capability = (request.query_params.get("capability") or "").strip()
+        if not ref and not capability:
+            return Response([])
+        if not ref:
+            # Nothing filed: the desk is everyone who holds the right to decide.
+            from .service import holders_of
+
+            return Response([
+                {"id": str(p.pk), "name": p.get_full_name() or p.username,
+                 "role": (p.role or "").replace("_", " ").title(), "since": None}
+                for p in holders_of(capability)
+            ])
+        rows = (
+            Notification.objects.filter(ref=ref, is_actionable=True, resolved_at__isnull=True)
+            .select_related("recipient").order_by("created_at")
+        )
+        seen, out = set(), []
+        for n in rows:
+            if n.recipient_id in seen:
+                continue
+            seen.add(n.recipient_id)
+            out.append({
+                "id": str(n.recipient_id),
+                "name": n.recipient.get_full_name() or n.recipient.username,
+                "role": (n.recipient.role or "").replace("_", " ").title(),
+                "since": n.created_at,
+            })
+        return Response(out)
 
     @action(detail=False, methods=["get"])
     def unread_count(self, request):
@@ -153,7 +189,9 @@ class StickyNoteViewSet(viewsets.ModelViewSet):
         self._tell_the_tagged(note)
 
     def perform_update(self, serializer):
-        self._author_only(serializer.instance)
+        # Ticking a note off is anybody's on that board; changing its words is the author's.
+        if set(serializer.validated_data) - {"done"}:
+            self._author_only(serializer.instance)
         note = serializer.save()
         self._tell_the_tagged(note)
 
@@ -169,11 +207,96 @@ class StickyNoteViewSet(viewsets.ModelViewSet):
         """A tag is only useful if it reaches the person tagged."""
         if note.scope != StickyNote.Scope.TEAM:
             return
+        from .service import tell
+
         who = note.author.get_full_name() or note.author.username
-        for user in note.mentions.exclude(pk=note.author_id):
-            Notification.objects.create(
-                recipient=user,
-                notification_type=Notification.Type.SYSTEM,
-                title=f"{who} tagged you on a team note",
-                message=note.body[:300],
-            )
+        # Through the service, so it reaches the bell and the phone at once
+        # and opens the board, rather than sitting in the list until the
+        # next refresh.
+        tell(
+            list(note.mentions.exclude(pk=note.author_id)), kind=Notification.Type.SYSTEM,
+            title=f"{who} tagged you on a team note", message=note.body[:300],
+            link="/", ref=f"note:{note.pk}", data={"note": str(note.pk)},
+        )
+
+
+class CalendarEventViewSet(viewsets.ModelViewSet):
+    """The dashboard calendar: what people planned, and what the projects fix.
+
+    A person sees team events and their own. ``agenda`` adds the dates the
+    system already knows - project start and delivery dates, milestones -
+    for the month asked for, so one view holds everything that is coming.
+    """
+
+    serializer_class = CalendarEventSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        return (
+            CalendarEvent.objects.filter(Q(scope=CalendarEvent.Scope.TEAM) | Q(owner=user))
+            .select_related("owner", "project")
+        )
+
+    def perform_create(self, serializer):
+        serializer.save(owner=self.request.user)
+
+    def _owner_only(self, event):
+        if event.owner_id != self.request.user.id:
+            raise PermissionDenied("An event belongs to whoever planned it.")
+
+    def perform_update(self, serializer):
+        self._owner_only(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._owner_only(instance)
+        instance.delete()
+
+    @action(detail=False, methods=["get"])
+    def agenda(self, request):
+        """Everything dated in ``?month=YYYY-MM`` (this month by default)."""
+        import calendar as _cal
+        from datetime import date
+
+        raw = request.query_params.get("month") or ""
+        try:
+            y, m = (int(p) for p in raw.split("-"))
+            first = date(y, m, 1)
+        except (TypeError, ValueError):
+            today = timezone.localdate()
+            first = date(today.year, today.month, 1)
+        last = date(first.year, first.month, _cal.monthrange(first.year, first.month)[1])
+
+        items = [
+            {**CalendarEventSerializer(e, context={"request": request}).data, "kind": "event"}
+            for e in self.get_queryset().filter(date__range=(first, last))
+        ]
+        # The project dates are read from the projects themselves, so the
+        # calendar is never a second copy that drifts.
+        if request.user.can("view_projects"):
+            from apps.teams.models import Project, ProjectMilestone
+
+            projects = Project.objects.exclude(status__in=["completed", "on_hold"])
+            for p in projects.filter(target_date__range=(first, last)):
+                items.append({
+                    "id": f"project-target:{p.pk}", "kind": "project_target", "title": f"{p.name} - delivery",
+                    "date": p.target_date.isoformat(), "time": None, "project": str(p.pk), "project_name": p.name,
+                    "notes": "", "mine": False,
+                })
+            for p in projects.filter(start_date__range=(first, last)):
+                items.append({
+                    "id": f"project-start:{p.pk}", "kind": "project_start", "title": f"{p.name} - start",
+                    "date": p.start_date.isoformat(), "time": None, "project": str(p.pk), "project_name": p.name,
+                    "notes": "", "mine": False,
+                })
+            for ms in ProjectMilestone.objects.filter(
+                project__in=projects, due_date__range=(first, last), completed_at__isnull=True
+            ).select_related("project"):
+                items.append({
+                    "id": f"milestone:{ms.pk}", "kind": "milestone", "title": ms.title,
+                    "date": ms.due_date.isoformat(), "time": None, "project": str(ms.project_id),
+                    "project_name": ms.project.name, "notes": "", "mine": False,
+                })
+        items.sort(key=lambda i: (i["date"], i.get("time") or "", i["title"]))
+        return Response({"month": first.strftime("%Y-%m"), "items": items})

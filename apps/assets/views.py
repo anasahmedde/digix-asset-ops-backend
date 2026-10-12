@@ -1,3 +1,4 @@
+from apps.notifications.service import inform_line, who as _who
 import uuid
 
 from django.db import transaction
@@ -156,6 +157,16 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         "device_model__name", "current_site__name", "assigned_client__name",
     ]
     ordering_fields = ["created_at", "asset_code", "status", "installation_date"]
+
+    def perform_create(self, serializer):
+        device = serializer.save()
+        # The people above the registrar hear of a new asset, for information.
+        inform_line(
+            self.request.user,
+            title=f"Asset registered: {device.asset_code}",
+            message=f"{device.display_name or ''} - by {_who(self.request.user)}".strip(" -"),
+            link=f"/assets?device={device.pk}", ref=f"fyi-device:{device.pk}",
+        )
 
     def get_queryset(self):
         qs = super().get_queryset()

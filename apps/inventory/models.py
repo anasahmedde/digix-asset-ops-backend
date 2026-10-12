@@ -312,10 +312,19 @@ class InventoryUnit(TimeStampedModel):
 
     @property
     def warranty_state(self) -> str:
-        """``none`` | ``active`` | ``expired`` — drives the UI badge."""
+        """none / not_started / active / expired / ended — drives the badge.
+
+        Read from the dates and from the part itself: a scrapped or damaged
+        part has no cover worth the name whatever its certificate says.
+        """
         if not self.has_warranty or not self.warranty_end:
             return "none"
-        return "expired" if self.warranty_end < timezone.now().date() else "active"
+        if self.status in (self.Status.SCRAPPED, self.Status.DAMAGED):
+            return "ended"
+        today = timezone.localdate()
+        if self.warranty_start and today < self.warranty_start:
+            return "not_started"
+        return "expired" if self.warranty_end < today else "active"
 
     @property
     def is_under_warranty(self) -> bool:
@@ -342,6 +351,9 @@ class StockMovement(TimeStampedModel):
         "inventory.GoodsReceiptLine", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="stock_movements",
     )
+    # What this lot cost when it came in. Kept on the movement because the
+    # item's own rate follows the latest delivery and must not rewrite history.
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     notes = models.TextField(blank=True)
     performed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="stock_movements"
@@ -454,6 +466,9 @@ class GoodsReceiptLine(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="stocked_receipt_lines",
     )
+    # Where this delivery was put. One component can sit in several bins,
+    # a batch in each; the item's own field only remembers the latest.
+    storage_location = models.CharField(max_length=200, blank=True)
     receiving_notes = models.TextField(blank=True)
 
     class Meta:
@@ -682,6 +697,12 @@ class ReorderRequest(TimeStampedModel):
     purchase_order_item = models.ForeignKey(
         "procurement.PurchaseOrderItem", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="reorder_requests",
+    )
+    # The material request this buys for, when the store raised it because
+    # the shelf could not cover the ask. Stocking the delivery releases it.
+    issuance_request = models.ForeignKey(
+        "inventory.IssuanceRequest", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="reorders",
     )
     requested_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="reorder_requests"

@@ -16,6 +16,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from common.branding import letterhead
+
 
 def _company():
     from apps.setup.models import Company
@@ -36,7 +38,7 @@ def build_quotation_pdf(quotation) -> bytes:
     label = ParagraphStyle("l", parent=styles["Normal"], fontSize=8, textColor=colors.grey)
     body = ParagraphStyle("b", parent=styles["Normal"], fontSize=9)
 
-    elements = []
+    elements = [letterhead()]
     company = _company()
 
     # ── Header: company + quotation number ───────────────────────────

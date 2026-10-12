@@ -17,7 +17,7 @@ MONEY_FIELDS = frozenset({
     "grand_total", "budget", "budgeted", "planned_cost", "actual_cost",
     "estimated_cost", "labour_cost", "material_cost", "overhead_cost",
     "paid_amount", "balance", "balance_due", "margin", "selling_price",
-    "last_unit_price",
+    "last_unit_price", "latest_cost",
     "declared_value", "insured_value", "rate", "value",
     # Found leaking during the organogram walkthrough: a repair's cost
     # reached technicians through the maintenance record and the ticket,

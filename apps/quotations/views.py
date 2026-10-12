@@ -1,3 +1,4 @@
+from apps.notifications.service import inform_line, who as _who
 from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
@@ -63,7 +64,13 @@ class QuotationViewSet(viewsets.ModelViewSet):
     ordering_fields = ["created_at", "valid_until", "total_amount"]
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        quotation = serializer.save(created_by=self.request.user)
+        inform_line(
+            self.request.user,
+            title=f"Quotation raised: {quotation.quote_number}",
+            message=f"{quotation.title} - by {_who(self.request.user)}",
+            link="/quotations", ref=f"fyi-quote:{quotation.pk}",
+        )
 
     @action(detail=True, methods=["post"])
     def transition(self, request, pk=None):
@@ -71,6 +78,8 @@ class QuotationViewSet(viewsets.ModelViewSet):
         ser = QuotationTransitionSerializer(data=request.data, context={"quotation": quotation})
         ser.is_valid(raise_exception=True)
         new_status = ser.validated_data["status"]
+        if new_status == Quotation.Status.REJECTED and not (ser.validated_data.get("notes") or "").strip():
+            return Response({"notes": ["Say why it was rejected."]}, status=400)
 
         update_fields = ["status", "updated_at"]
         quotation.status = new_status

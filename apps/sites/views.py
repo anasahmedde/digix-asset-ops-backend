@@ -1,3 +1,4 @@
+from apps.notifications.service import inform_line, who as _who
 from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
@@ -105,6 +106,16 @@ class SiteViewSet(viewsets.ModelViewSet):
         if self.action == "list":
             return SiteListSerializer
         return SiteDetailSerializer
+
+
+    def perform_create(self, serializer):
+        site = serializer.save()
+        inform_line(
+            self.request.user,
+            title=f"Site added: {site.name}",
+            message=f"{(site.client.name + ' - ') if site.client_id else ''}{site.city or ''} - by {_who(self.request.user)}".replace("  ", " ").strip(" -"),
+            link=f"/sites?site={site.pk}", ref=f"fyi-site:{site.pk}",
+        )
 
 
 class SiteContactViewSet(viewsets.ModelViewSet):

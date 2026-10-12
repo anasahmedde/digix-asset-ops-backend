@@ -30,6 +30,10 @@ app.conf.beat_schedule = {
         "task": "apps.notifications.tasks.remind_pending_work",
         "schedule": 86400.0,  # daily
     },
+    "remind-calendar-dates": {
+        "task": "apps.notifications.tasks.remind_calendar_dates",
+        "schedule": 3600.0,  # hourly, so a reminder lands the morning it is due
+    },
     "warn-expiring-warranties": {
         "task": "apps.notifications.tasks.warn_expiring_warranties",
         "schedule": 86400.0,  # daily

@@ -241,6 +241,19 @@ class ProjectDetailSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, 
         # number typed when the project is opened.
         read_only_fields = ["id", "budget", "created_at", "updated_at"]
 
+    # Who may not run a project: the field, the system's administrator, and
+    # the external logins. Everyone else on the staff may.
+    NOT_MANAGERS = ("technician", "super_admin", "client_viewer", "vendor")
+
+    def validate_manager(self, user):
+        if user is None:
+            return user
+        if user.role in self.NOT_MANAGERS:
+            raise serializers.ValidationError(
+                "A project is run by a member of staff - not a technician, the Administrator or an external login."
+            )
+        return user
+
     # How far each phase of the work has got, counted from the work itself.
     phase_progress = serializers.SerializerMethodField()
 
