@@ -1946,3 +1946,118 @@ def test_the_store_takes_a_return_in_whole_and_turns_nothing_away(db):
     assert "turned this line away" in str(r.data)
     stock.refresh_from_db()
     assert stock.quantity == 7, "a refused line must not move stock"
+
+
+@pytest.mark.django_db
+def test_a_short_material_request_is_sent_to_procurement():
+    """The store can ask for what the shelf lacks, straight from the request:
+    a reorder for the shortfall, tied to the line, and the line marked on order
+    until the delivery is stocked."""
+    from apps.accounts.models import User
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem, IssuanceRequest, ReorderRequest
+    from rest_framework.test import APIClient
+
+    store = User.objects.create_user(username="mr-store", password="x", role="warehouse")
+    c = APIClient()
+    c.force_authenticate(store)
+    material = MaterialType.objects.create(name="MR Cable")
+    item = InventoryItem.objects.create(material_type=material, sku="MR-CABLE-1", quantity=2)
+    r = c.post("/api/inventory/issuance-requests/", {
+        "item": str(item.pk), "quantity_requested": 5, "purpose": "Site office rewire", "source": "other",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    rid = r.data["id"]
+    assert r.data["available_quantity"] == 2
+    r = c.post(f"/api/inventory/issuance-requests/{rid}/procure/", {}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["awaiting_procurement"] is True
+    reorder = ReorderRequest.objects.get(issuance_request_id=rid)
+    assert reorder.quantity == 3 and reorder.item_id == item.pk
+    assert "MR-" in reorder.reason or "Site office" in reorder.reason
+    # Not twice.
+    assert c.post(f"/api/inventory/issuance-requests/{rid}/procure/", {}, format="json").status_code == 400
+    assert IssuanceRequest.objects.get(pk=rid).awaiting_procurement is True
+
+
+@pytest.mark.django_db
+def test_batches_are_drawn_down_oldest_first_and_keep_their_bins():
+    """Two deliveries into two bins, one issue: the oldest batch is drawn
+    first, each batch reports its own bin and purchase cost, and the row lists
+    only the bins that still hold stock."""
+    from decimal import Decimal
+    from apps.accounts.models import User
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine, InventoryItem, StockMovement
+    from apps.inventory.services import batches_for
+    from apps.suppliers.models import Supplier
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from rest_framework.test import APIClient
+
+    material = MaterialType.objects.create(name="Batch Cable")
+    item = InventoryItem.objects.create(material_type=material, sku="BATCH-1", quantity=0, unit_cost=Decimal("5"))
+    supplier = Supplier.objects.create(name="Batch Supplier")
+    po = PurchaseOrder.objects.create(supplier=supplier, status="approved")
+    first = PurchaseOrderItem.objects.create(purchase_order=po, description="cable", quantity=10, unit_price=Decimal("4"))
+    second = PurchaseOrderItem.objects.create(purchase_order=po, description="cable", quantity=10, unit_price=Decimal("6"))
+    receipt = GoodsReceipt.objects.create(purchase_order=po)
+    l1 = GoodsReceiptLine.objects.create(receipt=receipt, po_item=first, quantity=10, batch_number="B1", storage_location="Rack A1", inventory_item=item)
+    l2 = GoodsReceiptLine.objects.create(receipt=receipt, po_item=second, quantity=10, batch_number="B2", storage_location="Rack B2", inventory_item=item)
+    StockMovement.objects.create(item=item, movement_type="in", quantity=10, batch_number="B1", goods_receipt_line=l1)
+    StockMovement.objects.create(item=item, movement_type="in", quantity=10, batch_number="B2", goods_receipt_line=l2)
+    StockMovement.objects.create(item=item, movement_type="out", quantity=12)
+    item.quantity = 8
+    item.save()
+
+    rows = batches_for(item)
+    assert [(b["batch_number"], b["remaining"], b["storage_location"], float(b["unit_cost"])) for b in rows] == [
+        ("B1", 0, "Rack A1", 4.0), ("B2", 8, "Rack B2", 6.0),
+    ]
+    assert rows[1]["value"] == 48.0
+
+    ops = User.objects.create_user(username="batch-ops", password="x", role="ops_manager")
+    c = APIClient()
+    c.force_authenticate(ops)
+    r = c.get(f"/api/inventory/items/{item.pk}/batches/")
+    assert r.status_code == 200 and [b["batch_number"] for b in r.data] == ["B1", "B2"]
+    r = c.get(f"/api/inventory/items/{item.pk}/")
+    assert r.data["storage_locations"] == ["Rack B2"]
+    assert float(r.data["latest_cost"]) == 6.0
+
+
+@pytest.mark.django_db
+def test_opening_stock_keeps_its_own_cost_after_a_dearer_delivery():
+    """Opened at 811, then a delivery at 900: the opening batch still reads 811,
+    the latest cost reads 900."""
+    from decimal import Decimal
+    from apps.accounts.models import User
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine, InventoryItem, StockMovement
+    from apps.inventory.services import batches_for
+    from apps.suppliers.models import Supplier
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from rest_framework.test import APIClient
+
+    ops = User.objects.create_user(username="open-cost-ops", password="x", role="ops_manager")
+    material = MaterialType.objects.create(name="Opening Cost Cable")
+    c = APIClient()
+    c.force_authenticate(ops)
+    r = c.post("/api/inventory/items/", {"material_type": str(material.pk), "quantity": 50, "unit_cost": "811.00"}, format="json")
+    assert r.status_code == 201, r.content
+    item = InventoryItem.objects.get(pk=r.data["id"])
+    assert item.movements.get(movement_type="opening").unit_cost == Decimal("811.00")
+
+    supplier = Supplier.objects.create(name="Opening Cost Supplier")
+    po = PurchaseOrder.objects.create(supplier=supplier, status="approved")
+    po_item = PurchaseOrderItem.objects.create(purchase_order=po, description="cable", quantity=10, unit_price=Decimal("900"))
+    receipt = GoodsReceipt.objects.create(purchase_order=po)
+    line = GoodsReceiptLine.objects.create(receipt=receipt, po_item=po_item, quantity=10, inventory_item=item)
+    StockMovement.objects.create(item=item, movement_type="in", quantity=10, goods_receipt_line=line, unit_cost=Decimal("900"))
+    item.quantity = 60
+    item.unit_cost = Decimal("900")
+    item.save()
+
+    assert [(b["remaining"], float(b["unit_cost"])) for b in batches_for(item)] == [(50, 811.0), (10, 900.0)]
+    r = c.get(f"/api/inventory/items/{item.pk}/")
+    assert float(r.data["latest_cost"]) == 900.0
+    assert float(r.data["total_value"]) == 50 * 811 + 10 * 900

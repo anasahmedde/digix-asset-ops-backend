@@ -616,3 +616,176 @@ def test_returned_units_come_back_by_serial_number(fault):
     assert ok.status_code == 200, ok.content
     line = MaintenancePartRequest.objects.get(pk=line_id)
     assert (line.quantity_used, line.quantity_returned) == (1, 2)
+
+
+@pytest.mark.django_db
+def test_before_and_after_photos_are_the_technicians(fault):
+    """BUG-08: the office could photograph a visit nobody had been sent on.
+    Before and After belong to the technician on the visit; the office may
+    only attach other material."""
+    job, tech, office = fault["job"], fault["tech"], fault["office"]
+    visit = job.visits.get()
+    photos = f"/api/maintenance/visits/{visit.id}/photos/"
+    # Nobody sent yet: nothing to photograph.
+    r = _client(office).post(photos, {"kind": "before", "image": _png()}, format="multipart")
+    assert r.status_code == 400 and "Assign" in r.data["detail"]
+    _client(office).post(f"/api/maintenance/schedules/{job.id}/assign/",
+                         {"technician": str(tech.id), "due_date": str(timezone.localdate())}, format="json")
+    assert _client(office).post(photos, {"kind": "before", "image": _png()}, format="multipart").status_code == 403
+    assert _client(office).post(photos, {"kind": "other", "image": _png()}, format="multipart").status_code == 201
+    assert _client(tech).post(photos, {"kind": "before", "image": _png()}, format="multipart").status_code == 201
+
+
+@pytest.mark.django_db
+def test_assigning_the_corrective_job_assigns_the_ticket_and_tells_the_technician():
+    """The job's technician becomes the ticket's technician; the ticket shows
+    in their list and a ticket notification lands with a link to it."""
+    from apps.notifications.models import Notification
+
+    ops = User.objects.create_user(username="cj-ops", password="x", role="ops_manager")
+    tech = User.objects.create_user(username="cj-tech", password="x", role="technician", is_field_staff=True)
+    ticket = Ticket.objects.create(title="Screen flickers", description="x", reported_by=ops, status="open")
+    job = MaintenanceSchedule.objects.create(title="Screen flickers", maintenance_type="corrective", ticket=ticket, status="pending", next_due=timezone.localdate())
+
+    job.assigned_to = tech
+    job.save()
+
+    ticket.refresh_from_db()
+    assert ticket.assigned_to_id == tech.id and ticket.assigned_at is not None
+    # One notice, the job's, opening the job; the ticket does not shout too.
+    notices = list(Notification.objects.filter(recipient=tech).order_by("created_at"))
+    assert [x.notification_type for x in notices] == ["maintenance_reminder"]
+    n = notices[0]
+    assert n.link == f"/maintenance?schedule={job.pk}" and n.is_actionable and n.resolved_at is None
+    # Starting the job answers the notice: it no longer waits on them.
+    job.status = "in_process"
+    job.save()
+    n.refresh_from_db()
+    assert n.resolved_at is not None
+
+    mine = _client(tech).get("/api/tickets/")
+    assert [t["id"] for t in (mine.data.get("results") or mine.data)] == [str(ticket.id)]
+
+
+@pytest.mark.django_db
+def test_the_field_acts_only_on_its_own_jobs():
+    """A technician cannot ask for parts on, start, or move along a job given
+    to a colleague; the supervisor can."""
+    from apps.maintenance.models import MaintenancePartRequest
+
+    sup = User.objects.create_user(username="own-sup", password="x", role="supervisor")
+    mine = User.objects.create_user(username="own-me", password="x", role="technician", is_field_staff=True)
+    other = User.objects.create_user(username="own-other", password="x", role="technician", is_field_staff=True)
+    job = MaintenanceSchedule.objects.create(
+        title="Colleague's job", maintenance_type="corrective", status="pending", next_due=timezone.localdate(), assigned_to=other,
+    )
+    me = _client(mine)
+    r = me.post("/api/maintenance/part-requests/", {"schedule": str(job.pk), "name": "Cable", "quantity_requested": 1, "unit": "piece"}, format="json")
+    assert r.status_code == 403, r.content
+    assert "assigned to" in r.json()["detail"]
+    assert not MaintenancePartRequest.objects.filter(schedule=job).exists()
+    r = me.patch(f"/api/maintenance/schedules/{job.pk}/", {"status": "in_process"}, format="json")
+    assert r.status_code == 403, r.content
+    # The supervisor may; so may the technician on their own job.
+    r = _client(sup).patch(f"/api/maintenance/schedules/{job.pk}/", {"status": "in_process"}, format="json")
+    assert r.status_code == 200, r.content
+    own = MaintenanceSchedule.objects.create(
+        title="My job", maintenance_type="corrective", status="pending", next_due=timezone.localdate(), assigned_to=mine,
+    )
+    r = me.patch(f"/api/maintenance/schedules/{own.pk}/", {"status": "in_process"}, format="json")
+    assert r.status_code == 200, r.content
+
+
+@pytest.mark.django_db
+def test_a_fresh_round_goes_to_the_standing_technician_and_tells_them():
+    """Once a preventive round is done, the next one opens in the name of
+    the schedule's technician - theirs unless a supervisor reassigns it -
+    and they are told."""
+    from datetime import timedelta
+
+    tech = User.objects.create_user(username="round-tech", password="x", role="technician", is_field_staff=True)
+    job = MaintenanceSchedule.objects.create(
+        title="Monthly check", maintenance_type="preventive", frequency="monthly", status="active",
+        next_due=timezone.localdate(), assigned_to=tech,
+    )
+    first = job.open_visit()
+    assert first.assigned_to_id == tech.id and first.sequence == 1
+    first.status = "completed"
+    first.save()
+    job.next_due = timezone.localdate() + timedelta(days=30)
+    job.save()
+    second = job.open_visit()
+    job.refresh_from_db()
+    assert second.sequence == 2 and second.assigned_to_id == tech.id
+    assert job.assigned_to_id == tech.id
+    from apps.notifications.models import Notification
+
+    n = Notification.objects.get(recipient=tech, ref=f"maintenance-round:{second.pk}")
+    assert n.link == f"/maintenance?schedule={job.pk}" and "Next round is yours" in n.title
+
+
+@pytest.mark.django_db
+def test_a_parts_request_is_answered_by_the_askers_own_supervisor_only():
+    """Two supervisors side by side: the one the technician reports to may
+    approve; the other sees no Approve and is refused if they try."""
+    from apps.maintenance.models import MaintenancePartRequest
+
+    head = User.objects.create_user(username="pr-head", password="x", role="ops_manager")
+    own = User.objects.create_user(username="pr-own", password="x", role="supervisor", reports_to=head)
+    lateral = User.objects.create_user(username="pr-lateral", password="x", role="supervisor", reports_to=head)
+    tech = User.objects.create_user(username="pr-tech", password="x", role="technician", is_field_staff=True, reports_to=own)
+    job = MaintenanceSchedule.objects.create(
+        title="Round", maintenance_type="preventive", frequency="monthly", status="active",
+        next_due=timezone.localdate(), assigned_to=tech,
+    )
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem
+
+    stock = InventoryItem.objects.create(material_type=MaterialType.objects.create(name="PR Cable"), quantity=10)
+    line = MaintenancePartRequest.objects.create(schedule=job, item=stock, quantity_requested=2, requested_by=tech)
+
+    for who, may in ((lateral, False), (own, True), (head, True)):
+        r = _client(who).get(f"/api/maintenance/part-requests/{line.pk}/")
+        assert r.data["decidable_by_me"] is may, (who.username, r.data["decidable_by_me"])
+    r = _client(lateral).post(f"/api/maintenance/part-requests/{line.pk}/decide/", {"approve": True, "quantity": 2}, format="json")
+    assert r.status_code == 403 and "their own supervisor" in r.json()["detail"]
+    r = _client(own).post(f"/api/maintenance/part-requests/{line.pk}/decide/", {"approve": True, "quantity": 2}, format="json")
+    assert r.status_code == 200, r.content
+
+
+@pytest.mark.django_db
+def test_a_round_awaiting_review_offers_accept_to_the_technicians_own_line_only():
+    """Waseem (the technician's supervisor) and the head above see Accept;
+    a lateral supervisor does not, matching what the review endpoint allows."""
+    from apps.maintenance import lifecycle
+
+    head = User.objects.create_user(username="rv-head", password="x", role="ops_manager")
+    own = User.objects.create_user(username="rv-own", password="x", role="supervisor", reports_to=head)
+    lateral = User.objects.create_user(username="rv-lateral", password="x", role="supervisor", reports_to=head)
+    tech = User.objects.create_user(username="rv-tech", password="x", role="technician", is_field_staff=True, reports_to=own)
+    job = MaintenanceSchedule.objects.create(
+        title="Round", maintenance_type="preventive", frequency="monthly", status="in_process",
+        next_due=timezone.localdate(), assigned_to=tech,
+    )
+    visit = job.open_visit()
+    visit.status = "awaiting_review"
+    visit.save()
+    assert "accept" in lifecycle.allowed_actions(job, own)
+    assert "accept" in lifecycle.allowed_actions(job, head)
+    assert "accept" not in lifecycle.allowed_actions(job, lateral)
+    r = _client(lateral).post(f"/api/maintenance/visits/{visit.pk}/review/", {"accepted": True}, format="json")
+    assert r.status_code == 403
+
+
+@pytest.mark.django_db
+def test_a_ticket_says_who_may_review_it():
+    """The reporter and the technician's own reporting line may; a lateral
+    supervisor may not - and the review endpoint agrees."""
+    head = User.objects.create_user(username="tr-head", password="x", role="ops_manager")
+    own = User.objects.create_user(username="tr-own", password="x", role="supervisor", reports_to=head)
+    lateral = User.objects.create_user(username="tr-lateral", password="x", role="supervisor", reports_to=head)
+    tech = User.objects.create_user(username="tr-tech", password="x", role="technician", is_field_staff=True, reports_to=own)
+    ticket = Ticket.objects.create(title="Flicker", description="x", reported_by=head, status="pending_review", assigned_to=tech)
+    for who, may in ((lateral, False), (own, True), (head, True)):
+        r = _client(who).get(f"/api/tickets/{ticket.pk}/")
+        assert r.status_code == 200 and r.data["reviewable_by_me"] is may, (who.username, r.status_code)

@@ -545,20 +545,25 @@ def test_a_warranty_has_to_end_after_it_starts(device):
     admin = User.objects.create_user(username="span-admin", password="x", role="super_admin")
     c = APIClient()
     c.force_authenticate(admin)
-    day = (timezone.localdate() + timedelta(days=10)).isoformat()
+    # The start is the delivery inspection, stamped on the asset at receipt.
+    delivered = timezone.localdate() - timedelta(days=10)
+    device.purchase_date = delivered
+    device.save(update_fields=["purchase_date"])
+    day = delivered.isoformat()
     r = c.post("/api/warranties/", {"device": str(device.id), "warranty_type": "supplier",
-                                    "start_date": day, "end_date": day}, format="json")
+                                    "end_date": day}, format="json")
     assert r.status_code == 400 and "end_date" in r.data
 
     ok = c.post("/api/warranties/", {"device": str(device.id), "warranty_type": "supplier",
-                                     "start_date": day, "months": 12}, format="json")
+                                     "months": 12}, format="json")
     assert ok.status_code == 201, ok.content
+    assert ok.data["start_date"] == day
     r = c.patch(f"/api/warranties/{ok.data['id']}/", {"end_date": day}, format="json")
     assert r.status_code == 400 and "end_date" in r.data
 
     # A part's cover is held to the same rule.
-    unit = InventoryUnit.objects.create(serial_number="SPAN-1", model_name="Player")
-    r = c.post(f"/api/inventory/units/{unit.id}/warranty/", {"start_date": day, "end_date": day}, format="json")
+    unit = InventoryUnit.objects.create(serial_number="SPAN-1", model_name="Player", purchase_date=delivered)
+    r = c.post(f"/api/inventory/units/{unit.id}/warranty/", {"end_date": day}, format="json")
     assert r.status_code == 400
 
 
@@ -617,3 +622,53 @@ def test_a_warranty_claim_runs_raise_send_decide_settle(device):
     }, format="json")
     assert r.status_code == 201, r.content
     assert r.data["kind"] == "Component" and r.data["covered"] == "CLM-1"
+
+
+@pytest.mark.django_db
+def test_status_is_read_from_the_dates_and_the_asset(device, ops):
+    """A warranty's status is derived: not started before its start, expired
+    after its end, ended once the asset is gone - whatever the stored word."""
+    today = timezone.now().date()
+    w = Warranty.objects.create(
+        device=device, warranty_type="supplier", start_date=today - timedelta(days=400),
+        end_date=today - timedelta(days=35), months=12,
+    )
+    assert w.status == "active" and w.state == "expired"
+    r = _client(ops).get(f"/api/warranties/{w.pk}/")
+    assert (r.data["status"], r.data["status_display"], r.data["is_expired"]) == ("expired", "Expired", True)
+
+    w.start_date, w.end_date = today + timedelta(days=10), today + timedelta(days=375)
+    w.save()
+    assert w.state == "not_started"
+
+    w.start_date, w.end_date = today - timedelta(days=10), today + timedelta(days=355)
+    w.save()
+    assert w.state == "active"
+    device.status = "decommissioned"
+    device.save(update_fields=["status"])
+    w.refresh_from_db()
+    assert w.state == "ended"
+    assert _client(ops).get(f"/api/warranties/{w.pk}/").data["status_display"] == "Ended"
+
+
+@pytest.mark.django_db
+def test_the_term_and_the_dates_stay_one_fact(device, ops):
+    """QUERY-01: a warranty cannot quote 1 Year over two months. Editing the
+    dates re-reads the term; editing the term moves the end date."""
+    from datetime import date
+
+    w = Warranty.objects.create(
+        device=device, warranty_type="supplier", start_date=date(2026, 10, 30),
+        end_date=date(2027, 10, 30), months=12,
+    )
+    c = _client(ops)
+    r = c.patch(f"/api/warranties/{w.pk}/", {"end_date": "2026-12-31"}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["months"] is None  # 62 days is no whole term
+    r = c.patch(f"/api/warranties/{w.pk}/", {"end_date": "2027-04-30"}, format="json")
+    assert r.data["months"] == 6
+    r = c.patch(f"/api/warranties/{w.pk}/", {"months": 24}, format="json")
+    assert r.data["end_date"] == "2028-10-30"
+    # The start is anchored by the work, not typed: a sent one is ignored.
+    r = c.patch(f"/api/warranties/{w.pk}/", {"start_date": "2026-11-15", "end_date": "2027-10-30"}, format="json")
+    assert (r.data["start_date"], r.data["months"]) == ("2026-10-30", 12)

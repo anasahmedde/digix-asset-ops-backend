@@ -165,19 +165,34 @@ class MaintenanceSchedule(TimeStampedModel):
             .first()
         )
         if visit is None:
-            # A fresh round is numbered after the last one. The very first
-            # takes the technician the schedule was set up with, because
-            # that is what the form asked for; every round after it goes
-            # out to nobody, so the supervisor decides again each time.
-            # Carrying the last technician forward made the screen offer
-            # "Reassign" for a round nobody had been given.
+            # A fresh round is numbered after the last one and goes to the
+            # schedule's standing technician: the person it was set up with
+            # is responsible for every round unless a supervisor or head
+            # reassigns that round to somebody else. They are told each time
+            # a round opens in their name, so nothing lands on them unseen.
             from django.db.models import Max
 
             last = self.visits.aggregate(n=Max("sequence"))["n"] or 0
-            return MaintenanceVisit.objects.create(
+            visit = MaintenanceVisit.objects.create(
                 schedule=self, due_date=self.next_due, sequence=last + 1,
-                assigned_to=self.assigned_to if last == 0 else None,
+                assigned_to=self.assigned_to,
             )
+            if last > 0 and self.assigned_to_id:
+                from apps.notifications.service import tell
+
+                tell(
+                    [self.assigned_to], kind="maintenance_reminder",
+                    title=f"Next round is yours: {self.title}",
+                    message=(
+                        f"Round {last + 1}"
+                        + (f" on {self.device.asset_code}" if self.device_id else "")
+                        + (f" · due {self.next_due}" if self.next_due else "")
+                        + ". Yours unless a supervisor reassigns it."
+                    ),
+                    link=f"/maintenance?schedule={self.pk}",
+                    ref=f"maintenance-round:{visit.pk}",
+                )
+            return visit
         # The open round is the next one due, so it follows the schedule when
         # the schedule is what moved — but only while it is still plannable.
         if visit.status == MaintenanceVisit.Status.PLANNED and visit.due_date != self.next_due:

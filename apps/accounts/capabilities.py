@@ -37,10 +37,12 @@ class Capability:
     # people's accounts. Shown with a warning and never a role default for
     # the junior tiers.
     sensitive: bool = False
+    # Held by the Super Admin alone: no role and no adjustment may grant it.
+    super_admin_only: bool = False
 
 
-def _c(key, label, module, description, kind="work", sensitive=False):
-    return Capability(key, label, module, description, kind, sensitive)
+def _c(key, label, module, description, kind="work", sensitive=False, super_admin_only=False):
+    return Capability(key, label, module, description, kind, sensitive, super_admin_only)
 
 
 CAPABILITIES: tuple[Capability, ...] = (
@@ -209,8 +211,9 @@ CAPABILITIES: tuple[Capability, ...] = (
        "The employee list and the organogram.", "view"),
     _c("manage_team", "Manage people", "People",
        "Change a person's role, job details and reporting line.", "admin", True),
-    _c("manage_logins", "Create and remove logins", "People",
-       "Add accounts, remove them, and reset passwords.", "admin", True),
+    _c("manage_logins", "Administer accounts", "People",
+       "Add accounts, remove them, reset passwords, change usernames and "
+       "switch accounts on or off. Administrator only.", "admin", True, True),
     _c("manage_permissions", "Change what people may do", "People",
        "Grant and withdraw the capabilities on this list, and edit roles.", "admin", True),
     _c("act_across_teams", "Act across teams", "People",
@@ -287,7 +290,7 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
         "close_installation", "view_tickets", "raise_ticket", "work_tickets", "review_tickets",
         "close_ticket", "view_maintenance", "manage_maintenance", "assign_maintenance",
         "work_maintenance", "review_maintenance", "view_warranties", "raise_claim",
-        "view_team", "manage_permissions", "view_attendance", "view_clients",
+        "view_team", "manage_permissions", "view_attendance", "view_clients", "view_suppliers",
     ),
     "warehouse": _keys(
         "view_stock", "manage_stock", "receive_goods", "inspect_goods", "request_material",
@@ -348,6 +351,11 @@ def catalogue() -> list[dict]:
             "kind": c.kind,
             "description": c.description,
             "sensitive": c.sensitive,
+            "super_admin_only": c.super_admin_only,
         }
         for c in CAPABILITIES
     ]
+
+
+SUPER_ADMIN_ONLY: frozenset[str] = frozenset(c.key for c in CAPABILITIES if c.super_admin_only)
+

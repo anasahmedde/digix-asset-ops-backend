@@ -24,6 +24,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from common.branding import letterhead
+
 from apps.procurement.documents import BAND, COMPANY_NAME, RULE, _styles
 
 # A line somebody writes on. Long enough to sign across.
@@ -77,7 +79,7 @@ def render_handover_pdf(installation) -> bytes:
         leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm,
         title=f"Handover — {device.asset_code}",
     )
-    body = []
+    body = [letterhead()]
 
     # ── Letterhead ──
     head = Table(

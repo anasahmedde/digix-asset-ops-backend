@@ -122,6 +122,8 @@ def test_transition_machine_happy_and_invalid(people, customer):
     assert r.status_code == 200, r.content
 
     r = api.post(url, {"status": "rejected"}, format="json")
+    assert r.status_code == 400, "a rejection says why"
+    r = api.post(url, {"status": "rejected", "notes": "Too expensive."}, format="json")
     assert r.status_code == 200, r.content
 
     # terminal: nothing moves out of rejected

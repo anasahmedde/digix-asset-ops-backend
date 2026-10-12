@@ -194,13 +194,13 @@ def test_item_writes_rejected_after_approval(people, supplier):
     pid = body["id"]
     assert c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "pending_approval"}, format="json").status_code == 200
 
-    # pending_approval still allows item edits
+    # Once sent for approval the lines are frozen: only Draft can change them.
     r = c.patch(
         f"/api/procurement/orders/{pid}/",
-        {"items": [{"description": "Still editable", "quantity": 1, "unit_price": "5.00"}]},
+        {"items": [{"description": "Too late", "quantity": 1, "unit_price": "5.00"}]},
         format="json",
     )
-    assert r.status_code == 200, r.content
+    assert r.status_code == 400, r.content
 
     assert _client(people["group_head"]).post(f"/api/procurement/orders/{pid}/transition/", {"status": "approved"}, format="json").status_code == 200
 
@@ -210,23 +210,15 @@ def test_item_writes_rejected_after_approval(people, supplier):
         {"items": [{"description": "Too late", "quantity": 1, "unit_price": "5.00"}]},
         format="json",
     )
-    assert r.status_code == 400
-    assert "items" in r.json()
+    assert r.status_code == 400 and "Draft" in r.json()["detail"]
     po = PurchaseOrder.objects.get(pk=pid)
-    assert po.items.count() == 1
-    assert po.items.first().description == "Still editable"
+    assert po.items.count() == 2
 
-    # non-item fields remain editable
-    from datetime import timedelta
-
-    from django.utils import timezone
-
-    later = (timezone.localdate() + timedelta(days=30)).isoformat()
-    r = c.patch(f"/api/procurement/orders/{pid}/", {"expected_delivery": later}, format="json")
+    # Only the notes may still change.
+    r = c.patch(f"/api/procurement/orders/{pid}/", {"notes": "Call before delivery"}, format="json")
     assert r.status_code == 200, r.content
-    # ...but a delivery before the order was placed is not.
     r = c.patch(f"/api/procurement/orders/{pid}/", {"expected_delivery": "2020-01-01"}, format="json")
-    assert r.status_code == 400 and "expected_delivery" in r.data
+    assert r.status_code == 400
 
 
 @pytest.mark.django_db
@@ -355,9 +347,12 @@ def test_transition_notes_appended_to_po_notes(people, supplier):
     assert "Draft → Pending Approval" in last_line
     assert "Please review urgently" in last_line
 
-    # transition without notes leaves notes untouched
+    # a move forward without notes leaves notes untouched (going back needs a reason)
     notes_before = po.notes
-    r = c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "draft"}, format="json")
+    r = c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "draft", "notes": "x"}, format="json")
+    assert r.status_code == 200, r.content
+    po.refresh_from_db(); notes_before = po.notes
+    r = c.post(f"/api/procurement/orders/{pid}/transition/", {"status": "pending_approval"}, format="json")
     assert r.status_code == 200, r.content
     po.refresh_from_db()
     assert po.notes == notes_before
@@ -1639,7 +1634,7 @@ def test_a_cancelled_order_stops_waiting_on_anybody(people, over_plan):
 
     r = _client(people["ops"]).post(
         f"/api/procurement/purchase-orders/{po.pk}/transition/",
-        {"status": "cancelled"}, format="json",
+        {"status": "cancelled", "notes": "No longer needed."}, format="json",
     )
     assert r.status_code == 200, r.content
 
@@ -1682,3 +1677,45 @@ def test_terms_typed_for_a_deal_reach_the_order_and_the_page(people, supplier, r
     po.save(update_fields=["payment_terms"])
     detail = c.get(f"/api/procurement/purchase-orders/{po.pk}/")
     assert detail.data["payment_terms_display"] == "Net 45"
+
+
+@pytest.mark.django_db
+def test_an_order_past_draft_only_takes_notes(people, supplier):
+    """What was signed stays signed: after Draft, a PO accepts notes and
+    nothing else. Back to Draft is the way to change it."""
+    body = _create_po(_client(people["ops"]), supplier)
+    pid = body["id"]
+    c = _client(people["ops"])
+    assert c.post(f"/api/procurement/purchase-orders/{pid}/transition/", {"status": "pending_approval"}, format="json").status_code == 200
+    r = c.patch(f"/api/procurement/purchase-orders/{pid}/", {"notes": "Supplier confirmed by phone"}, format="json")
+    assert r.status_code == 200, r.content
+    r = c.patch(f"/api/procurement/purchase-orders/{pid}/", {"currency": "USD"}, format="json")
+    assert r.status_code == 400 and "Draft" in str(r.data)
+    r = c.patch(f"/api/procurement/purchase-orders/{pid}/", {"items": []}, format="json")
+    assert r.status_code == 400
+    # Sent back to Draft, it opens again.
+    # Going back needs its reason.
+    assert c.post(f"/api/procurement/purchase-orders/{pid}/transition/", {"status": "draft"}, format="json").status_code == 400
+    assert c.post(f"/api/procurement/purchase-orders/{pid}/transition/", {"status": "draft", "notes": "Price wrong."}, format="json").status_code == 200
+    assert c.patch(f"/api/procurement/purchase-orders/{pid}/", {"currency": "USD"}, format="json").status_code == 200
+
+
+@pytest.mark.django_db
+def test_a_turnkey_asset_takes_its_vendor_from_the_order(supplier):
+    """Registered without a vendor; the approved order names one."""
+    from apps.assets.models import AssetType, Device
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.procurement.services import vendor_from_order
+
+    kind = AssetType.objects.create(name="Turnkey Standee")
+    device = Device.objects.create(display_name="Lobby standee", asset_type=kind, source="vendor_turnkey", status="procured")
+    assert device.assigned_vendor_id is None
+    po = PurchaseOrder.objects.create(supplier=supplier, status="pending_approval")
+    item = PurchaseOrderItem.objects.create(purchase_order=po, description="standee", quantity=1, unit_price=1000)
+    device.procurement_item = item
+    device.save(update_fields=["procurement_item"])
+
+    assert vendor_from_order(po) == 1
+    device.refresh_from_db()
+    assert device.assigned_vendor_id == supplier.pk and device.assigned_vendor_name == supplier.name
+    assert vendor_from_order(po) == 0  # already named

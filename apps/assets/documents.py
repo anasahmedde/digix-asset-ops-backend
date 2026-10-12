@@ -13,6 +13,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from common.branding import letterhead
+
 from apps.procurement.documents import BAND, COMPANY_NAME, INK, RULE, _styles
 
 
@@ -48,7 +50,7 @@ def render_bom_pdf(device) -> bytes:
         title=f"Bill of Materials {device.asset_code}",
         author=COMPANY_NAME,
     )
-    story: list = []
+    story: list = [letterhead()]
 
     masthead = Table(
         [[

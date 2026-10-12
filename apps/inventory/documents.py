@@ -14,6 +14,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from common.branding import letterhead
+
 COMPANY_NAME = "DIGIX Asset Management"
 
 INK = colors.HexColor("#111827")
@@ -110,7 +112,7 @@ def render_issue_slip_pdf(issuance_request) -> bytes:
         title=f"Material Issue Slip {req.request_number}",
         author=COMPANY_NAME,
     )
-    story: list = []
+    story: list = [letterhead()]
 
     masthead = Table(
         [[Paragraph("MATERIAL ISSUE SLIP", s["title"]),

@@ -195,8 +195,7 @@ def _warranty_status(device) -> str:
     warranties = list(device.warranties.all())
     if not warranties:
         return "none"
-    today = timezone.now().date()
-    if any(w.status == "active" and w.end_date >= today for w in warranties):
+    if any(w.state == "active" for w in warranties):
         return "active"
     return "expired"
 

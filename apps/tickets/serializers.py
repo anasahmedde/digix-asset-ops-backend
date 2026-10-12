@@ -31,13 +31,18 @@ class TicketCommentSerializer(serializers.ModelSerializer):
     # before it touched it, and it wrote that next to its explanation. The
     # explanation belongs in the feed; a job id and a quoted status do not,
     # so they are kept in the row and taken off on the way out.
-    content = serializers.SerializerMethodField()
+    # Writable: what a person types is the comment. The migration lines are
+    # taken off on the way out, in to_representation, not by making the
+    # field read-only - that silently dropped every typed comment.
+    content = serializers.CharField(required=False, allow_blank=True)
 
-    def get_content(self, obj):
-        return "\n".join(
-            line for line in (obj.content or "").splitlines()
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["content"] = "\n".join(
+            line for line in (instance.content or "").splitlines()
             if not line.lstrip().startswith("[migration ")
         ).strip()
+        return data
 
     author_name = serializers.CharField(source="author.get_full_name", read_only=True, default=None)
     author_avatar = serializers.ImageField(source="author.avatar", read_only=True, default=None)
@@ -95,6 +100,21 @@ class TicketSerializer(DateOrder, HidesMoney, _AssignmentGuardMixin, serializers
         source="inventory_unit.serial_number", read_only=True, default=None
     )
     inventory_unit_part = serializers.SerializerMethodField()
+    # Whether the reader reviews this ticket's work: the reporter, the
+    # technician's own reporting line, or whoever acts across teams - the
+    # rule the review action enforces, so a screen offers the buttons only
+    # where they would be accepted.
+    reviewable_by_me = serializers.SerializerMethodField()
+
+    def get_reviewable_by_me(self, obj):
+        from common.permissions import decides_for
+
+        user = getattr(self.context.get("request"), "user", None)
+        if user is None or not user.is_authenticated:
+            return False
+        if obj.reported_by_id == user.pk:
+            return True
+        return decides_for(user, obj.assigned_to, "review_tickets")
 
     def get_inventory_unit_part(self, obj):
         """What the claimed part is, however it was described when registered."""
@@ -252,6 +272,7 @@ class TicketSerializer(DateOrder, HidesMoney, _AssignmentGuardMixin, serializers
     class Meta:
         model = Ticket
         fields = [
+            "reviewable_by_me",
             "id", "ticket_number", "occurrence", "complaint_by", "title", "description", "priority", "status", "category",
             "issue_type", "issue_type_name",
             "device", "device_code", "devices", "devices_info", "site", "site_name",

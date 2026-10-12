@@ -15,6 +15,8 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from common.branding import letterhead
+
 COMPANY_NAME = "DIGIX Asset Management"
 
 INK = colors.HexColor("#111827")
@@ -78,7 +80,7 @@ def _masthead(title, project, s, width_left=110):
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
-    return [head, Spacer(1, 6 * mm), facts, Spacer(1, 5 * mm)]
+    return [letterhead(), head, Spacer(1, 6 * mm), facts, Spacer(1, 5 * mm)]
 
 
 def _doc(buf, title):

@@ -1,3 +1,4 @@
+from apps.notifications.service import inform_line, who as _who
 from django.db.models import DateField
 from django.db.models.functions import Cast, Coalesce
 from rest_framework import serializers as drf_serializers
@@ -94,6 +95,31 @@ def _may_withdraw(user, line) -> bool:
     return _answers_for(user, line)
 
 
+def _acts_for_everyone(user) -> bool:
+    """Supervisors and managers act on any job; the field only on its own."""
+    return can_any(user, "review_maintenance", "manage_maintenance", "assign_maintenance", "act_across_teams")
+
+
+def _own_job_only(user, schedule, doing: str):
+    """A technician works the jobs given to them, not a colleague's."""
+    if schedule is None or _acts_for_everyone(user):
+        return
+    visit = schedule.open_visit()
+    holder = visit.assigned_to_id if visit is not None and visit.assigned_to_id else schedule.assigned_to_id
+    # Nobody's yet: anyone who works maintenance may pick it up. Somebody
+    # else's: hands off.
+    if holder is None or holder == user.id:
+        return
+    if True:
+        from rest_framework.exceptions import PermissionDenied
+
+        from apps.accounts.models import User as _User
+
+        person = _User.objects.filter(pk=holder).first()
+        who = (person.get_full_name() or person.username) if person else "somebody else"
+        raise PermissionDenied(f"You can only {doing} a job assigned to you. This one is assigned to {who}.")
+
+
 class CanAskOrAnswerForParts(BasePermission):
     """Technicians ask, supervisors and managers answer; everyone else reads.
 
@@ -130,6 +156,7 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
         # A line is asked for on a round, and the round being planned is the
         # one it is for.
         schedule = serializer.validated_data.get("schedule")
+        _own_job_only(self.request.user, schedule, "ask for parts on")
         line = serializer.save(
             requested_by=self.request.user,
             visit=schedule.open_visit() if schedule is not None else None,
@@ -259,6 +286,24 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         "maintenance_type", "frequency", "status", "is_active", "assigned_to", "device", "priority",
         "ticket",
     ]
+
+    def perform_create(self, serializer):
+        job = serializer.save()
+        inform_line(
+            self.request.user,
+            title=f"Maintenance scheduled: {job.title}",
+            message=f"{job.device.asset_code + ' - ' if job.device_id else ''}{job.get_maintenance_type_display()} - by {_who(self.request.user)}",
+            link=f"/maintenance?schedule={job.pk}", ref=f"fyi-schedule:{job.pk}",
+        )
+
+    def perform_update(self, serializer):
+        # The office changes any job; the field only moves its own along.
+        instance = serializer.instance
+        if not _acts_for_everyone(self.request.user) and instance.assigned_to_id != self.request.user.id:
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied("You can only update a job assigned to you.")
+        serializer.save()
     search_fields = ["title", "device__asset_code", "device__display_name"]
     ordering_fields = ["began", "next_due", "created_at", "priority"]
 
@@ -409,14 +454,28 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         from .models import MaintenanceVisitPhoto
 
         visit = self.get_object()
-        if visit.assigned_to_id != request.user.pk and not lifecycle.is_office(request.user):
-            return Response(
-                {"detail": "Only the technician on this visit, or the office, can add photos."},
-                status=drf_status.HTTP_403_FORBIDDEN,
-            )
         kind = request.data.get("kind") or MaintenanceVisitPhoto.Kind.OTHER
         if kind not in dict(MaintenanceVisitPhoto.Kind.choices):
             return Response({"kind": ["Say whether it is a before, after or other photo."]}, status=400)
+        # Before and After are the record of what the technician found and
+        # left: only the technician the visit was given to takes them (a
+        # super admin may press the button for them). The office adds the
+        # other kind - a document, a quote - but never stands in for the
+        # site photographs, and nothing is photographed before anybody is sent.
+        is_record = kind in (MaintenanceVisitPhoto.Kind.BEFORE, MaintenanceVisitPhoto.Kind.AFTER)
+        if is_record and visit.assigned_to_id is None:
+            return Response(
+                {"detail": "Assign a technician first - the before and after photos are theirs to take."},
+                status=400,
+            )
+        allowed = visit.assigned_to_id == request.user.pk or lifecycle.is_admin(request.user) or (
+            not is_record and lifecycle.is_office(request.user)
+        )
+        if not allowed:
+            return Response(
+                {"detail": "Only the technician on this visit takes its before and after photos."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
         images = request.FILES.getlist("images") or (
             [request.FILES["image"]] if "image" in request.FILES else []
         )
@@ -507,6 +566,8 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             # sent back for another visit with a reason on the record.
             call = request.data.get("decision") or MaintenanceVisit.Review.ACCEPTED
             if call == MaintenanceVisit.Review.UNRESOLVED:
+                if not (request.data.get("reason") or "").strip():
+                    return Response({"reason": ["Say why it is going back."]}, status=drf_status.HTTP_400_BAD_REQUEST)
                 tech = User.objects.filter(pk=request.data.get("technician")).first()
                 nxt = lifecycle.send_round_back(
                     visit, user=request.user,
@@ -561,6 +622,11 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         from django.utils import timezone
 
         visit = self.get_object()
+        if not _acts_for_everyone(request.user) and visit.assigned_to_id != request.user.id:
+            return Response(
+                {"detail": "You can only start a round assigned to you."},
+                status=403,
+            )
         # Where the phone says it is. Offered, never demanded: a basement
         # with no signal is still a place work gets done.
         where = _where_from(request.data)

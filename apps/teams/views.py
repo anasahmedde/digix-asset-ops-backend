@@ -1,3 +1,4 @@
+from apps.notifications.service import inform_line, who as _who
 from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
@@ -122,6 +123,12 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     def perform_create(self, serializer):
         project = serializer.save()
         self._tell_the_manager(project, None)
+        inform_line(
+            self.request.user,
+            title=f"Project opened: {project.name}",
+            message=f"{project.client.name + ' - ' if project.client_id else ''}by {_who(self.request.user)}",
+            link=f"/projects?project={project.pk}", ref=f"fyi-project:{project.pk}",
+        )
 
     def perform_update(self, serializer):
         before = serializer.instance.manager_id
@@ -713,6 +720,13 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         denied = self._require(request, project, "plan_budget")
         if denied is not None:
             return denied
+        # Four eyes, from the other side: whoever signs budgets off does not
+        # submit one for their own signature (a superuser account excepted).
+        if can(request.user, "approve_budget") and not request.user.is_superuser:
+            return Response(
+                {"detail": "You approve budgets. The planner submits this one; you sign it or send it back."},
+                status=403,
+            )
         plan = get_or_create_plan(project)
         if not plan.is_editable:
             return Response(
@@ -811,6 +825,14 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         plan = get_or_create_plan(project)
         if plan.is_editable:
             return Response({"detail": "The budget is already open for changes."}, status=400)
+        # Once sent up it is the approver's: they approve it or send it
+        # back with a reason. The planner cannot quietly change what is
+        # being signed.
+        if plan.status == ProjectBudget.Status.SUBMITTED and not request.user.is_superuser:
+            return Response(
+                {"detail": "This budget is awaiting approval. It comes back to you when the approver sends it back."},
+                status=400,
+            )
         notices.resolve(f"budget:{project.pk}")
         plan.status = ProjectBudget.Status.DRAFT
         # Reopening withdraws the approval. The figure that was signed off

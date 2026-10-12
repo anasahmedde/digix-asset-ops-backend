@@ -78,6 +78,17 @@ STEPPER = (
 TERMINAL = (Ticket.Status.CLOSED, Ticket.Status.CANCELLED)
 
 
+def reviews_work_of(user, technician) -> bool:
+    """May this person review that technician's work: their own reporting
+    line, or somebody who acts across teams. Nobody's work yet reviews as
+    the office's."""
+    from common.permissions import can, decides_for
+
+    if technician is None:
+        return can(user, "review_maintenance")
+    return decides_for(user, technician, "review_maintenance")
+
+
 def is_office(user) -> bool:
     from common.permissions import can_any
 
@@ -124,6 +135,10 @@ def allowed_actions(job: MaintenanceSchedule, user) -> list[str]:
     visit = current_visit(job)
     mine = visit is not None and theirs(visit, user)
     ticket = _ticket_of(job)
+    # Reviewing is the technician's own reporting line, or whoever acts
+    # across teams - the same rule the review endpoint enforces, so a
+    # lateral supervisor is not offered a button that would be refused.
+    reviews = visit is not None and reviews_work_of(user, visit.assigned_to)
 
     if ticket is None:
         # A scheduled round has no ticket to move, so its own state is the
@@ -149,7 +164,7 @@ def allowed_actions(job: MaintenanceSchedule, user) -> list[str]:
             and visit.has_after_photo
         ):
             rounds.append(COMPLETE)
-        if office and visit.status == MaintenanceVisit.Status.AWAITING_REVIEW:
+        if reviews and visit.status == MaintenanceVisit.Status.AWAITING_REVIEW:
             rounds.append(ACCEPT)
             rounds.append(UNRESOLVED)
         return rounds
@@ -180,9 +195,9 @@ def allowed_actions(job: MaintenanceSchedule, user) -> list[str]:
     # Accepting work the technician has just said is not fixed would be
     # the office overruling the only person who saw it. When the verdict
     # is "not fixed" the only way on is another visit.
-    if office and may(ACCEPT) and visit is not None and visit.resolved is not False:
+    if reviews and may(ACCEPT) and visit is not None and visit.resolved is not False:
         out.append(ACCEPT)
-    if office and may(UNRESOLVED):
+    if reviews and may(UNRESOLVED):
         out.append(UNRESOLVED)
     if office and may(CANCEL):
         out.append(CANCEL)

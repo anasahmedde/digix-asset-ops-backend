@@ -1,3 +1,4 @@
+from apps.notifications.service import inform_line, who as _who
 from common.scoping import for_client
 from rest_framework import viewsets
 from rest_framework.permissions import IsAuthenticated
@@ -22,3 +23,13 @@ class ClientViewSet(viewsets.ModelViewSet):
     filterset_fields = ["is_active"]
     search_fields = ["name", "code", "contact_person"]
     ordering_fields = ["name", "created_at"]
+
+    def perform_create(self, serializer):
+        client = serializer.save()
+        inform_line(
+            self.request.user,
+            title=f"Client added: {client.name}",
+            message=f"by {_who(self.request.user)}",
+            link="/clients", ref=f"fyi-client:{client.pk}",
+        )
+

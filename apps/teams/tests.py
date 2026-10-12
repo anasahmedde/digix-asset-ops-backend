@@ -1661,3 +1661,56 @@ def test_health_follows_the_dates_the_work_and_the_blockers(db):
     # On hold says so.
     project.phase = Project.Phase.ON_HOLD
     assert project.health(progress=45) == Project.Status.ON_HOLD
+
+
+@pytest.mark.django_db
+def test_a_project_manager_is_any_staff_member_but_a_technician():
+    """The Super Admin and a technician cannot be set as a project's manager;
+    a supervisor, the operations head or a marketing person can."""
+    from rest_framework.test import APIClient
+
+    from apps.accounts.models import User
+    from apps.teams.models import Project
+
+    ops = User.objects.create_user(username="pm-ops", password="x", role="ops_manager")
+    sup = User.objects.create_user(username="pm-sup", password="x", role="supervisor")
+    mkt = User.objects.create_user(username="pm-mkt", password="x", role="marketing")
+    admin = User.objects.create_user(username="pm-admin", password="x", role="super_admin")
+    tech = User.objects.create_user(username="pm-tech", password="x", role="technician")
+    project = Project.objects.create(name="PM Rule", status="planning")
+    c = APIClient()
+    c.force_authenticate(ops)
+    for who, ok in ((sup, True), (ops, True), (mkt, True), (admin, False), (tech, False)):
+        r = c.patch(f"/api/teams/projects/{project.pk}/", {"manager": str(who.pk)}, format="json")
+        assert (r.status_code == 200) == ok, (who.role, r.status_code, r.content)
+
+
+@pytest.mark.django_db
+def test_the_approver_does_not_submit_and_a_submitted_budget_waits_for_the_approver():
+    """The Group Head cannot submit a budget for their own signature; once the
+    planner has sent it up, only a send-back (with a reason) reopens it."""
+    from rest_framework.test import APIClient
+
+    from apps.accounts.models import User
+    from apps.teams.models import Project, ProjectCostLine
+
+    head = User.objects.create_user(username="bd-head", password="x", role="group_head")
+    ops = User.objects.create_user(username="bd-ops", password="x", role="ops_manager", reports_to=head)
+    project = Project.objects.create(name="Budget Rules", status="planning", manager=ops)
+    ProjectCostLine.objects.create(project=project, description="travel", quantity=1, unit_cost=5000)
+
+    h = APIClient(); h.force_authenticate(head)
+    o = APIClient(); o.force_authenticate(ops)
+    r = h.post(f"/api/teams/projects/{project.pk}/submit-budget/", {}, format="json")
+    assert r.status_code == 403, r.content
+    r = o.post(f"/api/teams/projects/{project.pk}/submit-budget/", {}, format="json")
+    assert r.status_code == 200, r.content
+    # The planner cannot reopen it now...
+    r = o.post(f"/api/teams/projects/{project.pk}/revise-budget/", {}, format="json")
+    assert r.status_code == 400 and "awaiting approval" in r.json()["detail"]
+    # ...and the approver cannot send it back without a reason.
+    r = h.post(f"/api/teams/projects/{project.pk}/reject-budget/", {}, format="json")
+    assert r.status_code == 400
+    r = h.post(f"/api/teams/projects/{project.pk}/reject-budget/", {"notes": "Travel is double-counted."}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["status"] == "rejected"
