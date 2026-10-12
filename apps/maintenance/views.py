@@ -1,6 +1,9 @@
+import hashlib
+
 from apps.notifications.service import inform_line, who as _who
 from django.db.models import DateField
 from django.db.models.functions import Cast, Coalesce
+from django.core.files.uploadedfile import UploadedFile
 from rest_framework import serializers as drf_serializers
 from rest_framework import status as drf_status
 from common.noops import RefusesSilentNoOps
@@ -93,6 +96,19 @@ def _may_withdraw(user, line) -> bool:
     if line.requested_by_id == user.pk:
         return True
     return _answers_for(user, line)
+
+
+def _fingerprint(f) -> str:
+    """The picture's bytes, hashed, so the same file is known again by any name."""
+    if isinstance(f, UploadedFile):
+        f.seek(0)
+    else:
+        f.open("rb")
+    digest = hashlib.md5()
+    for chunk in f.chunks():
+        digest.update(chunk)
+    f.seek(0)
+    return digest.hexdigest()
 
 
 def _acts_for_everyone(user) -> bool:
@@ -481,6 +497,15 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         )
         if not images:
             return Response({"images": ["Attach at least one photo."]}, status=400)
+        # An After photo that is the Before photo again shows nothing changed:
+        # the same bytes under any name are refused.
+        if kind == MaintenanceVisitPhoto.Kind.AFTER:
+            before = {_fingerprint(ph.image) for ph in visit.photos.filter(kind=MaintenanceVisitPhoto.Kind.BEFORE)}
+            if any(_fingerprint(image) in before for image in images):
+                return Response(
+                    {"images": ["That is the Before photo again - the After photo must be a new picture."]},
+                    status=400,
+                )
 
         def coord(name):
             raw = request.data.get(name)
