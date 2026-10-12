@@ -1203,6 +1203,12 @@ def test_every_round_is_planned_on_its_own(parts_job):
         f"/api/maintenance/visits/{visit.id}/photos/",
         {"kind": "before", "image": _png()}, format="multipart",
     )
+    # The After photo cannot be the Before photo handed in again.
+    same = _client(parts_job["tech"]).post(
+        f"/api/maintenance/visits/{visit.id}/photos/",
+        {"kind": "after", "image": _png()}, format="multipart",
+    )
+    assert same.status_code == 400 and "Before photo again" in str(same.data["images"]), same.content
 
     # Starting says so on the round and on the schedule.
     r = _client(parts_job["tech"]).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
