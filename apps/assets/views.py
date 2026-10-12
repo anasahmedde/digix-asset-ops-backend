@@ -638,7 +638,12 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         """
         from .serializers import _warranty_status
 
-        qs = self.filter_queryset(self.get_queryset())[:EXPORT_MAX_ROWS]
+        qs = self.filter_queryset(self.get_queryset())
+        # ?ids=a,b,c - only the rows somebody ticked on the list.
+        ids = [i for i in request.query_params.get("ids", "").split(",") if i]
+        if ids:
+            qs = qs.filter(id__in=ids)
+        qs = qs[:EXPORT_MAX_ROWS]
         columns = [
             "Asset Code", "Serial Number", "Name", "Model", "Asset Type",
             "Status", "Source", "Batch Number", "Client", "Site", "Project",
