@@ -224,8 +224,114 @@ def teams_report(request, date_from, date_to):
     }
 
 
+def visits_report(request, date_from, date_to):
+    """Maintenance visits, one row each, or rolled up by technician, site or project."""
+    from django.db.models import Q
+
+    from apps.maintenance.models import MaintenanceVisit
+
+    qs = MaintenanceVisit.objects.select_related(
+        "schedule", "schedule__site", "schedule__device", "schedule__device__project",
+        "schedule__ticket", "assigned_to",
+    ).exclude(status=MaintenanceVisit.Status.SKIPPED)
+    if date_from:
+        qs = qs.filter(Q(started_at__date__gte=date_from) | Q(started_at__isnull=True, due_date__gte=date_from))
+    if date_to:
+        qs = qs.filter(Q(started_at__date__lte=date_to) | Q(started_at__isnull=True, due_date__lte=date_to))
+    p = request.query_params
+    if p.get("technician"):
+        qs = qs.filter(assigned_to_id=p["technician"])
+    if p.get("site"):
+        qs = qs.filter(schedule__site_id=p["site"])
+    if p.get("project"):
+        qs = qs.filter(schedule__device__project_id=p["project"])
+    if p.get("status"):
+        qs = qs.filter(status=p["status"])
+
+    def hours(v):
+        if v.started_at and v.completed_at:
+            return round((v.completed_at - v.started_at).total_seconds() / 3600, 2)
+        return None
+
+    def name_of(v, what):
+        s = v.schedule
+        if what == "technician":
+            return (v.assigned_to.get_full_name() or v.assigned_to.username) if v.assigned_to_id else "Unassigned"
+        if what == "site":
+            return s.site.name if s.site_id else "No site"
+        return s.device.project.name if s.device_id and s.device.project_id else "No project"
+
+    visits = list(qs.order_by("-due_date")[:5000])
+    group_by = p.get("group_by") or ""
+    if group_by in ("technician", "site", "project"):
+        buckets = {}
+        for v in visits:
+            b = buckets.setdefault(name_of(v, group_by), {
+                group_by: name_of(v, group_by), "visits": 0, "completed": 0, "in_progress": 0,
+                "awaiting_review": 0, "planned": 0, "unresolved": 0, "hours": 0.0, "_timed": 0,
+            })
+            b["visits"] += 1
+            b[v.status] = b.get(v.status, 0) + 1
+            if v.review_decision == MaintenanceVisit.Review.UNRESOLVED:
+                b["unresolved"] += 1
+            h = hours(v)
+            if h is not None:
+                b["hours"] += h
+                b["_timed"] += 1
+        rows = []
+        for b in sorted(buckets.values(), key=lambda r: -r["visits"]):
+            timed = b.pop("_timed")
+            b["hours"] = round(b["hours"], 1)
+            b["avg_hours"] = round(b["hours"] / timed, 1) if timed else None
+            rows.append(b)
+        return {
+            "type": "visits",
+            "columns": _cols(
+                (group_by, group_by.title()), ("visits", "Visits"), ("completed", "Completed"),
+                ("in_progress", "In Progress"), ("awaiting_review", "Awaiting Review"),
+                ("planned", "Planned"), ("unresolved", "Sent Back"), ("hours", "Hours on Site"),
+                ("avg_hours", "Avg Hours / Visit"),
+            ),
+            "rows": rows, "count": len(rows),
+            "summary": {"total": len(visits), "group_by": group_by},
+        }
+
+    rows = [{
+        "technician": name_of(v, "technician"),
+        "site": name_of(v, "site"),
+        "project": name_of(v, "project"),
+        "asset": v.schedule.device.asset_code if v.schedule.device_id else "",
+        "job": v.schedule.ticket.ticket_number if v.schedule.ticket_id and v.schedule.ticket.ticket_number else v.schedule.title,
+        "type": v.schedule.get_maintenance_type_display(),
+        "visit": v.sequence,
+        "status": v.get_status_display(),
+        "due_date": v.due_date,
+        "started_at": v.started_at.strftime("%Y-%m-%d %H:%M") if v.started_at else "",
+        "completed_at": v.completed_at.strftime("%Y-%m-%d %H:%M") if v.completed_at else "",
+        "hours": hours(v),
+        "asset_verified": "Yes" if v.asset_verified_at else "No",
+        "outcome": v.get_review_decision_display() if v.review_decision else ("Fixed" if v.resolved else "Not fixed" if v.resolved is False else ""),
+    } for v in visits]
+    by_status = {}
+    for v in visits:
+        by_status[v.status] = by_status.get(v.status, 0) + 1
+    return {
+        "type": "visits",
+        "columns": _cols(
+            ("technician", "Technician"), ("site", "Site"), ("project", "Project"),
+            ("asset", "Asset"), ("job", "Job"), ("type", "Type"), ("visit", "Visit #"),
+            ("status", "Status"), ("due_date", "Due"), ("started_at", "Started"),
+            ("completed_at", "Finished"), ("hours", "Hours"), ("asset_verified", "Asset Scanned"),
+            ("outcome", "Outcome"),
+        ),
+        "rows": rows, "count": len(rows),
+        "summary": {"total": len(rows), "by_status": by_status},
+    }
+
+
 BUILDERS = {
     "assets": assets_report,
+    "visits": visits_report,
     "tickets": tickets_report,
     "work_orders": work_orders_report,
     "inventory": inventory_report,

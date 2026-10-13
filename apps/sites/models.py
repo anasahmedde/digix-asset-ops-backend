@@ -102,6 +102,13 @@ class DeviceInstallation(TimeStampedModel):
     )
     position_label = models.CharField(max_length=200, blank=True)
     notes = models.TextField(blank=True)
+    # The installer scanned the asset's label on site before the first step
+    # moved: proof the checklist is being worked on the right asset.
+    asset_verified_at = models.DateTimeField(null=True, blank=True)
+    asset_verified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installations_verified",
+    )
 
     class Meta:
         ordering = ["-installed_at"]

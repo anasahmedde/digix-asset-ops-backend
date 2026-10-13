@@ -116,6 +116,24 @@ def _acts_for_everyone(user) -> bool:
     return can_any(user, "review_maintenance", "manage_maintenance", "assign_maintenance", "act_across_teams")
 
 
+def _from_the_site(user, schedule):
+    """The field acts from the site it is clocked in at; the office from a desk."""
+    from apps.attendance.presence import require_on_site
+
+    if _acts_for_everyone(user):
+        return
+    require_on_site(user, schedule.site)
+
+
+def _at_the_asset(user, visit):
+    """The field has scanned this job's asset before recording work on it."""
+    from apps.attendance.presence import require_verified_asset
+
+    if _acts_for_everyone(user):
+        return
+    require_verified_asset(visit, visit.schedule.device)
+
+
 def _own_job_only(user, schedule, doing: str):
     """A technician works the jobs given to them, not a colleague's."""
     if schedule is None or _acts_for_everyone(user):
@@ -431,7 +449,7 @@ class CanPlanOrStartARound(BasePermission):
         # technician this visit was given to may photograph or finish it,
         # only the office may review it — and those need the visit itself
         # to decide, which a has_permission check cannot see.
-        if view.action in ("photos", "complete_visit", "review"):
+        if view.action in ("photos", "complete_visit", "review", "verify_asset"):
             return True
         return False
 
@@ -463,6 +481,18 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             visit.schedule.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE
             and visit.schedule.ticket_id is not None
         )
+
+    @action(detail=True, methods=["post"], url_path="verify-asset")
+    def verify_asset(self, request, pk=None):
+        """The phone scanned a label: is it this job's asset?"""
+        from apps.attendance.presence import verify_asset
+
+        visit = self.get_object()
+        if not _acts_for_everyone(request.user) and visit.assigned_to_id != request.user.id:
+            return Response({"detail": "Only the technician on this visit verifies its asset."}, status=403)
+        _from_the_site(request.user, visit.schedule)
+        verify_asset(request.user, visit, visit.schedule.device, request.data.get("code"))
+        return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
     def photos(self, request, pk=None):
@@ -497,6 +527,9 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         )
         if not images:
             return Response({"images": ["Attach at least one photo."]}, status=400)
+        if is_record:
+            _from_the_site(request.user, visit.schedule)
+            _at_the_asset(request.user, visit)
         # An After photo that is the Before photo again shows nothing changed:
         # the same bytes under any name are refused.
         if kind == MaintenanceVisitPhoto.Kind.AFTER:
@@ -529,6 +562,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
     def complete_visit(self, request, pk=None):
         """The technician is done, and says whether the fault is fixed."""
         visit = self.get_object()
+        _from_the_site(request.user, visit.schedule)
         if not self._corrective(visit):
             # A round has no ticket to move, but it is handed in and
             # accepted exactly as a breakdown is.
@@ -652,6 +686,8 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 {"detail": "You can only start a round assigned to you."},
                 status=403,
             )
+        _from_the_site(request.user, visit.schedule)
+        _at_the_asset(request.user, visit)
         # Where the phone says it is. Offered, never demanded: a basement
         # with no signal is still a place work gets done.
         where = _where_from(request.data)
