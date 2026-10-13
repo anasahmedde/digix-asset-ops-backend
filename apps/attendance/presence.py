@@ -7,7 +7,8 @@ asked. The rule is a setting so a test suite, or a site with no signal, can
 switch it off.
 """
 from django.conf import settings
-from rest_framework.exceptions import PermissionDenied
+from django.utils import timezone
+from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from .models import AttendanceRecord
 
@@ -24,6 +25,43 @@ def clocked_in_at(user, site_id) -> bool:
         return False
     check_type, where = last
     return check_type == AttendanceRecord.CheckType.CHECK_IN and (site_id is None or where == site_id)
+
+
+def require_verified_asset(stamped, device):
+    """Refuse work on a job whose asset the phone has not scanned yet.
+
+    ``stamped`` is the visit or installation carrying ``asset_verified_at``.
+    A job with no asset has nothing to scan.
+    """
+    if not getattr(settings, "FIELD_WORK_NEEDS_CHECK_IN", True):
+        return
+    if device is None or stamped.asset_verified_at:
+        return
+    raise PermissionDenied(
+        f"Scan the QR label on {device.asset_code} first - the buttons open once "
+        "the phone has confirmed you are at the right asset."
+    )
+
+
+def verify_asset(user, stamped, device, code):
+    """The code the phone scanned is this job's asset, or it is refused."""
+    code = (code or "").strip()
+    if device is None:
+        raise ValidationError({"detail": "This job has no asset to verify."})
+    if not code:
+        raise ValidationError({"code": ["Scan the asset's QR label."]})
+    accepted = {device.asset_code.casefold()}
+    if device.serial_number:
+        accepted.add(device.serial_number.casefold())
+    if code.casefold() not in accepted:
+        raise ValidationError({"detail": (
+            f"That label reads {code}, not {device.asset_code}. "
+            "This is not the asset this job is for."
+        )})
+    stamped.asset_verified_at = timezone.now()
+    stamped.asset_verified_by = user
+    stamped.save(update_fields=["asset_verified_at", "asset_verified_by", "updated_at"])
+    return stamped
 
 
 def require_on_site(user, site):

@@ -134,6 +134,7 @@ class _InstallationCommonMixin(serializers.Serializer):
     asset_type_name = serializers.CharField(source="device.asset_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True)
     installed_by_name = serializers.CharField(source="installed_by.get_full_name", read_only=True, default=None)
+    asset_verified_by_name = serializers.CharField(source="asset_verified_by.get_full_name", read_only=True, default=None)
     installed_by_phone = serializers.CharField(source="installed_by.phone", read_only=True, default=None)
     # Technician identity comes straight from the manpower record — no retyping.
     installed_by_employee_id = serializers.CharField(
@@ -341,10 +342,10 @@ class DeviceInstallationListSerializer(DateOrder, _InstallationCommonMixin, seri
             "installed_by_employee_id", "installed_by_job_title", "installed_by_role",
             "vendor", "vendor_name", "external_vendor_name", "external_vendor_contact", "vendor_display",
             "installed_at", "removed_at", "due_date", "completed_at",
-            "escalated", "escalation_state",
+            "escalated", "escalation_state", "asset_verified_at", "asset_verified_by_name",
             "progress", "steps_done", "steps_total", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
         ]
-        read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
+        read_only_fields = ["id", "completed_at", "escalation_state", "asset_verified_at", "created_at"]
 
 
 class HandoverRecordSerializer(DateOrder, serializers.ModelSerializer):
@@ -471,11 +472,11 @@ class DeviceInstallationDetailSerializer(DateOrder, _InstallationCommonMixin, se
             "installed_at", "removed_at",
             "vendor", "vendor_name", "external_vendor_name", "external_vendor_contact", "vendor_display",
             "due_date", "completed_at",
-            "escalated", "escalation_state",
+            "escalated", "escalation_state", "asset_verified_at", "asset_verified_by_name",
             "position_label", "notes", "photos", "steps", "delays", "step_types",
             "handover", "progress", "steps_done", "steps_total", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
         ]
-        read_only_fields = ["id", "completed_at", "escalation_state", "created_at"]
+        read_only_fields = ["id", "completed_at", "escalation_state", "asset_verified_at", "created_at"]
 
     def validate(self, attrs):
         """A vendor is either a registered supplier or a hand-entered one."""

@@ -176,7 +176,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
     # are checked inside, against the installer and the capability.
     write_capability = "assign_installation"
     action_capabilities = {
-        "activate": None, "handover": None,
+        "activate": None, "handover": None, "verify_asset": None,
         "export": "view_installations", "handover_document": "view_installations",
         "reorder_steps": "edit_installation",
         "save_step_template": "manage_setup", "apply_step_template": "edit_installation",
@@ -424,6 +424,21 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             ).data,
         })
 
+    @action(detail=True, methods=["post"], url_path="verify-asset")
+    def verify_asset(self, request, pk=None):
+        """The phone scanned a label: is it the asset this installation is for?"""
+        from apps.attendance.presence import require_on_site, verify_asset
+
+        installation = self.get_object()
+        user = request.user
+        office = can(user, "act_across_teams") or can(user, "assign_installation")
+        if not office and installation.installed_by_id != user.id:
+            return Response({"detail": "Only the assigned installer verifies this asset."}, status=drf_status.HTTP_403_FORBIDDEN)
+        if not office:
+            require_on_site(user, installation.site)
+        verify_asset(user, installation, installation.device, request.data.get("code"))
+        return Response(DeviceInstallationDetailSerializer(installation, context=self.get_serializer_context()).data)
+
     @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
     def activate(self, request, pk=None):
         """Technician marks the installed asset live, with a photo of it.
@@ -447,9 +462,10 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             )
 
         if mine and not (can(user, "act_across_teams") or can(user, "assign_installation")):
-            from apps.attendance.presence import require_on_site
+            from apps.attendance.presence import require_on_site, require_verified_asset
 
             require_on_site(user, installation.site)
+            require_verified_asset(installation, installation.device)
 
         device = installation.device
         if device.status == "active":
@@ -699,11 +715,12 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
     def _from_the_site(self, installation):
         """The installer works the checklist from the site; who else may edit
         it (the office, their supervisor) is decided further down."""
-        from apps.attendance.presence import require_on_site
+        from apps.attendance.presence import require_on_site, require_verified_asset
 
         user = self.request.user
         if installation.installed_by_id == user.id and not can(user, "act_across_teams"):
             require_on_site(user, installation.site)
+            require_verified_asset(installation, installation.device)
 
     def perform_create(self, serializer):
         refuse_if_closed_out(serializer.validated_data["installation"])

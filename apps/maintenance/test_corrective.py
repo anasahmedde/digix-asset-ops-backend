@@ -821,6 +821,14 @@ def test_the_field_works_a_visit_from_the_site_it_is_clocked_in_at(fault, settin
     assert away.status_code == 403 and "Check in at Mall atrium" in str(away.data["detail"]), away.content
 
     AttendanceRecord.objects.create(user=tech, check_type="check_in", site=here)
+    # On site, but the asset has not been scanned: still nothing opens.
+    unscanned = _client(tech).post(photos, {"kind": "before", "image": _png()}, format="multipart")
+    assert unscanned.status_code == 403 and "Scan the QR label" in str(unscanned.data["detail"]), unscanned.content
+    verify = f"/api/maintenance/visits/{visit.id}/verify-asset/"
+    wrong = _client(tech).post(verify, {"code": "AST-SOMEONE-ELSE"}, format="json")
+    assert wrong.status_code == 400 and "not the asset this job is for" in str(wrong.data["detail"]), wrong.content
+    right = _client(tech).post(verify, {"code": job.device.asset_code.lower()}, format="json")
+    assert right.status_code == 200 and right.data["asset_verified_at"], right.content
     r = _client(tech).post(photos, {"kind": "before", "image": _png()}, format="multipart")
     assert r.status_code in (200, 201), r.content
     assert _client(tech).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json").status_code == 200
