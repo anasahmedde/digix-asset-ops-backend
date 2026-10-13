@@ -1780,3 +1780,26 @@ def test_a_step_is_started_before_it_is_finished(db):
     step.refresh_from_db()
     assert step.status == InstallationStep.StepStatus.COMPLETED
     assert step.started_at is not None and step.completed_at is not None
+
+
+@pytest.mark.django_db
+def test_the_installer_scans_the_asset_before_the_checklist_opens(tech, installation, settings):
+    """With the field gate on: checked in at the site is not enough, the
+    phone must also have read this asset's label."""
+    from apps.attendance.models import AttendanceRecord
+
+    settings.FIELD_WORK_NEEDS_CHECK_IN = True
+    step = installation.steps.first()
+    move = f"/api/sites/installation-steps/{step.id}/"
+    AttendanceRecord.objects.create(user=tech, check_type="check_in", site=installation.site)
+    r = _client(tech).patch(move, {"status": "in_progress"}, format="json")
+    assert r.status_code == 403 and "Scan the QR label on AST-INST-1" in str(r.data["detail"]), r.content
+
+    verify = f"/api/sites/installations/{installation.id}/verify-asset/"
+    wrong = _client(tech).post(verify, {"code": "AST-OTHER"}, format="json")
+    assert wrong.status_code == 400 and "not the asset this job is for" in str(wrong.data["detail"]), wrong.content
+    right = _client(tech).post(verify, {"code": "ast-inst-1"}, format="json")
+    assert right.status_code == 200 and right.data["asset_verified_at"], right.content
+    assert right.data["asset_verified_by_name"] == "Tariq Installer"
+    r = _client(tech).patch(move, {"status": "in_progress"}, format="json")
+    assert r.status_code == 200, r.content

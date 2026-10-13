@@ -25,14 +25,19 @@ def _client(user):
     return c
 
 
-def _png():
-    # A one-pixel PNG: enough for ImageField to accept it.
+def _png(tag=""):
+    # A one-pixel PNG: enough for ImageField to accept it. Two calls with the
+    # same tag are the same bytes; a different tag is a different photograph
+    # (an After photo that is the Before photo again is refused).
+    import base64
+    import zlib
+
+    head = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottA==")
+    iend = base64.b64decode("AAAAAElFTkSuQmCC")
+    text = b"Comment" + bytes(1) + tag.encode()
+    chunk = len(text).to_bytes(4, "big") + b"tEXt" + text + zlib.crc32(b"tEXt" + text).to_bytes(4, "big")
     return SimpleUploadedFile(
-        "shot.png",
-        (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06"
-         b"\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05"
-         b"\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"),
-        content_type="image/png",
+        "shot.png", head + (chunk if tag else b"") + iend, content_type="image/png",
     )
 
 
@@ -190,7 +195,7 @@ def test_a_visit_cannot_complete_without_an_after_photo_or_feedback(fault):
     r = _client(tech).post(done, {"resolved": True}, format="json")
     assert r.status_code == 400 and "AFTER photo" in str(r.data["detail"])
 
-    _client(tech).post(photos, {"kind": "after", "image": _png()}, format="multipart")
+    _client(tech).post(photos, {"kind": "after", "image": _png("after")}, format="multipart")
     # "Not fixed" has to say why.
     r = _client(tech).post(done, {"resolved": False}, format="json")
     assert r.status_code == 400 and "remarks" in r.data
@@ -223,7 +228,7 @@ def test_a_super_admin_may_do_what_the_technician_does(fault):
                               format="multipart").status_code == 201
     assert _client(boss).post(f"/api/maintenance/visits/{visit.id}/start/",
                               {}, format="json").status_code == 200
-    assert _client(boss).post(photos, {"kind": "after", "image": _png()},
+    assert _client(boss).post(photos, {"kind": "after", "image": _png("after")},
                               format="multipart").status_code == 201
     r = _client(boss).post(f"/api/maintenance/visits/{visit.id}/complete/",
                            {"resolved": True, "remarks": "seen to"}, format="json")
@@ -244,7 +249,7 @@ def _to_review(fault):
     p = f"/api/maintenance/visits/{visit.id}/photos/"
     _client(tech).post(p, {"kind": "before", "image": _png()}, format="multipart")
     _client(tech).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
-    _client(tech).post(p, {"kind": "after", "image": _png()}, format="multipart")
+    _client(tech).post(p, {"kind": "after", "image": _png("after")}, format="multipart")
     _client(tech).post(
         f"/api/maintenance/visits/{visit.id}/complete/",
         {"resolved": True, "remarks": "done"}, format="json",
@@ -391,7 +396,7 @@ def test_a_round_is_worked_the_same_way_without_a_ticket(team):
 
     # Handing it in needs the other photograph, and goes to the office.
     assert _client(tech).post(f"{url}/complete/", {}, format="json").status_code == 400
-    _client(tech).post(f"{url}/photos/", {"kind": "after", "image": _png()}, format="multipart")
+    _client(tech).post(f"{url}/photos/", {"kind": "after", "image": _png("after")}, format="multipart")
     r = _client(tech).post(f"{url}/complete/", {"remarks": "Cleaned and checked"}, format="json")
     assert r.status_code == 200, r.content
     visit.refresh_from_db()
@@ -464,7 +469,7 @@ def test_a_round_the_office_is_not_happy_with_goes_back(team):
     url = f"/api/maintenance/visits/{visit.id}"
     _client(tech).post(f"{url}/photos/", {"kind": "before", "image": _png()}, format="multipart")
     _client(tech).post(f"{url}/start/", {}, format="json")
-    _client(tech).post(f"{url}/photos/", {"kind": "after", "image": _png()}, format="multipart")
+    _client(tech).post(f"{url}/photos/", {"kind": "after", "image": _png("after")}, format="multipart")
     _client(tech).post(f"{url}/complete/", {"remarks": "Wiped over"}, format="json")
 
     was_due = job.next_due
@@ -538,7 +543,7 @@ def _ready_to_finish(fault):
     p = f"/api/maintenance/visits/{visit.id}/photos/"
     _client(tech).post(p, {"kind": "before", "image": _png()}, format="multipart")
     _client(tech).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
-    _client(tech).post(p, {"kind": "after", "image": _png()}, format="multipart")
+    _client(tech).post(p, {"kind": "after", "image": _png("after")}, format="multipart")
     return visit
 
 
@@ -789,3 +794,48 @@ def test_a_ticket_says_who_may_review_it():
     for who, may in ((lateral, False), (own, True), (head, True)):
         r = _client(who).get(f"/api/tickets/{ticket.pk}/")
         assert r.status_code == 200 and r.data["reviewable_by_me"] is may, (who.username, r.status_code)
+
+
+# ── From the site ────────────────────────────────────────────────────────
+
+@pytest.mark.django_db
+def test_the_field_works_a_visit_from_the_site_it_is_clocked_in_at(fault, settings):
+    """With the attendance gate on, a technician who has not checked in at the
+    job's site cannot photograph, start or finish it."""
+    from apps.attendance.models import AttendanceRecord
+    from apps.sites.models import Site
+
+    settings.FIELD_WORK_NEEDS_CHECK_IN = True
+    job, tech, office = fault["job"], fault["tech"], fault["office"]
+    here = Site.objects.create(name="Mall atrium", address="x")
+    job.site = here
+    job.save(update_fields=["site"])
+    _client(office).post(
+        f"/api/maintenance/schedules/{job.id}/assign/",
+        {"technician": str(tech.id), "due_date": str(timezone.localdate())}, format="json",
+    )
+    visit = job.visits.order_by("-sequence").first()
+    photos = f"/api/maintenance/visits/{visit.id}/photos/"
+
+    away = _client(tech).post(photos, {"kind": "before", "image": _png()}, format="multipart")
+    assert away.status_code == 403 and "Check in at Mall atrium" in str(away.data["detail"]), away.content
+
+    AttendanceRecord.objects.create(user=tech, check_type="check_in", site=here)
+    # On site, but the asset has not been scanned: still nothing opens.
+    unscanned = _client(tech).post(photos, {"kind": "before", "image": _png()}, format="multipart")
+    assert unscanned.status_code == 403 and "Scan the QR label" in str(unscanned.data["detail"]), unscanned.content
+    verify = f"/api/maintenance/visits/{visit.id}/verify-asset/"
+    wrong = _client(tech).post(verify, {"code": "AST-SOMEONE-ELSE"}, format="json")
+    assert wrong.status_code == 400 and "not the asset this job is for" in str(wrong.data["detail"]), wrong.content
+    right = _client(tech).post(verify, {"code": job.device.asset_code.lower()}, format="json")
+    assert right.status_code == 200 and right.data["asset_verified_at"], right.content
+    r = _client(tech).post(photos, {"kind": "before", "image": _png()}, format="multipart")
+    assert r.status_code in (200, 201), r.content
+    assert _client(tech).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json").status_code == 200
+
+    # Checked out again: the buttons close until the next check-in.
+    AttendanceRecord.objects.create(user=tech, check_type="check_out", site=here)
+    gone = _client(tech).post(photos, {"kind": "after", "image": _png("after")}, format="multipart")
+    assert gone.status_code == 403, gone.content
+    assert _client(tech).post(f"/api/maintenance/visits/{visit.id}/complete/",
+                              {"resolved": True, "remarks": "done"}, format="json").status_code == 403

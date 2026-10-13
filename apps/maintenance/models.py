@@ -255,6 +255,13 @@ class MaintenanceVisit(TimeStampedModel):
     start_longitude = models.DecimalField(
         max_digits=10, decimal_places=7, null=True, blank=True,
     )
+    # The phone scanned the asset's label on site before any work was
+    # recorded: proof the technician stood at the right asset.
+    asset_verified_at = models.DateTimeField(null=True, blank=True)
+    asset_verified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="maintenance_visits_verified",
+    )
     # What was recorded when the round was closed out.
     record = models.OneToOneField(
         "maintenance.MaintenanceRecord", on_delete=models.SET_NULL, null=True, blank=True,

@@ -279,6 +279,9 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     reviewed_by_name = serializers.SerializerMethodField()
     has_before_photo = serializers.BooleanField(read_only=True)
     has_after_photo = serializers.BooleanField(read_only=True)
+    asset_verified_by_name = serializers.CharField(
+        source="asset_verified_by.get_full_name", read_only=True, default=None,
+    )
     # What the parts this visit used are worth, so the person accepting it
     # sees the figure before they commit to it rather than after.
     component_costs = serializers.SerializerMethodField()
@@ -325,6 +328,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
             "review_decision", "review_decision_display", "review_reason",
             "review_note", "reviewed_by", "reviewed_by_name",
             "reviewed_at", "visit_photos", "has_before_photo", "has_after_photo",
+            "asset_verified_at", "asset_verified_by_name",
             "component_costs", "cost_lines",
             "created_at", "updated_at",
         ]
@@ -332,7 +336,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
         read_only_fields = [
             "id", "schedule", "status", "started_at", "record", "created_at", "updated_at",
             # Stamped by the act of starting, never typed in afterwards.
-            "start_latitude", "start_longitude",
+            "start_latitude", "start_longitude", "asset_verified_at",
             # Everything below is written by the lifecycle, never by a PATCH:
             # a verdict somebody could edit is not a verdict.
             "sequence", "completed_at", "resolved", "remarks", "review_decision",
