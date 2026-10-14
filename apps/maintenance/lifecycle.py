@@ -401,6 +401,40 @@ def outstanding_parts(visit: MaintenanceVisit):
     ]
 
 
+def _refuse_while_parts_unreturned(visit: MaintenanceVisit) -> None:
+    """The cost of a visit is what it used, so nobody signs it off until the
+    technician has said what was used and what is going back."""
+    owed = outstanding_parts(visit)
+    if owed:
+        raise ValidationError({"detail": (
+            "The technician has not yet said how much was used of: "
+            + ", ".join(line.what for line in owed)
+            + ". The leftovers are returned from the field app (Return unused components), "
+            "or recorded when the visit is completed on the web."
+        )})
+
+
+@transaction.atomic
+def return_parts(visit: MaintenanceVisit, *, user, settlement):
+    """The technician, back from site, says what was used; the rest goes to
+    receiving under its own reference. Returns the receipt, or None."""
+    from .parts import settle
+
+    if not (theirs(visit, user) or is_office(user)):
+        raise PermissionDenied("Only the technician on this visit, or the office, returns its parts.")
+    if visit.status not in (MaintenanceVisit.Status.IN_PROGRESS, MaintenanceVisit.Status.AWAITING_REVIEW):
+        raise ValidationError({"detail": (
+            f"Visit {visit.sequence} is {visit.get_status_display().lower()}: its parts are settled already."
+        )})
+    if not settlement:
+        raise ValidationError({"parts_settlement": ["Say how much of each issued component was used."]})
+    owed = {str(line.pk) for line in outstanding_parts(visit)}
+    for row in settlement:
+        if str(row.get("part_request")) not in owed:
+            raise ValidationError({"parts_settlement": ["That line has been accounted for already, or nothing was issued on it."]})
+    return settle(visit.schedule, user=user, rows=settlement, visit=visit)
+
+
 def complete(
     visit: MaintenanceVisit, *, user, resolved: bool, remarks: str = "",
     settlement=None,
@@ -427,12 +461,10 @@ def complete(
     # it is not put straight on the shelf.
     from .parts import settle
 
-    owed = outstanding_parts(visit)
-    if owed and not settlement:
-        raise ValidationError({"parts_settlement": [
-            "Say how much of each issued component was used: "
-            + ", ".join(line.what for line in owed)
-        ]})
+    # What the store handed over may be squared up here, or once the
+    # technician is back from site (return_parts): the field app asks for the
+    # leftovers after check-out, at the store. The office cannot accept the
+    # visit until it has been done either way.
     receipt = settle(
         visit.schedule, user=user, rows=settlement, visit=visit,
     ) if settlement else None
@@ -473,6 +505,7 @@ def accept(
     job = visit.schedule
     ticket = _require(ACCEPT, job)
     _office_only(user, "accept work as resolved")
+    _refuse_while_parts_unreturned(visit)
     if visit.resolved is False:
         raise ValidationError({"detail": (
             f"Visit {visit.sequence} reports the fault is not fixed, so there is "
@@ -585,12 +618,10 @@ def complete_round(
     if not visit.has_after_photo:
         raise ValidationError({"detail": "Upload an AFTER photo before completing the round."})
 
-    owed = outstanding_parts(visit)
-    if owed and not settlement:
-        raise ValidationError({"parts_settlement": [
-            "Say how much of each issued component was used: "
-            + ", ".join(line.what for line in owed)
-        ]})
+    # What the store handed over may be squared up here, or once the
+    # technician is back from site (return_parts): the field app asks for the
+    # leftovers after check-out, at the store. The office cannot accept the
+    # visit until it has been done either way.
     receipt = settle(
         visit.schedule, user=user, rows=settlement, visit=visit,
     ) if settlement else None
@@ -612,6 +643,7 @@ def accept_round(
 ):
     """The office accepts the round: the register is written, the cycle rolls."""
     _office_only(user, "accept a round")
+    _refuse_while_parts_unreturned(visit)
     if visit.status != MaintenanceVisit.Status.AWAITING_REVIEW:
         raise ValidationError({"detail": (
             f"This round is {visit.get_status_display().lower()}, so there is "

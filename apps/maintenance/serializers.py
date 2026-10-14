@@ -132,6 +132,7 @@ class MaintenanceScheduleSerializer(DateOrder, serializers.ModelSerializer):
             "start_date", "next_due", "instructions", "required_components",
             "status", "status_display",
             "effective_status", "is_active", "next_visit_assignee",
+            "current_technician", "current_technician_name",
             "ticket", "ticket_number", "ticket_description", "ticket_raised_at",
             "last_technician_on_asset",
             "visits", "allowed_actions", "is_corrective",
@@ -142,6 +143,27 @@ class MaintenanceScheduleSerializer(DateOrder, serializers.ModelSerializer):
         # caller set a date that disagrees with the two it comes from, and the
         # model would overwrite it on save anyway.
         read_only_fields = ["id", "next_due", "created_at", "updated_at"]
+
+    current_technician = serializers.SerializerMethodField()
+    current_technician_name = serializers.SerializerMethodField()
+
+    def _open_visit(self, obj):
+        return next(
+            (v for v in obj.visits.all() if v.status in ("planned", "in_progress", "awaiting_review")), None
+        )
+
+    def get_current_technician(self, obj):
+        # Who is on the job now: the open visit's technician, or the job's
+        # when no visit is open. The job's own name can lag behind a visit
+        # handed to somebody else.
+        visit = self._open_visit(obj)
+        who = visit.assigned_to_id if visit and visit.assigned_to_id else obj.assigned_to_id
+        return str(who) if who else None
+
+    def get_current_technician_name(self, obj):
+        visit = self._open_visit(obj)
+        person = visit.assigned_to if visit and visit.assigned_to_id else obj.assigned_to
+        return (person.get_full_name() or person.username) if person else None
 
     def get_next_visit_assignee(self, obj):
         visit = next(
