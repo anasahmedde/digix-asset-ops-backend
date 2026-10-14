@@ -1,7 +1,7 @@
 import hashlib
 
 from apps.notifications.service import inform_line, who as _who
-from django.db.models import DateField
+from django.db.models import DateField, Q
 from django.db.models.functions import Cast, Coalesce
 from django.core.files.uploadedfile import UploadedFile
 from rest_framework import serializers as drf_serializers
@@ -321,6 +321,24 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         "ticket",
     ]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # ?technician=<id>: the jobs that person is on now - their open visit,
+        # or, where no visit is open, the job in their name. The field app
+        # lists "my jobs" this way; listing by the job's name showed a
+        # technician a job whose open visit had gone to somebody else.
+        who = self.request.query_params.get("technician")
+        if who:
+            from django.db.models import Exists, OuterRef
+
+            open_states = ("planned", "in_progress", "awaiting_review")
+            mine = MaintenanceVisit.objects.filter(
+                schedule=OuterRef("pk"), status__in=open_states, assigned_to_id=who,
+            )
+            any_open = MaintenanceVisit.objects.filter(schedule=OuterRef("pk"), status__in=open_states)
+            qs = qs.filter(Exists(mine) | (Q(assigned_to_id=who) & ~Exists(any_open)))
+        return qs
+
     def perform_create(self, serializer):
         job = serializer.save()
         inform_line(
@@ -449,7 +467,7 @@ class CanPlanOrStartARound(BasePermission):
         # technician this visit was given to may photograph or finish it,
         # only the office may review it — and those need the visit itself
         # to decide, which a has_permission check cannot see.
-        if view.action in ("photos", "complete_visit", "review", "verify_asset"):
+        if view.action in ("photos", "complete_visit", "review", "verify_asset", "return_parts"):
             return True
         return False
 
@@ -475,12 +493,38 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             {"detail": "A round is completed or skipped, not deleted."}
         )
 
+    def perform_update(self, serializer):
+        visit = serializer.save()
+        # On a fault the open visit decides who is on the job: when it is
+        # handed to somebody else, the job follows, the way assigning from the
+        # job does. A preventive round given to a stand-in leaves the
+        # arrangement with its standing technician.
+        job = visit.schedule
+        if job.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE and (
+            visit.is_open or visit.status == MaintenanceVisit.Status.AWAITING_REVIEW
+        ):
+            if visit.assigned_to_id and job.assigned_to_id != visit.assigned_to_id:
+                job.assigned_to_id = visit.assigned_to_id
+                job.save(update_fields=["assigned_to", "updated_at"])
+
     def _corrective(self, visit):
         """Corrective work answers to the lifecycle; preventive does not."""
         return (
             visit.schedule.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE
             and visit.schedule.ticket_id is not None
         )
+
+    @action(detail=True, methods=["post"], url_path="return-parts")
+    def return_parts(self, request, pk=None):
+        """Back from site: how much of each issued part was used. The rest
+        goes to receiving. Not tied to the site - it is done at the store."""
+        visit = self.get_object()
+        receipt = lifecycle.return_parts(
+            visit, user=request.user, settlement=request.data.get("parts_settlement") or [],
+        )
+        data = self.get_serializer(visit).data
+        data["return_grn"] = receipt.grn_number if receipt else None
+        return Response(data)
 
     @action(detail=True, methods=["post"], url_path="verify-asset")
     def verify_asset(self, request, pk=None):
