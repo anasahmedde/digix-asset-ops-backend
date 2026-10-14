@@ -548,16 +548,50 @@ def _ready_to_finish(fault):
 
 
 @pytest.mark.django_db
-def test_a_visit_cannot_be_finished_leaving_issued_parts_unaccounted(fault):
-    """The difference between issued and used is not nothing — it is missing."""
-    _issued_line(fault, quantity=10)
+def test_a_visit_cannot_be_signed_off_leaving_issued_parts_unaccounted(fault):
+    """The difference between issued and used is not nothing — it is missing.
+
+    The technician may end the work and check out first: the field app asks
+    for the leftovers afterwards, at the store. The office cannot accept the
+    visit until they have been counted."""
+    from apps.inventory.models import GoodsReceipt
+    from apps.maintenance.models import MaintenancePartRequest
+
+    line_id = _issued_line(fault, quantity=10)
     visit = _ready_to_finish(fault)
 
-    bare = _client(fault["tech"]).post(
+    ended = _client(fault["tech"]).post(
         f"/api/maintenance/visits/{visit.id}/complete/",
         {"resolved": True, "remarks": "done"}, format="json")
-    assert bare.status_code == 400, bare.content
-    assert "issued component" in str(bare.data["parts_settlement"])
+    assert ended.status_code == 200, ended.content
+
+    review = f"/api/maintenance/visits/{visit.id}/review/"
+    early = _client(fault["office"]).post(review, {"decision": "accepted"}, format="json")
+    assert early.status_code == 400 and "has not yet said how much was used" in str(early.data["detail"]), early.content
+
+    # Somebody else's technician cannot return them.
+    other = _client(fault["other"]).post(
+        f"/api/maintenance/visits/{visit.id}/return-parts/",
+        {"parts_settlement": [{"part_request": line_id, "used": 6}]}, format="json")
+    assert other.status_code == 403, other.content
+
+    back = _client(fault["tech"]).post(
+        f"/api/maintenance/visits/{visit.id}/return-parts/",
+        {"parts_settlement": [{"part_request": line_id, "used": 6}]}, format="json")
+    assert back.status_code == 200, back.content
+    receipt = GoodsReceipt.objects.get(source=GoodsReceipt.Source.MAINTENANCE_RETURN)
+    assert back.data["return_grn"] == receipt.grn_number
+    line = MaintenancePartRequest.objects.get(pk=line_id)
+    assert (line.quantity_used, line.quantity_returned) == (6, 4)
+
+    # Counted once: a second return of the same line is refused.
+    again = _client(fault["tech"]).post(
+        f"/api/maintenance/visits/{visit.id}/return-parts/",
+        {"parts_settlement": [{"part_request": line_id, "used": 6}]}, format="json")
+    assert again.status_code == 400, again.content
+
+    ok = _client(fault["office"]).post(review, {"decision": "accepted"}, format="json")
+    assert ok.status_code == 200, ok.content
 
 
 @pytest.mark.django_db
@@ -839,3 +873,36 @@ def test_the_field_works_a_visit_from_the_site_it_is_clocked_in_at(fault, settin
     assert gone.status_code == 403, gone.content
     assert _client(tech).post(f"/api/maintenance/visits/{visit.id}/complete/",
                               {"resolved": True, "remarks": "done"}, format="json").status_code == 403
+
+
+@pytest.mark.django_db
+def test_a_job_is_listed_for_whoever_holds_its_open_visit(fault):
+    """TKT-2026-00035: the job read Sharjeel while its open visit had gone to
+    somebody else, so it sat in his job list with nothing he could do."""
+    job, tech, other, office = fault["job"], fault["tech"], fault["other"], fault["office"]
+    _client(office).post(
+        f"/api/maintenance/schedules/{job.id}/assign/",
+        {"technician": str(tech.id), "due_date": str(timezone.localdate())}, format="json",
+    )
+    visit = job.visits.order_by("-sequence").first()
+
+    def listed(who):
+        r = _client(office).get("/api/maintenance/schedules/", {"technician": str(who.id)})
+        assert r.status_code == 200, r.content
+        return [row["id"] for row in r.data["results"]]
+
+    assert str(job.id) in listed(tech) and str(job.id) not in listed(other)
+
+    # The office hands the visit itself to someone else: the job follows.
+    r = _client(office).patch(f"/api/maintenance/visits/{visit.id}/", {"assigned_to": str(other.id)}, format="json")
+    assert r.status_code == 200, r.content
+    job.refresh_from_db()
+    assert job.assigned_to_id == other.id
+    assert str(job.id) in listed(other) and str(job.id) not in listed(tech)
+    row = _client(office).get(f"/api/maintenance/schedules/{job.id}/").data
+    assert row["current_technician"] == str(other.id)
+
+    # Data that drifted before this fix: the list follows the visit, not the
+    # job's stale name.
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(assigned_to=tech)
+    assert str(job.id) in listed(tech) and str(job.id) not in listed(other)
