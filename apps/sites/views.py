@@ -245,8 +245,11 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 {"steps": ["Give the step ids in the order they should run."]},
                 status=drf_status.HTTP_400_BAD_REQUEST,
             )
+        from .ordering import keep_handover_last
+
         with transaction.atomic():
             apply_step_order(installation.pk, ids)
+            keep_handover_last(installation.pk)
         installation.refresh_from_db()
         return Response(self.get_serializer(installation).data)
 
@@ -722,10 +725,47 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
             require_on_site(user, installation.site)
             require_verified_asset(installation, installation.device)
 
+    def _may_change_checklist(self, installation):
+        """The office lays a checklist out; the installer may add to it or
+        take an unworked step off it on their own job, from the site."""
+        user = self.request.user
+        if can(user, "assign_installation") or can(user, "act_across_teams"):
+            return
+        if may_advance_installation(user, installation) and can(user, "edit_installation"):
+            return
+        raise PermissionDenied("Only the office or this job's installer changes its checklist.")
+
+    def create(self, request, *args, **kwargs):
+        # A new step goes on the end of the list, wherever the screen thought
+        # the end was: the phone counted without Handover and asked for a
+        # number Handover already held, and was refused.
+        from django.db.models import Max
+
+        data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data)
+        last = (
+            InstallationStep.objects.filter(installation_id=data.get("installation"))
+            .aggregate(m=Max("step_number"))["m"]
+            or 0
+        )
+        data["step_number"] = last + 1
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        serializer.instance.refresh_from_db()
+        return Response(self.get_serializer(serializer.instance).data, status=drf_status.HTTP_201_CREATED)
+
     def perform_create(self, serializer):
-        refuse_if_closed_out(serializer.validated_data["installation"])
-        self._from_the_site(serializer.validated_data["installation"])
-        serializer.save()
+        from .ordering import keep_handover_last
+
+        installation = serializer.validated_data["installation"]
+        refuse_if_closed_out(installation)
+        self._may_change_checklist(installation)
+        self._from_the_site(installation)
+        with transaction.atomic():
+            serializer.save()
+            # Added after Handover, it would wait on Handover, which waits on
+            # it: the new step goes in before Handover instead.
+            keep_handover_last(installation.pk)
 
     def perform_update(self, serializer):
         from django.utils import timezone
@@ -736,6 +776,11 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         self._from_the_site(step.installation)
 
         new_status = serializer.validated_data.get("status", step.status)
+        if step.step_type == InstallationStep.StepType.HANDOVER and new_status != step.status:
+            raise _VE({"status": (
+                "Handover completes itself when the signed handover is recorded, "
+                "at the end of the job - it is not started or ticked off by hand."
+            )})
         moving_on = new_status in (
             InstallationStep.StepStatus.IN_PROGRESS,
             InstallationStep.StepStatus.COMPLETED,
@@ -760,7 +805,9 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         if moving_on and new_status != step.status:
             behind = [
                 s.custom_label or s.get_step_type_display()
+                # Handover comes after everything, wherever it is numbered.
                 for s in step.installation.steps.filter(step_number__lt=step.step_number)
+                .exclude(step_type=InstallationStep.StepType.HANDOVER)
                 if s.status not in (
                     InstallationStep.StepStatus.COMPLETED,
                     InstallationStep.StepStatus.SKIPPED,
@@ -799,9 +846,19 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         """Remove the step, then close the gap it leaves in the numbering."""
+        from rest_framework.exceptions import ValidationError as _VE
+
         from .ordering import renumber_steps
 
         refuse_if_closed_out(instance.installation)
+        self._may_change_checklist(instance.installation)
+        # A step that has been worked is part of the record of the job.
+        if instance.status != InstallationStep.StepStatus.NOT_STARTED:
+            raise _VE({"detail": (
+                f"{instance.custom_label or instance.get_step_type_display()} has been worked on, "
+                "so it stays on the checklist. Skip it if it no longer applies."
+            )})
+        self._from_the_site(instance.installation)
         installation_id = instance.installation_id
         with transaction.atomic():
             instance.delete()
@@ -812,7 +869,10 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
     # Steps are added and removed by whoever assigns the job; advancing one
     # is the installer's, checked against the installation itself.
     write_capability = "assign_installation"
-    action_capabilities = {"update": None, "partial_update": None}
+    # Adding a step and taking an unworked one off are open to the job's own
+    # installer too, checked against the installation in perform_create and
+    # perform_destroy: the phone offers both, and the gate refused them.
+    action_capabilities = {"update": None, "partial_update": None, "create": None, "destroy": None}
 
     def get_permissions(self):
         if self.action in ("update", "partial_update"):

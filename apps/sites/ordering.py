@@ -53,6 +53,32 @@ def renumber_steps(installation_id) -> int:
     return out_of_place
 
 
+def keep_handover_last(installation_id) -> bool:
+    """Put a checklist's Handover step at the end, numbered 1..n.
+
+    Handover is not a step worked on site in its turn: it is done when the
+    signed handover is recorded, after everything else, and recording it is
+    what completes it. Sitting in the middle of the list it blocked the steps
+    numbered after it (they could not start until Handover was done, and
+    Handover could not be done until they were), and the phone, which shows
+    Handover as the last stage of the job, numbered the list differently from
+    the desktop. Returns whether anything moved.
+    """
+    from .models import InstallationStep
+
+    steps = list(
+        InstallationStep.objects
+        .filter(installation_id=installation_id)
+        .order_by("step_number", "created_at")
+    )
+    handover = InstallationStep.StepType.HANDOVER
+    ordered = [s for s in steps if s.step_type != handover] + [s for s in steps if s.step_type == handover]
+    in_place = ordered == steps and all(s.step_number == i for i, s in enumerate(steps, start=1))
+    if not in_place:
+        _write_positions(ordered)
+    return not in_place
+
+
 def apply_step_order(installation_id, step_ids) -> list:
     """Put this installation's steps in the given order, numbered 1..n.
 
