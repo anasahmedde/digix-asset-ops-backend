@@ -1386,19 +1386,29 @@ def test_removing_a_step_closes_the_gap_it_leaves(ops, checklist):
 
 @pytest.mark.django_db
 def test_a_step_can_be_moved_to_any_position(ops, checklist):
-    """A step remembered late belongs where it happens, not at the end."""
+    """A step remembered late belongs where it happens, not at the end -
+    except Handover, which is done last whatever order it is given."""
     ids = [str(s.id) for s in checklist.steps.order_by("step_number")]
-    # Take the last one and put it first.
+    # Take the last work step (Testing) and put it first.
+    r = _client(ops).post(
+        f"/api/sites/installations/{checklist.id}/reorder-steps/",
+        {"steps": [ids[-2], *ids[:-2], ids[-1]]}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    assert _numbers(checklist) == [1, 2, 3, 4, 5, 6]
+    assert _types(checklist) == [
+        "testing", "survey", "wiring", "structure", "programming", "handover",
+    ]
+
+    # Asked to put Handover first, it stays at the end.
+    ids = [str(s.id) for s in checklist.steps.order_by("step_number")]
     r = _client(ops).post(
         f"/api/sites/installations/{checklist.id}/reorder-steps/",
         {"steps": [ids[-1], *ids[:-1]]}, format="json",
     )
     assert r.status_code == 200, r.content
-
+    assert _types(checklist)[-1] == "handover"
     assert _numbers(checklist) == [1, 2, 3, 4, 5, 6]
-    assert _types(checklist) == [
-        "handover", "survey", "wiring", "structure", "programming", "testing",
-    ]
 
 
 @pytest.mark.django_db
@@ -1803,3 +1813,68 @@ def test_the_installer_scans_the_asset_before_the_checklist_opens(tech, installa
     assert right.data["asset_verified_by_name"] == "Tariq Installer"
     r = _client(tech).patch(move, {"status": "in_progress"}, format="json")
     assert r.status_code == 200, r.content
+
+
+@pytest.mark.django_db
+def test_handover_stays_last_and_never_blocks_the_steps_before_it(tech, installation):
+    """DGX-2026-00060: a step added after Handover could not be started
+    ("Finish the steps before this one first: Handover"), and Handover only
+    completes with the signed handover, after everything else."""
+    from apps.sites.models import InstallationStep
+    from apps.sites.ordering import keep_handover_last
+
+    c = _client(tech)
+    steps = list(installation.steps.order_by("step_number"))
+    assert steps[-1].step_type == "handover", [s.step_type for s in steps]
+
+    # The installer adds a step from the phone, numbered the way the phone
+    # counted (without Handover): it lands before Handover.
+    r = c.post("/api/sites/installation-steps/", {
+        "installation": str(installation.id), "step_type": "other", "custom_label": "Cable dressing",
+        "step_number": len(steps) - 1,
+    }, format="json")
+    assert r.status_code == 201, r.content
+    order = list(installation.steps.order_by("step_number").values_list("step_type", "custom_label", "step_number"))
+    assert order[-1][0] == "handover" and order[-2][1] == "Cable dressing", order
+    assert [n for *_, n in order] == list(range(1, len(order) + 1)), order
+
+    # A checklist already saved with Handover in the middle is put right.
+    handover = installation.steps.get(step_type="handover")
+    InstallationStep.objects.filter(pk=handover.pk).update(step_number=500)
+    InstallationStep.objects.filter(installation=installation, custom_label="Cable dressing").update(step_number=600)
+    assert keep_handover_last(installation.pk) is True
+    assert installation.steps.order_by("step_number").last().step_type == "handover"
+
+    # Every step up to Handover can be worked in turn; Handover never blocks.
+    for st in installation.steps.exclude(step_type="handover").order_by("step_number"):
+        for status in ("in_progress", "completed"):
+            r = c.patch(f"/api/sites/installation-steps/{st.id}/", {"status": status}, format="json")
+            assert r.status_code == 200, (st.step_type, status, r.content)
+
+    # Handover is done by recording the signed handover, not by hand.
+    r = c.patch(f"/api/sites/installation-steps/{handover.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 400 and "signed handover" in str(r.data["status"]), r.content
+
+
+@pytest.mark.django_db
+def test_the_installer_adds_and_removes_unworked_steps_on_their_own_job(tech, installation):
+    c = _client(tech)
+    r = c.post("/api/sites/installation-steps/", {
+        "installation": str(installation.id), "step_type": "other", "custom_label": "Extra bracket",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    extra = r.data["id"]
+    first = installation.steps.order_by("step_number").first()
+    c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json")
+
+    assert c.delete(f"/api/sites/installation-steps/{extra}/").status_code == 204
+    worked = c.delete(f"/api/sites/installation-steps/{first.id}/")
+    assert worked.status_code == 400 and "has been worked on" in str(worked.data["detail"]), worked.content
+
+    # Somebody else's technician may not touch this checklist.
+    from apps.accounts.models import User
+    stranger = User.objects.create_user(username="site-stranger-tech", password="x", role="technician")
+    r = _client(stranger).post("/api/sites/installation-steps/", {
+        "installation": str(installation.id), "step_type": "other", "custom_label": "Not mine",
+    }, format="json")
+    assert r.status_code == 403, r.content
