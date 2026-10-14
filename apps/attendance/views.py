@@ -13,9 +13,13 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
     read_capability = "view_attendance"
     serializer_class = AttendanceRecordSerializer
     permission_classes = [IsAuthenticated, CapabilityGate]
-    # Anyone may clock themselves in; correcting other people's records is
-    # manage_attendance.
-    action_capabilities = {"create": None}
+    # Anyone may clock themselves in, and read back whether they are in;
+    # seeing the register is view_attendance, correcting other people's
+    # records is manage_attendance. The field app checks a technician in and
+    # then reads `status`: with that read behind view_attendance, which the
+    # technician role does not carry, every check-in was saved and then
+    # answered "You do not have permission to perform this action."
+    action_capabilities = {"create": None, "status": None}
     write_capability = "manage_attendance"
     filterset_fields = ["user", "check_type", "site"]
     ordering_fields = ["created_at"]
