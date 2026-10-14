@@ -31,7 +31,10 @@ class CustomTokenObtainPairView(TokenObtainPairView):
     """
 
     def post(self, request, *args, **kwargs):
-        username = request.data.get("username", "")
+        # A phone keyboard capitalises the first letter and a suggestion
+        # adds a space after the word, so "Sharjeel " is how "sharjeel"
+        # often arrives. Usernames are matched without either.
+        username = str(request.data.get("username", "") or "").strip()
         password = request.data.get("password", "")
 
         if not username or not password:
@@ -40,9 +43,13 @@ class CustomTokenObtainPairView(TokenObtainPairView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            user = User.objects.get(username=username)
-        except User.DoesNotExist:
+        user = User.objects.filter(username=username).first()
+        if user is None:
+            same = list(User.objects.filter(username__iexact=username)[:2])
+            # Only when the spelling picks out one account: two that differ
+            # only by case are never guessed between.
+            user = same[0] if len(same) == 1 else None
+        if user is None:
             return Response(
                 {"detail": "No account found with this username."},
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -61,7 +68,10 @@ class CustomTokenObtainPairView(TokenObtainPairView):
             )
 
         try:
-            return super().post(request, *args, **kwargs)
+            # The account's own spelling, whatever case it was typed in.
+            serializer = self.get_serializer(data={User.USERNAME_FIELD: user.get_username(), "password": password})
+            serializer.is_valid(raise_exception=True)
+            return Response(serializer.validated_data, status=status.HTTP_200_OK)
         except (InvalidToken, TokenError) as e:
             return Response(
                 {"detail": str(e)},
