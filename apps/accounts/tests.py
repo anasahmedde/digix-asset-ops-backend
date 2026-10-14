@@ -467,3 +467,29 @@ def test_account_administration_stays_with_the_super_admin(group_head, technicia
     technician.refresh_from_db()
     assert technician.check_password("Str0ng-Pass!23")
     assert "last_login" in a.get(f"/api/accounts/users/{technician.pk}/").data
+
+
+@pytest.mark.django_db
+def test_sign_in_forgives_a_phone_keyboard():
+    """A capital first letter and a trailing space are how a phone keyboard
+    types a username; the account is still found, and a real mistake still
+    says which half was wrong."""
+    User.objects.create_user(username="field-sharjeel", password="Pass-1234", role="technician")
+    c = APIClient()
+    url = "/api/auth/token/"
+
+    for typed in ("field-sharjeel", "Field-Sharjeel ", "  FIELD-SHARJEEL"):
+        r = c.post(url, {"username": typed, "password": "Pass-1234"}, format="json")
+        assert r.status_code == 200 and r.data["access"] and r.data["refresh"], (typed, r.content)
+
+    r = c.post(url, {"username": "Field-Sharjeel", "password": "wrong"}, format="json")
+    assert r.status_code == 401 and r.data["detail"] == "Incorrect password."
+    r = c.post(url, {"username": "nobody-here", "password": "Pass-1234"}, format="json")
+    assert r.status_code == 401 and r.data["detail"] == "No account found with this username."
+
+    # Two accounts that differ only by case: the typed spelling must be exact.
+    User.objects.create_user(username="Field-Sharjeel", password="Other-999", role="technician")
+    r = c.post(url, {"username": "FIELD-sharjeel", "password": "Pass-1234"}, format="json")
+    assert r.status_code == 401
+    r = c.post(url, {"username": "Field-Sharjeel", "password": "Other-999"}, format="json")
+    assert r.status_code == 200, r.content
