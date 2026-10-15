@@ -467,7 +467,7 @@ class CanPlanOrStartARound(BasePermission):
         # technician this visit was given to may photograph or finish it,
         # only the office may review it — and those need the visit itself
         # to decide, which a has_permission check cannot see.
-        if view.action in ("photos", "complete_visit", "review", "verify_asset", "return_parts"):
+        if view.action in ("photos", "complete_visit", "review", "verify_asset", "return_parts", "notes"):
             return True
         return False
 
@@ -513,6 +513,29 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             visit.schedule.maintenance_type == MaintenanceSchedule.MaintenanceType.CORRECTIVE
             and visit.schedule.ticket_id is not None
         )
+
+    @action(detail=True, methods=["post"], url_path="notes")
+    def notes(self, request, pk=None):
+        """What has been done so far, written on site as the work goes.
+
+        The technician's own record, so the technician on the visit (or
+        the office) writes it; nobody needs manage_maintenance to say what
+        they did. Closed visits keep what they have.
+        """
+        visit = self.get_object()
+        if not (lifecycle.theirs(visit, request.user) or lifecycle.is_office(request.user)):
+            return Response(
+                {"detail": "Only the technician on this visit, or the office, writes up its work."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+        if visit.status not in (MaintenanceVisit.Status.PLANNED, MaintenanceVisit.Status.IN_PROGRESS):
+            return Response(
+                {"detail": f"Visit {visit.sequence} is {visit.get_status_display().lower()}: its write-up is closed."},
+                status=400,
+            )
+        visit.notes = (request.data.get("notes") or "").strip()
+        visit.save(update_fields=["notes", "updated_at"])
+        return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"], url_path="return-parts")
     def return_parts(self, request, pk=None):
