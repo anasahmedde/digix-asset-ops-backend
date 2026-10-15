@@ -48,6 +48,11 @@ from .serializers import (
 from .services import apply_issuance_stock_out, issue_against_request, stock_inspected_line
 
 
+# Who may read what the store carries: the store and its readers, and
+# anyone whose work asks it for parts.
+ASKS_FOR_PARTS = ("view_stock", "request_material", "work_maintenance")
+
+
 class InventoryCategoryViewSet(viewsets.ModelViewSet):
     queryset = InventoryCategory.objects.all()
     serializer_class = InventoryCategorySerializer
@@ -59,8 +64,12 @@ class InventoryCategoryViewSet(viewsets.ModelViewSet):
 
 
 class InventoryItemViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
-    # Reading this is a permission, not just a menu entry.
-    read_capability = "view_stock"
+    # Reading this is a permission, not just a menu entry. Asking for a part
+    # means naming one, so whoever may ask reads the list too - a role that
+    # had view_stock withdrawn could otherwise request from an empty picker.
+    read_capability = ASKS_FOR_PARTS
+    # Costs and the full export stay with the store.
+    action_capabilities = {"export": "view_stock", "batches": "view_stock"}
     # Coalesce so unpriced items sort as zero value instead of NULLs-first.
     queryset = (
         InventoryItem.objects.select_related("material_type", "category")
@@ -193,7 +202,7 @@ class InventoryUnitTypeViewSet(viewsets.ModelViewSet):
     ).all()
     serializer_class = InventoryUnitTypeSerializer
     permission_classes = [IsAuthenticated, CapabilityGate]
-    read_capability = "view_stock"
+    read_capability = ASKS_FOR_PARTS
     write_capability = "manage_stock"
     filterset_fields = [
         "is_active", "category", "material_type", "brand", "supplier", "is_high_value",
