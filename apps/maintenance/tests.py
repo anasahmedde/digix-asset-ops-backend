@@ -1456,3 +1456,24 @@ def test_cancelling_a_ticket_puts_the_asset_back_in_service(corrective_client):
     assert ticket.status == Ticket.Status.CANCELLED
     assert job.status == _Schedule.Status.CANCELLED
     assert asset.status == _Device.Status.ACTIVE, "the asset must not be left under maintenance"
+
+
+@pytest.mark.django_db
+def test_the_technician_writes_up_the_work_as_it_goes(parts_job):
+    """Saving the work-done notes from the field needs no manage_maintenance:
+    the technician on the visit writes them, the office may too, nobody else."""
+    from apps.maintenance.lifecycle import current_visit
+
+    visit = current_visit(parts_job["schedule"])
+    url = f"/api/maintenance/visits/{visit.id}/notes/"
+    r = _client(parts_job["tech"]).post(url, {"notes": "  Replaced the driver board.  "}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["notes"] == "Replaced the driver board."
+    other = User.objects.create_user(username="other-tech", password="x", role="technician")
+    assert _client(other).post(url, {"notes": "mine now"}, format="json").status_code == 403
+    r = _client(parts_job["boss"]).post(url, {"notes": "Office addendum"}, format="json")
+    assert r.status_code == 200, r.content
+    visit.refresh_from_db()
+    assert visit.notes == "Office addendum"
+    # A plain PATCH is still the planner's: the technician cannot rewrite the round.
+    assert _client(parts_job["tech"]).patch(f"/api/maintenance/visits/{visit.id}/", {"notes": "x"}, format="json").status_code == 403
