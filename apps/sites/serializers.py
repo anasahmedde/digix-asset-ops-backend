@@ -71,9 +71,14 @@ class InstallationStepSerializer(serializers.ModelSerializer):
     step_type_display = serializers.SerializerMethodField()
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     completed_by_name = serializers.SerializerMethodField()
+    started_by_name = serializers.SerializerMethodField()
 
     def get_completed_by_name(self, obj):
         who = obj.completed_by
+        return (who.get_full_name() or who.username) if who else None
+
+    def get_started_by_name(self, obj):
+        who = obj.started_by
         return (who.get_full_name() or who.username) if who else None
 
     class Meta:
@@ -82,9 +87,12 @@ class InstallationStepSerializer(serializers.ModelSerializer):
             "id", "installation", "step_type", "step_type_display", "custom_label",
             "step_number", "status", "status_display",
             "assigned_team", "description",
-            "started_at", "completed_at", "completed_by", "completed_by_name", "created_at",
+            "started_at", "started_by", "started_by_name",
+            "completed_at", "completed_by", "completed_by_name", "created_at",
         ]
-        read_only_fields = ["id", "created_at", "completed_by", "completed_by_name"]
+        read_only_fields = [
+            "id", "created_at", "started_by", "started_by_name", "completed_by", "completed_by_name",
+        ]
 
     def get_step_type_display(self, obj):
         return obj.custom_label or obj.get_step_type_display()

@@ -855,6 +855,8 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
             )})
 
         extra = {}
+        if new_status == InstallationStep.StepStatus.IN_PROGRESS and step.started_by_id is None:
+            extra["started_by"] = self.request.user
         if new_status == InstallationStep.StepStatus.COMPLETED and step.status != new_status:
             extra["completed_by"] = self.request.user
             if "completed_at" not in serializer.validated_data and not step.completed_at:

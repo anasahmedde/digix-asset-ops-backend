@@ -156,6 +156,12 @@ class InstallationStep(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="installation_steps_completed",
     )
+    # Who pressed Start on it - the technician on site, from the field app.
+    # A resume after a hold keeps the first name: the work began then.
+    started_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installation_steps_started",
+    )
 
     class Meta:
         ordering = ["step_number"]

@@ -1609,10 +1609,17 @@ def test_steps_are_done_in_order_and_say_who_did_them(ops, tech, installation):
     assert "before this one" in str(r.data["status"])
 
     first = steps[0]
-    _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json")
+    me = tech.get_full_name() or tech.username
+    r = _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json")
+    assert r.data["started_by_name"] == me, "the card names who pressed Start"
+    # A hold and a resume by somebody else keep the first starter: the work began then.
+    _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "on_hold"}, format="json")
+    r = _client(ops).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["started_by_name"] == me
     r = _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json")
     assert r.status_code == 200, r.content
-    assert r.data["completed_by_name"] == (tech.get_full_name() or tech.username)
+    assert r.data["completed_by_name"] == me
     assert r.data["completed_at"] is not None
 
     # Skipping is the way past a step that does not apply.
