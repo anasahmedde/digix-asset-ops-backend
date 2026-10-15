@@ -2061,3 +2061,26 @@ def test_opening_stock_keeps_its_own_cost_after_a_dearer_delivery():
     r = c.get(f"/api/inventory/items/{item.pk}/")
     assert float(r.data["latest_cost"]) == 900.0
     assert float(r.data["total_value"]) == 50 * 811 + 10 * 900
+
+
+# ---------------------------------------------------------------------------
+# Naming a part means seeing the list, whatever else was withdrawn
+# ---------------------------------------------------------------------------
+@pytest.mark.django_db
+def test_a_technician_without_view_stock_still_reads_what_the_store_carries(items):
+    from apps.accounts.models import UserCapability
+
+    tech = User.objects.create_user(username="pick-tech", password="x", role="technician")
+    # As a live role edit might leave it: the register is withdrawn, the work is not.
+    UserCapability.objects.create(user=tech, capability="view_stock", allowed=False)
+    assert not tech.can("view_stock") and tech.can("work_maintenance")
+    c = APIClient()
+    c.force_authenticate(tech)
+    for path in ("/api/inventory/items/", "/api/inventory/products/"):
+        r = c.get(path, {"page_size": 500})
+        assert r.status_code == 200, (path, r.content)
+    assert {row["id"] for row in c.get("/api/inventory/items/").data["results"]} >= {str(i.id) for i in items}
+    # Costs stay the store's: hidden on the rows, and the export is refused.
+    assert all(row["unit_cost"] is None for row in c.get("/api/inventory/items/").data["results"])
+    assert c.get("/api/inventory/items/export/").status_code == 403
+    assert c.get(f"/api/inventory/items/{items[0].id}/batches/").status_code == 403
