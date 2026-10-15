@@ -191,23 +191,40 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
     ]
     ordering_fields = ["installed_at", "due_date", "completed_at", "created_at"]
 
-    def perform_destroy(self, instance):
-        """A duplicate can go; a handed-over job cannot.
+    def create(self, request, *args, **kwargs):
+        """There is no opening a job by hand.
 
-        The handover is the client's record of acceptance as much as ours,
-        so the job it belongs to stays. Anything short of that — above all
-        the second entry opened by mistake for an asset already on the
-        tracker — can be removed, steps and photos with it.
+        An installation is the end of the asset's own road - registered,
+        built from its components, planned and approved on its project, then
+        assigned to a technician - and that assignment is what opens the job
+        (services.open_installation_for). A job typed in here skipped all of
+        it and put assets on the tracker that no project had agreed to.
         """
-        from rest_framework.exceptions import ValidationError as _VE
+        return Response(
+            {"detail": (
+                "Installations are not added by hand. Assign the asset to a technician "
+                "on its page (Assets › the asset › Installation & Activation); "
+                "that opens its installation here."
+            )},
+            status=drf_status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
 
-        if getattr(instance, "handover", None) is not None:
-            raise _VE(
-                "This installation has been handed over to the client, so it "
-                "stays on the record. Record its removal instead if the asset "
-                "has come down."
-            )
-        instance.delete()
+    def destroy(self, request, *args, **kwargs):
+        """An installation record is never deleted - by anyone.
+
+        It is the asset's history on site: who was sent, what was done,
+        when it went live and who signed for it. Overriding the action (not
+        a capability check) means the Administrator, who holds every
+        capability, is refused too. An asset that came down is recorded as
+        removed (removed_at); a wrong technician is reassigned on the asset.
+        """
+        return Response(
+            {"detail": (
+                "Installation records cannot be deleted. Reassign the technician on the "
+                "asset's page, or record the removal if the asset has come down."
+            )},
+            status=drf_status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
 
     @action(detail=True, methods=["get"], url_path="handover-document")
     def handover_document(self, request, pk=None):

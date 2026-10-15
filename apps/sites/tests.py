@@ -232,38 +232,21 @@ def test_delay_create_restricted(ops, tech, installation):
 
 
 @pytest.mark.django_db
-def test_custom_step_pipeline(ops, installation):
-    fresh = Device.objects.create(asset_code="AST-PIPE-1", serial_number="PIPE-1")
-    r = _client(ops).post("/api/sites/installations/", {
-        "device": str(fresh.id),
-        "site": str(installation.site_id),
-        "installed_at": timezone.now().isoformat(),
-        "step_types": ["survey", "programming", "handover"],
-    }, format="json")
-    assert r.status_code == 201, r.content
-    steps = r.data["steps"]
-    assert [s["step_type"] for s in steps] == ["survey", "programming", "handover"]
-    assert [s["step_number"] for s in steps] == [1, 2, 3]
-
-
-@pytest.mark.django_db
-def test_custom_named_steps_and_vendor(ops, installation):
-    from apps.suppliers.models import Supplier
-
-    vendor = Supplier.objects.create(name="Rigging Co")
-    fresh = Device.objects.create(asset_code="AST-RIG-1", serial_number="RIG-1")
-    r = _client(ops).post("/api/sites/installations/", {
-        "device": str(fresh.id),
-        "site": str(installation.site_id),
-        "installed_at": timezone.now().isoformat(),
-        "vendor": str(vendor.pk),
-        "step_types": ["survey", "Crane lift", "handover"],
-    }, format="json")
-    assert r.status_code == 201, r.content
-    assert r.data["vendor_name"] == "Rigging Co"
-    steps = r.data["steps"]
-    assert [s["step_type"] for s in steps] == ["survey", "other", "handover"]
-    assert steps[1]["step_type_display"] == "Crane lift"
+def test_an_installation_is_not_added_by_hand(ops, installation):
+    """A job opens when the asset is assigned to a technician, at the end of
+    its own road; the tracker has no "New Installation", and nor does the
+    API - not even for the Administrator."""
+    fresh = Device.objects.create(asset_code="AST-HAND-1", serial_number="HAND-1")
+    body = {
+        "device": str(fresh.id), "site": str(installation.site_id),
+        "installed_at": timezone.now().isoformat(), "step_types": ["survey", "handover"],
+    }
+    admin = User.objects.create_superuser(username="inst-admin", password="x", email="a@x.io")
+    for who in (ops, admin):
+        r = _client(who).post("/api/sites/installations/", body, format="json")
+        assert r.status_code == 405, r.content
+        assert "not added by hand" in str(r.data["detail"])
+    assert not DeviceInstallation.objects.filter(device=fresh).exists()
 
 
 @pytest.mark.django_db
@@ -1586,39 +1569,32 @@ def test_a_live_assets_installation_steps_are_a_record():
 
 
 @pytest.mark.django_db
-def test_an_asset_is_on_the_tracker_once(ops, installation):
-    """The same asset appeared twice — once finished, once at 0% — and the
-    second one could not be taken away again."""
-    body = {
-        "device": str(installation.device_id),
-        "site": str(installation.site_id),
-        "installed_at": timezone.now().isoformat(),
-    }
-    again = _client(ops).post("/api/sites/installations/", body, format="json")
-    assert again.status_code == 400, again.content
-    assert "already on the tracker" in str(again.data["device"])
-
-    # Moving it is still possible: once the old job records that the asset
-    # came down, a new one can be opened where it is going.
-    installation.removed_at = timezone.now()
-    installation.save(update_fields=["removed_at"])
-    moved = _client(ops).post("/api/sites/installations/", body, format="json")
-    assert moved.status_code == 201, moved.content
-
-    # And a job that was opened by mistake can be removed — but not one the
-    # client has signed for.
-    gone = _client(ops).delete(f"/api/sites/installations/{moved.data['id']}/")
-    assert gone.status_code == 204, gone.content
+def test_an_installation_record_is_never_deleted(ops, installation):
+    """The tracker has no Remove button and the API refuses the delete for
+    everyone, the Administrator included, before handover and after."""
     from apps.sites.models import HandoverRecord
+    from apps.sites.services import open_installation_for
 
+    admin = User.objects.create_superuser(username="inst-admin2", password="x", email="b@x.io")
+    for who in (ops, admin):
+        r = _client(who).delete(f"/api/sites/installations/{installation.id}/")
+        assert r.status_code == 405, r.content
+        assert "cannot be deleted" in str(r.data["detail"])
     HandoverRecord.objects.create(
         installation=installation, device=installation.device,
         client=installation.device.assigned_client, site=installation.site,
         handover_date=timezone.localdate(), accepted_by_name="Client POC",
     )
-    kept = _client(ops).delete(f"/api/sites/installations/{installation.id}/")
-    assert kept.status_code == 400
-    assert "handed over" in str(kept.data)
+    assert _client(admin).delete(f"/api/sites/installations/{installation.id}/").status_code == 405
+    assert DeviceInstallation.objects.filter(pk=installation.pk).exists()
+
+    # The one way in stays single: assigning the same asset again keeps its job.
+    device = installation.device
+    device.current_site = installation.site
+    device.assigned_technician = installation.installed_by
+    device.save(update_fields=["current_site", "assigned_technician"])
+    assert open_installation_for(device) == installation
+    assert DeviceInstallation.objects.filter(device=device).count() == 1
 
 
 @pytest.mark.django_db
