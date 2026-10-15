@@ -704,3 +704,31 @@ def test_an_asset_in_procurement_with_a_client_term_is_not_expired(device, ops):
     rows = _client(ops).get("/api/assets/devices/", {"search": device.asset_code}).data
     rows = rows.get("results", rows)
     assert [d["warranty_status"] for d in rows if d["id"] == str(device.pk)] == ["not_started"]
+
+
+@pytest.mark.django_db
+def test_an_extended_warranty_reads_as_extended_while_it_runs(device, ops):
+    """Cover pushed past its first end is told apart from a first term: the
+    warranty says Extended, the list can filter on it, and the asset is
+    still under warranty."""
+    from apps.assets.serializers import _warranty_status
+
+    today = timezone.now().date()
+    w = Warranty.objects.create(
+        device=device, warranty_type="supplier", start_date=today - timedelta(days=300),
+        end_date=today + timedelta(days=65), months=12,
+    )
+    assert w.state == "active"
+    r = _client(ops).post(f"/api/warranties/{w.pk}/extend/", {"months": 6}, format="json")
+    assert r.status_code == 200, r.content
+    assert (r.data["status"], r.data["status_display"], r.data["is_expired"]) == ("extended", "Extended", False)
+    w.refresh_from_db()
+    assert w.extended_on == today
+    listed = _client(ops).get("/api/warranties/", {"status": "extended"}).data
+    listed = listed.get("results", listed)
+    assert [x["id"] for x in listed] == [str(w.pk)]
+    assert _client(ops).get("/api/warranties/", {"status": "active"}).data.get("count", 1) >= 1
+    # Once it lapses it is expired like any other; the extension is history.
+    w.end_date = today - timedelta(days=1)
+    w.save(update_fields=["end_date"])
+    assert w.state == "expired"

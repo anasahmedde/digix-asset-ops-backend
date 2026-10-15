@@ -202,7 +202,7 @@ def _warranty_status(device) -> str:
     states = {w.state for w in device.warranties.all() if w.warranty_type == "client"}
     if not states:
         return "none"
-    if "active" in states:
+    if states & {"active", "extended"}:
         return "active"
     if "not_started" in states:
         return "not_started"

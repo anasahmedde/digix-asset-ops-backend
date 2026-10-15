@@ -41,7 +41,7 @@ def get_active_client_warranty(device):
     live = [
         w for w in device.warranties.filter(warranty_type=Warranty.WarrantyType.CLIENT)
         .order_by("-end_date", "-created_at")
-        if w.state in ("active", "claimed")
+        if w.state in ("active", "extended", "claimed")
     ]
     return live[0] if live else None
 
