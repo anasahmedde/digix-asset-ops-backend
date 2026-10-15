@@ -672,3 +672,35 @@ def test_the_term_and_the_dates_stay_one_fact(device, ops):
     # The start is anchored by the work, not typed: a sent one is ignored.
     r = c.patch(f"/api/warranties/{w.pk}/", {"start_date": "2026-11-15", "end_date": "2027-10-30"}, format="json")
     assert (r.data["start_date"], r.data["months"]) == ("2026-10-30", 12)
+
+
+@pytest.mark.django_db
+def test_an_asset_in_procurement_with_a_client_term_is_not_expired(device, ops):
+    """A client term recorded ahead of go-live is cover waiting to start: the
+    asset list must not call it expired (it did), and the warranty says so."""
+    from apps.assets.serializers import _warranty_status
+
+    today = timezone.now().date()
+    device.status = "procured"
+    device.save(update_fields=["status"])
+    w = Warranty.objects.create(
+        device=device, warranty_type="client", start_date=today - timedelta(days=3),
+        end_date=today + timedelta(days=180), months=6,
+    )
+    assert w.state == "not_started"
+    assert _warranty_status(device) == "not_started"
+    # The registry column is the client's cover alone: a vendor warranty
+    # still running does not make the asset "under warranty" to the client.
+    Warranty.objects.create(
+        device=device, warranty_type="supplier", start_date=today - timedelta(days=30),
+        end_date=today + timedelta(days=335), months=12,
+    )
+    assert _warranty_status(device) == "not_started"
+    # The client's cover is read from the client side of the ledger.
+    desk = User.objects.create_user(username="war-mkt", password="x", role="marketing_head")
+    r = _client(desk).get(f"/api/warranties/{w.pk}/")
+    assert r.status_code == 200, r.content
+    assert (r.data["status"], r.data["status_display"], r.data["is_expired"]) == ("not_started", "Not started", False)
+    rows = _client(ops).get("/api/assets/devices/", {"search": device.asset_code}).data
+    rows = rows.get("results", rows)
+    assert [d["warranty_status"] for d in rows if d["id"] == str(device.pk)] == ["not_started"]
