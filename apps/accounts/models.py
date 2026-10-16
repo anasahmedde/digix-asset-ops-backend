@@ -250,3 +250,15 @@ class RequestReceipt(models.Model):
     def __str__(self):
         return f"{self.key} {self.path} {self.status_code}"
 
+
+
+class AppSetting(models.Model):
+    """A system-wide setting the Administrator changes from the web, by key
+    (the order of the sidebar's modules, for one)."""
+
+    key = models.CharField(max_length=60, primary_key=True)
+    value = models.JSONField(default=dict, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.key
