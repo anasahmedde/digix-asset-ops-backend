@@ -85,6 +85,9 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    # The field app's offline outbox: acts carry the time they happened and
+    # a once-only key (common/clock.py).
+    "common.clock.FieldSyncMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -202,6 +205,9 @@ SIMPLE_JWT = {
 # CORS
 # ---------------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=["http://localhost:3000"])
+from corsheaders.defaults import default_headers  # noqa: E402
+
+CORS_ALLOW_HEADERS = (*default_headers, "x-recorded-at", "x-idempotency-key")
 
 # ---------------------------------------------------------------------------
 # Channels (WebSocket)

@@ -14,6 +14,8 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
+from common import clock
+
 from . import activity, lifecycle
 
 
@@ -890,7 +892,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 + "."
             )}, status=drf_status.HTTP_400_BAD_REQUEST)
         visit.status = MaintenanceVisit.Status.IN_PROGRESS
-        visit.started_at = timezone.now()
+        visit.started_at = clock.now()
         visit.start_latitude, visit.start_longitude = where
         visit.save(update_fields=[
             "status", "started_at", "start_latitude", "start_longitude", "updated_at",

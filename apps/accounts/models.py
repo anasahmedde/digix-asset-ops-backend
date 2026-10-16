@@ -234,3 +234,19 @@ class CredentialVault(TimeStampedModel):
 
     def __str__(self):
         return f"{self.label} - {self.device}"
+
+
+class RequestReceipt(models.Model):
+    """A write the field app's outbox already sent, by its once-only key, and
+    the answer it got - so a resend after a lost reply is answered again
+    instead of being done twice (see common.clock)."""
+
+    key = models.CharField(max_length=64, unique=True)
+    path = models.CharField(max_length=300)
+    status_code = models.PositiveSmallIntegerField()
+    body = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    def __str__(self):
+        return f"{self.key} {self.path} {self.status_code}"
+

@@ -1,4 +1,5 @@
 from django.utils import timezone
+from common import clock
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from common.permissions import CapabilityGate, can
@@ -35,7 +36,15 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
         return qs.filter(Q(user=user) | Q(user__reports_to=user))
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        record = serializer.save(user=self.request.user)
+        if clock.offline():
+            # Sent from the phone's outbox: the record is dated when it
+            # happened, and says it arrived later.
+            when, arrived = clock.now(), timezone.now()
+            AttendanceRecord.objects.filter(pk=record.pk).update(
+                created_at=when, recorded_offline=True, uploaded_at=arrived,
+            )
+            record.created_at, record.recorded_offline, record.uploaded_at = when, True, arrived
 
     @action(detail=False, methods=["get"])
     def status(self, request):

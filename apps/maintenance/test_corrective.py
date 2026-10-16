@@ -974,3 +974,33 @@ def test_a_part_bought_on_site_is_recorded_with_its_receipt_and_priced_in(fault)
     # Closed: what was bought stays on the record.
     gone = _client(tech).delete(f"/api/maintenance/purchases/{MaintenancePurchase.objects.get().pk}/")
     assert gone.status_code == 400, gone.content
+
+
+@pytest.mark.django_db
+def test_a_visit_worked_offline_keeps_the_times_it_happened(fault):
+    """Photographed and started with no signal, uploaded hours later: the
+    visit says when it started, and the history says it came in late."""
+    from datetime import timedelta
+
+    job, tech, office = fault["job"], fault["tech"], fault["office"]
+    _client(office).post(f"/api/maintenance/schedules/{job.id}/assign/",
+                         {"technician": str(tech.id), "due_date": str(timezone.localdate())}, format="json")
+    visit = job.visits.get()
+    then = timezone.now() - timedelta(hours=2)
+    later = then + timedelta(minutes=5)
+    r = _client(tech).post(f"/api/maintenance/visits/{visit.id}/photos/", {"kind": "before", "image": _png()},
+                           format="multipart", HTTP_X_RECORDED_AT=then.isoformat(), HTTP_X_IDEMPOTENCY_KEY="op-photo-1")
+    assert r.status_code == 201, r.content
+    again = _client(tech).post(f"/api/maintenance/visits/{visit.id}/photos/", {"kind": "before", "image": _png("x")},
+                               format="multipart", HTTP_X_RECORDED_AT=then.isoformat(), HTTP_X_IDEMPOTENCY_KEY="op-photo-1")
+    assert again.status_code == 201 and visit.photos.count() == 1, "a resend adds no second photo"
+    r = _client(tech).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json",
+                           HTTP_X_RECORDED_AT=later.isoformat(), HTTP_X_IDEMPOTENCY_KEY="op-start-1")
+    assert r.status_code == 200, r.content
+    visit.refresh_from_db()
+    assert abs((visit.started_at - later).total_seconds()) < 1
+    assert abs((visit.photos.get().taken_at - then).total_seconds()) < 1
+    log = _client(office).get(f"/api/maintenance/schedules/{job.id}/activity/").data
+    started = next(row for row in log if row["action"] == "started")
+    assert "recorded offline" in started["text"]
+    assert abs((timezone.datetime.fromisoformat(started["at"]) - later).total_seconds()) < 1

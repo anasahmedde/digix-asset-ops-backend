@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from common import clock
 from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 
@@ -130,7 +131,7 @@ def stamp_installation_completion(sender, instance: InstallationStep, **kwargs):
         and any(s == InstallationStep.StepStatus.COMPLETED for s in statuses)
     )
     if done and installation.completed_at is None:
-        installation.completed_at = timezone.now()
+        installation.completed_at = clock.now()
         installation.save(update_fields=["completed_at", "updated_at"])
         _anchor_client_warranties(installation)
         _mark_device_installed(installation)

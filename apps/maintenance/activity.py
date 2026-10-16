@@ -7,6 +7,8 @@ here, and the job's screen reads them back.
 """
 from __future__ import annotations
 
+from common import clock
+
 
 def name(user) -> str:
     if user is None:
@@ -21,7 +23,7 @@ def log(job, action: str, text: str, *, user=None, visit=None, at=None):
     if job is None:
         return None
     actor = user if getattr(user, "is_authenticated", False) else None
-    fields = {"schedule": job, "visit": visit, "action": action, "text": text[:500], "actor": actor}
+    fields = {"schedule": job, "visit": visit, "action": action, "text": (text + clock.offline_note())[:500], "actor": actor}
     if at is not None:
         fields["at"] = at
     return MaintenanceActivity.objects.create(**fields)

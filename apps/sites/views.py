@@ -15,6 +15,8 @@ from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_resp
 from apps.notifications import service as notices
 from common.permissions import CapabilityGate, can, can_for_project
 
+from common import clock
+
 from . import activity
 
 
@@ -902,7 +904,7 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         if new_status == InstallationStep.StepStatus.COMPLETED and step.status != new_status:
             extra["completed_by"] = self.request.user
             if "completed_at" not in serializer.validated_data and not step.completed_at:
-                extra["completed_at"] = timezone.now()
+                extra["completed_at"] = clock.now()
         was = step.status
         step = serializer.save(**extra)
         if step.status != was:

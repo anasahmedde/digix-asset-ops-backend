@@ -2,6 +2,7 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
+from common import clock
 from common.models import TimeStampedModel
 from common.utils import upload_to_path
 
@@ -173,12 +174,12 @@ class InstallationStep(TimeStampedModel):
 
         # Stamp the timeline automatically as the step advances.
         if self.status == self.StepStatus.IN_PROGRESS and not self.started_at:
-            self.started_at = timezone.now()
+            self.started_at = clock.now()
         if self.status == self.StepStatus.COMPLETED:
             if not self.started_at:
-                self.started_at = timezone.now()
+                self.started_at = clock.now()
             if not self.completed_at:
-                self.completed_at = timezone.now()
+                self.completed_at = clock.now()
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -332,7 +333,7 @@ class InstallationActivity(TimeStampedModel):
     actor = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
     )
-    at = models.DateTimeField(default=timezone.now, db_index=True)
+    at = models.DateTimeField(default=clock.now, db_index=True)
 
     class Meta:
         ordering = ["-at", "-created_at"]

@@ -2,6 +2,7 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
+from common import clock
 from common.models import TimeStampedModel
 
 
@@ -342,7 +343,8 @@ class MaintenanceVisitPhoto(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="maintenance_visit_photos",
     )
-    taken_at = models.DateTimeField(auto_now_add=True)
+    # When the photo was taken - the phone's time for one sent later from the outbox.
+    taken_at = models.DateTimeField(default=clock.now)
     # Where the phone said it was, when it could say.
     latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
     longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
@@ -549,7 +551,7 @@ class MaintenanceActivity(TimeStampedModel):
     )
     # When it happened. Usually now; history written back from what the
     # records already said carries the time they said it.
-    at = models.DateTimeField(default=timezone.now, db_index=True)
+    at = models.DateTimeField(default=clock.now, db_index=True)
 
     class Meta:
         ordering = ["-at", "-created_at"]

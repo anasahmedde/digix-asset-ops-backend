@@ -28,6 +28,8 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from apps.tickets.models import Ticket, TicketComment
 
+from common import clock
+
 from . import activity
 from .models import MaintenanceSchedule, MaintenanceVisit, MaintenanceVisitPhoto
 
@@ -337,7 +339,7 @@ def start(visit: MaintenanceVisit, *, user, where=None) -> MaintenanceVisit:
     _refuse_if_parts_are_missing(visit)
 
     visit.status = MaintenanceVisit.Status.IN_PROGRESS
-    visit.started_at = timezone.now()
+    visit.started_at = clock.now()
     lat, lng = (where or (None, None))
     visit.start_latitude, visit.start_longitude = lat, lng
     visit.save(update_fields=[
@@ -489,7 +491,7 @@ def complete(
     ) if settlement else None
 
     visit.status = MaintenanceVisit.Status.AWAITING_REVIEW
-    visit.completed_at = timezone.now()
+    visit.completed_at = clock.now()
     visit.resolved = resolved
     visit.remarks = remarks or ""
     visit.save(update_fields=[
@@ -660,7 +662,7 @@ def complete_round(
     ) if settlement else None
 
     visit.status = MaintenanceVisit.Status.AWAITING_REVIEW
-    visit.completed_at = timezone.now()
+    visit.completed_at = clock.now()
     visit.resolved = True
     visit.remarks = remarks or ""
     visit.save(update_fields=[

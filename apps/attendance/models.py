@@ -22,6 +22,10 @@ class AttendanceRecord(TimeStampedModel):
         "sites.Site", on_delete=models.SET_NULL, null=True, blank=True, related_name="attendance_records"
     )
     note = models.CharField(max_length=300, blank=True)
+    # Kept on the phone without signal and sent later: created_at is the
+    # time it happened (the phone's), uploaded_at when the server got it.
+    recorded_offline = models.BooleanField(default=False)
+    uploaded_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
