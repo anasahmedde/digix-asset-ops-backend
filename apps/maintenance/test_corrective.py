@@ -396,11 +396,21 @@ def test_a_round_is_worked_the_same_way_without_a_ticket(team):
 
     # Handing it in needs the other photograph, and goes to the office.
     assert _client(tech).post(f"{url}/complete/", {}, format="json").status_code == 400
+    # The photo alone is not the work done: what was done is written too.
     _client(tech).post(f"{url}/photos/", {"kind": "after", "image": _png("after")}, format="multipart")
-    r = _client(tech).post(f"{url}/complete/", {"remarks": "Cleaned and checked"}, format="json")
+    blank = _client(tech).post(f"{url}/complete/", {}, format="json")
+    assert blank.status_code == 400 and "Work done" in str(blank.data["remarks"]), blank.content
+    # The phone hands both in at once: the After photo carries the write-up,
+    # and completion takes it as the remarks.
+    r = _client(tech).post(f"{url}/photos/", {"kind": "after", "image": _png("after-2"), "notes": " Cleaned and checked "}, format="multipart")
+    assert r.status_code == 201, r.content
+    visit.refresh_from_db()
+    assert visit.notes == "Cleaned and checked"
+    r = _client(tech).post(f"{url}/complete/", {}, format="json")
     assert r.status_code == 200, r.content
     visit.refresh_from_db()
     assert visit.status == MaintenanceVisit.Status.AWAITING_REVIEW
+    assert visit.remarks == "Cleaned and checked"
 
     # The office can send it back, with the same three things a breakdown
     # needs: a reason, somebody to go, and a day to go on.

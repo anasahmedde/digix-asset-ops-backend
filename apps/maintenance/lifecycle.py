@@ -401,6 +401,15 @@ def outstanding_parts(visit: MaintenanceVisit):
     ]
 
 
+def _work_done(visit: MaintenanceVisit, remarks: str) -> str:
+    """What was done is half of handing the work in - the After photo is the
+    other. Typed in the completion, or written on site as the work went."""
+    text = (remarks or "").strip() or (visit.notes or "").strip()
+    if not text:
+        raise ValidationError({"remarks": "Say what was done (Work done) before completing the visit."})
+    return text
+
+
 def _refuse_while_parts_unreturned(visit: MaintenanceVisit) -> None:
     """The cost of a visit is what it used, so nobody signs it off until the
     technician has said what was used and what is going back."""
@@ -450,6 +459,7 @@ def complete(
         )})
     if not visit.has_after_photo:
         raise ValidationError({"detail": "Upload an AFTER photo before completing the visit."})
+    remarks = _work_done(visit, remarks)
     if resolved is None:
         raise ValidationError({"resolved": "Say whether the fault is fixed."})
     if not resolved and not (remarks or "").strip():
@@ -617,6 +627,7 @@ def complete_round(
         )})
     if not visit.has_after_photo:
         raise ValidationError({"detail": "Upload an AFTER photo before completing the round."})
+    remarks = _work_done(visit, remarks)
 
     # What the store handed over may be squared up here, or once the
     # technician is back from site (return_parts): the field app asks for the

@@ -611,6 +611,12 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             raw = request.data.get(name)
             return raw if raw not in (None, "", "null") else None
 
+        # The phone hands the After photo in with the write-up, in one go:
+        # the two together are what finishing the work means.
+        if kind == MaintenanceVisitPhoto.Kind.AFTER and "notes" in request.data:
+            visit.notes = (request.data.get("notes") or "").strip()
+            visit.save(update_fields=["notes", "updated_at"])
+
         made = [
             MaintenanceVisitPhoto.objects.create(
                 visit=visit, kind=kind, image=image,
