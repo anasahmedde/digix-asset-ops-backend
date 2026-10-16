@@ -2,7 +2,7 @@ from rest_framework import serializers
 
 from common.geo import Coordinate
 
-from .models import AttendanceRecord
+from .models import AttendanceRecord, DutyRecord
 
 
 class AttendanceRecordSerializer(serializers.ModelSerializer):
@@ -20,6 +20,25 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
             "note", "created_at", "recorded_offline", "uploaded_at",
         ]
         read_only_fields = ["id", "user", "created_at", "recorded_offline", "uploaded_at"]
+
+    def get_user_name(self, obj):
+        return (obj.user.get_full_name() or "").strip() or obj.user.username
+
+
+class DutyRecordSerializer(serializers.ModelSerializer):
+    """Time in / Time out, as the supervisor reads it."""
+    latitude = Coordinate()
+    longitude = Coordinate()
+    user_name = serializers.SerializerMethodField()
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+
+    class Meta:
+        model = DutyRecord
+        fields = [
+            "id", "user", "user_name", "kind", "kind_display", "at",
+            "latitude", "longitude", "accuracy", "recorded_offline", "uploaded_at",
+        ]
+        read_only_fields = ["id", "user", "at", "recorded_offline", "uploaded_at"]
 
     def get_user_name(self, obj):
         return (obj.user.get_full_name() or "").strip() or obj.user.username

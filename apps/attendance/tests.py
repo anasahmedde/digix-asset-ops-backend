@@ -98,3 +98,49 @@ def test_an_offline_act_is_judged_by_where_the_person_was_at_the_time():
         assert clocked_in_at(tech, a.id), "at 10:30 they were at A"
     finally:
         clock._recorded.reset(token)
+
+
+@pytest.mark.django_db
+def test_time_in_and_out_is_seen_by_the_supervisor_not_by_the_person():
+    """Time in / Time out: the person learns only that they are timed in;
+    when and where is read by whoever they report to, and the office."""
+    boss = User.objects.create_user(username="duty-boss", password="x", role="supervisor")
+    other_boss = User.objects.create_user(username="duty-other", password="x", role="supervisor")
+    admin = User.objects.create_superuser(username="duty-admin", password="x")
+    tech = User.objects.create_user(username="duty-tech", password="x", role="technician", is_field_staff=True)
+    tech.reports_to = boss
+    tech.save(update_fields=["reports_to"])
+
+    def client(u):
+        c = APIClient()
+        c.force_authenticate(u)
+        return c
+
+    me = client(tech)
+    assert me.post("/api/attendance/duty/", {"kind": "time_out"}, format="json").status_code == 400, "not timed in yet"
+    r = me.post("/api/attendance/duty/", {"kind": "time_in", "latitude": "31.5204000", "longitude": "74.3587000", "accuracy": 8},
+                format="json")
+    assert r.status_code == 201, r.content
+    assert "latitude" not in r.data and "longitude" not in r.data, "the place is not echoed back"
+    s = me.get("/api/attendance/duty/status/").data
+    assert s["on_duty"] is True and s["since"] and set(s) == {"on_duty", "since"}
+    assert me.post("/api/attendance/duty/", {"kind": "time_in"}, format="json").status_code == 400, "already timed in"
+
+    # Their own register is not theirs to read.
+    own = me.get("/api/attendance/duty/")
+    assert own.status_code in (200, 403)
+    if own.status_code == 200:
+        assert (own.data.get("results", own.data)) == []
+
+    rows = client(boss).get("/api/attendance/duty/").data
+    rows = rows.get("results", rows)
+    assert len(rows) == 1 and rows[0]["kind"] == "time_in" and rows[0]["latitude"]
+    other = client(other_boss).get("/api/attendance/duty/").data
+    assert other.get("results", other) == [], "not their line"
+    every = client(admin).get("/api/attendance/duty/").data
+    assert len(every.get("results", every)) == 1
+
+    assert me.post("/api/attendance/duty/", {"kind": "time_out"}, format="json").status_code == 201
+    assert me.get("/api/attendance/duty/status/").data == {"on_duty": False, "since": None}
+    # Site check-in is a different thing: timing in does not check anyone in.
+    assert me.get("/api/attendance/records/status/").data["checked_in"] is False
