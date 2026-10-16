@@ -131,9 +131,9 @@ class Project(TimeStampedModel):
         - On Hold: the project is on hold.
         - Delayed: the target date has passed and the work is not done.
         - Planning: still being planned, and not yet late.
-        - At Risk: an unresolved bottleneck; or the target is a week or less
-          away with under 90% done; or progress trails the time used by 15
-          points or more (half the time gone, a third of the work done).
+        - At Risk: the target is a week or less away with under 90% done;
+          or progress trails the time used by 15 points or more (half the
+          time gone, a third of the work done).
         - On Track: everything else.
         """
         from django.utils import timezone
@@ -150,8 +150,6 @@ class Project(TimeStampedModel):
             return self.Status.DELAYED
         if self.phase == self.Phase.PLANNING:
             return self.Status.PLANNING
-        if self.bottlenecks.filter(is_resolved=False).exists():
-            return self.Status.AT_RISK
         if self.target_date:
             progress = self.computed_progress() if progress is None else progress
             if (self.target_date - today).days <= self.AT_RISK_DAYS_LEFT and progress < self.AT_RISK_PROGRESS_BELOW:

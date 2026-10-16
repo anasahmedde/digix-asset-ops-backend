@@ -1652,11 +1652,9 @@ def test_health_follows_the_dates_the_work_and_the_blockers(db):
     project.start_date, project.target_date = today - timedelta(days=50), today + timedelta(days=50)
     assert project.health(progress=20) == Project.Status.AT_RISK
     assert project.health(progress=45) == Project.Status.ON_TRACK
-    # An open bottleneck: at risk; resolved, back on track.
-    blocker = ProjectBottleneck.objects.create(project=project, title="Panels held at customs")
-    assert project.health(progress=45) == Project.Status.AT_RISK
-    blocker.is_resolved = True
-    blocker.save()
+    # Bottlenecks are gone from the projects module: an old open one left in
+    # the table no longer marks a project at risk for a reason nobody can see.
+    ProjectBottleneck.objects.create(project=project, title="Panels held at customs")
     assert project.health(progress=45) == Project.Status.ON_TRACK
     # On hold says so.
     project.phase = Project.Phase.ON_HOLD

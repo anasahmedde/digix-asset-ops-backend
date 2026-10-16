@@ -22,7 +22,6 @@ from .models import (
     BOMAllocation,
     Project,
     ProjectBOMLine,
-    ProjectBottleneck,
     ProjectMember,
     ProjectMilestone,
     ProjectScopeItem,
@@ -30,7 +29,6 @@ from .models import (
 from .serializers import (
     ProjectCostLineSerializer,
     ProjectBOMLineSerializer,
-    ProjectBottleneckSerializer,
     ProjectDetailSerializer,
     ProjectListSerializer,
     ProjectMemberSerializer,
@@ -210,7 +208,6 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         return (
             Project.objects
             .select_related("client", "site", "manager")
-            .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
             .prefetch_related("scope_items", "milestones")
             .order_by("-created_at")
         )
@@ -867,21 +864,9 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 "name": p.name,
                 "progress": p.computed_progress(),
                 "status": p.status,
-                "bottleneck_count": p.bottleneck_count,
             }
-            for p in (
-                qs.filter(status__in=["at_risk", "delayed"])
-                .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
-                .prefetch_related("milestones")[:8]
-            )
+            for p in qs.filter(status__in=["at_risk", "delayed"]).prefetch_related("milestones")[:8]
         ]
-        top_bottlenecks = list(
-            ProjectBottleneck.objects
-            .filter(is_resolved=False)
-            .values("title")
-            .annotate(project_count=Count("project", distinct=True))
-            .order_by("-project_count")[:5]
-        )
         return Response({
             "total": total,
             "on_track": by_status.get("on_track", 0),
@@ -889,7 +874,6 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             "delayed": by_status.get("delayed", 0),
             "completed": by_status.get("completed", 0),
             "flagged_projects": flagged,
-            "top_bottlenecks": top_bottlenecks,
         })
 
 
@@ -924,12 +908,6 @@ class _ProjectSideTable(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         self._check(self._project_of(instance=instance))
         super().perform_destroy(instance)
-
-
-class ProjectBottleneckViewSet(_ProjectSideTable):
-    queryset = ProjectBottleneck.objects.select_related("project").all()
-    serializer_class = ProjectBottleneckSerializer
-    filterset_fields = ["project", "severity", "is_resolved"]
 
 
 class ProjectMemberViewSet(_ProjectSideTable):
