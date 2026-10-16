@@ -2821,7 +2821,12 @@ def test_the_due_date_agreed_at_assignment_lands_on_the_tracker(admin_client, in
         username="due-date-tech", password="x", role="technician", is_field_staff=True,
         first_name="Bilal", last_name="Hussain",
     )
-    due = date(2026, 10, 15)
+    # A week ahead of today: a fixed date turned into "already passed" once the calendar caught up.
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    due = timezone.localdate() + timedelta(days=7)
     r = admin_client.post(
         f"/api/assets/devices/{in_stock_device.id}/transition/",
         {

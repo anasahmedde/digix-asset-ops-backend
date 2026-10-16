@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 from common.models import TimeStampedModel
 
@@ -528,3 +529,31 @@ class MaintenancePartRequest(TimeStampedModel):
         if self.unit_type_id:
             return self.unit_type.unit or "piece"
         return "piece"
+
+
+class MaintenanceActivity(TimeStampedModel):
+    """One thing somebody did on a job, and when: assigned, started, a part
+    asked for or issued, a photo, completed, accepted. The job's history."""
+
+    schedule = models.ForeignKey(MaintenanceSchedule, on_delete=models.CASCADE, related_name="activity")
+    visit = models.ForeignKey(
+        MaintenanceVisit, on_delete=models.SET_NULL, null=True, blank=True, related_name="activity",
+    )
+    # A short key for the kind of act ("assigned", "part_issued"...), so the
+    # screen can mark them; the sentence says the rest.
+    action = models.CharField(max_length=40)
+    text = models.CharField(max_length=500)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    # When it happened. Usually now; history written back from what the
+    # records already said carries the time they said it.
+    at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        ordering = ["-at", "-created_at"]
+        indexes = [models.Index(fields=["schedule", "-at"])]
+
+    def __str__(self):
+        return f"{self.schedule} - {self.text}"
+

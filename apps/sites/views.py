@@ -15,6 +15,8 @@ from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_resp
 from apps.notifications import service as notices
 from common.permissions import CapabilityGate, can, can_for_project
 
+from . import activity
+
 
 def may_advance_installation(user, installation) -> bool:
     """Who may move an installation along.
@@ -178,6 +180,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
     action_capabilities = {
         "activate": None, "handover": None, "verify_asset": None,
         "export": "view_installations", "handover_document": "view_installations",
+        "activity": "view_installations",
         "reorder_steps": "edit_installation",
         "save_step_template": "manage_setup", "apply_step_template": "edit_installation",
     }
@@ -208,6 +211,36 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             )},
             status=drf_status.HTTP_405_METHOD_NOT_ALLOWED,
         )
+
+    def perform_update(self, serializer):
+        """Edits say what changed: who installs it, when it is due, where."""
+        watched = {
+            "installed_by_id": "installer", "due_date": "due date", "position_label": "location at site",
+            "notes": "notes", "vendor_id": "vendor", "external_vendor_name": "vendor", "installed_at": "assigned date",
+        }
+        before = {f: getattr(serializer.instance, f) for f in watched}
+        installation = serializer.save()
+
+        def moved(f):
+            # The form sends the assigned time to the minute; a resave that
+            # only drops the seconds is not an edit anybody made.
+            old, new = before[f], getattr(installation, f)
+            if hasattr(old, "second") and hasattr(new, "second"):
+                return old.replace(second=0, microsecond=0) != new.replace(second=0, microsecond=0)
+            return old != new
+
+        changed = sorted({label for f, label in watched.items() if moved(f)})
+        if installation.installed_by_id != before["installed_by_id"] and installation.installed_by_id:
+            activity.log(installation, "reassigned", f"Reassigned to {activity.name(installation.installed_by)}",
+                         user=self.request.user)
+            changed = [c for c in changed if c != "installer"]
+        if changed:
+            activity.log(installation, "edited", "Edited: " + ", ".join(changed), user=self.request.user)
+
+    @action(detail=True, methods=["get"])
+    def activity(self, request, pk=None):
+        """Who did what on this installation, and when - newest first."""
+        return Response(activity.rows(self.get_object()))
 
     def destroy(self, request, *args, **kwargs):
         """An installation record is never deleted - by anyone.
@@ -268,6 +301,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             apply_step_order(installation.pk, ids)
             keep_handover_last(installation.pk)
         installation.refresh_from_db()
+        activity.log(installation, "steps_reordered", "Steps reordered", user=request.user)
         return Response(self.get_serializer(installation).data)
 
     def get_queryset(self):
@@ -437,6 +471,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             ])
         installation.refresh_from_db()
         installation._prefetched_objects_cache = {}
+        activity.log(installation, "steps_added", f"Standard checklist applied ({len(lines)} steps)", user=request.user)
         return Response({
             "applied": len(lines),
             "installation": DeviceInstallationDetailSerializer(
@@ -457,6 +492,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         if not office:
             require_on_site(user, installation.site)
         verify_asset(user, installation, installation.device, request.data.get("code"))
+        activity.log(installation, "asset_scanned", f"Asset {installation.device.asset_code} scanned on site", user=user)
         return Response(DeviceInstallationDetailSerializer(installation, context=self.get_serializer_context()).data)
 
     @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
@@ -559,6 +595,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         installation.refresh_from_db()
         installation._prefetched_objects_cache = {}
         self._tell_the_project(installation, user, f"{device.asset_code} is live")
+        activity.log(installation, "activated", f"{device.asset_code} marked Active, with a photo of it running", user=user)
         return Response(
             DeviceInstallationDetailSerializer(installation, context=self.get_serializer_context()).data
         )
@@ -700,6 +737,10 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 device.save(update_fields=["status", "updated_at"])
 
         self._tell_the_project(installation, user, f"{installation.device.asset_code} handed over to the client")
+        activity.log(installation, "handed_over", (
+            f"Handover recorded - accepted by {installation.handover.accepted_by_name}"
+            if getattr(installation, "handover", None) is not None else "Handover recorded"
+        ), user=user)
         installation.refresh_from_db()
         installation._prefetched_objects_cache = {}
         return Response(
@@ -779,10 +820,11 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         self._may_change_checklist(installation)
         self._from_the_site(installation)
         with transaction.atomic():
-            serializer.save()
+            step = serializer.save()
             # Added after Handover, it would wait on Handover, which waits on
             # it: the new step goes in before Handover instead.
             keep_handover_last(installation.pk)
+        activity.log(installation, "step_added", f"Step added: {activity.step_name(step)}", user=self.request.user, step=step)
 
     def perform_update(self, serializer):
         from django.utils import timezone
@@ -861,7 +903,16 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
             extra["completed_by"] = self.request.user
             if "completed_at" not in serializer.validated_data and not step.completed_at:
                 extra["completed_at"] = timezone.now()
-        serializer.save(**extra)
+        was = step.status
+        step = serializer.save(**extra)
+        if step.status != was:
+            moved = {
+                "in_progress": "resumed" if was == "on_hold" else "started",
+                "on_hold": "put on hold", "completed": "completed", "skipped": "skipped",
+                "not_started": "reset to Not Started",
+            }.get(step.status, step.get_status_display().lower())
+            activity.log(step.installation, f"step_{step.status}", f"{activity.step_name(step)} {moved}",
+                         user=self.request.user, step=step)
 
     def perform_destroy(self, instance):
         """Remove the step, then close the gap it leaves in the numbering."""
@@ -879,9 +930,12 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
             )})
         self._from_the_site(instance.installation)
         installation_id = instance.installation_id
+        removed = activity.step_name(instance)
+        installation = instance.installation
         with transaction.atomic():
             instance.delete()
             renumber_steps(installation_id)
+        activity.log(installation, "step_removed", f"Step removed: {removed}", user=self.request.user)
 
     permission_classes = [IsAuthenticated, CapabilityGate]
     read_capability = "view_installations"
@@ -914,12 +968,24 @@ class InstallationDelayViewSet(viewsets.ModelViewSet):
     # whoever assigns installations edits and resolves them.
     action_capabilities = {"create": None}
 
+    def perform_update(self, serializer):
+        was = serializer.instance.resolved_at
+        delay = serializer.save()
+        if delay.resolved_at and not was:
+            activity.log(delay.installation, "delay_resolved", f"Delay resolved: {delay.get_cause_display()}",
+                         user=self.request.user, step=delay.step)
+
     def perform_create(self, serializer):
         installation = serializer.validated_data["installation"]
         user = self.request.user
         if not may_advance_installation(user, installation):
             raise PermissionDenied("This installation is not yours to flag a delay on.")
         delay = serializer.save(reported_by=user)
+        activity.log(installation, "delay", (
+            f"Delay flagged: {delay.get_cause_display()}"
+            + (f" on {activity.step_name(delay.step)}" if delay.step_id else "")
+            + (f" - {delay.description}" if getattr(delay, "description", "") else "")
+        ), user=user, step=delay.step)
         notices.tell(
             notices.holders_of("assign_installation", exclude=[user]),
             title=f"Delay flagged: {installation.device.asset_code}",
@@ -946,4 +1012,5 @@ class InstallationPhotoViewSet(viewsets.ModelViewSet):
             installation = serializer.validated_data["installation"]
             if not user.supplier_id or installation.vendor_id != user.supplier_id:
                 raise PermissionDenied("Vendors can only add photos to their own installations.")
-        serializer.save(taken_by=user)
+        photo = serializer.save(taken_by=user)
+        activity.log(photo.installation, "photo", f"{photo.get_photo_type_display()} photo added", user=user)

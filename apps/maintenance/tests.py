@@ -1477,3 +1477,36 @@ def test_the_technician_writes_up_the_work_as_it_goes(parts_job):
     assert visit.notes == "Office addendum"
     # A plain PATCH is still the planner's: the technician cannot rewrite the round.
     assert _client(parts_job["tech"]).patch(f"/api/maintenance/visits/{visit.id}/", {"notes": "x"}, format="json").status_code == 403
+
+
+@pytest.mark.django_db
+def test_a_job_keeps_a_history_of_who_did_what_and_when(parts_job):
+    """CR-08: assigning, asking for a part, approving it and the store
+    issuing it each leave a line on the job, with the person and the time."""
+    from apps.accounts.models import User
+    from apps.inventory.models import IssuanceRequest
+    from apps.maintenance import activity
+
+    job = parts_job["schedule"]
+    store = User.objects.create_user(username="hist-store", password="x", role="warehouse")
+    tech = parts_job["tech"].get_full_name() or parts_job["tech"].username
+    boss = parts_job["boss"].get_full_name() or parts_job["boss"].username
+
+    line_id = _approved_line(parts_job, quantity=3)
+    issuance = IssuanceRequest.objects.get(maintenance_part_request=line_id)
+    r = _client(store).post(f"/api/inventory/issuance-requests/{issuance.id}/issue/",
+                            {"quantity": 3, "received_by": tech}, format="json")
+    assert r.status_code == 200, r.content
+    activity.log(job, "notes", "Work done saved", user=parts_job["tech"])
+
+    r = _client(parts_job["boss"]).get(f"/api/maintenance/schedules/{job.id}/activity/")
+    assert r.status_code == 200, r.content
+    rows = r.data
+    by_action = {row["action"]: row for row in rows}
+    assert by_action["part_requested"]["actor"] == tech
+    assert by_action["part_approved"]["actor"] == boss
+    assert "Store issued 3" in by_action["part_issued"]["text"]
+    assert all(row["at"] for row in rows), "every line says when"
+    assert [row["at"] for row in rows] == sorted((row["at"] for row in rows), reverse=True), "newest first"
+    # The technician reads their job's history too.
+    assert _client(parts_job["tech"]).get(f"/api/maintenance/schedules/{job.id}/activity/").status_code == 200

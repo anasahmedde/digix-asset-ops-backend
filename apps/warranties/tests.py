@@ -713,7 +713,7 @@ def test_an_extended_warranty_reads_as_extended_while_it_runs(device, ops):
     still under warranty."""
     from apps.assets.serializers import _warranty_status
 
-    today = timezone.now().date()
+    today = timezone.localdate()
     w = Warranty.objects.create(
         device=device, warranty_type="supplier", start_date=today - timedelta(days=300),
         end_date=today + timedelta(days=65), months=12,

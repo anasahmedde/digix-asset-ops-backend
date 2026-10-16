@@ -909,6 +909,17 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         issuance_request.refresh_from_db()
         if issuance_request.status in (IssuanceRequest.Status.FULFILLED, IssuanceRequest.Status.CANCELLED):
             notices.resolve(f"issue:{issuance_request.pk}")
+        # A part asked for on a maintenance job: the job's history says it
+        # left the store, and to whom.
+        part = getattr(issuance_request, "maintenance_part_request", None)
+        if part is not None and result["quantity"]:
+            from apps.maintenance.activity import log
+
+            log(part.schedule, "part_issued", (
+                f"Store issued {result['quantity']} {part.unit} of {part.what} ({issuance_request.request_number})"
+                + (f" - serials {', '.join(result['serials'])}" if result.get("serials") else "")
+                + (f", received by {result['received_by']}" if result.get("received_by") else "")
+            ), user=request.user, visit=part.visit)
         if issuance_request.requested_by_id:
             notices.tell(
                 [issuance_request.requested_by], exclude=[request.user], kind="request_answered",
@@ -1005,6 +1016,10 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
                         "status", "quantity_approved", "decided_by", "decided_at",
                         "decision_note", "issuance_request", "updated_at",
                     ])
+                from apps.maintenance.activity import log
+
+                log(part.schedule, "part_sent_back", f"Store sent back the request for {part.what}: {note}",
+                    user=request.user, visit=part.visit)
                 where = part.schedule.title
             elif component is not None:
                 # A cancelled request stops counting against the requirement,

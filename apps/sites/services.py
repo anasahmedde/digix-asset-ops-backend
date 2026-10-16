@@ -48,10 +48,14 @@ def open_installation_for(device, user=None):
             for field, value in updates.items():
                 setattr(existing, field, value)
             existing.save(update_fields=[*updates, "updated_at"])
+            if "installed_by" in updates and existing.installed_by_id:
+                from .activity import log, name
+
+                log(existing, "reassigned", f"Reassigned to {name(existing.installed_by)}", user=user)
         return existing
 
     try:
-        return DeviceInstallation.objects.create(
+        made = DeviceInstallation.objects.create(
             device=device,
             site=device.current_site,
             installed_by=device.assigned_technician,
@@ -66,3 +70,11 @@ def open_installation_for(device, user=None):
     except Exception:  # pragma: no cover - a status change must never 500
         logger.exception("Failed to open an installation for %s", device.pk)
         return None
+    from .activity import log, name
+
+    log(made, "opened", (
+        f"Installation opened at {made.site.name}"
+        + (f", assigned to {name(made.installed_by)}" if made.installed_by_id else "")
+        + (f", due {made.due_date:%d %b %Y}" if made.due_date else "")
+    ), user=user)
+    return made

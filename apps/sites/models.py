@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 from common.models import TimeStampedModel
 from common.utils import upload_to_path
@@ -316,3 +317,27 @@ class InstallationRouteTemplateStep(TimeStampedModel):
     def __str__(self):
         label = self.custom_label or self.get_step_type_display()
         return f"{self.template.asset_type.name} · {self.step_number}. {label}"
+
+
+class InstallationActivity(TimeStampedModel):
+    """One thing somebody did on an installation, and when: assigned, a step
+    started or completed, the asset scanned, a delay, live, handed over."""
+
+    installation = models.ForeignKey(DeviceInstallation, on_delete=models.CASCADE, related_name="activity")
+    step = models.ForeignKey(
+        InstallationStep, on_delete=models.SET_NULL, null=True, blank=True, related_name="activity",
+    )
+    action = models.CharField(max_length=40)
+    text = models.CharField(max_length=500)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        ordering = ["-at", "-created_at"]
+        indexes = [models.Index(fields=["installation", "-at"])]
+
+    def __str__(self):
+        return f"{self.installation} - {self.text}"
+

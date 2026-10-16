@@ -1861,3 +1861,28 @@ def test_the_installer_adds_and_removes_unworked_steps_on_their_own_job(tech, in
         "installation": str(installation.id), "step_type": "other", "custom_label": "Not mine",
     }, format="json")
     assert r.status_code == 403, r.content
+
+
+@pytest.mark.django_db
+def test_an_installation_keeps_a_history_of_who_did_what_and_when(ops, tech, installation):
+    """CR-08: moving a step, editing the job and flagging a delay each leave
+    a line on the installation, with the person and the time."""
+    first = installation.steps.order_by("step_number").first()
+    c = _client(tech)
+    assert c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json").status_code == 200
+    assert c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json").status_code == 200
+    r = _client(ops).patch(f"/api/sites/installations/{installation.id}/", {"position_label": "Main entrance"}, format="json")
+    assert r.status_code == 200, r.content
+    r = c.post("/api/sites/installation-delays/", {"installation": str(installation.id), "cause": "client"}, format="json")
+    assert r.status_code == 201, r.content
+
+    r = _client(ops).get(f"/api/sites/installations/{installation.id}/activity/")
+    assert r.status_code == 200, r.content
+    texts = [(row["action"], row["text"], row["actor"]) for row in r.data]
+    me = tech.get_full_name() or tech.username
+    step = first.custom_label or first.get_step_type_display()
+    assert ("step_in_progress", f"{step} started", me) in texts
+    assert ("step_completed", f"{step} completed", me) in texts
+    assert any(a == "edited" and "location at site" in t for a, t, _ in texts)
+    assert any(a == "delay" and t.startswith("Delay flagged: Client") for a, t, _ in texts)
+    assert all(row["at"] for row in r.data)

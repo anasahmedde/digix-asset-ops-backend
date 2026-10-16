@@ -14,7 +14,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
-from . import lifecycle
+from . import activity, lifecycle
 
 
 def _where_from(data):
@@ -195,6 +195,10 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
             requested_by=self.request.user,
             visit=schedule.open_visit() if schedule is not None else None,
         )
+        activity.log(schedule, "part_requested", (
+            f"Requested {line.quantity_requested} {line.unit} of {line.what}"
+            + (f" - {line.reason}" if line.reason else "")
+        ), user=self.request.user, visit=line.visit)
         # The asker's own supervisor hears about it; so does anyone who
         # answers for every team.
         notices.ask(
@@ -231,6 +235,8 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
             "status", "decided_by", "decided_at", "decision_note", "updated_at",
         ])
         notices.resolve(f"part:{instance.pk}")
+        activity.log(instance.schedule, "part_withdrawn", f"Request for {instance.what} withdrawn",
+                     user=user, visit=instance.visit)
 
     @action(detail=True, methods=["post"])
     def decide(self, request, pk=None):
@@ -341,6 +347,10 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         job = serializer.save()
+        activity.log(job, "opened", (
+            f"{job.get_maintenance_type_display()} job created"
+            + (f" for {job.device.asset_code}" if job.device_id else "")
+        ), user=self.request.user)
         inform_line(
             self.request.user,
             title=f"Maintenance scheduled: {job.title}",
@@ -355,7 +365,20 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
 
             raise PermissionDenied("You can only update a job assigned to you.")
-        serializer.save()
+        watched = {
+            "status": "status", "next_due": "next due date", "assigned_to_id": "technician",
+            "title": "title", "priority": "priority", "frequency": "frequency",
+            "instructions": "instructions", "is_active": "active",
+        }
+        before = {f: getattr(instance, f) for f in watched}
+        job = serializer.save()
+        changed = [label for f, label in watched.items() if getattr(job, f) != before[f]]
+        if before["status"] != job.status and job.status == MaintenanceSchedule.Status.ON_HOLD:
+            activity.log(job, "paused", "Schedule paused", user=self.request.user)
+        elif before["status"] == MaintenanceSchedule.Status.ON_HOLD and job.status != before["status"]:
+            activity.log(job, "resumed", "Schedule resumed", user=self.request.user)
+        elif changed:
+            activity.log(job, "edited", "Edited: " + ", ".join(changed), user=self.request.user)
     search_fields = ["title", "device__asset_code", "device__display_name"]
     ordering_fields = ["began", "next_due", "created_at", "priority"]
 
@@ -392,6 +415,11 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         return Response(
             MaintenanceVisitSerializer(visit, context=self.get_serializer_context()).data
         )
+
+    @action(detail=True, methods=["get"])
+    def activity(self, request, pk=None):
+        """Who did what on this job, and when - newest first."""
+        return Response(activity.rows(self.get_object()))
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
@@ -494,7 +522,17 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
+        was = serializer.instance
+        before = (was.assigned_to_id, was.due_date)
         visit = serializer.save()
+        if visit.assigned_to_id != before[0] and visit.assigned_to_id:
+            activity.log(visit.schedule, "reassigned", (
+                f"{activity.visit_word(visit)} reassigned to {activity.name(visit.assigned_to)}"
+            ), user=self.request.user, visit=visit)
+        if visit.due_date != before[1] and visit.due_date:
+            activity.log(visit.schedule, "edited", (
+                f"{activity.visit_word(visit)} due date moved to {visit.due_date:%d %b %Y}"
+            ), user=self.request.user, visit=visit)
         # On a fault the open visit decides who is on the job: when it is
         # handed to somebody else, the job follows, the way assigning from the
         # job does. A preventive round given to a stand-in leaves the
@@ -535,6 +573,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             )
         visit.notes = (request.data.get("notes") or "").strip()
         visit.save(update_fields=["notes", "updated_at"])
+        activity.log(visit.schedule, "notes", "Work done saved", user=request.user, visit=visit)
         return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"], url_path="return-parts")
@@ -559,6 +598,10 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Only the technician on this visit verifies its asset."}, status=403)
         _from_the_site(request.user, visit.schedule)
         verify_asset(request.user, visit, visit.schedule.device, request.data.get("code"))
+        activity.log(visit.schedule, "asset_scanned", (
+            f"Asset {visit.schedule.device.asset_code} scanned on site" if visit.schedule.device_id
+            else "Asset scanned on site"
+        ), user=request.user, visit=visit)
         return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
@@ -626,6 +669,11 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             )
             for image in images
         ]
+        activity.log(visit.schedule, "photo", (
+            f"{dict(MaintenanceVisitPhoto.Kind.choices)[kind]} photo added"
+            + (f" ({len(made)})" if len(made) > 1 else "")
+            + (" with Work done" if kind == MaintenanceVisitPhoto.Kind.AFTER and "notes" in request.data else "")
+        ), user=request.user, visit=visit)
         return Response(
             MaintenanceVisitPhotoSerializer(made, many=True, context=self.get_serializer_context()).data,
             status=drf_status.HTTP_201_CREATED,
