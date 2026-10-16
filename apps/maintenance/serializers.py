@@ -10,6 +10,7 @@ from .models import (
     MaintenanceSchedule,
     MaintenanceVisit,
     MaintenanceVisitPhoto,
+    MaintenancePurchase,
 )
 
 
@@ -254,6 +255,41 @@ class MaintenanceRecordPhotoSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "taken_by", "created_at"]
 
 
+class MaintenancePurchaseSerializer(serializers.ModelSerializer):
+    """Bought on site: what, how many, what was paid, where, and the proof."""
+
+    bought_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MaintenancePurchase
+        fields = [
+            "id", "schedule", "visit", "description", "quantity", "amount", "shop",
+            "receipt", "photo", "bought_by", "bought_by_name", "created_at",
+        ]
+        read_only_fields = ["id", "schedule", "bought_by", "bought_by_name", "created_at"]
+        extra_kwargs = {"receipt": {"required": True}, "photo": {"required": True}}
+
+    def get_bought_by_name(self, obj):
+        who = obj.bought_by
+        return (who.get_full_name() or who.username) if who else None
+
+    def validate_description(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Say what was bought.")
+        return value
+
+    def validate_amount(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError("Say what was paid, as the receipt shows.")
+        return value
+
+    def validate_quantity(self, value):
+        if not value or value < 1:
+            raise serializers.ValidationError("At least one.")
+        return value
+
+
 class MaintenanceVisitPhotoSerializer(serializers.ModelSerializer):
     """A photograph, and what it is a photograph of."""
 
@@ -295,6 +331,8 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     photos = serializers.SerializerMethodField()
     # Corrective: the evidence and the verdicts the office reviews.
     visit_photos = MaintenanceVisitPhotoSerializer(source="photos", many=True, read_only=True)
+    # What the technician bought on site for this visit, receipts and all.
+    purchases = MaintenancePurchaseSerializer(many=True, read_only=True)
     review_decision_display = serializers.CharField(
         source="get_review_decision_display", read_only=True, default="",
     )
@@ -349,7 +387,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
             "sequence", "completed_at", "resolved", "remarks",
             "review_decision", "review_decision_display", "review_reason",
             "review_note", "reviewed_by", "reviewed_by_name",
-            "reviewed_at", "visit_photos", "has_before_photo", "has_after_photo",
+            "reviewed_at", "visit_photos", "purchases", "has_before_photo", "has_after_photo",
             "asset_verified_at", "asset_verified_by_name",
             "component_costs", "cost_lines",
             "created_at", "updated_at",

@@ -69,6 +69,7 @@ from .models import (
     MaintenanceRecordPhoto,
     MaintenanceSchedule,
     MaintenanceVisit,
+    MaintenancePurchase,
 )
 from .serializers import (
     MaintenanceVisitPhotoSerializer,
@@ -78,6 +79,7 @@ from .serializers import (
     MaintenanceRecordSerializer,
     MaintenanceScheduleSerializer,
     MaintenanceVisitSerializer,
+    MaintenancePurchaseSerializer,
 )
 
 def _answers_for(user, line) -> bool:
@@ -475,6 +477,49 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         instance.delete()
 
 
+class MaintenancePurchaseViewSet(viewsets.ModelViewSet):
+    """Bought on site, against a visit: recorded with the receipt and a photo
+    by the technician on the visit (or the office), taken back while the
+    visit is still open. Everyone who can read the job can read them."""
+
+    queryset = MaintenancePurchase.objects.select_related("visit", "schedule", "bought_by").all()
+    serializer_class = MaintenancePurchaseSerializer
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_maintenance"
+    action_capabilities = {"create": None, "destroy": None}
+    http_method_names = ["get", "post", "delete", "head", "options"]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    filterset_fields = ["schedule", "visit"]
+
+    OPEN = (MaintenanceVisit.Status.PLANNED, MaintenanceVisit.Status.IN_PROGRESS,
+            MaintenanceVisit.Status.AWAITING_REVIEW)
+
+    def perform_create(self, serializer):
+        visit = serializer.validated_data["visit"]
+        user = self.request.user
+        if not (lifecycle.theirs(visit, user) or lifecycle.is_office(user)):
+            raise PermissionDenied("Only the technician on this visit, or the office, records what was bought for it.")
+        if visit.status not in self.OPEN:
+            raise drf_serializers.ValidationError(
+                {"visit": f"Visit {visit.sequence} is {visit.get_status_display().lower()}: its cost is settled."}
+            )
+        bought = serializer.save(schedule=visit.schedule, bought_by=user)
+        activity.log(visit.schedule, "purchase", (
+            f"Bought on site: {bought.quantity} x {bought.description} for PKR {bought.amount:,.2f}"
+            + (f" at {bought.shop}" if bought.shop else "")
+        ), user=user, visit=visit)
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not (instance.bought_by_id == user.pk or lifecycle.is_office(user)):
+            raise PermissionDenied("Only whoever recorded it, or the office, takes a purchase back.")
+        if instance.visit.status not in self.OPEN:
+            raise drf_serializers.ValidationError({"detail": "The visit is closed: its purchases are on the record."})
+        activity.log(instance.schedule, "purchase_removed", f"Purchase taken back: {instance.description}",
+                     user=user, visit=instance.visit)
+        instance.delete()
+
+
 class CanPlanOrStartARound(BasePermission):
     """Planning a round is a supervisor's call; attending one is not.
 
@@ -510,7 +555,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
     queryset = MaintenanceVisit.objects.select_related(
         "schedule", "schedule__device", "schedule__site", "assigned_to",
         "record", "record__performed_by",
-    ).prefetch_related("record__components_used", "record__photos").all()
+    ).prefetch_related("record__components_used", "record__photos", "purchases__bought_by").all()
     serializer_class = MaintenanceVisitSerializer
     permission_classes = [IsAuthenticated, CanPlanOrStartARound]
     filterset_fields = ["schedule", "status", "assigned_to"]

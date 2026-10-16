@@ -7,6 +7,7 @@ from .views import (
     MaintenanceRecordViewSet,
     MaintenanceScheduleViewSet,
     MaintenanceVisitViewSet,
+    MaintenancePurchaseViewSet,
 )
 
 router = DefaultRouter()
@@ -15,6 +16,7 @@ router.register("records", MaintenanceRecordViewSet, basename="record")
 router.register("record-photos", MaintenanceRecordPhotoViewSet, basename="record-photo")
 router.register("part-requests", MaintenancePartRequestViewSet, basename="part-request")
 router.register("visits", MaintenanceVisitViewSet, basename="visit")
+router.register("purchases", MaintenancePurchaseViewSet, basename="purchase")
 
 urlpatterns = [
     path("", include(router.urls)),

@@ -403,6 +403,7 @@ class MaintenanceCostLine(TimeStampedModel):
 
     class Source(models.TextChoices):
         COMPONENT = "component", "Component used"
+        PURCHASE = "purchase", "Bought on site"
         MANUAL = "manual", "Added on review"
 
     record = models.ForeignKey(
@@ -556,4 +557,34 @@ class MaintenanceActivity(TimeStampedModel):
 
     def __str__(self):
         return f"{self.schedule} - {self.text}"
+
+
+class MaintenancePurchase(TimeStampedModel):
+    """Something the technician bought on site for the job - from the market,
+    because the store did not have it or there was no time to send for it.
+
+    The receipt is the proof of what was paid; the photo is the part itself.
+    Both are required: a figure without either is a claim, not a record. The
+    purchase is priced into the visit's cost when the office accepts it.
+    """
+
+    schedule = models.ForeignKey(MaintenanceSchedule, on_delete=models.CASCADE, related_name="purchases")
+    visit = models.ForeignKey(MaintenanceVisit, on_delete=models.CASCADE, related_name="purchases")
+    # What was bought, in the technician's words: make, model, size.
+    description = models.CharField(max_length=255)
+    quantity = models.PositiveIntegerField(default=1)
+    # What was paid in all, as the receipt says.
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    shop = models.CharField(max_length=200, blank=True)
+    receipt = models.FileField(upload_to="maintenance/purchases/receipts/")
+    photo = models.ImageField(upload_to="maintenance/purchases/photos/")
+    bought_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="maintenance_purchases",
+    )
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.description} x{self.quantity} - {self.amount}"
 

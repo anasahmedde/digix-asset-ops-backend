@@ -916,3 +916,61 @@ def test_a_job_is_listed_for_whoever_holds_its_open_visit(fault):
     # job's stale name.
     MaintenanceVisit.objects.filter(pk=visit.pk).update(assigned_to=tech)
     assert str(job.id) in listed(tech) and str(job.id) not in listed(other)
+
+
+# ── Bought on site ───────────────────────────────────────────────────────
+
+def _upload(name, tag):
+    return SimpleUploadedFile(name, _png(tag).read(), content_type="image/png")
+
+
+@pytest.mark.django_db
+def test_a_part_bought_on_site_is_recorded_with_its_receipt_and_priced_in(fault):
+    """The technician buys a part in the market: it goes on the job with the
+    receipt, the amount, what it was and a photo, and into the visit's cost."""
+    from apps.maintenance.models import MaintenanceCostLine, MaintenancePurchase
+
+    job, tech, office = fault["job"], fault["tech"], fault["office"]
+    _client(office).post(
+        f"/api/maintenance/schedules/{job.id}/assign/",
+        {"technician": str(tech.id), "due_date": str(timezone.localdate())}, format="json",
+    )
+    visit = job.visits.get()
+    def body():
+        return {"visit": str(visit.id), "description": "5V 40A power supply, Meanwell", "quantity": 2,
+                "amount": "3400", "shop": "Hall Road", "receipt": _upload("receipt.png", "rcpt"),
+                "photo": _upload("psu.png", "psu")}
+
+    # No receipt, no record.
+    bare = body(); bare.pop("receipt")
+    assert _client(tech).post("/api/maintenance/purchases/", bare, format="multipart").status_code == 400
+    # Somebody else's visit is not theirs to spend on.
+    stranger = User.objects.create_user(username="cm-stranger", password="x", role="technician")
+    assert _client(stranger).post("/api/maintenance/purchases/", body(), format="multipart").status_code == 403
+    r = _client(tech).post("/api/maintenance/purchases/", body(), format="multipart")
+    assert r.status_code == 201, r.content
+    assert r.data["bought_by_name"] and r.data["receipt"] and r.data["photo"]
+
+    seen = _client(office).get(f"/api/maintenance/visits/{visit.id}/").data
+    assert [p["description"] for p in seen["purchases"]] == ["5V 40A power supply, Meanwell"]
+    log = _client(office).get(f"/api/maintenance/schedules/{job.id}/activity/").data
+    assert any(row["action"] == "purchase" and "3,400.00" in row["text"] for row in log)
+
+    # Through to acceptance: the purchase is a cost line of its own.
+    photos = f"/api/maintenance/visits/{visit.id}/photos/"
+    _client(tech).post(photos, {"kind": "before", "image": _png()}, format="multipart")
+    _client(tech).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
+    _client(tech).post(photos, {"kind": "after", "image": _png("after"), "notes": "PSU replaced"}, format="multipart")
+    assert _client(tech).post(f"/api/maintenance/visits/{visit.id}/complete/", {"resolved": True},
+                              format="json").status_code == 200
+    r = _client(office).post(f"/api/maintenance/visits/{visit.id}/review/", {"decision": "accepted"}, format="json")
+    assert r.status_code == 200, r.content
+    visit.refresh_from_db()
+    lines = list(MaintenanceCostLine.objects.filter(record=visit.record))
+    bought = [x for x in lines if x.source == MaintenanceCostLine.Source.PURCHASE]
+    assert len(bought) == 1 and bought[0].amount == 3400
+    assert visit.record.cost == sum(x.amount for x in lines)
+
+    # Closed: what was bought stays on the record.
+    gone = _client(tech).delete(f"/api/maintenance/purchases/{MaintenancePurchase.objects.get().pk}/")
+    assert gone.status_code == 400, gone.content

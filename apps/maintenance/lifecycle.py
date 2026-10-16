@@ -831,6 +831,17 @@ def component_costs(visit: MaintenanceVisit, prices=None):
             "unit_cost": unit,
             "amount": (unit * qty).quantize(Decimal("0.01")) if unit is not None else Decimal("0.00"),
         })
+    # Bought on site: the receipt says what it cost, so it prices itself.
+    for bought in visit.purchases.all():
+        qty = Decimal(bought.quantity)
+        out.append({
+            "part_request": None,
+            "purchase": str(bought.pk),
+            "description": f"Bought on site: {bought.description}" + (f" ({bought.shop})" if bought.shop else ""),
+            "quantity": qty,
+            "unit_cost": (bought.amount / qty).quantize(Decimal("0.01")),
+            "amount": bought.amount,
+        })
     return out
 
 
@@ -841,7 +852,9 @@ def price_the_visit(record, visit: MaintenanceVisit, extra=None, prices=None):
     record.cost_lines.all().delete()
     lines = [
         MaintenanceCostLine(
-            record=record, source=MaintenanceCostLine.Source.COMPONENT,
+            record=record,
+            source=(MaintenanceCostLine.Source.PURCHASE if row.get("purchase")
+                    else MaintenanceCostLine.Source.COMPONENT),
             description=row["description"], quantity=row["quantity"],
             unit_cost=row["unit_cost"], amount=row["amount"],
         )
