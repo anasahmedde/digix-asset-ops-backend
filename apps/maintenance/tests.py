@@ -1510,3 +1510,37 @@ def test_a_job_keeps_a_history_of_who_did_what_and_when(parts_job):
     assert [row["at"] for row in rows] == sorted((row["at"] for row in rows), reverse=True), "newest first"
     # The technician reads their job's history too.
     assert _client(parts_job["tech"]).get(f"/api/maintenance/schedules/{job.id}/activity/").status_code == 200
+
+
+@pytest.mark.django_db
+def test_each_visit_says_when_the_technician_arrived_and_left(parts_job):
+    """The visit history shows the check-in the work began under and the
+    check-out after it - not some other day's attendance."""
+    from datetime import timedelta
+
+    from apps.attendance.models import AttendanceRecord
+    from apps.maintenance.lifecycle import current_visit
+
+    job, tech = parts_job["schedule"], parts_job["tech"]
+    visit = current_visit(job)
+    now = timezone.now()
+
+    def mark(kind, at, site=job.site):
+        r = AttendanceRecord.objects.create(user=tech, check_type=kind, site=site)
+        AttendanceRecord.objects.filter(pk=r.pk).update(created_at=at)
+
+    url = f"/api/maintenance/visits/{visit.id}/"
+    assert _client(parts_job["boss"]).get(url).data["on_site"] is None, "not started: nothing to show"
+
+    mark("check_in", now - timedelta(days=3))           # an old trip
+    mark("check_out", now - timedelta(days=3, hours=-1))
+    mark("check_in", now - timedelta(hours=2))          # this one
+    visit.started_at = now - timedelta(hours=1)
+    visit.status = "in_progress"
+    visit.save(update_fields=["started_at", "status"])
+    on = _client(parts_job["boss"]).get(url).data["on_site"]
+    assert on["checked_in_at"] and on["checked_out_at"] is None
+    assert abs((on["checked_in_at"] - (now - timedelta(hours=2))).total_seconds()) < 2
+
+    mark("check_out", now - timedelta(minutes=5))
+    assert _client(parts_job["boss"]).get(url).data["on_site"]["checked_out_at"] is not None

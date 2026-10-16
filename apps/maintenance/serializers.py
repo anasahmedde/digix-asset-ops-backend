@@ -346,6 +346,32 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     # sees the figure before they commit to it rather than after.
     component_costs = serializers.SerializerMethodField()
     cost_lines = serializers.SerializerMethodField()
+    # When the technician arrived at and left the site for this visit.
+    on_site = serializers.SerializerMethodField()
+
+    def get_on_site(self, obj):
+        """The check-in this visit's work began under, and the check-out after it."""
+        from apps.attendance.models import AttendanceRecord
+
+        acts = [t for t in (obj.asset_verified_at, obj.started_at, obj.completed_at) if t]
+        if not obj.assigned_to_id or not obj.schedule.site_id or not acts:
+            return None
+        # ponytail: two small queries per visit worked; a job has a handful.
+        mine = AttendanceRecord.objects.filter(user_id=obj.assigned_to_id)
+        came = mine.filter(
+            check_type=AttendanceRecord.CheckType.CHECK_IN, site_id=obj.schedule.site_id,
+            created_at__lte=min(acts),
+        ).order_by("-created_at").first()
+        if came is None:
+            return None
+        left = mine.filter(
+            check_type=AttendanceRecord.CheckType.CHECK_OUT, created_at__gte=came.created_at,
+        ).order_by("created_at").first()
+        return {
+            "checked_in_at": came.created_at,
+            "checked_out_at": left.created_at if left else None,
+            "offline": came.recorded_offline or bool(left and left.recorded_offline),
+        }
 
     def get_component_costs(self, obj):
         from . import lifecycle
@@ -389,7 +415,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
             "review_note", "reviewed_by", "reviewed_by_name",
             "reviewed_at", "visit_photos", "purchases", "has_before_photo", "has_after_photo",
             "asset_verified_at", "asset_verified_by_name",
-            "component_costs", "cost_lines",
+            "component_costs", "cost_lines", "on_site",
             "created_at", "updated_at",
         ]
         # A round is closed out by recording the visit, not by editing it here.
