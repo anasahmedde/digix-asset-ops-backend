@@ -807,8 +807,13 @@ class GoodsReceiptSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source="item.material_type.name", read_only=True, default=None)
     wo_number = serializers.CharField(source="work_order.wo_number", read_only=True, default=None)
     po_number = serializers.CharField(source="purchase_order.po_number", read_only=True, default=None)
-    received_by_name = serializers.CharField(source="received_by.get_full_name", read_only=True, default=None)
+    # An account with no full name still received it.
+    received_by_name = serializers.SerializerMethodField()
     lines = GoodsReceiptLineSerializer(many=True, read_only=True)
+
+    def get_received_by_name(self, obj):
+        user = obj.received_by
+        return (user.get_full_name() or user.username) if user else None
 
     class Meta:
         model = GoodsReceipt

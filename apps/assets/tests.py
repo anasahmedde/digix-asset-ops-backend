@@ -2821,7 +2821,12 @@ def test_the_due_date_agreed_at_assignment_lands_on_the_tracker(admin_client, in
         username="due-date-tech", password="x", role="technician", is_field_staff=True,
         first_name="Bilal", last_name="Hussain",
     )
-    due = date(2026, 10, 15)
+    # A week ahead of today: a fixed date turned into "already passed" once the calendar caught up.
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    due = timezone.localdate() + timedelta(days=7)
     r = admin_client.post(
         f"/api/assets/devices/{in_stock_device.id}/transition/",
         {
@@ -2927,3 +2932,32 @@ def test_a_route_waits_for_its_parts_and_a_decision_can_be_sent_back(admin_clien
     assert r.status_code == 200, r.content
     later.refresh_from_db()
     assert later.location == ProductionStep.Location.UNDECIDED
+
+
+@pytest.mark.django_db
+def test_a_bought_asset_lists_its_po_and_goods_received_notes():
+    """The asset's Documents: the order that bought it and the GRN it came in
+    on, each with the path that prints it."""
+    from apps.assets.models import AssetType
+    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine
+    from apps.procurement.models import PurchaseOrder, PurchaseOrderItem
+    from apps.suppliers.models import Supplier
+
+    admin = User.objects.create_superuser(username="gendoc-admin", password="x")
+    po = PurchaseOrder.objects.create(supplier=Supplier.objects.create(name="Gen Vendor"), status="ordered")
+    line = PurchaseOrderItem.objects.create(purchase_order=po, description="LED wall", quantity=1, unit_price=100)
+    device = Device.objects.create(asset_type=AssetType.objects.create(name="Gen Kind"), procurement_item=line)
+    grn = GoodsReceipt.objects.create(purchase_order=po, received_by=admin)
+    GoodsReceiptLine.objects.create(receipt=grn, po_item=line, quantity=1)
+
+    c = APIClient()
+    c.force_authenticate(admin)
+    docs = c.get(f"/api/assets/devices/{device.id}/generated-documents/").data
+    kinds = {d["kind"]: d for d in docs}
+    assert kinds["purchase_order"]["url"] == f"/procurement/purchase-orders/{po.id}/document/"
+    assert kinds["goods_receipt"]["url"] == f"/inventory/receipts/{grn.id}/document/"
+    assert "received by gendoc-admin" in kinds["goods_receipt"]["detail"]
+    # The paths it names really print.
+    for d in docs:
+        r = c.get("/api" + d["url"])
+        assert r.status_code == 200 and r["Content-Type"] == "application/pdf", d

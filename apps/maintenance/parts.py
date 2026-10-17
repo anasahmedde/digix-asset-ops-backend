@@ -9,6 +9,8 @@ from __future__ import annotations
 from django.utils import timezone
 from rest_framework import serializers
 
+from . import activity
+
 
 def decide(part_request, *, user, approve, quantity=None, note=""):
     """Answer one line, and raise the store request when it is approved.
@@ -37,6 +39,9 @@ def decide(part_request, *, user, approve, quantity=None, note=""):
             "status", "quantity_approved", "decided_by", "decided_at",
             "decision_note", "updated_at",
         ])
+        activity.log(part_request.schedule, "part_rejected", (
+            f"Request for {part_request.what} rejected" + (f": {note}" if note else "")
+        ), user=user, visit=part_request.visit)
         return part_request
 
     agreed = part_request.quantity_requested if quantity is None else int(quantity)
@@ -70,6 +75,10 @@ def decide(part_request, *, user, approve, quantity=None, note=""):
         "status", "quantity_approved", "issuance_request", "decided_by",
         "decided_at", "decision_note", "updated_at",
     ])
+    activity.log(part_request.schedule, "part_approved", (
+        f"Request for {part_request.what} approved: {part_request.quantity_approved} {part_request.unit}"
+        + (f" ({issuance.request_number} on the store's queue)" if getattr(issuance, "request_number", "") else "")
+    ), user=user, visit=part_request.visit)
     return part_request
 
 
@@ -160,4 +169,8 @@ def settle(schedule, *, user, rows, visit=None):
         line.save(update_fields=[
             "visit", "quantity_used", "quantity_returned", "return_reference", "updated_at",
         ])
+        activity.log(schedule, "parts_settled", (
+            f"{line.what}: {line.quantity_used} {line.unit} used"
+            + (f", {line.quantity_returned} back to the store on {line.return_reference}" if line.quantity_returned else "")
+        ), user=user, visit=visit)
     return receipt

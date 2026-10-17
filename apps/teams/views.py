@@ -14,6 +14,7 @@ from rest_framework.response import Response
 
 from common.permissions import CapabilityGate, can, can_for_project, is_project_manager
 from apps.notifications import service as notices
+from . import activity as project_log
 
 from .costing import project_devices
 from .models import (
@@ -22,7 +23,6 @@ from .models import (
     BOMAllocation,
     Project,
     ProjectBOMLine,
-    ProjectBottleneck,
     ProjectMember,
     ProjectMilestone,
     ProjectScopeItem,
@@ -30,7 +30,6 @@ from .models import (
 from .serializers import (
     ProjectCostLineSerializer,
     ProjectBOMLineSerializer,
-    ProjectBottleneckSerializer,
     ProjectDetailSerializer,
     ProjectListSerializer,
     ProjectMemberSerializer,
@@ -103,7 +102,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         "procure_asset": None, "raise_work_order": None,
         "bom_summary": "view_projects", "actuals": "view_projects", "boq": "view_projects",
         "actuals_document": "view_projects", "plan_document": "view_projects", "boq_document": "view_projects",
-        "dashboard_stats": "view_projects",
+        "dashboard_stats": "view_projects", "activity": "view_projects",
     }
     permission_classes = [IsAuthenticated, CapabilityGate]
     filterset_fields = ["status", "phase", "contract_type", "client", "site", "manager"]
@@ -122,6 +121,11 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         project = serializer.save()
+        project_log.log(project, "created", (
+            f"Project opened: {project.name}"
+            + (f" for {project.client.name}" if project.client_id else "")
+            + (f" - manager {project_log.name(project.manager)}" if project.manager_id else "")
+        ), user=self.request.user)
         self._tell_the_manager(project, None)
         inform_line(
             self.request.user,
@@ -132,7 +136,9 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         before = serializer.instance.manager_id
+        shown = project_log.snapshot(serializer.instance)
         project = serializer.save()
+        project_log.log_edit(project, shown, user=self.request.user)
         if project.manager_id != before:
             self._tell_the_manager(project, before)
 
@@ -210,7 +216,6 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         return (
             Project.objects
             .select_related("client", "site", "manager")
-            .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
             .prefetch_related("scope_items", "milestones")
             .order_by("-created_at")
         )
@@ -313,6 +318,11 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             "results": rows,
             "awaiting": [r["asset_code"] for r in rows if r["handed_over"] and not r["warranty"]],
         }, status=drf_status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"])
+    def activity(self, request, pk=None):
+        """Who did what on this project, end to end - newest first."""
+        return Response(project_log.rows(self.get_object()))
 
     @action(detail=True, methods=["get"], url_path="bom-summary")
     def bom_summary(self, request, pk=None):
@@ -489,10 +499,12 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         if request.data.get("undo"):
             device.procurement_requested_at = None
             detail = f"{device.asset_code} taken back from Procurement."
+            project_log.log(project, "procure", detail, user=request.user)
             notices.resolve(f"procure-asset:{device.pk}")
         else:
             device.procurement_requested_at = timezone.now()
             detail = f"{device.asset_code} sent to Procurement — raise the purchase order from To Procure."
+            project_log.log(project, "procure", f"{device.asset_code} sent to Procurement to be bought complete", user=request.user)
             notices.ask(
                 "raise_po", exclude=[request.user], kind="request_raised",
                 title=f"To procure: {device.asset_code}",
@@ -528,6 +540,8 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 return Response({"contingency_percent": ["Must be a number."]}, status=400)
             if pct < 0 or pct > 100:
                 return Response({"contingency_percent": ["Must be between 0 and 100."]}, status=400)
+            if plan.contingency_percent != pct:
+                project_log.log(project, "budget", f"Contingency: {plan.contingency_percent}% → {pct}%", user=request.user)
             plan.contingency_percent = pct
             plan.save(update_fields=["contingency_percent", "updated_at"])
         return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
@@ -674,6 +688,11 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 step.workshop = supplier
                 step.workshop_name = ""
                 step.save(update_fields=["location", "workshop", "workshop_name", "updated_at"])
+        project_log.log(project, "work_order", (
+            f"Work order {order.wo_number} raised with {supplier.name} for "
+            + (f"'{step.name}' on " if step is not None else "")
+            + device.asset_code
+        ), user=request.user)
         from apps.workorders.serializers import WorkOrderSerializer
 
         return Response(WorkOrderSerializer(order).data, status=201)
@@ -742,6 +761,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         plan.submitted_at = timezone.now()
         plan.decision_notes = ""
         plan.save(update_fields=["status", "submitted_by", "submitted_at", "decision_notes", "updated_at"])
+        project_log.log(project, "budget", f"Budget submitted for approval - PKR {summary['total']:,.0f}", user=request.user)
         notices.ask(
             "approve_budget", exclude=[request.user],
             title=f"Budget for {project.name} needs your approval",
@@ -800,6 +820,10 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 moved.append("status")
             project.save(update_fields=moved)
         plan.save(update_fields=update)
+        project_log.log(project, "budget", (
+            f"Budget approved - PKR {summary['total']:,.0f}" if approve
+            else f"Budget sent back: {notes}"
+        ) + (f" (submitted by {project_log.name(plan.submitted_by)})" if plan.submitted_by_id else ""), user=request.user)
         notices.resolve(f"budget:{project.pk}")
         notices.tell(
             [plan.submitted_by, project.manager], exclude=[request.user], kind="approval_decided",
@@ -850,6 +874,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             "status", "approved_total", "decided_by", "decided_at",
             "decision_notes", "updated_at",
         ])
+        project_log.log(project, "budget", "Budget reopened for changes - execution waits for the revised approval", user=request.user)
         return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
 
     @action(detail=False, methods=["get"])
@@ -867,21 +892,9 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 "name": p.name,
                 "progress": p.computed_progress(),
                 "status": p.status,
-                "bottleneck_count": p.bottleneck_count,
             }
-            for p in (
-                qs.filter(status__in=["at_risk", "delayed"])
-                .annotate(bottleneck_count=Count("bottlenecks", filter=Q(bottlenecks__is_resolved=False)))
-                .prefetch_related("milestones")[:8]
-            )
+            for p in qs.filter(status__in=["at_risk", "delayed"]).prefetch_related("milestones")[:8]
         ]
-        top_bottlenecks = list(
-            ProjectBottleneck.objects
-            .filter(is_resolved=False)
-            .values("title")
-            .annotate(project_count=Count("project", distinct=True))
-            .order_by("-project_count")[:5]
-        )
         return Response({
             "total": total,
             "on_track": by_status.get("on_track", 0),
@@ -889,7 +902,6 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             "delayed": by_status.get("delayed", 0),
             "completed": by_status.get("completed", 0),
             "flagged_projects": flagged,
-            "top_bottlenecks": top_bottlenecks,
         })
 
 
@@ -913,29 +925,35 @@ class _ProjectSideTable(viewsets.ModelViewSet):
 
             raise PermissionDenied("That is for the project's manager or whoever runs projects.")
 
+    #: How a row of this table reads in the project's log ("Team: ...").
+    log_label = ""
+
+    def _log(self, instance, verb):
+        if self.log_label:
+            project_log.log(instance.project, self.log_label.lower(),
+                            f"{self.log_label}: {project_log.describe(instance)} {verb}", user=self.request.user)
+
     def perform_create(self, serializer):
         self._check(self._project_of(serializer))
         super().perform_create(serializer)
+        self._log(serializer.instance, "added")
 
     def perform_update(self, serializer):
         self._check(self._project_of(serializer, serializer.instance))
         super().perform_update(serializer)
+        self._log(serializer.instance, "changed")
 
     def perform_destroy(self, instance):
         self._check(self._project_of(instance=instance))
+        self._log(instance, "removed")
         super().perform_destroy(instance)
-
-
-class ProjectBottleneckViewSet(_ProjectSideTable):
-    queryset = ProjectBottleneck.objects.select_related("project").all()
-    serializer_class = ProjectBottleneckSerializer
-    filterset_fields = ["project", "severity", "is_resolved"]
 
 
 class ProjectMemberViewSet(_ProjectSideTable):
     queryset = ProjectMember.objects.select_related("project", "user").all()
     serializer_class = ProjectMemberSerializer
     filterset_fields = ["project", "user", "role"]
+    log_label = "Team"
 
 
 class ProjectScopeItemViewSet(_ProjectSideTable):
@@ -944,6 +962,7 @@ class ProjectScopeItemViewSet(_ProjectSideTable):
     ).all()
     serializer_class = ProjectScopeItemSerializer
     filterset_fields = ["project", "device", "site"]
+    log_label = "Scope"
 
 
 class ProjectMilestoneViewSet(_ProjectSideTable):
@@ -951,6 +970,7 @@ class ProjectMilestoneViewSet(_ProjectSideTable):
     serializer_class = ProjectMilestoneSerializer
     filterset_fields = ["project"]
     ordering_fields = ["order", "due_date"]
+    log_label = "Milestones"
 
 
 class ProjectBOMLineViewSet(viewsets.ModelViewSet):
@@ -973,6 +993,18 @@ class ProjectBOMLineViewSet(viewsets.ModelViewSet):
     filterset_fields = ["project"]
     search_fields = ["description"]
     ordering_fields = ["created_at"]
+
+    def perform_create(self, serializer):
+        line = serializer.save()
+        project_log.log(line.project, "requirements", f"Requirements: {project_log.describe(line)} added", user=self.request.user)
+
+    def perform_update(self, serializer):
+        line = serializer.save()
+        project_log.log(line.project, "requirements", f"Requirements: {project_log.describe(line)} changed", user=self.request.user)
+
+    def perform_destroy(self, instance):
+        project_log.log(instance.project, "requirements", f"Requirements: {project_log.describe(instance)} removed", user=self.request.user)
+        instance.delete()
 
     def _line_response(self, line_pk):
         line = self.get_queryset().get(pk=line_pk)
@@ -1020,6 +1052,7 @@ class ProjectBOMLineViewSet(viewsets.ModelViewSet):
                 BOMAllocation.objects.create(
                     bom_line=line, device=device, quantity=1, allocated_by=request.user
                 )
+                project_log.log(line.project, "allocated", f"{device.asset_code} allocated to '{line.description}'", user=request.user)
             else:
                 try:
                     item = InventoryItem.objects.select_for_update().get(pk=item_id)
@@ -1056,6 +1089,7 @@ class ProjectBOMLineViewSet(viewsets.ModelViewSet):
                 BOMAllocation.objects.create(
                     bom_line=line, inventory_item=item, quantity=quantity, allocated_by=request.user
                 )
+                project_log.log(line.project, "allocated", f"{quantity} x {item} reserved for '{line.description}'", user=request.user)
 
         return self._line_response(line.pk)
 
@@ -1117,6 +1151,7 @@ class ProjectBOMLineViewSet(viewsets.ModelViewSet):
             apply_issuance_stock_out(issuance, request.user)
             allocation.status = BOMAllocation.Status.ISSUED
             allocation.save(update_fields=["status", "updated_at"])
+            project_log.log(line.project, "issued", f"{allocation.quantity} x {item} issued for '{line.description}'", user=request.user)
 
         return self._line_response(line.pk)
 
@@ -1128,6 +1163,7 @@ class ProjectCostLineViewSet(_ProjectSideTable):
     serializer_class = ProjectCostLineSerializer
     project_capability = "plan_budget"
     filterset_fields = ["project"]
+    log_label = "Costs"
 
     def perform_create(self, serializer):
         from .costing import get_or_create_plan
@@ -1135,6 +1171,7 @@ class ProjectCostLineViewSet(_ProjectSideTable):
         self._check(self._project_of(serializer))
         line = serializer.save()
         get_or_create_plan(line.project)
+        self._log(line, "added")
 
     #: What the budget promised. Recording what was actually spent is the
     #: whole point of an approved budget, so only these are frozen by one.
@@ -1149,10 +1186,12 @@ class ProjectCostLineViewSet(_ProjectSideTable):
         if any(f in serializer.validated_data for f in self.PLANNED):
             self._refuse_if_signed_off(serializer.instance)
         serializer.save()
+        self._log(serializer.instance, "changed")
 
     def perform_destroy(self, instance):
         self._check(instance.project)
         self._refuse_if_signed_off(instance)
+        self._log(instance, "removed")
         instance.delete()
 
     @staticmethod

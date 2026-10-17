@@ -396,3 +396,32 @@ class RoleDefinitionViewSet(viewsets.ModelViewSet):
                 ]
             })
         instance.delete()
+
+
+class MenuOrderView(APIView):
+    """The order of the sidebar's modules, the same for everyone.
+
+    Everybody reads it; changing it is configuring the system (manage_setup).
+    An empty list puts the menu back the way it ships.
+    """
+
+    permission_classes = [IsAuthenticated]
+    KEY = "menu_order"
+
+    def get(self, request):
+        from .models import AppSetting
+
+        row = AppSetting.objects.filter(key=self.KEY).first()
+        return Response({"order": (row.value or {}).get("order", []) if row else []})
+
+    def put(self, request):
+        from .models import AppSetting
+
+        if not (request.user.is_superuser or request.user.can("manage_setup")):
+            raise PermissionDenied("Only the Administrator arranges the menu.")
+        order = request.data.get("order")
+        if not isinstance(order, list) or not all(isinstance(h, str) and h.startswith("/") for h in order):
+            raise ValidationError({"order": ["A list of page addresses, top to bottom."]})
+        order = list(dict.fromkeys(order))[:100]
+        AppSetting.objects.update_or_create(key=self.KEY, defaults={"value": {"order": order}})
+        return Response({"order": order})

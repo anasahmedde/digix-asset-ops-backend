@@ -1,12 +1,14 @@
 from django.utils import timezone
-from rest_framework import viewsets
+from common import clock
+from rest_framework import mixins, status as http, viewsets
+from rest_framework.exceptions import ValidationError
 from rest_framework.decorators import action
 from common.permissions import CapabilityGate, can
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from .models import AttendanceRecord
-from .serializers import AttendanceRecordSerializer
+from .models import AttendanceRecord, DutyRecord
+from .serializers import AttendanceRecordSerializer, DutyRecordSerializer
 
 class AttendanceRecordViewSet(viewsets.ModelViewSet):
     # Reading this is a permission, not just a menu entry.
@@ -35,7 +37,31 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
         return qs.filter(Q(user=user) | Q(user__reports_to=user))
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        from .presence import on_duty
+
+        user = self.request.user
+        # Time in is how worked hours are counted, so a field person who
+        # checks in at a job without having timed in is timed in by it.
+        starts_day = (
+            serializer.validated_data.get("check_type") == AttendanceRecord.CheckType.CHECK_IN
+            and getattr(user, "is_field_staff", False)
+            and not on_duty(user)
+        )
+        record = serializer.save(user=user)
+        if clock.offline():
+            # Sent from the phone's outbox: the record is dated when it
+            # happened, and says it arrived later.
+            when, arrived = clock.now(), timezone.now()
+            AttendanceRecord.objects.filter(pk=record.pk).update(
+                created_at=when, recorded_offline=True, uploaded_at=arrived,
+            )
+            record.created_at, record.recorded_offline, record.uploaded_at = when, True, arrived
+        if starts_day:
+            DutyRecord.objects.create(
+                user=user, kind=DutyRecord.Kind.TIME_IN, at=record.created_at, automatic=True,
+                latitude=record.latitude, longitude=record.longitude, accuracy=record.accuracy,
+                recorded_offline=record.recorded_offline, uploaded_at=record.uploaded_at,
+            )
 
     @action(detail=False, methods=["get"])
     def status(self, request):
@@ -65,3 +91,54 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
             "currently_in": len(checked_in_users),
             "records": AttendanceRecordSerializer(qs, many=True).data,
         })
+
+
+class DutyRecordViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, viewsets.GenericViewSet):
+    """Time in / Time out from the field app.
+
+    Anyone may time themselves in and out and ask whether they are timed in;
+    that answer carries no place. The register - when and where - is read by
+    the person's supervisor (whoever they report to) and by the office. Not
+    by the person themselves.
+    """
+
+    read_capability = "view_attendance"
+    action_capabilities = {"create": None, "status": None}
+    serializer_class = DutyRecordSerializer
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    filterset_fields = ["user", "kind"]
+    ordering_fields = ["at"]
+
+    def get_queryset(self):
+        qs = DutyRecord.objects.select_related("user")
+        user = self.request.user
+        if user.is_superuser or can(user, "manage_attendance") or can(user, "act_across_teams"):
+            return qs.all()
+        return qs.filter(user__reports_to=user)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        kind = serializer.validated_data["kind"]
+        from .presence import on_duty as timed_in
+
+        when = clock.now()
+        on_duty = timed_in(request.user)
+        if kind == DutyRecord.Kind.TIME_IN and on_duty:
+            raise ValidationError({"detail": "You are already timed in."})
+        if kind == DutyRecord.Kind.TIME_OUT and not on_duty:
+            raise ValidationError({"detail": "You have not timed in."})
+        offline = clock.offline()
+        record = serializer.save(
+            user=request.user, at=when, recorded_offline=offline,
+            uploaded_at=timezone.now() if offline else None,
+        )
+        # The person is told it is done, not where they were.
+        return Response({"id": str(record.pk), "kind": record.kind, "at": record.at}, status=http.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["get"])
+    def status(self, request):
+        """Whether the current user is timed in, and since when. No place."""
+        last = DutyRecord.objects.filter(user=request.user, at__lte=clock.now()).order_by("-at").first()
+        on_duty = bool(last and last.kind == DutyRecord.Kind.TIME_IN)
+        return Response({"on_duty": on_duty, "since": last.at if on_duty else None})

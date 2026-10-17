@@ -39,6 +39,9 @@ class Warranty(TimeStampedModel):
     months = models.PositiveSmallIntegerField(
         null=True, blank=True, help_text="Term in months (client warranties: 3/6/12)"
     )
+    # Stamped by /extend/: cover that was pushed past its original end reads
+    # as Extended while it runs, so it is told apart from the first term.
+    extended_on = models.DateField(null=True, blank=True)
     reissued_from = models.ForeignKey(
         "self", on_delete=models.SET_NULL, null=True, blank=True, related_name="reissues",
         help_text="Original warranty this one was reissued from",
@@ -83,7 +86,7 @@ class Warranty(TimeStampedModel):
     # itself rather than from a stored word. Reissued and void are records
     # of what was done to it and stay as written.
     STATE_LABELS = {
-        "active": "Active", "expired": "Expired", "not_started": "Not started",
+        "active": "Active", "extended": "Extended", "expired": "Expired", "not_started": "Not started",
         "ended": "Ended", "claimed": "Pending", "reissued": "Reissued", "void": "Void",
     }
 
@@ -111,7 +114,7 @@ class Warranty(TimeStampedModel):
             Device.Status.ASSIGNED, Device.Status.IN_TRANSIT,
         ):
             return "not_started"
-        return "active"
+        return "extended" if self.extended_on else "active"
 
     @property
     def state_display(self) -> str:

@@ -142,7 +142,7 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     write_capability = "edit_assets"
     action_capabilities = {
         "destroy": "delete_assets",
-        "export": "view_assets", "bom": "view_assets",
+        "export": "view_assets", "bom": "view_assets", "generated_documents": "view_assets",
         # Printing a label registers the code on the asset, so it is a write.
         "label": "edit_assets", "labels": "edit_assets",
         # Checked inside against the status asked for and the project.
@@ -299,6 +299,11 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         device._transition_user = request.user
         device._transition_reason = reason
         device.save(update_fields=update_fields)
+        # Helpers named with the assignment go on the installation it opened.
+        if new_status == Device.Status.ASSIGNED and "helpers" in request.data:
+            from apps.sites.views import set_helpers_for_asset
+
+            set_helpers_for_asset(device, request.data.get("helpers"), request.user)
 
         device.refresh_from_db()
         return Response(DeviceDetailSerializer(device, context={"request": request}).data)
@@ -345,6 +350,11 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             "assigned_technician", "assigned_vendor", "assigned_vendor_name",
             "assigned_vendor_contact", "updated_at",
         ])
+
+        if "helpers" in request.data:
+            from apps.sites.views import set_helpers_for_asset
+
+            set_helpers_for_asset(device, request.data.get("helpers"), request.user)
 
         new_label = assignee_label(technician, vendor, contact)
         # No status change here, so the status signal won't fire — journal it.
@@ -669,6 +679,80 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             ])
         log_export(request.user, "device", len(rows), export_params(request))
         return xlsx_response("assets", "Assets", columns, rows)
+
+    @action(detail=True, methods=["get"], url_path="generated-documents")
+    def generated_documents(self, request, pk=None):
+        """Every document the system has produced for this asset, oldest first:
+        the purchase order that bought it (and those for its components), the
+        goods received notes, its work orders, the store's issue slips for its
+        parts and the handover certificate. Each names the API path that
+        prints it; that path checks its own rights."""
+        from apps.inventory.models import GoodsReceipt, IssuanceRequest
+        from apps.sites.models import DeviceInstallation
+        from apps.workorders.models import WorkOrder
+
+        device = self.get_object()
+
+        def who(user):
+            return (user.get_full_name() or user.username) if user else None
+
+        docs = []
+        lines = []
+        if device.procurement_item_id:
+            lines.append((device.procurement_item, "this asset"))
+        for comp in device.components.filter(purchase_order_item__isnull=False).select_related(
+            "purchase_order_item__purchase_order__supplier"
+        ):
+            lines.append((comp.purchase_order_item, comp.name))
+        seen = {}
+        for item, what in lines:
+            po = item.purchase_order
+            if po.pk in seen:
+                seen[po.pk]["detail"] += f", {what}"
+                continue
+            seen[po.pk] = {
+                "kind": "purchase_order", "title": f"Purchase order {po.po_number}",
+                "detail": (f"{po.supplier.name} · " if po.supplier_id else "") + f"for {what}",
+                "at": po.created_at, "url": f"/procurement/purchase-orders/{po.pk}/document/",
+                "filename": f"{po.po_number}.pdf",
+            }
+            docs.append(seen[po.pk])
+        receipts = (
+            GoodsReceipt.objects.filter(lines__po_item__in=[item.pk for item, _ in lines])
+            .select_related("purchase_order", "received_by").distinct()
+        )
+        for grn in receipts:
+            docs.append({
+                "kind": "goods_receipt", "title": f"Goods received note {grn.grn_number}",
+                "detail": (f"against {grn.purchase_order.po_number}" if grn.purchase_order_id else grn.get_source_display())
+                + (f" · received by {who(grn.received_by)}" if grn.received_by_id else ""),
+                "at": grn.created_at, "url": f"/inventory/receipts/{grn.pk}/document/",
+                "filename": f"{grn.grn_number}.pdf",
+            })
+        for wo in WorkOrder.objects.filter(device=device).exclude(status="cancelled").select_related("supplier"):
+            docs.append({
+                "kind": "work_order", "title": f"Work order {wo.wo_number}",
+                "detail": (f"{wo.supplier.name} · " if wo.supplier_id else "") + wo.get_status_display(),
+                "at": wo.created_at, "url": f"/work-orders/{wo.pk}/print/", "filename": f"{wo.wo_number}.pdf",
+            })
+        for req in IssuanceRequest.objects.filter(asset_component__device=device, quantity_issued__gt=0):
+            docs.append({
+                "kind": "issue_slip", "title": f"Material issue slip {req.request_number}",
+                "detail": f"{req.quantity_issued} x {req.what}",
+                "at": req.last_issued_at or req.updated_at,
+                "url": f"/inventory/issuance-requests/{req.pk}/slip/", "filename": f"{req.request_number}.pdf",
+            })
+        for inst in DeviceInstallation.objects.filter(device=device).select_related("site"):
+            record = getattr(inst, "handover", None)
+            docs.append({
+                "kind": "handover", "title": "Handover certificate",
+                "detail": f"{inst.site.name} · " + (f"accepted by {record.accepted_by_name}" if record else "not signed yet"),
+                "at": record.created_at if record else inst.created_at,
+                "url": f"/sites/installations/{inst.pk}/handover-document/",
+                "filename": f"handover-{device.asset_code}.pdf",
+            })
+        docs.sort(key=lambda d: d["at"])
+        return Response([{**d, "at": d["at"].isoformat()} for d in docs])
 
     @action(detail=True, methods=["get"], url_path="bom")
     def bom_document(self, request, pk=None):

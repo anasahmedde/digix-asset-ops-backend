@@ -1,6 +1,8 @@
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
+from common import clock
 from common.models import TimeStampedModel
 
 
@@ -177,6 +179,11 @@ class MaintenanceSchedule(TimeStampedModel):
                 schedule=self, due_date=self.next_due, sequence=last + 1,
                 assigned_to=self.assigned_to,
             )
+            # The next round goes with the last round's helpers.
+            if last > 0:
+                from .lifecycle import carry_helpers
+
+                carry_helpers(self.visits.filter(sequence=last).first(), visit)
             if last > 0 and self.assigned_to_id:
                 from apps.notifications.service import tell
 
@@ -244,6 +251,11 @@ class MaintenanceVisit(TimeStampedModel):
     assigned_to = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="maintenance_visits",
+    )
+    # More hands on this visit. The technician (the lead) works the visit;
+    # a helper checks in and out at the site and nothing more.
+    helpers = models.ManyToManyField(
+        settings.AUTH_USER_MODEL, blank=True, related_name="visits_helped",
     )
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.PLANNED)
     started_at = models.DateTimeField(null=True, blank=True)
@@ -341,7 +353,8 @@ class MaintenanceVisitPhoto(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="maintenance_visit_photos",
     )
-    taken_at = models.DateTimeField(auto_now_add=True)
+    # When the photo was taken - the phone's time for one sent later from the outbox.
+    taken_at = models.DateTimeField(default=clock.now)
     # Where the phone said it was, when it could say.
     latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
     longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
@@ -402,6 +415,7 @@ class MaintenanceCostLine(TimeStampedModel):
 
     class Source(models.TextChoices):
         COMPONENT = "component", "Component used"
+        PURCHASE = "purchase", "Bought on site"
         MANUAL = "manual", "Added on review"
 
     record = models.ForeignKey(
@@ -528,3 +542,61 @@ class MaintenancePartRequest(TimeStampedModel):
         if self.unit_type_id:
             return self.unit_type.unit or "piece"
         return "piece"
+
+
+class MaintenanceActivity(TimeStampedModel):
+    """One thing somebody did on a job, and when: assigned, started, a part
+    asked for or issued, a photo, completed, accepted. The job's history."""
+
+    schedule = models.ForeignKey(MaintenanceSchedule, on_delete=models.CASCADE, related_name="activity")
+    visit = models.ForeignKey(
+        MaintenanceVisit, on_delete=models.SET_NULL, null=True, blank=True, related_name="activity",
+    )
+    # A short key for the kind of act ("assigned", "part_issued"...), so the
+    # screen can mark them; the sentence says the rest.
+    action = models.CharField(max_length=40)
+    text = models.CharField(max_length=500)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    # When it happened. Usually now; history written back from what the
+    # records already said carries the time they said it.
+    at = models.DateTimeField(default=clock.now, db_index=True)
+
+    class Meta:
+        ordering = ["-at", "-created_at"]
+        indexes = [models.Index(fields=["schedule", "-at"])]
+
+    def __str__(self):
+        return f"{self.schedule} - {self.text}"
+
+
+class MaintenancePurchase(TimeStampedModel):
+    """Something the technician bought on site for the job - from the market,
+    because the store did not have it or there was no time to send for it.
+
+    The receipt is the proof of what was paid; the photo is the part itself.
+    Both are required: a figure without either is a claim, not a record. The
+    purchase is priced into the visit's cost when the office accepts it.
+    """
+
+    schedule = models.ForeignKey(MaintenanceSchedule, on_delete=models.CASCADE, related_name="purchases")
+    visit = models.ForeignKey(MaintenanceVisit, on_delete=models.CASCADE, related_name="purchases")
+    # What was bought, in the technician's words: make, model, size.
+    description = models.CharField(max_length=255)
+    quantity = models.PositiveIntegerField(default=1)
+    # What was paid in all, as the receipt says.
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    shop = models.CharField(max_length=200, blank=True)
+    receipt = models.FileField(upload_to="maintenance/purchases/receipts/")
+    photo = models.ImageField(upload_to="maintenance/purchases/photos/")
+    bought_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="maintenance_purchases",
+    )
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.description} x{self.quantity} - {self.amount}"
+

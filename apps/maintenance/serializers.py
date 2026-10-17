@@ -10,6 +10,7 @@ from .models import (
     MaintenanceSchedule,
     MaintenanceVisit,
     MaintenanceVisitPhoto,
+    MaintenancePurchase,
 )
 
 
@@ -132,7 +133,7 @@ class MaintenanceScheduleSerializer(DateOrder, serializers.ModelSerializer):
             "start_date", "next_due", "instructions", "required_components",
             "status", "status_display",
             "effective_status", "is_active", "next_visit_assignee",
-            "current_technician", "current_technician_name",
+            "current_technician", "current_technician_name", "current_helpers",
             "ticket", "ticket_number", "ticket_description", "ticket_raised_at",
             "last_technician_on_asset",
             "visits", "allowed_actions", "is_corrective",
@@ -146,6 +147,12 @@ class MaintenanceScheduleSerializer(DateOrder, serializers.ModelSerializer):
 
     current_technician = serializers.SerializerMethodField()
     current_technician_name = serializers.SerializerMethodField()
+    # Who is helping on the open visit: they check in and out, nothing more.
+    current_helpers = serializers.SerializerMethodField()
+
+    def get_current_helpers(self, obj):
+        visit = self._open_visit(obj)
+        return [str(h.pk) for h in visit.helpers.all()] if visit else []
 
     def _open_visit(self, obj):
         return next(
@@ -254,6 +261,41 @@ class MaintenanceRecordPhotoSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "taken_by", "created_at"]
 
 
+class MaintenancePurchaseSerializer(serializers.ModelSerializer):
+    """Bought on site: what, how many, what was paid, where, and the proof."""
+
+    bought_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MaintenancePurchase
+        fields = [
+            "id", "schedule", "visit", "description", "quantity", "amount", "shop",
+            "receipt", "photo", "bought_by", "bought_by_name", "created_at",
+        ]
+        read_only_fields = ["id", "schedule", "bought_by", "bought_by_name", "created_at"]
+        extra_kwargs = {"receipt": {"required": True}, "photo": {"required": True}}
+
+    def get_bought_by_name(self, obj):
+        who = obj.bought_by
+        return (who.get_full_name() or who.username) if who else None
+
+    def validate_description(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Say what was bought.")
+        return value
+
+    def validate_amount(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError("Say what was paid, as the receipt shows.")
+        return value
+
+    def validate_quantity(self, value):
+        if not value or value < 1:
+            raise serializers.ValidationError("At least one.")
+        return value
+
+
 class MaintenanceVisitPhotoSerializer(serializers.ModelSerializer):
     """A photograph, and what it is a photograph of."""
 
@@ -280,6 +322,18 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     future_dates = ("due_date",)
 
     assigned_to_name = serializers.SerializerMethodField()
+    helper_names = serializers.SerializerMethodField()
+
+    def get_helper_names(self, obj):
+        return [h.get_full_name() or h.username for h in obj.helpers.all()]
+
+    def validate(self, attrs):
+        lead = attrs.get("assigned_to", getattr(self.instance, "assigned_to", None))
+        if lead is not None and lead in (attrs.get("helpers") or []):
+            raise serializers.ValidationError({
+                "helpers": f"{lead.get_full_name() or lead.username} is the technician - a helper is somebody else."
+            })
+        return attrs
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     schedule_title = serializers.CharField(source="schedule.title", read_only=True)
     # What the round came to, once it was closed out.
@@ -295,6 +349,8 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     photos = serializers.SerializerMethodField()
     # Corrective: the evidence and the verdicts the office reviews.
     visit_photos = MaintenanceVisitPhotoSerializer(source="photos", many=True, read_only=True)
+    # What the technician bought on site for this visit, receipts and all.
+    purchases = MaintenancePurchaseSerializer(many=True, read_only=True)
     review_decision_display = serializers.CharField(
         source="get_review_decision_display", read_only=True, default="",
     )
@@ -308,6 +364,32 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     # sees the figure before they commit to it rather than after.
     component_costs = serializers.SerializerMethodField()
     cost_lines = serializers.SerializerMethodField()
+    # When the technician arrived at and left the site for this visit.
+    on_site = serializers.SerializerMethodField()
+
+    def get_on_site(self, obj):
+        """The check-in this visit's work began under, and the check-out after it."""
+        from apps.attendance.models import AttendanceRecord
+
+        acts = [t for t in (obj.asset_verified_at, obj.started_at, obj.completed_at) if t]
+        if not obj.assigned_to_id or not obj.schedule.site_id or not acts:
+            return None
+        # ponytail: two small queries per visit worked; a job has a handful.
+        mine = AttendanceRecord.objects.filter(user_id=obj.assigned_to_id)
+        came = mine.filter(
+            check_type=AttendanceRecord.CheckType.CHECK_IN, site_id=obj.schedule.site_id,
+            created_at__lte=min(acts),
+        ).order_by("-created_at").first()
+        if came is None:
+            return None
+        left = mine.filter(
+            check_type=AttendanceRecord.CheckType.CHECK_OUT, created_at__gte=came.created_at,
+        ).order_by("created_at").first()
+        return {
+            "checked_in_at": came.created_at,
+            "checked_out_at": left.created_at if left else None,
+            "offline": came.recorded_offline or bool(left and left.recorded_offline),
+        }
 
     def get_component_costs(self, obj):
         from . import lifecycle
@@ -341,7 +423,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     class Meta:
         model = MaintenanceVisit
         fields = [
-            "id", "schedule", "schedule_title", "due_date", "assigned_to", "assigned_to_name",
+            "id", "schedule", "schedule_title", "due_date", "assigned_to", "assigned_to_name", "helpers", "helper_names",
             "status", "status_display", "started_at", "record", "notes",
             "start_latitude", "start_longitude",
             "performed_at", "performed_by_name", "cost", "is_billable", "charge_to",
@@ -349,9 +431,9 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
             "sequence", "completed_at", "resolved", "remarks",
             "review_decision", "review_decision_display", "review_reason",
             "review_note", "reviewed_by", "reviewed_by_name",
-            "reviewed_at", "visit_photos", "has_before_photo", "has_after_photo",
+            "reviewed_at", "visit_photos", "purchases", "has_before_photo", "has_after_photo",
             "asset_verified_at", "asset_verified_by_name",
-            "component_costs", "cost_lines",
+            "component_costs", "cost_lines", "on_site",
             "created_at", "updated_at",
         ]
         # A round is closed out by recording the visit, not by editing it here.

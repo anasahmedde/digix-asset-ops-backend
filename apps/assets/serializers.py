@@ -191,13 +191,24 @@ def _upsert_asset_warranty(device, kind, *, end=None, months=None):
 
 
 def _warranty_status(device) -> str:
-    """none / active / expired for the device's warranties (prefetch-friendly)."""
-    warranties = list(device.warranties.all())
-    if not warranties:
+    """none / active / not_started / expired - the client's cover only.
+
+    The registry answers "is this asset under warranty to the client"; the
+    vendor's and the parts' cover are the asset's own affair and live on
+    its Warranties tab. A client term recorded before the asset goes live
+    is cover that has not started, not cover that ran out - the list said
+    "Expired" for an asset still in procurement. Prefetch-friendly.
+    """
+    states = {w.state for w in device.warranties.all() if w.warranty_type == "client"}
+    if not states:
         return "none"
-    if any(w.state == "active" for w in warranties):
+    if states & {"active", "extended"}:
         return "active"
-    return "expired"
+    if "not_started" in states:
+        return "not_started"
+    if states & {"expired", "ended", "claimed"}:
+        return "expired"
+    return "none"
 
 
 class AssetTypeSerializer(serializers.ModelSerializer):

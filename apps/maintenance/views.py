@@ -14,7 +14,9 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
-from . import lifecycle
+from common import clock
+
+from . import activity, lifecycle
 
 
 def _where_from(data):
@@ -69,6 +71,7 @@ from .models import (
     MaintenanceRecordPhoto,
     MaintenanceSchedule,
     MaintenanceVisit,
+    MaintenancePurchase,
 )
 from .serializers import (
     MaintenanceVisitPhotoSerializer,
@@ -78,6 +81,7 @@ from .serializers import (
     MaintenanceRecordSerializer,
     MaintenanceScheduleSerializer,
     MaintenanceVisitSerializer,
+    MaintenancePurchaseSerializer,
 )
 
 def _answers_for(user, line) -> bool:
@@ -132,6 +136,30 @@ def _at_the_asset(user, visit):
     if _acts_for_everyone(user):
         return
     require_verified_asset(visit, visit.schedule.device)
+
+
+def visit_crew_changed(visit, before: set, user) -> None:
+    """Helpers added or taken off a visit: on the job's log, newcomers told."""
+    from apps.notifications import service as notices
+
+    now = set(visit.helpers.values_list("pk", flat=True))
+    if now == before:
+        return
+    job = visit.schedule
+    names = ", ".join(activity.name(h) for h in visit.helpers.all()) or "none"
+    activity.log(job, "helpers", f"{activity.visit_word(visit)} helpers: {names}", user=user, visit=visit)
+    added = list(visit.helpers.filter(pk__in=now - before))
+    if added:
+        notices.tell(
+            added, exclude=[user], kind="work_assigned",
+            title=f"You are helping on {job.title}",
+            message=(
+                f"Technician: {activity.name(visit.assigned_to) or 'not named yet'}"
+                + (f" at {job.site.name}" if job.site_id else "")
+                + ". Check in and check out at the site from the field app."
+            ),
+            link=f"/maintenance?schedule={job.pk}", data={"schedule": str(job.pk)},
+        )
 
 
 def _own_job_only(user, schedule, doing: str):
@@ -195,6 +223,10 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
             requested_by=self.request.user,
             visit=schedule.open_visit() if schedule is not None else None,
         )
+        activity.log(schedule, "part_requested", (
+            f"Requested {line.quantity_requested} {line.unit} of {line.what}"
+            + (f" - {line.reason}" if line.reason else "")
+        ), user=self.request.user, visit=line.visit)
         # The asker's own supervisor hears about it; so does anyone who
         # answers for every team.
         notices.ask(
@@ -231,6 +263,8 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
             "status", "decided_by", "decided_at", "decision_note", "updated_at",
         ])
         notices.resolve(f"part:{instance.pk}")
+        activity.log(instance.schedule, "part_withdrawn", f"Request for {instance.what} withdrawn",
+                     user=user, visit=instance.visit)
 
     @action(detail=True, methods=["post"])
     def decide(self, request, pk=None):
@@ -304,7 +338,7 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         MaintenanceSchedule.objects.select_related(
             "device", "site", "assigned_to", "ticket"
         )
-        .prefetch_related("vendors", "visits__assigned_to", "visits__photos")
+        .prefetch_related("vendors", "visits__assigned_to", "visits__photos", "visits__helpers")
         .annotate(
             began=Coalesce(
                 Cast("ticket__created_at", DateField()),
@@ -332,8 +366,9 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             from django.db.models import Exists, OuterRef
 
             open_states = ("planned", "in_progress", "awaiting_review")
+            # On it as the technician, or helping on the visit.
             mine = MaintenanceVisit.objects.filter(
-                schedule=OuterRef("pk"), status__in=open_states, assigned_to_id=who,
+                Q(assigned_to_id=who) | Q(helpers__id=who), schedule=OuterRef("pk"), status__in=open_states,
             )
             any_open = MaintenanceVisit.objects.filter(schedule=OuterRef("pk"), status__in=open_states)
             qs = qs.filter(Exists(mine) | (Q(assigned_to_id=who) & ~Exists(any_open)))
@@ -341,6 +376,10 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         job = serializer.save()
+        activity.log(job, "opened", (
+            f"{job.get_maintenance_type_display()} job created"
+            + (f" for {job.device.asset_code}" if job.device_id else "")
+        ), user=self.request.user)
         inform_line(
             self.request.user,
             title=f"Maintenance scheduled: {job.title}",
@@ -355,7 +394,20 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
 
             raise PermissionDenied("You can only update a job assigned to you.")
-        serializer.save()
+        watched = {
+            "status": "status", "next_due": "next due date", "assigned_to_id": "technician",
+            "title": "title", "priority": "priority", "frequency": "frequency",
+            "instructions": "instructions", "is_active": "active",
+        }
+        before = {f: getattr(instance, f) for f in watched}
+        job = serializer.save()
+        changed = [label for f, label in watched.items() if getattr(job, f) != before[f]]
+        if before["status"] != job.status and job.status == MaintenanceSchedule.Status.ON_HOLD:
+            activity.log(job, "paused", "Schedule paused", user=self.request.user)
+        elif before["status"] == MaintenanceSchedule.Status.ON_HOLD and job.status != before["status"]:
+            activity.log(job, "resumed", "Schedule resumed", user=self.request.user)
+        elif changed:
+            activity.log(job, "edited", "Edited: " + ", ".join(changed), user=self.request.user)
     search_fields = ["title", "device__asset_code", "device__display_name"]
     ordering_fields = ["began", "next_due", "created_at", "priority"]
 
@@ -389,9 +441,19 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             if job.ticket_id
             else lifecycle.assign_round(job, user=request.user, technician=tech, due_date=due)
         )
+        if "helpers" in request.data:
+            ids = [h for h in (request.data.get("helpers") or []) if h and str(h) != str(tech.pk if tech else "")]
+            before = set(visit.helpers.values_list("pk", flat=True))
+            visit.helpers.set(User.objects.filter(pk__in=ids, is_active=True))
+            visit_crew_changed(visit, before, request.user)
         return Response(
             MaintenanceVisitSerializer(visit, context=self.get_serializer_context()).data
         )
+
+    @action(detail=True, methods=["get"])
+    def activity(self, request, pk=None):
+        """Who did what on this job, and when - newest first."""
+        return Response(activity.rows(self.get_object()))
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
@@ -447,6 +509,49 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         instance.delete()
 
 
+class MaintenancePurchaseViewSet(viewsets.ModelViewSet):
+    """Bought on site, against a visit: recorded with the receipt and a photo
+    by the technician on the visit (or the office), taken back while the
+    visit is still open. Everyone who can read the job can read them."""
+
+    queryset = MaintenancePurchase.objects.select_related("visit", "schedule", "bought_by").all()
+    serializer_class = MaintenancePurchaseSerializer
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_maintenance"
+    action_capabilities = {"create": None, "destroy": None}
+    http_method_names = ["get", "post", "delete", "head", "options"]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    filterset_fields = ["schedule", "visit"]
+
+    OPEN = (MaintenanceVisit.Status.PLANNED, MaintenanceVisit.Status.IN_PROGRESS,
+            MaintenanceVisit.Status.AWAITING_REVIEW)
+
+    def perform_create(self, serializer):
+        visit = serializer.validated_data["visit"]
+        user = self.request.user
+        if not (lifecycle.theirs(visit, user) or lifecycle.is_office(user)):
+            raise PermissionDenied("Only the technician on this visit, or the office, records what was bought for it.")
+        if visit.status not in self.OPEN:
+            raise drf_serializers.ValidationError(
+                {"visit": f"Visit {visit.sequence} is {visit.get_status_display().lower()}: its cost is settled."}
+            )
+        bought = serializer.save(schedule=visit.schedule, bought_by=user)
+        activity.log(visit.schedule, "purchase", (
+            f"Bought on site: {bought.quantity} x {bought.description} for PKR {bought.amount:,.2f}"
+            + (f" at {bought.shop}" if bought.shop else "")
+        ), user=user, visit=visit)
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not (instance.bought_by_id == user.pk or lifecycle.is_office(user)):
+            raise PermissionDenied("Only whoever recorded it, or the office, takes a purchase back.")
+        if instance.visit.status not in self.OPEN:
+            raise drf_serializers.ValidationError({"detail": "The visit is closed: its purchases are on the record."})
+        activity.log(instance.schedule, "purchase_removed", f"Purchase taken back: {instance.description}",
+                     user=user, visit=instance.visit)
+        instance.delete()
+
+
 class CanPlanOrStartARound(BasePermission):
     """Planning a round is a supervisor's call; attending one is not.
 
@@ -467,7 +572,7 @@ class CanPlanOrStartARound(BasePermission):
         # technician this visit was given to may photograph or finish it,
         # only the office may review it — and those need the visit itself
         # to decide, which a has_permission check cannot see.
-        if view.action in ("photos", "complete_visit", "review", "verify_asset", "return_parts", "notes"):
+        if view.action in ("photos", "complete_visit", "review", "verify_asset", "return_parts", "notes", "helpers"):
             return True
         return False
 
@@ -482,7 +587,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
     queryset = MaintenanceVisit.objects.select_related(
         "schedule", "schedule__device", "schedule__site", "assigned_to",
         "record", "record__performed_by",
-    ).prefetch_related("record__components_used", "record__photos").all()
+    ).prefetch_related("record__components_used", "record__photos", "purchases__bought_by").all()
     serializer_class = MaintenanceVisitSerializer
     permission_classes = [IsAuthenticated, CanPlanOrStartARound]
     filterset_fields = ["schedule", "status", "assigned_to"]
@@ -493,8 +598,39 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             {"detail": "A round is completed or skipped, not deleted."}
         )
 
+    @action(detail=True, methods=["post"])
+    def helpers(self, request, pk=None):
+        """Set who is helping on this visit, any time it is open. The office's."""
+        from apps.accounts.models import User
+
+        visit = self.get_object()
+        if not (can(request.user, "assign_maintenance") or lifecycle.is_office(request.user)):
+            raise PermissionDenied("Helpers are chosen by whoever assigns the work.")
+        if visit.status not in (MaintenanceVisit.Status.PLANNED, MaintenanceVisit.Status.IN_PROGRESS):
+            raise drf_serializers.ValidationError({"detail": (
+                f"{activity.visit_word(visit)} is {visit.get_status_display().lower()} - "
+                "helpers are set while it is planned or under way."
+            )})
+        ids = [h for h in (request.data.get("helpers") or []) if h and str(h) != str(visit.assigned_to_id)]
+        before = set(visit.helpers.values_list("pk", flat=True))
+        visit.helpers.set(User.objects.filter(pk__in=ids, is_active=True))
+        visit_crew_changed(visit, before, request.user)
+        return Response(MaintenanceVisitSerializer(visit, context=self.get_serializer_context()).data)
+
     def perform_update(self, serializer):
+        was = serializer.instance
+        before = (was.assigned_to_id, was.due_date)
+        helped_before = set(was.helpers.values_list("pk", flat=True))
         visit = serializer.save()
+        visit_crew_changed(visit, helped_before, self.request.user)
+        if visit.assigned_to_id != before[0] and visit.assigned_to_id:
+            activity.log(visit.schedule, "reassigned", (
+                f"{activity.visit_word(visit)} reassigned to {activity.name(visit.assigned_to)}"
+            ), user=self.request.user, visit=visit)
+        if visit.due_date != before[1] and visit.due_date:
+            activity.log(visit.schedule, "edited", (
+                f"{activity.visit_word(visit)} due date moved to {visit.due_date:%d %b %Y}"
+            ), user=self.request.user, visit=visit)
         # On a fault the open visit decides who is on the job: when it is
         # handed to somebody else, the job follows, the way assigning from the
         # job does. A preventive round given to a stand-in leaves the
@@ -535,6 +671,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             )
         visit.notes = (request.data.get("notes") or "").strip()
         visit.save(update_fields=["notes", "updated_at"])
+        activity.log(visit.schedule, "notes", "Work done saved", user=request.user, visit=visit)
         return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"], url_path="return-parts")
@@ -559,6 +696,10 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Only the technician on this visit verifies its asset."}, status=403)
         _from_the_site(request.user, visit.schedule)
         verify_asset(request.user, visit, visit.schedule.device, request.data.get("code"))
+        activity.log(visit.schedule, "asset_scanned", (
+            f"Asset {visit.schedule.device.asset_code} scanned on site" if visit.schedule.device_id
+            else "Asset scanned on site"
+        ), user=request.user, visit=visit)
         return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"], parser_classes=[MultiPartParser, FormParser, JSONParser])
@@ -611,6 +752,12 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             raw = request.data.get(name)
             return raw if raw not in (None, "", "null") else None
 
+        # The phone hands the After photo in with the write-up, in one go:
+        # the two together are what finishing the work means.
+        if kind == MaintenanceVisitPhoto.Kind.AFTER and "notes" in request.data:
+            visit.notes = (request.data.get("notes") or "").strip()
+            visit.save(update_fields=["notes", "updated_at"])
+
         made = [
             MaintenanceVisitPhoto.objects.create(
                 visit=visit, kind=kind, image=image,
@@ -620,6 +767,11 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
             )
             for image in images
         ]
+        activity.log(visit.schedule, "photo", (
+            f"{dict(MaintenanceVisitPhoto.Kind.choices)[kind]} photo added"
+            + (f" ({len(made)})" if len(made) > 1 else "")
+            + (" with Work done" if kind == MaintenanceVisitPhoto.Kind.AFTER and "notes" in request.data else "")
+        ), user=request.user, visit=visit)
         return Response(
             MaintenanceVisitPhotoSerializer(made, many=True, context=self.get_serializer_context()).data,
             status=drf_status.HTTP_201_CREATED,
@@ -791,7 +943,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 + "."
             )}, status=drf_status.HTTP_400_BAD_REQUEST)
         visit.status = MaintenanceVisit.Status.IN_PROGRESS
-        visit.started_at = timezone.now()
+        visit.started_at = clock.now()
         visit.start_latitude, visit.start_longitude = where
         visit.save(update_fields=[
             "status", "started_at", "start_latitude", "start_longitude", "updated_at",

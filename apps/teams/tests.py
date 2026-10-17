@@ -1652,11 +1652,9 @@ def test_health_follows_the_dates_the_work_and_the_blockers(db):
     project.start_date, project.target_date = today - timedelta(days=50), today + timedelta(days=50)
     assert project.health(progress=20) == Project.Status.AT_RISK
     assert project.health(progress=45) == Project.Status.ON_TRACK
-    # An open bottleneck: at risk; resolved, back on track.
-    blocker = ProjectBottleneck.objects.create(project=project, title="Panels held at customs")
-    assert project.health(progress=45) == Project.Status.AT_RISK
-    blocker.is_resolved = True
-    blocker.save()
+    # Bottlenecks are gone from the projects module: an old open one left in
+    # the table no longer marks a project at risk for a reason nobody can see.
+    ProjectBottleneck.objects.create(project=project, title="Panels held at customs")
     assert project.health(progress=45) == Project.Status.ON_TRACK
     # On hold says so.
     project.phase = Project.Phase.ON_HOLD
@@ -1714,3 +1712,37 @@ def test_the_approver_does_not_submit_and_a_submitted_budget_waits_for_the_appro
     r = h.post(f"/api/teams/projects/{project.pk}/reject-budget/", {"notes": "Travel is double-counted."}, format="json")
     assert r.status_code == 200, r.content
     assert r.data["status"] == "rejected"
+
+
+@pytest.mark.django_db
+def test_a_project_keeps_a_history_of_who_did_what_end_to_end():
+    """Opened, edited, its team: each act a line with the person and the time;
+    and what the asset went through comes in from its own record."""
+    from apps.assets.models import AssetType, Device, DeviceLifecycleEvent
+    from apps.teams.models import ProjectScopeItem
+
+    ops = User.objects.create_user(username="log-ops", password="x", role="ops_manager",
+                                   first_name="Ayesha", last_name="Ops")
+    tech = User.objects.create_user(username="log-tech", password="x", role="technician")
+    c = _client(ops)
+    r = c.post("/api/teams/projects/", {"name": "Log project"}, format="json")
+    assert r.status_code == 201, r.content
+    pid = r.data["id"]
+    assert c.patch(f"/api/teams/projects/{pid}/", {"target_date": "2027-01-31"}, format="json").status_code == 200
+    assert c.post("/api/teams/members/", {"project": pid, "user": str(tech.id), "role": "member"},
+                  format="json").status_code == 201
+
+    device = Device.objects.create(asset_type=AssetType.objects.create(name="Log Kind"))
+    ProjectScopeItem.objects.create(project_id=pid, device=device)
+    DeviceLifecycleEvent.objects.create(device=device, event_type="status_change", from_value="installed",
+                                        to_value="active", description="Marked active", performed_by=tech)
+
+    rows = c.get(f"/api/teams/projects/{pid}/activity/").data
+    texts = [r["text"] for r in rows]
+    assert any(t.startswith("Project opened: Log project") for t in texts)
+    edit = next(r for r in rows if r["action"] == "edited")
+    assert "Target date" in edit["text"] and edit["actor"] == "Ayesha Ops"
+    assert any(t.startswith("Team: log-tech (Member) added") for t in texts)
+    asset = next(r for r in rows if r["action"] == "asset")
+    assert "Installed → Active" in asset["text"] and asset["actor"] == "log-tech"
+    assert [r["at"] for r in rows] == sorted((r["at"] for r in rows), reverse=True), "newest first"

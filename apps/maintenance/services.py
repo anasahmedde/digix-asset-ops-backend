@@ -60,7 +60,7 @@ def open_corrective_job(device, user=None, reason: str = "", details=None, ticke
 
     note = (reason or "").strip()
     details = details or {}
-    return MaintenanceSchedule.objects.create(
+    job = MaintenanceSchedule.objects.create(
         title=(note[:300] or f"Corrective maintenance — {device.asset_code}"),
         # Unplanned downtime defaults to high: the asset is not earning while
         # it sits. The person raising it can say otherwise.
@@ -88,6 +88,13 @@ def open_corrective_job(device, user=None, reason: str = "", details=None, ticke
         ),
         ticket=ticket,
     )
+    from .activity import log
+
+    log(job, "opened", (
+        f"Job opened from ticket {ticket.ticket_number}" if ticket is not None and getattr(ticket, "ticket_number", "")
+        else f"Job opened for {device.asset_code}"
+    ), user=user)
+    return job
 
 
 def close_corrective_jobs(device, user=None, reason: str = "", *, returned_to_service=True):

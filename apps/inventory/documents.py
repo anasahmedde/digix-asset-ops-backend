@@ -1,4 +1,7 @@
-"""The issue slip: the paper that goes with material leaving the store.
+"""The store's paper: the issue slip for material leaving the store, and
+the goods received note for material arriving.
+
+The issue slip: the paper that goes with material leaving the store.
 
 Whoever signs for stock should be able to see exactly what they took, what it
 was for, and who handed it over — so the slip carries the serial numbers of
@@ -13,6 +16,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+from django.utils import timezone
 
 from common.branding import letterhead
 
@@ -248,5 +253,162 @@ def render_issue_slip_pdf(issuance_request) -> bytes:
     ]))
     story += [sign]
 
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _table(rows, widths):
+    t = Table(rows, colWidths=widths, repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), BAND),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, RULE),
+        ("LINEBELOW", (0, 1), (-1, -1), 0.25, RULE),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+    ]
+    t.setStyle(TableStyle(style))
+    return t
+
+
+def _stamp(user, at):
+    when = f"{timezone.localtime(at):%d %b %Y, %H:%M}"
+    return f"{_who(user)}<br/>{when}" if user is not None else when
+
+
+def render_goods_receipt_pdf(receipt) -> bytes:
+    """The goods received note: what arrived, against which order, who
+    received it, and what inspection and the store made of each line."""
+    from apps.procurement.lines import describe_item
+
+    from .serializers import GoodsReceiptLineSerializer
+
+    s = _styles()
+    small = ParagraphStyle("grn_small", parent=s["cell"], fontSize=7.5, textColor=MUTED, leading=10)
+    num = ParagraphStyle("grn_num", parent=s["cell"], alignment=2)
+    num_head = ParagraphStyle("grn_num_head", parent=s["head"], alignment=2)
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm,
+        title=f"Goods Received Note {receipt.grn_number}",
+        author=COMPANY_NAME,
+    )
+    story: list = [letterhead()]
+    masthead = Table(
+        [[Paragraph("GOODS RECEIVED NOTE", s["title"]), Paragraph(f"<b>{COMPANY_NAME}</b>", s["company"])]],
+        colWidths=[110 * mm, 64 * mm],
+    )
+    masthead.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "BOTTOM"),
+        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+        ("LINEBELOW", (0, 0), (-1, 0), 1, INK),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    story += [masthead, Spacer(1, 7 * mm)]
+
+    def field(label, value):
+        return [Paragraph(label.upper(), s["label"]), Paragraph(str(value or "—"), s["body"])]
+
+    po = receipt.purchase_order
+    supplier = po.supplier if po is not None and po.supplier_id else None
+    when = timezone.localtime(receipt.created_at)
+    facts = Table(
+        [
+            field("GRN No.", receipt.grn_number) + field("Received On", when.strftime("%d %b %Y, %H:%M")),
+            field("Received By", _who(receipt.received_by)) + field("Source", receipt.get_source_display()),
+            field("Purchase Order", po.po_number if po else "—") + field("Supplier", supplier.name if supplier else "—"),
+            field("Order Date", po.order_date.strftime("%d %b %Y") if po and po.order_date else "—")
+            + field("Delivery Ref.", receipt.reference),
+        ],
+        colWidths=[30 * mm, 57 * mm, 30 * mm, 57 * mm],
+    )
+    facts.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story += [facts, Spacer(1, 4 * mm)]
+
+    lines = list(receipt.lines.select_related(
+        "po_item", "inventory_item__material_type", "inspected_by", "stocked_by",
+    ).all())
+
+    # --- What arrived ----------------------------------------------------
+    rows = [[Paragraph(h, s["head"]) for h in ("#", "DESCRIPTION", "UOM")]
+            + [Paragraph(h, num_head) for h in ("ORDERED", "RECEIVED", "ACCEPTED", "REJECTED")]]
+    for n, line in enumerate(lines, 1):
+        d = GoodsReceiptLineSerializer(line).data
+        if line.po_item_id:
+            title, detail = describe_item(line.po_item)
+        else:
+            title, detail = d.get("known_component") or d.get("inventory_item_name") or "Item", ""
+        extra = []
+        if line.batch_number:
+            extra.append(f"Batch {line.batch_number}")
+        if line.serial_numbers:
+            extra.append("S/N " + ", ".join(line.serial_numbers))
+        cell = [Paragraph(f"<b>{title}</b>", s["cell"])]
+        if detail:
+            cell.append(Paragraph(detail, small))
+        if extra:
+            cell.append(Paragraph(" · ".join(extra), small))
+        accepted = line.accepted_quantity if line.accepted_quantity is not None else "—"
+        rows.append([
+            Paragraph(str(n), s["cell"]), cell, Paragraph(d.get("unit") or "piece", s["cell"]),
+            Paragraph(str(line.po_item.quantity) if line.po_item_id else "—", num),
+            Paragraph(str(line.quantity), num),
+            Paragraph(str(accepted), num),
+            Paragraph(str(line.rejected_quantity or 0), num),
+        ])
+    story += [_table(rows, [7 * mm, 66 * mm, 15 * mm, 21 * mm, 22 * mm, 22 * mm, 21 * mm]),
+              Spacer(1, 5 * mm)]
+
+    # --- What inspection and the store made of it ------------------------
+    story += [Paragraph("<b>Inspection and stocking</b>", s["body"]), Spacer(1, 2 * mm)]
+    rows = [[Paragraph(h, s["head"]) for h in ("#", "INSPECTION", "INSPECTED BY", "STOCKED BY", "LOCATION / NOTES")]]
+    for n, line in enumerate(lines, 1):
+        status = line.get_inspection_status_display()
+        if line.routed_to:
+            status += f"<br/>{line.get_routed_to_display()}"
+        if line.warranty_months:
+            status += f"<br/>Vendor warranty {line.warranty_months} months"
+        notes = [x for x in (line.storage_location, line.inspection_notes, line.receiving_notes) if x]
+        rows.append([
+            Paragraph(str(n), s["cell"]),
+            Paragraph(status, s["cell"]),
+            Paragraph(_stamp(line.inspected_by, line.inspected_at) if line.inspected_at else "—", s["cell"]),
+            Paragraph(_stamp(line.stocked_by, line.stocked_at) if line.stocked_at else "Not yet in stock", s["cell"]),
+            Paragraph("<br/>".join(notes) or "—", s["cell"]),
+        ])
+    story += [_table(rows, [8 * mm, 40 * mm, 38 * mm, 38 * mm, 50 * mm]), Spacer(1, 5 * mm)]
+
+    if receipt.notes:
+        remarks = receipt.notes.replace(chr(10), "<br/>")
+        story += [Paragraph(f"<b>Remarks</b><br/>{remarks}", s["cell"]), Spacer(1, 4 * mm)]
+
+    # --- Signatures --------------------------------------------------------
+    inspectors = ", ".join(dict.fromkeys(_who(x.inspected_by) for x in lines if x.inspected_by_id))
+    storers = ", ".join(dict.fromkeys(_who(x.stocked_by) for x in lines if x.stocked_by_id))
+    story += [Spacer(1, 10 * mm)]
+    sign = Table(
+        [
+            [Paragraph("", s["body"]) for _ in range(4)],
+            [Paragraph(x, s["label"]) for x in ("Delivered by (supplier)", "Received by", "Inspected by", "Stored by")],
+            [Paragraph(supplier.name if supplier else "", s["body"]), Paragraph(_who(receipt.received_by), s["body"]),
+             Paragraph(inspectors, s["body"]), Paragraph(storers, s["body"])],
+        ],
+        colWidths=[43.5 * mm] * 4,
+    )
+    sign.setStyle(TableStyle(
+        [("LINEBELOW", (i, 0), (i, 0), 0.5, INK) for i in range(4)]
+        + [("TOPPADDING", (0, 0), (-1, 0), 12), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+           ("RIGHTPADDING", (0, 0), (-1, -1), 8)]
+    ))
+    story += [sign]
     doc.build(story)
     return buf.getvalue()
