@@ -299,6 +299,11 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         device._transition_user = request.user
         device._transition_reason = reason
         device.save(update_fields=update_fields)
+        # Helpers named with the assignment go on the installation it opened.
+        if new_status == Device.Status.ASSIGNED and "helpers" in request.data:
+            from apps.sites.views import set_helpers_for_asset
+
+            set_helpers_for_asset(device, request.data.get("helpers"), request.user)
 
         device.refresh_from_db()
         return Response(DeviceDetailSerializer(device, context={"request": request}).data)
@@ -345,6 +350,11 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             "assigned_technician", "assigned_vendor", "assigned_vendor_name",
             "assigned_vendor_contact", "updated_at",
         ])
+
+        if "helpers" in request.data:
+            from apps.sites.views import set_helpers_for_asset
+
+            set_helpers_for_asset(device, request.data.get("helpers"), request.user)
 
         new_label = assignee_label(technician, vendor, contact)
         # No status change here, so the status signal won't fire — journal it.

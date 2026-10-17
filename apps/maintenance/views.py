@@ -572,7 +572,7 @@ class CanPlanOrStartARound(BasePermission):
         # technician this visit was given to may photograph or finish it,
         # only the office may review it — and those need the visit itself
         # to decide, which a has_permission check cannot see.
-        if view.action in ("photos", "complete_visit", "review", "verify_asset", "return_parts", "notes"):
+        if view.action in ("photos", "complete_visit", "review", "verify_asset", "return_parts", "notes", "helpers"):
             return True
         return False
 
@@ -597,6 +597,25 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         raise drf_serializers.ValidationError(
             {"detail": "A round is completed or skipped, not deleted."}
         )
+
+    @action(detail=True, methods=["post"])
+    def helpers(self, request, pk=None):
+        """Set who is helping on this visit, any time it is open. The office's."""
+        from apps.accounts.models import User
+
+        visit = self.get_object()
+        if not (can(request.user, "assign_maintenance") or lifecycle.is_office(request.user)):
+            raise PermissionDenied("Helpers are chosen by whoever assigns the work.")
+        if visit.status not in (MaintenanceVisit.Status.PLANNED, MaintenanceVisit.Status.IN_PROGRESS):
+            raise drf_serializers.ValidationError({"detail": (
+                f"{activity.visit_word(visit)} is {visit.get_status_display().lower()} - "
+                "helpers are set while it is planned or under way."
+            )})
+        ids = [h for h in (request.data.get("helpers") or []) if h and str(h) != str(visit.assigned_to_id)]
+        before = set(visit.helpers.values_list("pk", flat=True))
+        visit.helpers.set(User.objects.filter(pk__in=ids, is_active=True))
+        visit_crew_changed(visit, before, request.user)
+        return Response(MaintenanceVisitSerializer(visit, context=self.get_serializer_context()).data)
 
     def perform_update(self, serializer):
         was = serializer.instance

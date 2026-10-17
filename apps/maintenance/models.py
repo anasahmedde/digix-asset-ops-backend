@@ -179,6 +179,11 @@ class MaintenanceSchedule(TimeStampedModel):
                 schedule=self, due_date=self.next_due, sequence=last + 1,
                 assigned_to=self.assigned_to,
             )
+            # The next round goes with the last round's helpers.
+            if last > 0:
+                from .lifecycle import carry_helpers
+
+                carry_helpers(self.visits.filter(sequence=last).first(), visit)
             if last > 0 and self.assigned_to_id:
                 from apps.notifications.service import tell
 

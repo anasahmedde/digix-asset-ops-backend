@@ -141,6 +141,27 @@ class SiteZoneViewSet(viewsets.ModelViewSet):
     search_fields = ["name"]
 
 
+def set_helpers(installation, ids, user) -> None:
+    """Make these people the installation's helpers (the installer excepted)."""
+    from apps.accounts.models import User
+
+    if installation is None:
+        return
+    ids = [str(i) for i in (ids or []) if i and str(i) != str(installation.installed_by_id)]
+    before = set(installation.helpers.values_list("pk", flat=True))
+    installation.helpers.set(User.objects.filter(pk__in=ids, is_active=True))
+    crew_changed(installation, before, user)
+
+
+def set_helpers_for_asset(device, ids, user) -> None:
+    """Helpers named where the asset is assigned land on its open installation."""
+    installation = (
+        DeviceInstallation.objects.filter(device=device, completed_at__isnull=True)
+        .order_by("-installed_at").first()
+    )
+    set_helpers(installation, ids, user)
+
+
 def crew_changed(installation, before: set, user) -> None:
     """Helpers added or taken off: on the log, and the newcomers told."""
     from apps.notifications import service as notices

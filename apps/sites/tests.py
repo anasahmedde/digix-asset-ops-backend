@@ -1972,3 +1972,23 @@ def test_a_helper_is_on_the_job_but_only_the_installer_works_it(ops, tech, insta
     step = installation.steps.exclude(step_type="handover").order_by("step_number").first()
     r = _client(helper).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
     assert r.status_code == 403, "a helper checks in and out; the installer works the steps"
+
+
+@pytest.mark.django_db
+def test_helpers_named_with_the_asset_assignment_land_on_the_installation(ops, tech):
+    """Assigning an asset for installation names its installer and helpers in
+    one go; the installation it opens carries both."""
+    from apps.sites.models import DeviceInstallation
+
+    helper = User.objects.create_user(username="assign-helper", password="x", role="technician")
+    site = Site.objects.create(name="Assign Site", city="Lahore")
+    device = Device.objects.create(asset_code="AST-HELP-1", status="in_stock", current_site=site)
+    r = _client(ops).post(f"/api/assets/devices/{device.id}/transition/", {
+        "status": "assigned", "reason": "Assigned for installation", "assigned_technician": str(tech.id),
+        "installation_date": (timezone.localdate() + timezone.timedelta(days=5)).isoformat(),
+        "helpers": [str(helper.id), str(tech.id)],
+    }, format="json")
+    assert r.status_code == 200, r.content
+    job = DeviceInstallation.objects.get(device=device)
+    assert job.installed_by == tech
+    assert list(job.helpers.values_list("pk", flat=True)) == [helper.pk]

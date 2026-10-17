@@ -412,6 +412,19 @@ def outstanding_parts(visit: MaintenanceVisit):
     ]
 
 
+def carry_helpers(previous, nxt) -> None:
+    """The next visit goes with the same helpers (its technician excepted);
+    the office changes them on the visit if the crew is different."""
+    if previous is None:
+        return
+    crew = list(previous.helpers.exclude(pk=nxt.assigned_to_id))
+    if crew:
+        nxt.helpers.set(crew)
+        activity.log(nxt.schedule, "helpers", (
+            f"{activity.visit_word(nxt)} helpers: {', '.join(activity.name(h) for h in crew)} (same as before)"
+        ), visit=nxt)
+
+
 def _work_done(visit: MaintenanceVisit, remarks: str) -> str:
     """What was done is half of handing the work in - the After photo is the
     other. Typed in the completion, or written on site as the work went."""
@@ -605,6 +618,7 @@ def mark_unresolved(
         schedule=job, sequence=visit.sequence + 1, due_date=next_due,
         assigned_to=technician, status=MaintenanceVisit.Status.PLANNED,
     )
+    carry_helpers(visit, nxt)
     job.assigned_to = technician
     job.next_due = next_due
     job.status = MaintenanceSchedule.Status.PENDING
@@ -761,6 +775,7 @@ def send_round_back(
         schedule=job, sequence=visit.sequence + 1, due_date=next_due,
         assigned_to=technician, status=MaintenanceVisit.Status.PLANNED,
     )
+    carry_helpers(visit, nxt)
     job.assigned_to = technician
     job.next_due = next_due
     job.status = MaintenanceSchedule.Status.PENDING

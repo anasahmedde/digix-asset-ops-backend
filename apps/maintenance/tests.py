@@ -1567,3 +1567,30 @@ def test_a_helper_goes_on_the_visit_but_only_the_technician_works_it(parts_job):
     assert str(job.id) in [row["id"] for row in listed.get("results", listed)]
     assert any("helpers: Hamid" in row["text"] for row in _client(boss).get(f"/api/maintenance/schedules/{job.id}/activity/").data)
     assert _client(helper).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json").status_code == 403
+
+
+@pytest.mark.django_db
+def test_helpers_change_while_the_visit_is_open_and_go_on_to_the_next_visit(parts_job):
+    """The office changes helpers on an open visit (not only while it can be
+    reassigned), and a visit sent back goes again with the same helpers."""
+    from apps.maintenance import lifecycle
+    from apps.maintenance.lifecycle import current_visit
+
+    job, tech, boss = parts_job["schedule"], parts_job["tech"], parts_job["boss"]
+    helper = User.objects.create_user(username="carry-helper", password="x", role="technician")
+    visit = current_visit(job)
+    visit.status = "in_progress"
+    visit.assigned_to = tech
+    visit.save(update_fields=["status", "assigned_to"])
+
+    url = f"/api/maintenance/visits/{visit.id}/helpers/"
+    assert _client(tech).post(url, {"helpers": [str(helper.id)]}, format="json").status_code == 403, "the office's call"
+    r = _client(boss).post(url, {"helpers": [str(helper.id), str(tech.id)]}, format="json")
+    assert r.status_code == 200, r.content
+    assert list(visit.helpers.values_list("pk", flat=True)) == [helper.pk], "under way, and the technician is not a helper"
+
+    visit.status = "awaiting_review"
+    visit.save(update_fields=["status"])
+    nxt = lifecycle.send_round_back(visit, user=boss, reason="Not finished", technician=tech,
+                                    next_due=timezone.localdate() + timezone.timedelta(days=3))
+    assert list(nxt.helpers.values_list("pk", flat=True)) == [helper.pk], "the same crew goes again"
