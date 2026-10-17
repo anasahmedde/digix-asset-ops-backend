@@ -616,7 +616,8 @@ def test_installations_export_happy_path(ops, installation):
     assert row[2] == "Install Site"
     assert row[3] == "Primary Client, Second Client"
     assert row[4] == "Tariq Installer"
-    assert row[8] == 50  # 1 of 2 steps completed
+    # 3 of the 5 work steps, then Active and Handover still to come: 3/7.
+    assert row[8] == 43
     assert row[9] == "No"  # not escalated
 
     log = _AuditLog.objects.filter(action="export", resource_type="installation").latest("created_at")
@@ -1622,12 +1623,15 @@ def test_steps_are_done_in_order_and_say_who_did_them(ops, tech, installation):
     assert r.data["completed_by_name"] == me
     assert r.data["completed_at"] is not None
 
-    # Skipping is the way past a step that does not apply.
+    # Steps are not skipped - the web never offered it, and a skipped
+    # checklist read 0% on a job that was live and handed over.
     r = _client(tech).patch(f"/api/sites/installation-steps/{steps[1].id}/", {"status": "skipped"}, format="json")
-    assert r.status_code == 200, r.content
-    _client(tech).patch(f"/api/sites/installation-steps/{later.id}/", {"status": "in_progress"}, format="json")
-    r = _client(tech).patch(f"/api/sites/installation-steps/{later.id}/", {"status": "completed"}, format="json")
-    assert r.status_code == 200, r.content
+    assert r.status_code == 400, r.content
+    assert "not skipped" in str(r.data["status"])
+    for st in (steps[1], later):
+        _client(tech).patch(f"/api/sites/installation-steps/{st.id}/", {"status": "in_progress"}, format="json")
+        r = _client(tech).patch(f"/api/sites/installation-steps/{st.id}/", {"status": "completed"}, format="json")
+        assert r.status_code == 200, r.content
 
 
 @pytest.mark.django_db
@@ -1886,3 +1890,61 @@ def test_an_installation_keeps_a_history_of_who_did_what_and_when(ops, tech, ins
     assert any(a == "edited" and "location at site" in t for a, t, _ in texts)
     assert any(a == "delay" and t.startswith("Delay flagged: Client") for a, t, _ in texts)
     assert all(row["at"] for row in r.data)
+
+
+@pytest.mark.django_db
+def test_the_signed_handover_is_filed_with_the_documents(ops, handover_ready):
+    """The signed sheet shows under the installation's Related Documents and
+    the asset's Documents - the same file the handover record keeps."""
+    from apps.infrastructure.models import Document
+    from apps.sites.models import HandoverRecord
+
+    job = handover_ready["job"]
+    r = _client(ops).post(f"/api/sites/installations/{job.id}/handover/",
+                          {"accepted_by_name": "Site Manager", "signed_document": _signed_page()}, format="multipart")
+    assert r.status_code in (200, 201), r.content
+    record = HandoverRecord.objects.get(installation=job)
+    doc = Document.objects.get(installation=job, doc_type="handover")
+    assert doc.device_id == job.device_id and doc.file.name == record.signed_document.name
+    for params in ({"installation": str(job.id)}, {"device": str(job.device_id)}):
+        rows = _client(ops).get("/api/infrastructure/documents/", params).data
+        assert any(d["id"] == str(doc.id) for d in rows.get("results", rows)), params
+    assert _client(ops).get(f"/api/sites/installations/{job.id}/").data["progress"] == 100
+
+
+@pytest.mark.django_db
+def test_progress_counts_active_and_handover_and_ignores_skipped_steps(installation):
+    """Older jobs have skipped steps; a skipped checklist read 0% even after
+    the asset went live. Active and Handover are the last two stages."""
+    from apps.sites.models import InstallationStep
+    from apps.sites.serializers import installation_progress
+
+    work = list(installation.steps.exclude(step_type="handover"))
+    InstallationStep.objects.filter(pk__in=[s.pk for s in work]).update(status="skipped")
+    device = installation.device
+    device.status = "installed"
+    device.save(update_fields=["status"])
+    installation.refresh_from_db()
+    assert installation_progress(installation) == 0
+    device.status = "active"
+    device.save(update_fields=["status"])
+    installation.refresh_from_db()
+    assert installation_progress(installation) == 50, "live, not yet handed over"
+
+
+@pytest.mark.django_db
+def test_the_handover_document_lists_the_steps_as_they_are_now(ops, installation):
+    """Steps added during the job appear on the certificate, numbered in
+    order, followed by Active and Handover."""
+    pypdf = pytest.importorskip("pypdf")
+    from io import BytesIO
+
+    from apps.sites.models import InstallationStep
+
+    InstallationStep.objects.create(installation=installation, step_type="other",
+                                    custom_label="Extra bracket", step_number=99)
+    r = _client(ops).get(f"/api/sites/installations/{installation.id}/handover-document/")
+    assert r.status_code == 200, r.content
+    text = "".join(p.extract_text() for p in pypdf.PdfReader(BytesIO(r.content)).pages)
+    assert "Installation steps" in text and "Extra bracket" in text
+    assert "Active" in text and "On signature" in text

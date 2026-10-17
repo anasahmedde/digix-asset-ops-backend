@@ -14,6 +14,7 @@ class Document(TimeStampedModel):
         CONTRACT = "contract", "Contract"
         INVOICE = "invoice", "Invoice"
         PHOTO = "photo", "Photo"
+        HANDOVER = "handover", "Handover Certificate"
         OTHER = "other", "Other"
 
     title = models.CharField(max_length=300)

@@ -232,11 +232,7 @@ class _InstallationCommonMixin(serializers.Serializer):
         return names
 
     def get_progress(self, obj):
-        steps = obj.steps.all()
-        if not steps:
-            return 0
-        completed = steps.filter(status="completed").count()
-        return round((completed / steps.count()) * 100)
+        return installation_progress(obj)
 
     def get_steps_done(self, obj):
         return sum(1 for s in obj.steps.all() if s.status == InstallationStep.StepStatus.COMPLETED)
@@ -284,6 +280,30 @@ HEALTH_LABELS = {
     "on_time": "On Time",
     "not_started": "Not Started",
 }
+
+
+#: The asset is live, or has gone on from live: Active is behind it.
+LIVE_STATUSES = ("active", "under_maintenance", "client_property", "decommissioned")
+
+
+def installation_progress(inst) -> int:
+    """How far the job is, 0-100: the checklist, then Active, then Handover.
+
+    A skipped step (only older jobs have them) is out of the way and counts
+    neither for nor against. Active and Handover are the last two stages,
+    so a job that went live and was handed over is 100% - it read 0% when
+    its steps had been skipped.
+    """
+    if getattr(inst, "handover", None) is not None:
+        return 100
+    steps = [
+        s for s in inst.steps.all()
+        if s.step_type != InstallationStep.StepType.HANDOVER
+        and s.status != InstallationStep.StepStatus.SKIPPED
+    ]
+    done = sum(1 for s in steps if s.status == InstallationStep.StepStatus.COMPLETED)
+    live = 1 if inst.device.status in LIVE_STATUSES else 0
+    return round((done + live) * 100 / (len(steps) + 2))
 
 
 def _health(installation):

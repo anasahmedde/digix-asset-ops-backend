@@ -141,6 +141,33 @@ class SiteZoneViewSet(viewsets.ModelViewSet):
     search_fields = ["name"]
 
 
+def file_handover_document(record, user) -> None:
+    """File the signed handover sheet with the job's and the asset's documents.
+
+    It is the same file the handover record holds, so it appears under the
+    installation's Related Documents, the asset's Documents and the library.
+    """
+    from apps.infrastructure.models import Document
+
+    installation = record.installation
+    try:
+        size = record.signed_document.size
+    except Exception:  # noqa: BLE001 - a missing file still gets its entry
+        size = 0
+    Document.objects.create(
+        title=f"Signed handover - {record.device.asset_code}",
+        doc_type=Document.DocType.HANDOVER,
+        file=record.signed_document.name,
+        file_size=size,
+        description=f"Accepted by {record.accepted_by_name} on {record.handover_date:%d %b %Y}",
+        device=record.device,
+        site=installation.site,
+        installation=installation,
+        project=record.device.project_on,
+        uploaded_by=user,
+    )
+
+
 def _attach_to_asset_gallery(device, image, user, caption: str) -> None:
     """Put a photo taken on site into the asset's own gallery.
 
@@ -376,9 +403,9 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             for client in inst.device.clients.all():
                 if client.name not in client_names:
                     client_names.append(client.name)
-            steps = list(inst.steps.all())
-            completed = sum(1 for s in steps if s.status == InstallationStep.StepStatus.COMPLETED)
-            progress = round((completed / len(steps)) * 100) if steps else 0
+            from .serializers import installation_progress
+
+            progress = installation_progress(inst)
             rows.append([
                 inst.device.asset_code,
                 inst.device.display_name,
@@ -700,6 +727,8 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 signed_document=ser.validated_data.get("signed_document"),
                 performed_by=user,
             )
+            if record.signed_document:
+                file_handover_document(record, user)
             device.assigned_client = client
             device.current_site = installation.site
             device.installation_date = record.handover_date
@@ -837,6 +866,11 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         self._from_the_site(step.installation)
 
         new_status = serializer.validated_data.get("status", step.status)
+        if new_status == InstallationStep.StepStatus.SKIPPED and step.status != new_status:
+            raise _VE({"status": (
+                "Steps are not skipped. Start it and complete it - or, before any "
+                "step has started, remove it from the checklist."
+            )})
         if step.step_type == InstallationStep.StepType.HANDOVER and new_status != step.status:
             raise _VE({"status": (
                 "Handover completes itself when the signed handover is recorded, "
@@ -877,7 +911,7 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
             if behind:
                 raise _VE({"status": (
                     f"Finish the steps before this one first: {', '.join(behind)}. "
-                    "A step can be skipped if it does not apply."
+                    "They run in the order shown."
                 )})
 
         # Work that was never started cannot be finished. The step was being
@@ -928,7 +962,7 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         if instance.status != InstallationStep.StepStatus.NOT_STARTED:
             raise _VE({"detail": (
                 f"{instance.custom_label or instance.get_step_type_display()} has been worked on, "
-                "so it stays on the checklist. Skip it if it no longer applies."
+                "so it stays on the checklist: start it and complete it."
             )})
         self._from_the_site(instance.installation)
         installation_id = instance.installation_id

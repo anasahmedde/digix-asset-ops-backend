@@ -4,7 +4,8 @@ from .models import Document
 
 
 class DocumentSerializer(serializers.ModelSerializer):
-    uploaded_by_name = serializers.CharField(source="uploaded_by.get_full_name", read_only=True, default=None)
+    # An account with no full name still uploaded it.
+    uploaded_by_name = serializers.SerializerMethodField()
     device_code = serializers.CharField(source="device.asset_code", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     project_name = serializers.CharField(source="project.name", read_only=True, default=None)
@@ -21,3 +22,7 @@ class DocumentSerializer(serializers.ModelSerializer):
             "uploaded_by", "uploaded_by_name", "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+
+    def get_uploaded_by_name(self, obj):
+        user = obj.uploaded_by
+        return (user.get_full_name() or user.username) if user else None
