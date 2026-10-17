@@ -704,6 +704,17 @@ class GoodsReceiptViewSet(viewsets.ModelViewSet):
     filterset_fields = ["item", "work_order", "purchase_order", "source"]
     ordering_fields = ["created_at"]
 
+    @action(detail=True, methods=["get"], url_path="document")
+    def document(self, request, pk=None):
+        """The goods received note as a PDF: what arrived, and who received,
+        inspected and stocked it."""
+        from .documents import render_goods_receipt_pdf
+
+        receipt = self.get_object()
+        response = HttpResponse(render_goods_receipt_pdf(receipt), content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{receipt.grn_number or "goods-receipt"}.pdf"'
+        return response
+
     @action(detail=False, methods=["post"], url_path="return")
     def record_return(self, request):
         """Material coming back from a project or a maintenance job.
