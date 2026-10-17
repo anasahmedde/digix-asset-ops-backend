@@ -142,6 +142,10 @@ class _InstallationCommonMixin(serializers.Serializer):
     asset_type_name = serializers.CharField(source="device.asset_type.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True)
     installed_by_name = serializers.CharField(source="installed_by.get_full_name", read_only=True, default=None)
+    helper_names = serializers.SerializerMethodField()
+
+    def get_helper_names(self, obj):
+        return [h.get_full_name() or h.username for h in obj.helpers.all()]
     asset_verified_by_name = serializers.CharField(source="asset_verified_by.get_full_name", read_only=True, default=None)
     installed_by_phone = serializers.CharField(source="installed_by.phone", read_only=True, default=None)
     # Technician identity comes straight from the manpower record — no retyping.
@@ -366,7 +370,7 @@ class DeviceInstallationListSerializer(DateOrder, _InstallationCommonMixin, seri
         fields = [
             "id", "device", "device_code", "device_name", "asset_name", "asset_type_name",
             "client_names", "client_id", "project_name", "poc_name", "poc_phone",
-            "site", "site_name", "installed_by", "installed_by_name", "installed_by_phone",
+            "site", "site_name", "installed_by", "installed_by_name", "installed_by_phone", "helpers", "helper_names",
             "installed_by_employee_id", "installed_by_job_title", "installed_by_role",
             "vendor", "vendor_name", "external_vendor_name", "external_vendor_contact", "vendor_display",
             "installed_at", "removed_at", "due_date", "completed_at",
@@ -495,7 +499,7 @@ class DeviceInstallationDetailSerializer(DateOrder, _InstallationCommonMixin, se
             "device_image", "device_status", "device_activated_at", "device_source", "device_source_display",
             "client_names", "client_id", "project_name", "poc_name", "poc_phone",
             "site", "site_name", "site_city", "zone", "can_advance", "device_activated_by",
-            "installed_by", "installed_by_name", "installed_by_phone",
+            "installed_by", "installed_by_name", "installed_by_phone", "helpers", "helper_names",
             "installed_by_employee_id", "installed_by_job_title", "installed_by_role",
             "installed_at", "removed_at",
             "vendor", "vendor_name", "external_vendor_name", "external_vendor_contact", "vendor_display",
@@ -510,6 +514,12 @@ class DeviceInstallationDetailSerializer(DateOrder, _InstallationCommonMixin, se
         """A vendor is either a registered supplier or a hand-entered one."""
         def current(name):
             return attrs[name] if name in attrs else getattr(self.instance, name, None)
+
+        lead = current("installed_by")
+        if lead is not None and lead in (attrs.get("helpers") or []):
+            raise serializers.ValidationError({
+                "helpers": f"{lead.get_full_name() or lead.username} is the installer - a helper is somebody else."
+            })
 
         vendor = current("vendor")
         manual = (current("external_vendor_name") or "").strip()

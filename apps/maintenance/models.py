@@ -247,6 +247,11 @@ class MaintenanceVisit(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="maintenance_visits",
     )
+    # More hands on this visit. The technician (the lead) works the visit;
+    # a helper checks in and out at the site and nothing more.
+    helpers = models.ManyToManyField(
+        settings.AUTH_USER_MODEL, blank=True, related_name="visits_helped",
+    )
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.PLANNED)
     started_at = models.DateTimeField(null=True, blank=True)
     # Where the phone was standing when work began. A time on its own says

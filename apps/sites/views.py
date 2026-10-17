@@ -1,6 +1,6 @@
 from apps.notifications.service import inform_line, who as _who
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.utils import timezone
 from common.scoping import for_client
 from rest_framework import status as drf_status
@@ -141,6 +141,28 @@ class SiteZoneViewSet(viewsets.ModelViewSet):
     search_fields = ["name"]
 
 
+def crew_changed(installation, before: set, user) -> None:
+    """Helpers added or taken off: on the log, and the newcomers told."""
+    from apps.notifications import service as notices
+
+    now = set(installation.helpers.values_list("pk", flat=True))
+    if now == before:
+        return
+    names = ", ".join(activity.name(h) for h in installation.helpers.all()) or "none"
+    activity.log(installation, "helpers", f"Helpers: {names}", user=user)
+    added = list(installation.helpers.filter(pk__in=now - before))
+    if added:
+        notices.tell(
+            added, exclude=[user], kind="work_assigned",
+            title=f"You are helping on {installation.device.asset_code}",
+            message=(
+                f"Installer: {activity.name(installation.installed_by) or 'not named yet'} at {installation.site.name}. "
+                "Check in and check out at the site from the field app."
+            ),
+            link=f"/installation-tracker?installation={installation.pk}", data={"installation": str(installation.pk)},
+        )
+
+
 def file_handover_document(record, user) -> None:
     """File the signed handover sheet with the job's and the asset's documents.
 
@@ -197,7 +219,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             "device__asset_type", "device__assigned_client", "device__project",
             "installed_by", "vendor", "site", "zone",
         )
-        .prefetch_related("photos", "steps", "delays", "device__clients")
+        .prefetch_related("photos", "steps", "delays", "device__clients", "helpers")
         .all()
     )
     permission_classes = [IsAuthenticated, CapabilityGate]
@@ -248,7 +270,9 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             "notes": "notes", "vendor_id": "vendor", "external_vendor_name": "vendor", "installed_at": "assigned date",
         }
         before = {f: getattr(serializer.instance, f) for f in watched}
+        helped_before = set(serializer.instance.helpers.values_list("pk", flat=True))
         installation = serializer.save()
+        crew_changed(installation, helped_before, self.request.user)
 
         def moved(f):
             # The form sends the assigned time to the minute; a resave that
@@ -335,6 +359,10 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        # ?crew=<id>: the jobs that person is on - as the installer or a helper.
+        crew = self.request.query_params.get("crew")
+        if crew:
+            qs = qs.filter(Q(installed_by_id=crew) | Q(helpers__id=crew)).distinct()
         # Vendor scope (XC-04): portal users only see installations their
         # supplier is doing; a vendor login without a supplier sees nothing.
         user = self.request.user

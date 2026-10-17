@@ -1948,3 +1948,27 @@ def test_the_handover_document_lists_the_steps_as_they_are_now(ops, installation
     text = "".join(p.extract_text() for p in pypdf.PdfReader(BytesIO(r.content)).pages)
     assert "Installation steps" in text and "Extra bracket" in text
     assert "Active" in text and "On signature" in text
+
+
+@pytest.mark.django_db
+def test_a_helper_is_on_the_job_but_only_the_installer_works_it(ops, tech, installation):
+    """Helpers: the job shows in their app (crew), the office is told who they
+    are, and a step is still the installer's to move."""
+    from apps.notifications.models import Notification
+
+    helper = User.objects.create_user(username="site-helper", password="x", role="technician", first_name="Hamid")
+    url = f"/api/sites/installations/{installation.id}/"
+    assert _client(ops).patch(url, {"helpers": [str(tech.id)]}, format="json").status_code == 400, "the installer is not a helper"
+    r = _client(ops).patch(url, {"helpers": [str(helper.id)]}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["helpers"] == [helper.id] or [str(h) for h in r.data["helpers"]] == [str(helper.id)]
+    assert r.data["helper_names"] == ["Hamid"]
+    assert Notification.objects.filter(recipient=helper, title__icontains="helping").exists()
+    texts = [row["text"] for row in _client(ops).get(f"{url}activity/").data]
+    assert "Helpers: Hamid" in texts
+
+    mine = _client(helper).get("/api/sites/installations/", {"crew": str(helper.id)}).data
+    assert [row["id"] for row in mine.get("results", mine)] == [str(installation.id)]
+    step = installation.steps.exclude(step_type="handover").order_by("step_number").first()
+    r = _client(helper).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 403, "a helper checks in and out; the installer works the steps"

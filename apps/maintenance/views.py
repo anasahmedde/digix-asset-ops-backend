@@ -138,6 +138,30 @@ def _at_the_asset(user, visit):
     require_verified_asset(visit, visit.schedule.device)
 
 
+def visit_crew_changed(visit, before: set, user) -> None:
+    """Helpers added or taken off a visit: on the job's log, newcomers told."""
+    from apps.notifications import service as notices
+
+    now = set(visit.helpers.values_list("pk", flat=True))
+    if now == before:
+        return
+    job = visit.schedule
+    names = ", ".join(activity.name(h) for h in visit.helpers.all()) or "none"
+    activity.log(job, "helpers", f"{activity.visit_word(visit)} helpers: {names}", user=user, visit=visit)
+    added = list(visit.helpers.filter(pk__in=now - before))
+    if added:
+        notices.tell(
+            added, exclude=[user], kind="work_assigned",
+            title=f"You are helping on {job.title}",
+            message=(
+                f"Technician: {activity.name(visit.assigned_to) or 'not named yet'}"
+                + (f" at {job.site.name}" if job.site_id else "")
+                + ". Check in and check out at the site from the field app."
+            ),
+            link=f"/maintenance?schedule={job.pk}", data={"schedule": str(job.pk)},
+        )
+
+
 def _own_job_only(user, schedule, doing: str):
     """A technician works the jobs given to them, not a colleague's."""
     if schedule is None or _acts_for_everyone(user):
@@ -314,7 +338,7 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         MaintenanceSchedule.objects.select_related(
             "device", "site", "assigned_to", "ticket"
         )
-        .prefetch_related("vendors", "visits__assigned_to", "visits__photos")
+        .prefetch_related("vendors", "visits__assigned_to", "visits__photos", "visits__helpers")
         .annotate(
             began=Coalesce(
                 Cast("ticket__created_at", DateField()),
@@ -342,8 +366,9 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             from django.db.models import Exists, OuterRef
 
             open_states = ("planned", "in_progress", "awaiting_review")
+            # On it as the technician, or helping on the visit.
             mine = MaintenanceVisit.objects.filter(
-                schedule=OuterRef("pk"), status__in=open_states, assigned_to_id=who,
+                Q(assigned_to_id=who) | Q(helpers__id=who), schedule=OuterRef("pk"), status__in=open_states,
             )
             any_open = MaintenanceVisit.objects.filter(schedule=OuterRef("pk"), status__in=open_states)
             qs = qs.filter(Exists(mine) | (Q(assigned_to_id=who) & ~Exists(any_open)))
@@ -416,6 +441,11 @@ class MaintenanceScheduleViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             if job.ticket_id
             else lifecycle.assign_round(job, user=request.user, technician=tech, due_date=due)
         )
+        if "helpers" in request.data:
+            ids = [h for h in (request.data.get("helpers") or []) if h and str(h) != str(tech.pk if tech else "")]
+            before = set(visit.helpers.values_list("pk", flat=True))
+            visit.helpers.set(User.objects.filter(pk__in=ids, is_active=True))
+            visit_crew_changed(visit, before, request.user)
         return Response(
             MaintenanceVisitSerializer(visit, context=self.get_serializer_context()).data
         )
@@ -571,7 +601,9 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         was = serializer.instance
         before = (was.assigned_to_id, was.due_date)
+        helped_before = set(was.helpers.values_list("pk", flat=True))
         visit = serializer.save()
+        visit_crew_changed(visit, helped_before, self.request.user)
         if visit.assigned_to_id != before[0] and visit.assigned_to_id:
             activity.log(visit.schedule, "reassigned", (
                 f"{activity.visit_word(visit)} reassigned to {activity.name(visit.assigned_to)}"

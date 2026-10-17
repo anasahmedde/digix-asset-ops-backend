@@ -78,6 +78,11 @@ class DeviceInstallation(TimeStampedModel):
     installed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="installations_done"
     )
+    # More hands on the same job. The installer (the lead) works every step;
+    # a helper checks in and out at the site and nothing more.
+    helpers = models.ManyToManyField(
+        settings.AUTH_USER_MODEL, blank=True, related_name="installations_helped",
+    )
     vendor = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="installations", help_text="External vendor doing the installation work",

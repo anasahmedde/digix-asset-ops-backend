@@ -133,7 +133,7 @@ class MaintenanceScheduleSerializer(DateOrder, serializers.ModelSerializer):
             "start_date", "next_due", "instructions", "required_components",
             "status", "status_display",
             "effective_status", "is_active", "next_visit_assignee",
-            "current_technician", "current_technician_name",
+            "current_technician", "current_technician_name", "current_helpers",
             "ticket", "ticket_number", "ticket_description", "ticket_raised_at",
             "last_technician_on_asset",
             "visits", "allowed_actions", "is_corrective",
@@ -147,6 +147,12 @@ class MaintenanceScheduleSerializer(DateOrder, serializers.ModelSerializer):
 
     current_technician = serializers.SerializerMethodField()
     current_technician_name = serializers.SerializerMethodField()
+    # Who is helping on the open visit: they check in and out, nothing more.
+    current_helpers = serializers.SerializerMethodField()
+
+    def get_current_helpers(self, obj):
+        visit = self._open_visit(obj)
+        return [str(h.pk) for h in visit.helpers.all()] if visit else []
 
     def _open_visit(self, obj):
         return next(
@@ -316,6 +322,18 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     future_dates = ("due_date",)
 
     assigned_to_name = serializers.SerializerMethodField()
+    helper_names = serializers.SerializerMethodField()
+
+    def get_helper_names(self, obj):
+        return [h.get_full_name() or h.username for h in obj.helpers.all()]
+
+    def validate(self, attrs):
+        lead = attrs.get("assigned_to", getattr(self.instance, "assigned_to", None))
+        if lead is not None and lead in (attrs.get("helpers") or []):
+            raise serializers.ValidationError({
+                "helpers": f"{lead.get_full_name() or lead.username} is the technician - a helper is somebody else."
+            })
+        return attrs
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     schedule_title = serializers.CharField(source="schedule.title", read_only=True)
     # What the round came to, once it was closed out.
@@ -405,7 +423,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     class Meta:
         model = MaintenanceVisit
         fields = [
-            "id", "schedule", "schedule_title", "due_date", "assigned_to", "assigned_to_name",
+            "id", "schedule", "schedule_title", "due_date", "assigned_to", "assigned_to_name", "helpers", "helper_names",
             "status", "status_display", "started_at", "record", "notes",
             "start_latitude", "start_longitude",
             "performed_at", "performed_by_name", "cost", "is_billable", "charge_to",

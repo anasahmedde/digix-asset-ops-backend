@@ -1544,3 +1544,26 @@ def test_each_visit_says_when_the_technician_arrived_and_left(parts_job):
 
     mark("check_out", now - timedelta(minutes=5))
     assert _client(parts_job["boss"]).get(url).data["on_site"]["checked_out_at"] is not None
+
+
+@pytest.mark.django_db
+def test_a_helper_goes_on_the_visit_but_only_the_technician_works_it(parts_job):
+    """Assigning with helpers: the job is in the helper's list, the log says
+    who, and starting the visit is still the technician's."""
+    from apps.maintenance.lifecycle import current_visit
+
+    job, tech, boss = parts_job["schedule"], parts_job["tech"], parts_job["boss"]
+    helper = User.objects.create_user(username="visit-helper", password="x", role="technician", first_name="Hamid")
+    due = (timezone.localdate() + timezone.timedelta(days=2)).isoformat()
+    r = _client(boss).post(f"/api/maintenance/schedules/{job.id}/assign/",
+                           {"technician": str(tech.id), "due_date": due, "helpers": [str(helper.id), str(tech.id)]},
+                           format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["helper_names"] == ["Hamid"], "the technician is not also a helper"
+    visit = current_visit(job)
+    assert list(visit.helpers.values_list("pk", flat=True)) == [helper.pk]
+
+    listed = _client(helper).get("/api/maintenance/schedules/", {"technician": str(helper.id)}).data
+    assert str(job.id) in [row["id"] for row in listed.get("results", listed)]
+    assert any("helpers: Hamid" in row["text"] for row in _client(boss).get(f"/api/maintenance/schedules/{job.id}/activity/").data)
+    assert _client(helper).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json").status_code == 403
