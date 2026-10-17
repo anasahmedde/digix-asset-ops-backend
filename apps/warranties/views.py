@@ -33,7 +33,7 @@ class WarrantyViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CapabilityGate]
     read_capability = "view_warranties"
     write_capability = "manage_warranties"
-    filterset_fields = ["status", "warranty_type", "device", "supplier"]
+    filterset_fields = ["warranty_type", "device", "supplier"]
     search_fields = [
         "reference_number", "vendor_reference", "coverage_details", "device__asset_code", "device__display_name",
     ]
@@ -59,6 +59,14 @@ class WarrantyViewSet(viewsets.ModelViewSet):
             qs = qs.filter(warranty_type__in=CLIENT_TYPES)
         elif side == "supplier":
             qs = qs.filter(warranty_type__in=SUPPLIER_TYPES)
+        # ?status= takes the words the screen shows. The stored ones filter
+        # directly; "extended" is running cover that was pushed past its
+        # first end, which the stamp records.
+        status = self.request.query_params.get("status")
+        if status == "extended":
+            qs = qs.filter(status=Warranty.Status.ACTIVE, extended_on__isnull=False)
+        elif status in dict(Warranty.Status.choices):
+            qs = qs.filter(status=status)
         return qs
 
     @action(detail=False, methods=["get"], url_path="export")
@@ -152,7 +160,8 @@ class WarrantyViewSet(viewsets.ModelViewSet):
             warranty.status = Warranty.Status.ACTIVE
         entry = extension_entry(old_end, new_end, request.user, request.data)
         warranty.notes = f"{warranty.notes}\n{entry}" if warranty.notes else entry
-        warranty.save(update_fields=["end_date", "months", "status", "notes", "updated_at"])
+        warranty.extended_on = timezone.localdate()
+        warranty.save(update_fields=["end_date", "months", "status", "notes", "extended_on", "updated_at"])
 
         DeviceLifecycleEvent.objects.create(
             device=warranty.device,

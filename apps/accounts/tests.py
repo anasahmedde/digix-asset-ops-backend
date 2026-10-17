@@ -493,3 +493,24 @@ def test_sign_in_forgives_a_phone_keyboard():
     assert r.status_code == 401
     r = c.post(url, {"username": "Field-Sharjeel", "password": "Other-999"}, format="json")
     assert r.status_code == 200, r.content
+
+
+@pytest.mark.django_db
+def test_the_administrator_arranges_the_menu_for_everyone():
+    from rest_framework.test import APIClient
+
+    admin = User.objects.create_superuser(username="menu-admin", password="x")
+    tech = User.objects.create_user(username="menu-tech", password="x", role="technician")
+
+    def client(u):
+        c = APIClient()
+        c.force_authenticate(u)
+        return c
+
+    assert client(tech).get("/api/accounts/menu-order/").data == {"order": []}, "ships in the default order"
+    order = ["/", "/maintenance", "/warranties", "/assets"]
+    assert client(tech).put("/api/accounts/menu-order/", {"order": order}, format="json").status_code == 403
+    assert client(admin).put("/api/accounts/menu-order/", {"order": "nope"}, format="json").status_code == 400
+    r = client(admin).put("/api/accounts/menu-order/", {"order": order + ["/maintenance"]}, format="json")
+    assert r.status_code == 200 and r.data["order"] == order, "duplicates dropped"
+    assert client(tech).get("/api/accounts/menu-order/").data["order"] == order, "everyone gets it"

@@ -3,7 +3,6 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     ProjectBOMLineViewSet,
-    ProjectBottleneckViewSet,
     ProjectCostLineViewSet,
     ProjectMemberViewSet,
     ProjectMilestoneViewSet,
@@ -13,7 +12,6 @@ from .views import (
 
 router = DefaultRouter()
 router.register("projects", ProjectViewSet, basename="project")
-router.register("bottlenecks", ProjectBottleneckViewSet)
 router.register("members", ProjectMemberViewSet)
 router.register("scope-items", ProjectScopeItemViewSet)
 router.register("milestones", ProjectMilestoneViewSet)

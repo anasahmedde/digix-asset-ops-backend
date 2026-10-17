@@ -28,6 +28,9 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from apps.tickets.models import Ticket, TicketComment
 
+from common import clock
+
+from . import activity
 from .models import MaintenanceSchedule, MaintenanceVisit, MaintenanceVisitPhoto
 
 # ── Who may do what ──────────────────────────────────────────────────────
@@ -272,6 +275,10 @@ def assign_round(job: MaintenanceSchedule, *, user, technician, due_date=None):
     visit.save(update_fields=fields)
     job.assigned_to = technician
     job.save(update_fields=["assigned_to", "updated_at"])
+    activity.log(job, "assigned", (
+        f"{activity.visit_word(visit)} assigned to {activity.name(technician)}"
+        + (f", due {visit.due_date:%d %b %Y}" if visit.due_date else "")
+    ), user=user, visit=visit)
     return visit
 
 
@@ -310,6 +317,9 @@ def assign(job: MaintenanceSchedule, *, user, technician, due_date) -> Maintenan
     _land(ticket, ASSIGN, user, (
         f"Visit {visit.sequence} {'opened for' if made else 'reassigned to'} {who}, due {due_date:%d %b %Y}."
     ))
+    activity.log(job, "assigned" if made else "reassigned", (
+        f"Visit {visit.sequence} {'assigned to' if made else 'reassigned to'} {who}, due {due_date:%d %b %Y}"
+    ), user=user, visit=visit)
     return visit
 
 
@@ -329,7 +339,7 @@ def start(visit: MaintenanceVisit, *, user, where=None) -> MaintenanceVisit:
     _refuse_if_parts_are_missing(visit)
 
     visit.status = MaintenanceVisit.Status.IN_PROGRESS
-    visit.started_at = timezone.now()
+    visit.started_at = clock.now()
     lat, lng = (where or (None, None))
     visit.start_latitude, visit.start_longitude = lat, lng
     visit.save(update_fields=[
@@ -338,6 +348,7 @@ def start(visit: MaintenanceVisit, *, user, where=None) -> MaintenanceVisit:
     job.status = MaintenanceSchedule.Status.IN_PROCESS
     job.save(update_fields=["status", "updated_at"])
     _land(ticket, START, user, f"Visit {visit.sequence} started on site.")
+    activity.log(job, "started", f"{activity.visit_word(visit)} started on site", user=user, visit=visit)
     return visit
 
 
@@ -401,6 +412,28 @@ def outstanding_parts(visit: MaintenanceVisit):
     ]
 
 
+def carry_helpers(previous, nxt) -> None:
+    """The next visit goes with the same helpers (its technician excepted);
+    the office changes them on the visit if the crew is different."""
+    if previous is None:
+        return
+    crew = list(previous.helpers.exclude(pk=nxt.assigned_to_id))
+    if crew:
+        nxt.helpers.set(crew)
+        activity.log(nxt.schedule, "helpers", (
+            f"{activity.visit_word(nxt)} helpers: {', '.join(activity.name(h) for h in crew)} (same as before)"
+        ), visit=nxt)
+
+
+def _work_done(visit: MaintenanceVisit, remarks: str) -> str:
+    """What was done is half of handing the work in - the After photo is the
+    other. Typed in the completion, or written on site as the work went."""
+    text = (remarks or "").strip() or (visit.notes or "").strip()
+    if not text:
+        raise ValidationError({"remarks": "Say what was done (Work done) before completing the visit."})
+    return text
+
+
 def _refuse_while_parts_unreturned(visit: MaintenanceVisit) -> None:
     """The cost of a visit is what it used, so nobody signs it off until the
     technician has said what was used and what is going back."""
@@ -450,6 +483,7 @@ def complete(
         )})
     if not visit.has_after_photo:
         raise ValidationError({"detail": "Upload an AFTER photo before completing the visit."})
+    remarks = _work_done(visit, remarks)
     if resolved is None:
         raise ValidationError({"resolved": "Say whether the fault is fixed."})
     if not resolved and not (remarks or "").strip():
@@ -470,7 +504,7 @@ def complete(
     ) if settlement else None
 
     visit.status = MaintenanceVisit.Status.AWAITING_REVIEW
-    visit.completed_at = timezone.now()
+    visit.completed_at = clock.now()
     visit.resolved = resolved
     visit.remarks = remarks or ""
     visit.save(update_fields=[
@@ -492,6 +526,11 @@ def complete(
     # Not a field on the visit: the caller needs to tell the technician
     # where the leftovers went, and only this call knows.
     visit.return_grn = receipt.grn_number if receipt else None
+    activity.log(visit.schedule, "completed", (
+        f"{activity.visit_word(visit)} completed and sent for review"
+        + ("" if visit.schedule.maintenance_type != "corrective"
+           else " - fault fixed" if visit.resolved else " - fault not fixed")
+    ), user=user, visit=visit)
     return visit
 
 
@@ -533,6 +572,10 @@ def accept(
         f"Visit {visit.sequence} accepted as resolved."
         + (f" {note.strip()}" if note and note.strip() else "")
     ))
+    activity.log(job, "accepted", (
+        f"Visit {visit.sequence} accepted as resolved - job closed"
+        + (f". {note.strip()}" if note and note.strip() else "")
+    ), user=user, visit=visit)
     return visit
 
 
@@ -575,6 +618,7 @@ def mark_unresolved(
         schedule=job, sequence=visit.sequence + 1, due_date=next_due,
         assigned_to=technician, status=MaintenanceVisit.Status.PLANNED,
     )
+    carry_helpers(visit, nxt)
     job.assigned_to = technician
     job.next_due = next_due
     job.status = MaintenanceSchedule.Status.PENDING
@@ -589,6 +633,10 @@ def mark_unresolved(
         + (f" {note.strip()}" if note and note.strip() else "")
         + f" Visit {nxt.sequence} opened for {who}, due {next_due:%d %b %Y}."
     ))
+    activity.log(job, "sent_back", f"Visit {visit.sequence} sent back: {reason}", user=user, visit=visit)
+    activity.log(job, "assigned", (
+        f"Visit {nxt.sequence} opened for {who}, due {next_due:%d %b %Y}"
+    ), user=user, visit=nxt)
     return nxt
 
 
@@ -617,6 +665,7 @@ def complete_round(
         )})
     if not visit.has_after_photo:
         raise ValidationError({"detail": "Upload an AFTER photo before completing the round."})
+    remarks = _work_done(visit, remarks)
 
     # What the store handed over may be squared up here, or once the
     # technician is back from site (return_parts): the field app asks for the
@@ -627,13 +676,18 @@ def complete_round(
     ) if settlement else None
 
     visit.status = MaintenanceVisit.Status.AWAITING_REVIEW
-    visit.completed_at = timezone.now()
+    visit.completed_at = clock.now()
     visit.resolved = True
     visit.remarks = remarks or ""
     visit.save(update_fields=[
         "status", "completed_at", "resolved", "remarks", "updated_at",
     ])
     visit.return_grn = receipt.grn_number if receipt else None
+    activity.log(visit.schedule, "completed", (
+        f"{activity.visit_word(visit)} completed and sent for review"
+        + ("" if visit.schedule.maintenance_type != "corrective"
+           else " - fault fixed" if visit.resolved else " - fault not fixed")
+    ), user=user, visit=visit)
     return visit
 
 
@@ -666,6 +720,16 @@ def accept_round(
     # Writing the register is what rolls the schedule on: the next round
     # opens from here, not from the moment the technician walked away.
     job.advance_after_completion((visit.completed_at or timezone.now()).date())
+    activity.log(job, "accepted", (
+        f"Round {visit.sequence} accepted" + (f". {note.strip()}" if note and note.strip() else "")
+    ), user=user, visit=visit)
+    nxt = job.open_visit()
+    if nxt is not None and nxt.pk != visit.pk:
+        activity.log(job, "planned", (
+            f"Round {nxt.sequence} planned"
+            + (f" for {activity.name(nxt.assigned_to)}" if nxt.assigned_to_id else "")
+            + (f", due {nxt.due_date:%d %b %Y}" if nxt.due_date else "")
+        ), user=user, visit=nxt)
     return visit
 
 
@@ -711,10 +775,15 @@ def send_round_back(
         schedule=job, sequence=visit.sequence + 1, due_date=next_due,
         assigned_to=technician, status=MaintenanceVisit.Status.PLANNED,
     )
+    carry_helpers(visit, nxt)
     job.assigned_to = technician
     job.next_due = next_due
     job.status = MaintenanceSchedule.Status.PENDING
     job.save(update_fields=["assigned_to", "next_due", "status", "updated_at"])
+    activity.log(job, "sent_back", f"Round {visit.sequence} sent back: {reason}", user=user, visit=visit)
+    activity.log(job, "assigned", (
+        f"Round {nxt.sequence} opened for {activity.name(technician)}, due {next_due:%d %b %Y}"
+    ), user=user, visit=nxt)
     return nxt
 
 
@@ -736,6 +805,7 @@ def cancel(job: MaintenanceSchedule, *, user, reason: str) -> Ticket:
     job.save(update_fields=["status", "is_active", "updated_at"])
 
     _land(ticket, CANCEL, user, f"Cancelled: {reason.strip()}")
+    activity.log(job, "cancelled", f"Job cancelled: {reason.strip()}", user=user)
     release_asset_for_cancelled_ticket(ticket, user, reason)
     return ticket
 
@@ -778,6 +848,17 @@ def component_costs(visit: MaintenanceVisit, prices=None):
             "unit_cost": unit,
             "amount": (unit * qty).quantize(Decimal("0.01")) if unit is not None else Decimal("0.00"),
         })
+    # Bought on site: the receipt says what it cost, so it prices itself.
+    for bought in visit.purchases.all():
+        qty = Decimal(bought.quantity)
+        out.append({
+            "part_request": None,
+            "purchase": str(bought.pk),
+            "description": f"Bought on site: {bought.description}" + (f" ({bought.shop})" if bought.shop else ""),
+            "quantity": qty,
+            "unit_cost": (bought.amount / qty).quantize(Decimal("0.01")),
+            "amount": bought.amount,
+        })
     return out
 
 
@@ -788,7 +869,9 @@ def price_the_visit(record, visit: MaintenanceVisit, extra=None, prices=None):
     record.cost_lines.all().delete()
     lines = [
         MaintenanceCostLine(
-            record=record, source=MaintenanceCostLine.Source.COMPONENT,
+            record=record,
+            source=(MaintenanceCostLine.Source.PURCHASE if row.get("purchase")
+                    else MaintenanceCostLine.Source.COMPONENT),
             description=row["description"], quantity=row["quantity"],
             unit_cost=row["unit_cost"], amount=row["amount"],
         )

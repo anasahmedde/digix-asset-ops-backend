@@ -232,38 +232,21 @@ def test_delay_create_restricted(ops, tech, installation):
 
 
 @pytest.mark.django_db
-def test_custom_step_pipeline(ops, installation):
-    fresh = Device.objects.create(asset_code="AST-PIPE-1", serial_number="PIPE-1")
-    r = _client(ops).post("/api/sites/installations/", {
-        "device": str(fresh.id),
-        "site": str(installation.site_id),
-        "installed_at": timezone.now().isoformat(),
-        "step_types": ["survey", "programming", "handover"],
-    }, format="json")
-    assert r.status_code == 201, r.content
-    steps = r.data["steps"]
-    assert [s["step_type"] for s in steps] == ["survey", "programming", "handover"]
-    assert [s["step_number"] for s in steps] == [1, 2, 3]
-
-
-@pytest.mark.django_db
-def test_custom_named_steps_and_vendor(ops, installation):
-    from apps.suppliers.models import Supplier
-
-    vendor = Supplier.objects.create(name="Rigging Co")
-    fresh = Device.objects.create(asset_code="AST-RIG-1", serial_number="RIG-1")
-    r = _client(ops).post("/api/sites/installations/", {
-        "device": str(fresh.id),
-        "site": str(installation.site_id),
-        "installed_at": timezone.now().isoformat(),
-        "vendor": str(vendor.pk),
-        "step_types": ["survey", "Crane lift", "handover"],
-    }, format="json")
-    assert r.status_code == 201, r.content
-    assert r.data["vendor_name"] == "Rigging Co"
-    steps = r.data["steps"]
-    assert [s["step_type"] for s in steps] == ["survey", "other", "handover"]
-    assert steps[1]["step_type_display"] == "Crane lift"
+def test_an_installation_is_not_added_by_hand(ops, installation):
+    """A job opens when the asset is assigned to a technician, at the end of
+    its own road; the tracker has no "New Installation", and nor does the
+    API - not even for the Administrator."""
+    fresh = Device.objects.create(asset_code="AST-HAND-1", serial_number="HAND-1")
+    body = {
+        "device": str(fresh.id), "site": str(installation.site_id),
+        "installed_at": timezone.now().isoformat(), "step_types": ["survey", "handover"],
+    }
+    admin = User.objects.create_superuser(username="inst-admin", password="x", email="a@x.io")
+    for who in (ops, admin):
+        r = _client(who).post("/api/sites/installations/", body, format="json")
+        assert r.status_code == 405, r.content
+        assert "not added by hand" in str(r.data["detail"])
+    assert not DeviceInstallation.objects.filter(device=fresh).exists()
 
 
 @pytest.mark.django_db
@@ -633,7 +616,8 @@ def test_installations_export_happy_path(ops, installation):
     assert row[2] == "Install Site"
     assert row[3] == "Primary Client, Second Client"
     assert row[4] == "Tariq Installer"
-    assert row[8] == 50  # 1 of 2 steps completed
+    # 3 of the 5 work steps, then Active and Handover still to come: 3/7.
+    assert row[8] == 43
     assert row[9] == "No"  # not escalated
 
     log = _AuditLog.objects.filter(action="export", resource_type="installation").latest("created_at")
@@ -1586,39 +1570,32 @@ def test_a_live_assets_installation_steps_are_a_record():
 
 
 @pytest.mark.django_db
-def test_an_asset_is_on_the_tracker_once(ops, installation):
-    """The same asset appeared twice — once finished, once at 0% — and the
-    second one could not be taken away again."""
-    body = {
-        "device": str(installation.device_id),
-        "site": str(installation.site_id),
-        "installed_at": timezone.now().isoformat(),
-    }
-    again = _client(ops).post("/api/sites/installations/", body, format="json")
-    assert again.status_code == 400, again.content
-    assert "already on the tracker" in str(again.data["device"])
-
-    # Moving it is still possible: once the old job records that the asset
-    # came down, a new one can be opened where it is going.
-    installation.removed_at = timezone.now()
-    installation.save(update_fields=["removed_at"])
-    moved = _client(ops).post("/api/sites/installations/", body, format="json")
-    assert moved.status_code == 201, moved.content
-
-    # And a job that was opened by mistake can be removed — but not one the
-    # client has signed for.
-    gone = _client(ops).delete(f"/api/sites/installations/{moved.data['id']}/")
-    assert gone.status_code == 204, gone.content
+def test_an_installation_record_is_never_deleted(ops, installation):
+    """The tracker has no Remove button and the API refuses the delete for
+    everyone, the Administrator included, before handover and after."""
     from apps.sites.models import HandoverRecord
+    from apps.sites.services import open_installation_for
 
+    admin = User.objects.create_superuser(username="inst-admin2", password="x", email="b@x.io")
+    for who in (ops, admin):
+        r = _client(who).delete(f"/api/sites/installations/{installation.id}/")
+        assert r.status_code == 405, r.content
+        assert "cannot be deleted" in str(r.data["detail"])
     HandoverRecord.objects.create(
         installation=installation, device=installation.device,
         client=installation.device.assigned_client, site=installation.site,
         handover_date=timezone.localdate(), accepted_by_name="Client POC",
     )
-    kept = _client(ops).delete(f"/api/sites/installations/{installation.id}/")
-    assert kept.status_code == 400
-    assert "handed over" in str(kept.data)
+    assert _client(admin).delete(f"/api/sites/installations/{installation.id}/").status_code == 405
+    assert DeviceInstallation.objects.filter(pk=installation.pk).exists()
+
+    # The one way in stays single: assigning the same asset again keeps its job.
+    device = installation.device
+    device.current_site = installation.site
+    device.assigned_technician = installation.installed_by
+    device.save(update_fields=["current_site", "assigned_technician"])
+    assert open_installation_for(device) == installation
+    assert DeviceInstallation.objects.filter(device=device).count() == 1
 
 
 @pytest.mark.django_db
@@ -1633,18 +1610,28 @@ def test_steps_are_done_in_order_and_say_who_did_them(ops, tech, installation):
     assert "before this one" in str(r.data["status"])
 
     first = steps[0]
-    _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json")
+    me = tech.get_full_name() or tech.username
+    r = _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json")
+    assert r.data["started_by_name"] == me, "the card names who pressed Start"
+    # A hold and a resume by somebody else keep the first starter: the work began then.
+    _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "on_hold"}, format="json")
+    r = _client(ops).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["started_by_name"] == me
     r = _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json")
     assert r.status_code == 200, r.content
-    assert r.data["completed_by_name"] == (tech.get_full_name() or tech.username)
+    assert r.data["completed_by_name"] == me
     assert r.data["completed_at"] is not None
 
-    # Skipping is the way past a step that does not apply.
+    # Steps are not skipped - the web never offered it, and a skipped
+    # checklist read 0% on a job that was live and handed over.
     r = _client(tech).patch(f"/api/sites/installation-steps/{steps[1].id}/", {"status": "skipped"}, format="json")
-    assert r.status_code == 200, r.content
-    _client(tech).patch(f"/api/sites/installation-steps/{later.id}/", {"status": "in_progress"}, format="json")
-    r = _client(tech).patch(f"/api/sites/installation-steps/{later.id}/", {"status": "completed"}, format="json")
-    assert r.status_code == 200, r.content
+    assert r.status_code == 400, r.content
+    assert "not skipped" in str(r.data["status"])
+    for st in (steps[1], later):
+        _client(tech).patch(f"/api/sites/installation-steps/{st.id}/", {"status": "in_progress"}, format="json")
+        r = _client(tech).patch(f"/api/sites/installation-steps/{st.id}/", {"status": "completed"}, format="json")
+        assert r.status_code == 200, r.content
 
 
 @pytest.mark.django_db
@@ -1878,3 +1865,130 @@ def test_the_installer_adds_and_removes_unworked_steps_on_their_own_job(tech, in
         "installation": str(installation.id), "step_type": "other", "custom_label": "Not mine",
     }, format="json")
     assert r.status_code == 403, r.content
+
+
+@pytest.mark.django_db
+def test_an_installation_keeps_a_history_of_who_did_what_and_when(ops, tech, installation):
+    """CR-08: moving a step, editing the job and flagging a delay each leave
+    a line on the installation, with the person and the time."""
+    first = installation.steps.order_by("step_number").first()
+    c = _client(tech)
+    assert c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json").status_code == 200
+    assert c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json").status_code == 200
+    r = _client(ops).patch(f"/api/sites/installations/{installation.id}/", {"position_label": "Main entrance"}, format="json")
+    assert r.status_code == 200, r.content
+    r = c.post("/api/sites/installation-delays/", {"installation": str(installation.id), "cause": "client"}, format="json")
+    assert r.status_code == 201, r.content
+
+    r = _client(ops).get(f"/api/sites/installations/{installation.id}/activity/")
+    assert r.status_code == 200, r.content
+    texts = [(row["action"], row["text"], row["actor"]) for row in r.data]
+    me = tech.get_full_name() or tech.username
+    step = first.custom_label or first.get_step_type_display()
+    assert ("step_in_progress", f"{step} started", me) in texts
+    assert ("step_completed", f"{step} completed", me) in texts
+    assert any(a == "edited" and "location at site" in t for a, t, _ in texts)
+    assert any(a == "delay" and t.startswith("Delay flagged: Client") for a, t, _ in texts)
+    assert all(row["at"] for row in r.data)
+
+
+@pytest.mark.django_db
+def test_the_signed_handover_is_filed_with_the_documents(ops, handover_ready):
+    """The signed sheet shows under the installation's Related Documents and
+    the asset's Documents - the same file the handover record keeps."""
+    from apps.infrastructure.models import Document
+    from apps.sites.models import HandoverRecord
+
+    job = handover_ready["job"]
+    r = _client(ops).post(f"/api/sites/installations/{job.id}/handover/",
+                          {"accepted_by_name": "Site Manager", "signed_document": _signed_page()}, format="multipart")
+    assert r.status_code in (200, 201), r.content
+    record = HandoverRecord.objects.get(installation=job)
+    doc = Document.objects.get(installation=job, doc_type="handover")
+    assert doc.device_id == job.device_id and doc.file.name == record.signed_document.name
+    for params in ({"installation": str(job.id)}, {"device": str(job.device_id)}):
+        rows = _client(ops).get("/api/infrastructure/documents/", params).data
+        assert any(d["id"] == str(doc.id) for d in rows.get("results", rows)), params
+    assert _client(ops).get(f"/api/sites/installations/{job.id}/").data["progress"] == 100
+
+
+@pytest.mark.django_db
+def test_progress_counts_active_and_handover_and_ignores_skipped_steps(installation):
+    """Older jobs have skipped steps; a skipped checklist read 0% even after
+    the asset went live. Active and Handover are the last two stages."""
+    from apps.sites.models import InstallationStep
+    from apps.sites.serializers import installation_progress
+
+    work = list(installation.steps.exclude(step_type="handover"))
+    InstallationStep.objects.filter(pk__in=[s.pk for s in work]).update(status="skipped")
+    device = installation.device
+    device.status = "installed"
+    device.save(update_fields=["status"])
+    installation.refresh_from_db()
+    assert installation_progress(installation) == 0
+    device.status = "active"
+    device.save(update_fields=["status"])
+    installation.refresh_from_db()
+    assert installation_progress(installation) == 50, "live, not yet handed over"
+
+
+@pytest.mark.django_db
+def test_the_handover_document_lists_the_steps_as_they_are_now(ops, installation):
+    """Steps added during the job appear on the certificate, numbered in
+    order, followed by Active and Handover."""
+    pypdf = pytest.importorskip("pypdf")
+    from io import BytesIO
+
+    from apps.sites.models import InstallationStep
+
+    InstallationStep.objects.create(installation=installation, step_type="other",
+                                    custom_label="Extra bracket", step_number=99)
+    r = _client(ops).get(f"/api/sites/installations/{installation.id}/handover-document/")
+    assert r.status_code == 200, r.content
+    text = "".join(p.extract_text() for p in pypdf.PdfReader(BytesIO(r.content)).pages)
+    assert "Installation steps" in text and "Extra bracket" in text
+    assert "Active" in text and "On signature" in text
+
+
+@pytest.mark.django_db
+def test_a_helper_is_on_the_job_but_only_the_installer_works_it(ops, tech, installation):
+    """Helpers: the job shows in their app (crew), the office is told who they
+    are, and a step is still the installer's to move."""
+    from apps.notifications.models import Notification
+
+    helper = User.objects.create_user(username="site-helper", password="x", role="technician", first_name="Hamid")
+    url = f"/api/sites/installations/{installation.id}/"
+    assert _client(ops).patch(url, {"helpers": [str(tech.id)]}, format="json").status_code == 400, "the installer is not a helper"
+    r = _client(ops).patch(url, {"helpers": [str(helper.id)]}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["helpers"] == [helper.id] or [str(h) for h in r.data["helpers"]] == [str(helper.id)]
+    assert r.data["helper_names"] == ["Hamid"]
+    assert Notification.objects.filter(recipient=helper, title__icontains="helping").exists()
+    texts = [row["text"] for row in _client(ops).get(f"{url}activity/").data]
+    assert "Helpers: Hamid" in texts
+
+    mine = _client(helper).get("/api/sites/installations/", {"crew": str(helper.id)}).data
+    assert [row["id"] for row in mine.get("results", mine)] == [str(installation.id)]
+    step = installation.steps.exclude(step_type="handover").order_by("step_number").first()
+    r = _client(helper).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 403, "a helper checks in and out; the installer works the steps"
+
+
+@pytest.mark.django_db
+def test_helpers_named_with_the_asset_assignment_land_on_the_installation(ops, tech):
+    """Assigning an asset for installation names its installer and helpers in
+    one go; the installation it opens carries both."""
+    from apps.sites.models import DeviceInstallation
+
+    helper = User.objects.create_user(username="assign-helper", password="x", role="technician")
+    site = Site.objects.create(name="Assign Site", city="Lahore")
+    device = Device.objects.create(asset_code="AST-HELP-1", status="in_stock", current_site=site)
+    r = _client(ops).post(f"/api/assets/devices/{device.id}/transition/", {
+        "status": "assigned", "reason": "Assigned for installation", "assigned_technician": str(tech.id),
+        "installation_date": (timezone.localdate() + timezone.timedelta(days=5)).isoformat(),
+        "helpers": [str(helper.id), str(tech.id)],
+    }, format="json")
+    assert r.status_code == 200, r.content
+    job = DeviceInstallation.objects.get(device=device)
+    assert job.installed_by == tech
+    assert list(job.helpers.values_list("pk", flat=True)) == [helper.pk]

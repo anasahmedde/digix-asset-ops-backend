@@ -8,7 +8,6 @@ from .models import (
     BOMAllocation,
     Project,
     ProjectBOMLine,
-    ProjectBottleneck,
     ProjectMember,
     ProjectMilestone,
     ProjectScopeItem,
@@ -55,15 +54,6 @@ class ProjectBOMLineSerializer(HidesMoney, serializers.ModelSerializer):
         if value <= 0:
             raise serializers.ValidationError("Quantity must be a positive integer.")
         return value
-
-
-class ProjectBottleneckSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ProjectBottleneck
-        fields = [
-            "id", "project", "title", "severity", "is_resolved", "resolved_at", "created_at",
-        ]
-        read_only_fields = ["id", "created_at"]
 
 
 class ProjectMemberSerializer(serializers.ModelSerializer):
@@ -155,7 +145,6 @@ class ProjectListSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, se
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     manager_name = serializers.CharField(source="manager.get_full_name", read_only=True, default=None)
-    bottleneck_count = serializers.IntegerField(read_only=True, default=0)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     phase_display = serializers.CharField(source="get_phase_display", read_only=True)
     contract_type_display = serializers.CharField(source="get_contract_type_display", read_only=True)
@@ -182,7 +171,7 @@ class ProjectListSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, se
             "phase", "phase_display", "resume_phase", "progress",
             "contract_type", "contract_type_display", "rental_end_date",
             "start_date", "target_date", "completed_date",
-            "manager", "manager_name", "bottleneck_count", "created_at",
+            "manager", "manager_name", "created_at",
             "assets_count", "sites", "site_names",
         ]
 
@@ -205,7 +194,6 @@ class ProjectDetailSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, 
     )
     site_name = serializers.CharField(source="site.name", read_only=True, default=None)
     manager_name = serializers.CharField(source="manager.get_full_name", read_only=True, default=None)
-    bottlenecks = ProjectBottleneckSerializer(many=True, read_only=True)
     members = ProjectMemberSerializer(many=True, read_only=True)
     scope_items = ProjectScopeItemSerializer(many=True, read_only=True)
     milestones = ProjectMilestoneSerializer(many=True, read_only=True)
@@ -234,7 +222,7 @@ class ProjectDetailSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, 
             "contract_type", "contract_type_display", "rental_end_date",
             "progress", "start_date", "target_date", "completed_date",
             "manager", "manager_name", "budget", "notes", "sites", "site_names",
-            "bottlenecks", "members", "scope_items", "milestones",
+            "members", "scope_items", "milestones",
             "phase_progress", "created_at", "updated_at",
         ]
         # The budget is what planning arrives at and approval freezes — not a

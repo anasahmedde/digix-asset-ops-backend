@@ -1477,3 +1477,120 @@ def test_the_technician_writes_up_the_work_as_it_goes(parts_job):
     assert visit.notes == "Office addendum"
     # A plain PATCH is still the planner's: the technician cannot rewrite the round.
     assert _client(parts_job["tech"]).patch(f"/api/maintenance/visits/{visit.id}/", {"notes": "x"}, format="json").status_code == 403
+
+
+@pytest.mark.django_db
+def test_a_job_keeps_a_history_of_who_did_what_and_when(parts_job):
+    """CR-08: assigning, asking for a part, approving it and the store
+    issuing it each leave a line on the job, with the person and the time."""
+    from apps.accounts.models import User
+    from apps.inventory.models import IssuanceRequest
+    from apps.maintenance import activity
+
+    job = parts_job["schedule"]
+    store = User.objects.create_user(username="hist-store", password="x", role="warehouse")
+    tech = parts_job["tech"].get_full_name() or parts_job["tech"].username
+    boss = parts_job["boss"].get_full_name() or parts_job["boss"].username
+
+    line_id = _approved_line(parts_job, quantity=3)
+    issuance = IssuanceRequest.objects.get(maintenance_part_request=line_id)
+    r = _client(store).post(f"/api/inventory/issuance-requests/{issuance.id}/issue/",
+                            {"quantity": 3, "received_by": tech}, format="json")
+    assert r.status_code == 200, r.content
+    activity.log(job, "notes", "Work done saved", user=parts_job["tech"])
+
+    r = _client(parts_job["boss"]).get(f"/api/maintenance/schedules/{job.id}/activity/")
+    assert r.status_code == 200, r.content
+    rows = r.data
+    by_action = {row["action"]: row for row in rows}
+    assert by_action["part_requested"]["actor"] == tech
+    assert by_action["part_approved"]["actor"] == boss
+    assert "Store issued 3" in by_action["part_issued"]["text"]
+    assert all(row["at"] for row in rows), "every line says when"
+    assert [row["at"] for row in rows] == sorted((row["at"] for row in rows), reverse=True), "newest first"
+    # The technician reads their job's history too.
+    assert _client(parts_job["tech"]).get(f"/api/maintenance/schedules/{job.id}/activity/").status_code == 200
+
+
+@pytest.mark.django_db
+def test_each_visit_says_when_the_technician_arrived_and_left(parts_job):
+    """The visit history shows the check-in the work began under and the
+    check-out after it - not some other day's attendance."""
+    from datetime import timedelta
+
+    from apps.attendance.models import AttendanceRecord
+    from apps.maintenance.lifecycle import current_visit
+
+    job, tech = parts_job["schedule"], parts_job["tech"]
+    visit = current_visit(job)
+    now = timezone.now()
+
+    def mark(kind, at, site=job.site):
+        r = AttendanceRecord.objects.create(user=tech, check_type=kind, site=site)
+        AttendanceRecord.objects.filter(pk=r.pk).update(created_at=at)
+
+    url = f"/api/maintenance/visits/{visit.id}/"
+    assert _client(parts_job["boss"]).get(url).data["on_site"] is None, "not started: nothing to show"
+
+    mark("check_in", now - timedelta(days=3))           # an old trip
+    mark("check_out", now - timedelta(days=3, hours=-1))
+    mark("check_in", now - timedelta(hours=2))          # this one
+    visit.started_at = now - timedelta(hours=1)
+    visit.status = "in_progress"
+    visit.save(update_fields=["started_at", "status"])
+    on = _client(parts_job["boss"]).get(url).data["on_site"]
+    assert on["checked_in_at"] and on["checked_out_at"] is None
+    assert abs((on["checked_in_at"] - (now - timedelta(hours=2))).total_seconds()) < 2
+
+    mark("check_out", now - timedelta(minutes=5))
+    assert _client(parts_job["boss"]).get(url).data["on_site"]["checked_out_at"] is not None
+
+
+@pytest.mark.django_db
+def test_a_helper_goes_on_the_visit_but_only_the_technician_works_it(parts_job):
+    """Assigning with helpers: the job is in the helper's list, the log says
+    who, and starting the visit is still the technician's."""
+    from apps.maintenance.lifecycle import current_visit
+
+    job, tech, boss = parts_job["schedule"], parts_job["tech"], parts_job["boss"]
+    helper = User.objects.create_user(username="visit-helper", password="x", role="technician", first_name="Hamid")
+    due = (timezone.localdate() + timezone.timedelta(days=2)).isoformat()
+    r = _client(boss).post(f"/api/maintenance/schedules/{job.id}/assign/",
+                           {"technician": str(tech.id), "due_date": due, "helpers": [str(helper.id), str(tech.id)]},
+                           format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["helper_names"] == ["Hamid"], "the technician is not also a helper"
+    visit = current_visit(job)
+    assert list(visit.helpers.values_list("pk", flat=True)) == [helper.pk]
+
+    listed = _client(helper).get("/api/maintenance/schedules/", {"technician": str(helper.id)}).data
+    assert str(job.id) in [row["id"] for row in listed.get("results", listed)]
+    assert any("helpers: Hamid" in row["text"] for row in _client(boss).get(f"/api/maintenance/schedules/{job.id}/activity/").data)
+    assert _client(helper).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json").status_code == 403
+
+
+@pytest.mark.django_db
+def test_helpers_change_while_the_visit_is_open_and_go_on_to_the_next_visit(parts_job):
+    """The office changes helpers on an open visit (not only while it can be
+    reassigned), and a visit sent back goes again with the same helpers."""
+    from apps.maintenance import lifecycle
+    from apps.maintenance.lifecycle import current_visit
+
+    job, tech, boss = parts_job["schedule"], parts_job["tech"], parts_job["boss"]
+    helper = User.objects.create_user(username="carry-helper", password="x", role="technician")
+    visit = current_visit(job)
+    visit.status = "in_progress"
+    visit.assigned_to = tech
+    visit.save(update_fields=["status", "assigned_to"])
+
+    url = f"/api/maintenance/visits/{visit.id}/helpers/"
+    assert _client(tech).post(url, {"helpers": [str(helper.id)]}, format="json").status_code == 403, "the office's call"
+    r = _client(boss).post(url, {"helpers": [str(helper.id), str(tech.id)]}, format="json")
+    assert r.status_code == 200, r.content
+    assert list(visit.helpers.values_list("pk", flat=True)) == [helper.pk], "under way, and the technician is not a helper"
+
+    visit.status = "awaiting_review"
+    visit.save(update_fields=["status"])
+    nxt = lifecycle.send_round_back(visit, user=boss, reason="Not finished", technician=tech,
+                                    next_due=timezone.localdate() + timezone.timedelta(days=3))
+    assert list(nxt.helpers.values_list("pk", flat=True)) == [helper.pk], "the same crew goes again"

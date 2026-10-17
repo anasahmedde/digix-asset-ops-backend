@@ -2084,3 +2084,29 @@ def test_a_technician_without_view_stock_still_reads_what_the_store_carries(item
     assert all(row["unit_cost"] is None for row in c.get("/api/inventory/items/").data["results"])
     assert c.get("/api/inventory/items/export/").status_code == 403
     assert c.get(f"/api/inventory/items/{items[0].id}/batches/").status_code == 403
+
+
+@pytest.mark.django_db
+def test_the_goods_received_note_names_who_received_and_inspected(inspector, received_line):
+    """The GRN PDF: the order, the line with its batch, who received it and who
+    inspected it - and the receipt names the receiver even without a full name."""
+    from io import BytesIO
+
+    line = received_line["line"]
+    store = User.objects.create_user(username="grn-store", password="x", role="warehouse")
+    line.receipt.received_by = store
+    line.receipt.save(update_fields=["received_by"])
+    _client(inspector).post(f"/api/inventory/receipt-lines/{line.id}/inspect/",
+                            {"route": "generic", "accepted_quantity": 10, "notes": "All good"}, format="json")
+
+    c = _client(inspector)
+    assert c.get(f"/api/inventory/receipts/{line.receipt_id}/").data["received_by_name"] == "grn-store"
+    r = c.get(f"/api/inventory/receipts/{line.receipt_id}/document/")
+    assert r.status_code == 200, r.content
+    assert r["Content-Type"] == "application/pdf"
+    assert line.receipt.grn_number in r["Content-Disposition"]
+    pypdf = pytest.importorskip("pypdf")  # not in requirements/base.txt; read it where installed
+    text = "".join(page.extract_text() for page in pypdf.PdfReader(BytesIO(r.content)).pages)
+    for expected in ("GOODS RECEIVED NOTE", line.receipt.grn_number, received_line["po"].po_number,
+                     "Insp Supplier", "DN-1", "Batch BATCH-9", "grn-store", "insp-supervisor", "All good"):
+        assert expected in text, expected

@@ -1,6 +1,8 @@
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
+from common import clock
 from common.models import TimeStampedModel
 from common.utils import upload_to_path
 
@@ -75,6 +77,11 @@ class DeviceInstallation(TimeStampedModel):
     zone = models.ForeignKey(SiteZone, on_delete=models.SET_NULL, null=True, blank=True, related_name="installations")
     installed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="installations_done"
+    )
+    # More hands on the same job. The installer (the lead) works every step;
+    # a helper checks in and out at the site and nothing more.
+    helpers = models.ManyToManyField(
+        settings.AUTH_USER_MODEL, blank=True, related_name="installations_helped",
     )
     vendor = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True,
@@ -156,6 +163,12 @@ class InstallationStep(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="installation_steps_completed",
     )
+    # Who pressed Start on it - the technician on site, from the field app.
+    # A resume after a hold keeps the first name: the work began then.
+    started_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installation_steps_started",
+    )
 
     class Meta:
         ordering = ["step_number"]
@@ -166,12 +179,12 @@ class InstallationStep(TimeStampedModel):
 
         # Stamp the timeline automatically as the step advances.
         if self.status == self.StepStatus.IN_PROGRESS and not self.started_at:
-            self.started_at = timezone.now()
+            self.started_at = clock.now()
         if self.status == self.StepStatus.COMPLETED:
             if not self.started_at:
-                self.started_at = timezone.now()
+                self.started_at = clock.now()
             if not self.completed_at:
-                self.completed_at = timezone.now()
+                self.completed_at = clock.now()
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -310,3 +323,27 @@ class InstallationRouteTemplateStep(TimeStampedModel):
     def __str__(self):
         label = self.custom_label or self.get_step_type_display()
         return f"{self.template.asset_type.name} · {self.step_number}. {label}"
+
+
+class InstallationActivity(TimeStampedModel):
+    """One thing somebody did on an installation, and when: assigned, a step
+    started or completed, the asset scanned, a delay, live, handed over."""
+
+    installation = models.ForeignKey(DeviceInstallation, on_delete=models.CASCADE, related_name="activity")
+    step = models.ForeignKey(
+        InstallationStep, on_delete=models.SET_NULL, null=True, blank=True, related_name="activity",
+    )
+    action = models.CharField(max_length=40)
+    text = models.CharField(max_length=500)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    at = models.DateTimeField(default=clock.now, db_index=True)
+
+    class Meta:
+        ordering = ["-at", "-created_at"]
+        indexes = [models.Index(fields=["installation", "-at"])]
+
+    def __str__(self):
+        return f"{self.installation} - {self.text}"
+
