@@ -37,7 +37,17 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
         return qs.filter(Q(user=user) | Q(user__reports_to=user))
 
     def perform_create(self, serializer):
-        record = serializer.save(user=self.request.user)
+        from .presence import on_duty
+
+        user = self.request.user
+        # Time in is how worked hours are counted, so a field person who
+        # checks in at a job without having timed in is timed in by it.
+        starts_day = (
+            serializer.validated_data.get("check_type") == AttendanceRecord.CheckType.CHECK_IN
+            and getattr(user, "is_field_staff", False)
+            and not on_duty(user)
+        )
+        record = serializer.save(user=user)
         if clock.offline():
             # Sent from the phone's outbox: the record is dated when it
             # happened, and says it arrived later.
@@ -46,6 +56,12 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
                 created_at=when, recorded_offline=True, uploaded_at=arrived,
             )
             record.created_at, record.recorded_offline, record.uploaded_at = when, True, arrived
+        if starts_day:
+            DutyRecord.objects.create(
+                user=user, kind=DutyRecord.Kind.TIME_IN, at=record.created_at, automatic=True,
+                latitude=record.latitude, longitude=record.longitude, accuracy=record.accuracy,
+                recorded_offline=record.recorded_offline, uploaded_at=record.uploaded_at,
+            )
 
     @action(detail=False, methods=["get"])
     def status(self, request):
@@ -104,9 +120,10 @@ class DutyRecordViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, viewsets
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         kind = serializer.validated_data["kind"]
+        from .presence import on_duty as timed_in
+
         when = clock.now()
-        last = DutyRecord.objects.filter(user=request.user, at__lte=when).order_by("-at").first()
-        on_duty = bool(last and last.kind == DutyRecord.Kind.TIME_IN)
+        on_duty = timed_in(request.user)
         if kind == DutyRecord.Kind.TIME_IN and on_duty:
             raise ValidationError({"detail": "You are already timed in."})
         if kind == DutyRecord.Kind.TIME_OUT and not on_duty:

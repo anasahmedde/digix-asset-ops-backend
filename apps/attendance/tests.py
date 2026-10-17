@@ -5,6 +5,17 @@ from apps.accounts.models import User, UserCapability
 from apps.sites.models import Site
 
 
+def _timed_in(user, hours=6):
+    """The working day began earlier: Time in comes before any check-in."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.attendance.models import DutyRecord
+
+    DutyRecord.objects.create(user=user, kind="time_in", at=timezone.now() - timedelta(hours=hours))
+
+
 @pytest.mark.django_db
 def test_a_technician_checks_in_and_reads_it_back_without_the_register():
     """Clocking in and asking "am I in?" are the person's own business; the
@@ -17,8 +28,16 @@ def test_a_technician_checks_in_and_reads_it_back_without_the_register():
     c = APIClient()
     c.force_authenticate(tech)
 
-    r = c.post("/api/attendance/records/", {"check_type": "check_in", "site": str(site.id)}, format="json")
+    # Not timed in yet: checking in at a job times them in, at that moment
+    # and place, marked as started by the check-in.
+    from apps.attendance.models import DutyRecord
+
+    r = c.post("/api/attendance/records/", {"check_type": "check_in", "site": str(site.id),
+                                            "latitude": "31.5204000", "longitude": "74.3587000"}, format="json")
     assert r.status_code == 201, r.content
+    auto = DutyRecord.objects.get(user=tech)
+    assert auto.kind == "time_in" and auto.automatic and str(auto.latitude) == "31.5204000"
+    assert c.get("/api/attendance/duty/status/").data["on_duty"] is True
     r = c.get("/api/attendance/records/status/")
     assert r.status_code == 200, r.content
     assert r.data["checked_in"] is True and str(r.data["last"]["site"]) == str(site.id)
@@ -45,6 +64,7 @@ def test_an_act_recorded_offline_is_dated_when_it_happened_and_sent_once(setting
     from apps.attendance.models import AttendanceRecord
 
     tech = User.objects.create_user(username="off-tech", password="x", role="technician", is_field_staff=True)
+    _timed_in(tech)
     site = Site.objects.create(name="Basement Mall", address="Lahore")
     c = APIClient()
     c.force_authenticate(tech)
@@ -84,6 +104,7 @@ def test_an_offline_act_is_judged_by_where_the_person_was_at_the_time():
     from common import clock
 
     tech = User.objects.create_user(username="off-tech2", password="x", role="technician", is_field_staff=True)
+    _timed_in(tech)
     a = Site.objects.create(name="Site A", address="Lahore")
     b = Site.objects.create(name="Site B", address="Lahore")
     c = APIClient()

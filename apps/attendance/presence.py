@@ -15,6 +15,18 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from .models import AttendanceRecord
 
 
+def on_duty(user) -> bool:
+    """Timed in (Time in / Time out), as of the act: an offline check-in is
+    judged by whether they had timed in by then."""
+    from .models import DutyRecord
+
+    last = (
+        DutyRecord.objects.filter(user=user, at__lte=clock.now())
+        .order_by("-at").values_list("kind", flat=True).first()
+    )
+    return last == DutyRecord.Kind.TIME_IN
+
+
 def clocked_in_at(user, site_id) -> bool:
     """True when the person's latest attendance record is a check-in at this site."""
     # Judged as of the act: a scan recorded offline at 10:30 asks where the

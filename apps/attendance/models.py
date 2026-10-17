@@ -57,6 +57,9 @@ class DutyRecord(TimeStampedModel):
     latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
     longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
     accuracy = models.FloatField(null=True, blank=True, help_text="GPS accuracy in metres")
+    # Somebody who checks in at a job without having timed in has started
+    # work all the same: the check-in times them in, and says so.
+    automatic = models.BooleanField(default=False, help_text="Started by a site check-in, not by pressing Time in")
     recorded_offline = models.BooleanField(default=False)
     uploaded_at = models.DateTimeField(null=True, blank=True)
 

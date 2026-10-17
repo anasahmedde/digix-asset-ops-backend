@@ -36,9 +36,9 @@ class DutyRecordSerializer(serializers.ModelSerializer):
         model = DutyRecord
         fields = [
             "id", "user", "user_name", "kind", "kind_display", "at",
-            "latitude", "longitude", "accuracy", "recorded_offline", "uploaded_at",
+            "latitude", "longitude", "accuracy", "automatic", "recorded_offline", "uploaded_at",
         ]
-        read_only_fields = ["id", "user", "at", "recorded_offline", "uploaded_at"]
+        read_only_fields = ["id", "user", "at", "automatic", "recorded_offline", "uploaded_at"]
 
     def get_user_name(self, obj):
         return (obj.user.get_full_name() or "").strip() or obj.user.username

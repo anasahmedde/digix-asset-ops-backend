@@ -26,6 +26,7 @@ class Migration(migrations.Migration):
                 ('latitude', models.DecimalField(blank=True, decimal_places=7, max_digits=10, null=True)),
                 ('longitude', models.DecimalField(blank=True, decimal_places=7, max_digits=10, null=True)),
                 ('accuracy', models.FloatField(blank=True, help_text='GPS accuracy in metres', null=True)),
+                ('automatic', models.BooleanField(default=False, help_text='Started by a site check-in, not by pressing Time in')),
                 ('recorded_offline', models.BooleanField(default=False)),
                 ('uploaded_at', models.DateTimeField(blank=True, null=True)),
                 ('user', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='duty_records', to=settings.AUTH_USER_MODEL)),
