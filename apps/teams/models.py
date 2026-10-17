@@ -1,6 +1,7 @@
 from django.conf import settings
 from django.db import models
 
+from common import clock
 from common.models import TimeStampedModel
 from common.utils import upload_to_path
 
@@ -195,7 +196,20 @@ class Project(TimeStampedModel):
             if "status" not in changed:
                 changed.append("status")
         if changed:
+            before = type(self).objects.filter(pk=self.pk).values_list("phase", "status").first()
             self.save(update_fields=[*changed, "updated_at"])
+            if before is not None:
+                from . import activity
+
+                old_phase, old_status = before
+                if "phase" in changed and old_phase != self.phase:
+                    activity.log(self, "phase", (
+                        f"Phase moved: {dict(self.Phase.choices).get(old_phase, old_phase)} → {self.get_phase_display()} (from the work done)"
+                    ))
+                if "status" in changed and old_status != self.status:
+                    activity.log(self, "status", (
+                        f"Status: {dict(self.Status.choices).get(old_status, old_status)} → {self.get_status_display()} (from dates and progress)"
+                    ))
         return settled
 
     def assets_awaiting_client_warranty(self):
@@ -483,3 +497,23 @@ class ProjectCostLine(TimeStampedModel):
             return None
         quantity = self.actual_quantity if self.actual_quantity is not None else 1
         return quantity * self.actual_unit_cost
+
+
+class ProjectActivity(TimeStampedModel):
+    """One thing somebody did on a project, and when: opened, edited, team
+    and scope changes, requirements, the budget's approvals, work orders."""
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="activity")
+    action = models.CharField(max_length=40)
+    text = models.CharField(max_length=500)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    at = models.DateTimeField(default=clock.now, db_index=True)
+
+    class Meta:
+        ordering = ["-at", "-created_at"]
+        indexes = [models.Index(fields=["project", "-at"])]
+
+    def __str__(self):
+        return f"{self.project} - {self.text}"
