@@ -574,6 +574,12 @@ def receivable_po(db, people, supplier):
     }
 
 
+def _booker():
+    """Booking a delivery in is inspecting it: a supervisor, per the client's sheet."""
+    user, _ = User.objects.get_or_create(username="po-booker", defaults={"role": "supervisor"})
+    return _client(user)
+
+
 def _receive(client, po_id, lines, **extra):
     payload = {"lines": lines}
     payload.update(extra)
@@ -605,7 +611,7 @@ def test_receive_serialized_line_creates_devices(people, supplier, receivable_po
 
     po, serialized = receivable_po["po"], receivable_po["serialized"]
     c = _client(people["finance"])
-    r = _receive(c, po.pk, [{
+    r = _receive(_booker(), po.pk, [{
         "po_item": str(serialized.pk), "quantity": 3, "batch_number": "B-77",
         "serial_numbers": ["GRN-SN-A", "GRN-SN-B", "GRN-SN-C"],
     }], reference="DN-991")
@@ -663,7 +669,7 @@ def test_receive_partial_then_full_advances_status(people, receivable_po):
     )
     c = _client(people["finance"])
 
-    r = _receive(c, po.pk, [
+    r = _receive(_booker(), po.pk, [
         {"po_item": str(serialized.pk), "quantity": 2, "serial_numbers": ["PF-1", "PF-2"]},
         {"po_item": str(consumable.pk), "quantity": 4},
     ])
@@ -673,7 +679,7 @@ def test_receive_partial_then_full_advances_status(people, receivable_po):
     assert consumable.received_quantity == 4
     assert po.status == "partially_received"
 
-    r = _receive(c, po.pk, [
+    r = _receive(_booker(), po.pk, [
         {"po_item": str(serialized.pk), "quantity": 1, "serial_numbers": ["PF-3"]},
         {"po_item": str(consumable.pk), "quantity": 6},
     ])
@@ -699,7 +705,7 @@ def test_receive_serial_count_mismatch_400(people, receivable_po):
 
     po, serialized = receivable_po["po"], receivable_po["serialized"]
     before_receipts = GoodsReceipt.objects.count()
-    r = _receive(_client(people["finance"]), po.pk, [{
+    r = _receive(_booker(), po.pk, [{
         "po_item": str(serialized.pk), "quantity": 2, "serial_numbers": ["ONLY-ONE"],
     }])
     assert r.status_code == 400, r.content
@@ -723,14 +729,14 @@ def test_receive_duplicate_serial_400_global_and_in_payload(people, receivable_p
     receipts_before = GoodsReceipt.objects.count()
 
     # global collision with an existing device
-    r = _receive(c, po.pk, [{
+    r = _receive(_booker(), po.pk, [{
         "po_item": str(serialized.pk), "quantity": 2, "serial_numbers": ["TAKEN-1", "FRESH-1"],
     }])
     assert r.status_code == 400, r.content
     assert "TAKEN-1" in str(r.json())
 
     # repeated within the payload
-    r = _receive(c, po.pk, [{
+    r = _receive(_booker(), po.pk, [{
         "po_item": str(serialized.pk), "quantity": 2, "serial_numbers": ["TWICE-1", "TWICE-1"],
     }])
     assert r.status_code == 400, r.content
@@ -751,7 +757,7 @@ def test_receive_consumable_updates_stock_and_movement(people, receivable_po):
     )
     stock = InventoryItem.objects.create(material_type=material, quantity=5)
 
-    r = _receive(_client(people["finance"]), po.pk, [{
+    r = _receive(_booker(), po.pk, [{
         "po_item": str(consumable.pk), "quantity": 10,
     }])
     assert r.status_code == 201, r.content
@@ -794,7 +800,7 @@ def test_receive_consumable_creates_inventory_item_when_missing(people, receivab
     )
     assert not InventoryItem.objects.filter(material_type=material).exists()
 
-    r = _receive(_client(people["finance"]), po.pk, [{
+    r = _receive(_booker(), po.pk, [{
         "po_item": str(consumable.pk), "quantity": 7,
     }])
     assert r.status_code == 201, r.content
@@ -819,7 +825,7 @@ def test_receive_mixed_po_single_call(people, receivable_po):
     po, serialized, consumable = (
         receivable_po["po"], receivable_po["serialized"], receivable_po["consumable"]
     )
-    r = _receive(_client(people["finance"]), po.pk, [
+    r = _receive(_booker(), po.pk, [
         {"po_item": str(serialized.pk), "quantity": 3, "batch_number": "MX-1",
          "serial_numbers": ["MX-A", "MX-B", "MX-C"]},
         {"po_item": str(consumable.pk), "quantity": 10},
@@ -848,7 +854,7 @@ def test_receive_mixed_po_single_call(people, receivable_po):
     assert po.status == "received"  # everything arrived in one delivery
     receipt = GoodsReceipt.objects.get(pk=body["id"])
     assert receipt.notes == "Full delivery"
-    assert receipt.received_by == people["finance"]
+    assert receipt.received_by.username == "po-booker"
 
 
 @pytest.mark.django_db
@@ -858,15 +864,15 @@ def test_receive_over_receive_400(people, receivable_po):
     )
     c = _client(people["finance"])
     # more than ordered
-    r = _receive(c, po.pk, [{
+    r = _receive(_booker(), po.pk, [{
         "po_item": str(serialized.pk), "quantity": 4,
         "serial_numbers": ["OV-1", "OV-2", "OV-3", "OV-4"],
     }])
     assert r.status_code == 400, r.content
 
     # more than remaining after a partial receipt
-    assert _receive(c, po.pk, [{"po_item": str(consumable.pk), "quantity": 8}]).status_code == 201
-    r = _receive(c, po.pk, [{"po_item": str(consumable.pk), "quantity": 3}])
+    assert _receive(_booker(), po.pk, [{"po_item": str(consumable.pk), "quantity": 8}]).status_code == 201
+    r = _receive(_booker(), po.pk, [{"po_item": str(consumable.pk), "quantity": 3}])
     assert r.status_code == 400, r.content
     consumable.refresh_from_db()
     assert consumable.received_quantity == 8
@@ -883,7 +889,7 @@ def test_receive_rejected_for_wrong_po_status(people, supplier, receivable_po):
             purchase_order=po, description="Line", quantity=1, unit_price=Decimal("1.00"),
             material_type=receivable_po["material"],
         )
-        r = _receive(c, po.pk, [{"po_item": str(item.pk), "quantity": 1}])
+        r = _receive(_booker(), po.pk, [{"po_item": str(item.pk), "quantity": 1}])
         assert r.status_code == 400, (bad_status, r.content)
 
 
@@ -893,7 +899,7 @@ def test_receive_line_without_type_400(people, supplier):
     untyped = PurchaseOrderItem.objects.create(
         purchase_order=po, description="Untyped line", quantity=2, unit_price=Decimal("9.00"),
     )
-    r = _receive(_client(people["finance"]), po.pk, [{"po_item": str(untyped.pk), "quantity": 2}])
+    r = _receive(_booker(), po.pk, [{"po_item": str(untyped.pk), "quantity": 2}])
     assert r.status_code == 400, r.content
     assert "names no component or asset" in str(r.json())
 
@@ -905,7 +911,7 @@ def test_receive_foreign_po_item_400(people, supplier, receivable_po):
         purchase_order=other, description="Foreign", quantity=1, unit_price=Decimal("2.00"),
         material_type=receivable_po["material"],
     )
-    r = _receive(_client(people["finance"]), receivable_po["po"].pk,
+    r = _receive(_booker(), receivable_po["po"].pk,
                  [{"po_item": str(foreign.pk), "quantity": 1}])
     assert r.status_code == 400, r.content
     foreign.refresh_from_db()
@@ -926,7 +932,7 @@ def test_receive_bom_line_sets_project_and_allocation(people, receivable_po):
     serialized.bom_line = bom_line
     serialized.save(update_fields=["bom_line", "updated_at"])
 
-    r = _receive(_client(people["finance"]), po.pk, [{
+    r = _receive(_booker(), po.pk, [{
         "po_item": str(serialized.pk), "quantity": 2, "serial_numbers": ["BOM-1", "BOM-2"],
     }])
     assert r.status_code == 201, r.content
@@ -956,10 +962,12 @@ def test_receive_bom_line_sets_project_and_allocation(people, receivable_po):
 
 @pytest.mark.django_db
 def test_receive_role_gated(people, receivable_po):
-    r = _receive(_client(people["inspector"]), receivable_po["po"].pk, [{
-        "po_item": str(receivable_po["consumable"].pk), "quantity": 1,
-    }])
-    assert r.status_code == 403
+    """Booking in is "Inspect deliveries": not the buyer, not a technician."""
+    line = [{"po_item": str(receivable_po["consumable"].pk), "quantity": 1}]
+    for who in ("finance", "tech"):
+        assert _receive(_client(people[who]), receivable_po["po"].pk, line).status_code == 403, who
+    r = _receive(_client(people["inspector"]), receivable_po["po"].pk, line)
+    assert r.status_code == 201, r.content
 
 
 # ---------------------------------------------------------------------------
@@ -1089,7 +1097,7 @@ def test_receiving_a_product_line_only_needs_serials(people, requisitions, suppl
         r_st = mover.post(f"/api/procurement/purchase-orders/{po_id}/transition/", {"status": st}, format="json")
         assert r_st.status_code == 200, r_st.content
 
-    received = _receive(c, po_id, [{
+    received = _receive(_booker(), po_id, [{
         "po_item": item_id, "quantity": 3, "batch_number": "REQ-B1",
         "serial_numbers": ["RQ-1", "RQ-2", "RQ-3"],
     }])
@@ -1312,7 +1320,7 @@ def test_receiving_a_complete_asset_asks_for_no_serial_number(people, supplier):
     store = _client(people["finance"])
 
     # No serial_numbers key at all — the receipt is accepted.
-    r = _receive(store, po_id, [{"po_item": item_id, "quantity": 1}])
+    r = _receive(_booker(), po_id, [{"po_item": item_id, "quantity": 1}])
     assert r.status_code == 201, r.content
 
     device.refresh_from_db()
@@ -1392,14 +1400,14 @@ def test_a_charge_on_an_order_is_not_goods_to_receive():
         assert r.status_code == 200, (status, r.content)
 
     # Nothing arrives for a charge.
-    r = store.post(f"/api/procurement/purchase-orders/{po.id}/receive/", {
+    r = _booker().post(f"/api/procurement/purchase-orders/{po.id}/receive/", {
         "lines": [{"po_item": str(charge.id), "quantity": 1}],
     }, format="json")
     assert r.status_code == 400, r.content
     assert "charge" in str(r.data).lower()
 
     # The goods arriving is the whole delivery.
-    r = store.post(f"/api/procurement/purchase-orders/{po.id}/receive/", {
+    r = _booker().post(f"/api/procurement/purchase-orders/{po.id}/receive/", {
         "lines": [{"po_item": str(goods.id), "quantity": 10}],
     }, format="json")
     assert r.status_code == 201, r.content

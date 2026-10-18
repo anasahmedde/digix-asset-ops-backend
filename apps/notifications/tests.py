@@ -336,3 +336,24 @@ def test_a_notification_travels_down_the_socket_as_plain_json(monkeypatch, djang
         service.notify([who], kind="approval_requested", title="Budget needs you", actionable=True)
     assert [m["notification"]["title"] for m in sent] == ["Budget needs you"]
     assert sent[0]["notification"]["recipient"] == str(who.pk)
+
+
+@pytest.mark.django_db
+def test_a_purchase_order_moving_reloads_every_procurement_screen(monkeypatch, django_capture_on_commit_callbacks):
+    """Waseem books a delivery in: Ahmer's Procurement list, open elsewhere,
+    stops offering "Inspect delivery" without a refresh."""
+    from apps.procurement.models import PurchaseOrder
+    from apps.suppliers.models import Supplier
+
+    sent = []
+
+    class Layer:
+        async def group_send(self, group, message):
+            sent.append((group, message["notification"]))
+
+    monkeypatch.setattr("apps.notifications.signals.get_channel_layer", lambda: Layer())
+    po = PurchaseOrder.objects.create(supplier=Supplier.objects.create(name="Live Supplier"))
+    with django_capture_on_commit_callbacks(execute=True):
+        po.status = PurchaseOrder.Status.RECEIVED
+        po.save(update_fields=["status"])
+    assert ("everyone", {"type": "changed", "data": {"section": "/procurement"}}) in sent

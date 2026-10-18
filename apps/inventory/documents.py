@@ -47,6 +47,56 @@ def _styles():
     }
 
 
+def bought_for(po_item) -> list[tuple[str, str]]:
+    """What a received line was bought for, as (kind, words): a project
+    (through a requirement, a complete asset, a BOM line, or a material
+    request the store reordered for), a maintenance job, a material request's
+    own purpose - or, with none of those, stock replenishment."""
+    if po_item is None:
+        return [("stock", "Stock replenishment")]
+    out = []
+
+    def project_of_request(ir):
+        if ir.project_id:
+            return ir.project
+        device = (ir.asset_component.device if ir.asset_component_id
+                  else ir.maintenance_schedule.device if ir.maintenance_schedule_id else None)
+        return device.project_on if device is not None else None
+
+    for component in po_item.asset_components.select_related("device"):
+        project = component.device.project_on if component.device_id else None
+        if project is not None:
+            out.append(("project", project.name))
+    for device in po_item.procured_devices.all():
+        if device.project_on is not None:
+            out.append(("project", device.project_on.name))
+    if po_item.bom_line_id:
+        out.append(("project", po_item.bom_line.project.name))
+    for reorder in po_item.reorder_requests.select_related("issuance_request"):
+        ir = reorder.issuance_request
+        if ir is None:
+            out.append(("stock", "Stock replenishment"))
+            continue
+        project = project_of_request(ir)
+        if project is not None:
+            out.append(("project", project.name))
+        elif ir.maintenance_schedule_id:
+            job = ir.maintenance_schedule
+            asset = job.device.asset_code if job.device_id else ""
+            out.append(("maintenance", f"Maintenance: {job.title}" + (f" · {asset}" if asset else "")))
+        else:
+            out.append(("request", f"{ir.request_number}: {ir.purpose}" if ir.purpose else ir.request_number))
+    return list(dict.fromkeys(out)) or [("stock", "Stock replenishment")]
+
+
+def sent_to(po_item) -> list[str]:
+    """Where a received line goes: the projects it was bought for; anything
+    else goes into the store, "Inventory"."""
+    found = bought_for(po_item)
+    names = [words for kind, words in found if kind == "project"]
+    return names + (["Inventory"] if len(names) < len(found) else [])
+
+
 def _who(user):
     if user is None:
         return "—"
@@ -368,16 +418,28 @@ def render_goods_receipt_pdf(receipt) -> bytes:
     story += [_table(rows, [7 * mm, 66 * mm, 15 * mm, 21 * mm, 22 * mm, 22 * mm, 21 * mm]),
               Spacer(1, 5 * mm)]
 
+    # Goods coming back (from a project, from maintenance) were bought for
+    # nothing new: they return to the shelf, and say where they came from.
+    returned = receipt.source != receipt.Source.PURCHASE
+
+    def line_for(line):
+        if line.po_item_id or not returned:
+            return bought_for(line.po_item)
+        return [("return", receipt.get_source_display())]
+
     # --- What inspection and the store made of it ------------------------
     story += [Paragraph("<b>Inspection and stocking</b>", s["body"]), Spacer(1, 2 * mm)]
-    rows = [[Paragraph(h, s["head"]) for h in ("#", "INSPECTION", "INSPECTED BY", "STOCKED BY", "LOCATION / NOTES")]]
+    rows = [[Paragraph(h, s["head"]) for h in ("#", "INSPECTION", "INSPECTED BY", "STOCKED BY", "FOR")]]
     for n, line in enumerate(lines, 1):
         status = line.get_inspection_status_display()
         if line.routed_to:
             status += f"<br/>{line.get_routed_to_display()}"
         if line.warranty_months:
             status += f"<br/>Vendor warranty {line.warranty_months} months"
-        notes = [x for x in (line.storage_location, line.inspection_notes, line.receiving_notes) if x]
+        # What it was bought for - a project, a maintenance job, the shelf -
+        # then why inspection said what it said.
+        notes = [("Project: " + words) if kind == "project" else words for kind, words in line_for(line)]
+        notes += [x for x in (line.inspection_notes,) if x]
         rows.append([
             Paragraph(str(n), s["cell"]),
             Paragraph(status, s["cell"]),
@@ -393,14 +455,18 @@ def render_goods_receipt_pdf(receipt) -> bytes:
 
     # --- Signatures --------------------------------------------------------
     inspectors = ", ".join(dict.fromkeys(_who(x.inspected_by) for x in lines if x.inspected_by_id))
-    storers = ", ".join(dict.fromkeys(_who(x.stocked_by) for x in lines if x.stocked_by_id))
+    # Where the delivery goes: the project(s) it was bought for, or the store.
+    destinations = ", ".join(dict.fromkeys(
+        name for x in lines
+        for name in (sent_to(x.po_item) if x.po_item_id or not returned else ["Inventory"])
+    ))
     story += [Spacer(1, 10 * mm)]
     sign = Table(
         [
             [Paragraph("", s["body"]) for _ in range(4)],
-            [Paragraph(x, s["label"]) for x in ("Delivered by (supplier)", "Received by", "Inspected by", "Stored by")],
+            [Paragraph(x, s["label"]) for x in ("Delivered by (supplier)", "Received by", "Inspected by", "Sent to")],
             [Paragraph(supplier.name if supplier else "", s["body"]), Paragraph(_who(receipt.received_by), s["body"]),
-             Paragraph(inspectors, s["body"]), Paragraph(storers, s["body"])],
+             Paragraph(inspectors, s["body"]), Paragraph(destinations, s["body"])],
         ],
         colWidths=[43.5 * mm] * 4,
     )

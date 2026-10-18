@@ -79,6 +79,12 @@ def project_changed(project_id):
         _send(EVERYONE, {"type": "changed", "data": {"project": str(project_id)}})
 
 
+def section_changed(section):
+    """Something on this page's list moved (a PO, a delivery, a material
+    request): every screen open on it reloads."""
+    _send(EVERYONE, {"type": "changed", "data": {"section": section}})
+
+
 def _device_project_changed(device):
     from apps.assets.serializers import _project_of
 
@@ -110,6 +116,24 @@ def _wire_project_changes():
     post_save.connect(on_device, sender=Device, weak=False, dispatch_uid="changed-device")
     for model in (AssetComponent, ProductionStep, DeviceLifecycleEvent):
         post_save.connect(on_device_row, sender=model, weak=False, dispatch_uid=f"changed-{model.__name__}")
+
+    # The store's and the buyers' lists: whoever has them open reloads.
+    from apps.inventory.models import GoodsReceipt, GoodsReceiptLine, IssuanceRequest
+    from apps.procurement.models import PurchaseOrder
+    from apps.workorders.models import WorkOrder
+
+    for model, sections in (
+        (PurchaseOrder, ("/procurement",)),
+        (GoodsReceipt, ("/procurement", "/inventory")),
+        (GoodsReceiptLine, ("/procurement", "/inventory")),
+        (IssuanceRequest, ("/inventory",)),
+        (WorkOrder, ("/work-orders",)),
+    ):
+        def on_section(sender, instance, _sections=sections, **kwargs):
+            for section in _sections:
+                section_changed(section)
+
+        post_save.connect(on_section, sender=model, weak=False, dispatch_uid=f"section-{model.__name__}")
 
 
 _wire_project_changes()
