@@ -530,7 +530,11 @@ def test_a_right_brings_the_prices_it_decides_on():
         r = c.post("/api/accounts/roles/", {"label": "Budget signer", "capabilities": ["approve_budget", "approve_po"]},
                    format="json")
         assert r.status_code == 201, r.content
-        assert {"view_project_costs", "view_prices"} <= set(r.data["capabilities"]), "saved with what they need"
+        assert {"view_projects", "view_project_costs", "view_prices"} <= set(r.data["capabilities"]), "saved with what they need"
+        from apps.accounts.capabilities import with_requirements
+
+        assert with_requirements({"record_client_warranty"}) == {"record_client_warranty", "view_projects"}
+        assert "view_projects" in with_requirements({"view_project_costs"}), "followed through"
         forget()
 
         signer = User.objects.create_user(username="req-signer", password="x", role=r.data["key"])

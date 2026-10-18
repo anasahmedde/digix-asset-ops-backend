@@ -341,11 +341,16 @@ def defaults_for(role: str) -> frozenset[str]:
 #: Holding one holds these too: approving a budget you cannot read is not
 #: approving it. Ticked with it on the Roles & Rights grid, and locked on.
 REQUIRES: dict[str, tuple[str, ...]] = {
-    # Project money
-    "plan_budget": ("view_project_costs",),
-    "approve_budget": ("view_project_costs",),
-    "approve_quantity_increase": ("view_project_costs",),
-    "agree_project_variance": ("view_project_costs", "view_prices"),
+    # Projects: nothing on a project is done without seeing the project,
+    # and nothing on its money without seeing its costs.
+    "view_project_costs": ("view_projects",),
+    "edit_projects": ("view_projects",),
+    "plan_budget": ("view_projects", "view_project_costs"),
+    "approve_budget": ("view_projects", "view_project_costs"),
+    "decide_requirements": ("view_projects",),
+    "approve_quantity_increase": ("view_projects", "view_project_costs"),
+    "agree_project_variance": ("view_projects", "view_project_costs", "view_prices"),
+    "record_client_warranty": ("view_projects",),
     # Prices everywhere else
     "edit_prices": ("view_prices",),
     "view_margins": ("view_prices",),
@@ -362,10 +367,15 @@ REQUIRES: dict[str, tuple[str, ...]] = {
 
 
 def with_requirements(keys) -> set[str]:
-    """These rights, and every right they cannot be used without."""
+    """These rights, and every right they cannot be used without - followed
+    through (approving budgets needs project costs, which needs projects)."""
     out = set(keys or ())
-    for key in list(out):
-        out.update(REQUIRES.get(key, ()))
+    todo = list(out)
+    while todo:
+        for need in REQUIRES.get(todo.pop(), ()):
+            if need not in out:
+                out.add(need)
+                todo.append(need)
     return out
 
 
