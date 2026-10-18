@@ -255,3 +255,28 @@ def test_a_tagged_person_replies_and_ticks_off_and_the_author_hears():
 
     private = a.post("/api/notifications/sticky-notes/", {"scope": "self", "body": "mine"}, format="json").data
     assert a.post(f"/api/notifications/sticky-notes/{private['id']}/reply/", {"body": "x"}, format="json").status_code == 403
+
+
+@pytest.mark.django_db
+def test_answering_a_request_tells_everyone_else_who_was_asked(monkeypatch):
+    """Two managers asked, one decides: the other's page hears it was resolved."""
+    from apps.notifications import service
+
+    sent = []
+
+    class Layer:
+        async def group_send(self, group, message):
+            sent.append((group, message["notification"]))
+
+    monkeypatch.setattr("channels.layers.get_channel_layer", lambda: Layer())
+    a = User.objects.create_user(username="res-a", password="x", role="group_head")
+    b = User.objects.create_user(username="res-b", password="x", role="ops_manager")
+    service.notify([a, b], kind="approval_requested", title="Increase", link="/projects?project=p1",
+                   ref="increase:res-test", actionable=True)
+    sent.clear()
+    assert service.resolve("increase:res-test") == 2
+    assert sorted(g for g, _ in sent) == sorted(f"notifications_{u.pk}" for u in (a, b))
+    assert all(m["type"] == "resolved" and m["ref"] == "increase:res-test" and m["link"] == "/projects?project=p1"
+               for _, m in sent)
+    sent.clear()
+    assert service.resolve("increase:res-test") == 0 and sent == []
