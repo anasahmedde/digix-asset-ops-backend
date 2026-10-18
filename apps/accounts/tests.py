@@ -628,3 +628,37 @@ def test_raising_an_order_brings_the_pages_and_vendors_it_needs():
         assert c.get("/api/procurement/purchase-orders/").status_code == 200
     finally:
         forget()
+
+
+@pytest.mark.django_db
+def test_only_those_given_the_field_app_may_use_it():
+    """Technicians may sign in to the field app by default; a supervisor may
+    not until "Use the field app" is ticked - and taking it away stops a phone
+    already signed in. The website is untouched."""
+    from apps.accounts.models import UserCapability
+    from apps.accounts.roles import forget
+
+    forget()
+    tech = User.objects.create_user(username="fa-tech", password="pw-123456", role="technician")
+    sup = User.objects.create_user(username="fa-sup", password="pw-123456", role="supervisor")
+    phone = {"HTTP_USER_AGENT": "okhttp/4.12.0"}
+    c = APIClient()
+
+    def sign_in(user, **headers):
+        return c.post("/api/auth/token/", {"username": user.username, "password": "pw-123456"}, format="json", **headers)
+
+    assert sign_in(tech, **phone).status_code == 200
+    r = sign_in(sup, **phone)
+    assert r.status_code == 403 and "field app" in r.data["detail"]
+    assert sign_in(sup, HTTP_X_CLIENT="field-app").status_code == 403, "the new header says the same"
+    assert sign_in(sup).status_code == 200, "the website signs in as before"
+
+    UserCapability.objects.create(user=sup, capability="use_field_app", allowed=True)
+    assert sign_in(sup, **phone).status_code == 200
+
+    access = sign_in(tech, **phone).data["access"]
+    c.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+    assert c.get("/api/accounts/users/me/", **phone).status_code == 200
+    UserCapability.objects.create(user=tech, capability="use_field_app", allowed=False)
+    assert c.get("/api/accounts/users/me/", **phone).status_code == 403, "taken away: the phone is stopped"
+    assert c.get("/api/accounts/users/me/").status_code == 200, "the website still works for them"
