@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
+from django.core.serializers.json import DjangoJSONEncoder
+from django.db import transaction
 from django.db.models.signals import post_save, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
@@ -25,31 +28,91 @@ logger = logging.getLogger(__name__)
 RESOLVED_STATUSES = (Ticket.Status.APPROVED, Ticket.Status.CLOSED)
 
 
-def _push_ws(notification: Notification):
-    channel_layer = get_channel_layer()
-    if channel_layer is not None:
-        group_name = f"notifications_{notification.recipient_id}"
+def _send(group_name: str, payload: dict):
+    """One message down the socket - once the request's work is saved.
+
+    Every request runs in one transaction. Sent straight away, the message
+    reached the other screen first, it reloaded, and read the database
+    before the change was committed: it showed the old state.
+
+    And as plain JSON: the serializer hands back UUIDs for linked records,
+    which neither the socket nor Redis can carry - every live notification
+    failed on them and was only logged, so no banner ever arrived."""
+    payload = json.loads(json.dumps(payload, cls=DjangoJSONEncoder))
+
+    def send():
+        channel_layer = get_channel_layer()
+        if channel_layer is None:
+            return
         try:
-            async_to_sync(channel_layer.group_send)(
-                group_name,
-                {
-                    "type": "send_notification",
-                    "notification": NotificationSerializer(notification).data,
-                },
-            )
+            async_to_sync(channel_layer.group_send)(group_name, {"type": "send_notification", "notification": payload})
         except Exception:
-            logger.exception("Failed to send WS notification to %s", group_name)
+            logger.exception("Failed to send WS message to %s", group_name)
+
+    transaction.on_commit(send)
+
+
+def _push_ws(notification: Notification):
+    _send(f"notifications_{notification.recipient_id}", NotificationSerializer(notification).data)
 
     # Also deliver an OS-level push to the recipient's registered devices.
-    try:
-        send_push_to_user(
-            notification.recipient_id,
-            notification.title,
-            notification.message,
-            {**(notification.data or {}), "notification_type": notification.notification_type},
-        )
-    except Exception:
-        logger.exception("Failed push to %s", notification.recipient_id)
+    recipient, title, message = notification.recipient_id, notification.title, notification.message
+    data = {**(notification.data or {}), "notification_type": notification.notification_type}
+
+    def push():
+        try:
+            send_push_to_user(recipient, title, message, data)
+        except Exception:
+            logger.exception("Failed push to %s", recipient)
+
+    transaction.on_commit(push)
+
+
+# Every signed-in page listens here (see the consumer).
+EVERYONE = "everyone"
+
+
+def project_changed(project_id):
+    """Something on this project moved: every screen open on it reloads,
+    whether or not that person was sent a notification about it."""
+    if project_id:
+        _send(EVERYONE, {"type": "changed", "data": {"project": str(project_id)}})
+
+
+def _device_project_changed(device):
+    from apps.assets.serializers import _project_of
+
+    project = _project_of(device) if device is not None else None
+    project_changed(project.pk if project else None)
+
+
+def _wire_project_changes():
+    """What a project's screen shows: its record, budget, activity, assets,
+    their parts and operations, and what happened to them."""
+    from apps.assets.models import AssetComponent, Device, DeviceLifecycleEvent, ProductionStep
+    from apps.teams.models import Project, ProjectActivity, ProjectBudget
+
+    def on_project(sender, instance, **kwargs):
+        project_changed(instance.pk)
+
+    def on_project_row(sender, instance, **kwargs):
+        project_changed(instance.project_id)
+
+    def on_device(sender, instance, **kwargs):
+        _device_project_changed(instance)
+
+    def on_device_row(sender, instance, **kwargs):
+        _device_project_changed(instance.device)
+
+    post_save.connect(on_project, sender=Project, weak=False, dispatch_uid="changed-project")
+    for model in (ProjectActivity, ProjectBudget):
+        post_save.connect(on_project_row, sender=model, weak=False, dispatch_uid=f"changed-{model.__name__}")
+    post_save.connect(on_device, sender=Device, weak=False, dispatch_uid="changed-device")
+    for model in (AssetComponent, ProductionStep, DeviceLifecycleEvent):
+        post_save.connect(on_device_row, sender=model, weak=False, dispatch_uid=f"changed-{model.__name__}")
+
+
+_wire_project_changes()
 
 
 # ── Chat message → push to the other participants ────────────────────

@@ -258,7 +258,7 @@ def test_a_tagged_person_replies_and_ticks_off_and_the_author_hears():
 
 
 @pytest.mark.django_db
-def test_answering_a_request_tells_everyone_else_who_was_asked(monkeypatch):
+def test_answering_a_request_tells_everyone_else_who_was_asked(monkeypatch, django_capture_on_commit_callbacks):
     """Two managers asked, one decides: the other's page hears it was resolved."""
     from apps.notifications import service
 
@@ -268,15 +268,71 @@ def test_answering_a_request_tells_everyone_else_who_was_asked(monkeypatch):
         async def group_send(self, group, message):
             sent.append((group, message["notification"]))
 
-    monkeypatch.setattr("channels.layers.get_channel_layer", lambda: Layer())
+    monkeypatch.setattr("apps.notifications.signals.get_channel_layer", lambda: Layer())
     a = User.objects.create_user(username="res-a", password="x", role="group_head")
     b = User.objects.create_user(username="res-b", password="x", role="ops_manager")
     service.notify([a, b], kind="approval_requested", title="Increase", link="/projects?project=p1",
                    ref="increase:res-test", actionable=True)
     sent.clear()
-    assert service.resolve("increase:res-test") == 2
+    # Sent once the change is saved, never before (the screen would read the old state).
+    with django_capture_on_commit_callbacks(execute=False) as waiting:
+        assert service.resolve("increase:res-test") == 2
+    assert sent == []
+    for send in waiting:
+        send()
     assert sorted(g for g, _ in sent) == sorted(f"notifications_{u.pk}" for u in (a, b))
     assert all(m["type"] == "resolved" and m["ref"] == "increase:res-test" and m["link"] == "/projects?project=p1"
                for _, m in sent)
     sent.clear()
-    assert service.resolve("increase:res-test") == 0 and sent == []
+    with django_capture_on_commit_callbacks(execute=True):
+        assert service.resolve("increase:res-test") == 0
+    assert sent == []
+
+
+@pytest.mark.django_db
+def test_a_change_on_a_project_reaches_every_open_screen(monkeypatch, django_capture_on_commit_callbacks):
+    """Waseem decides a line: Ahmer and Awais, looking at the project, reload -
+    told once the decision is saved, with nothing but the project's id."""
+    from apps.assets.models import AssetComponent, Device
+    from apps.teams.models import Project
+
+    sent = []
+
+    class Layer:
+        async def group_send(self, group, message):
+            sent.append((group, message["notification"]))
+
+    monkeypatch.setattr("apps.notifications.signals.get_channel_layer", lambda: Layer())
+    project = Project.objects.create(name="Changed", status="planning")
+    device = Device.objects.create(asset_code="AST-CHG-1", serial_number="CHG-1", project=project)
+    line = AssetComponent.objects.create(device=device, name="Cat6 Cable", quantity=5)
+    with django_capture_on_commit_callbacks(execute=False) as waiting:
+        line.fulfilment = AssetComponent.Fulfilment.PROCUREMENT
+        line.save(update_fields=["fulfilment"])
+    sent.clear()
+    for send in waiting:
+        send()
+    assert ("everyone", {"type": "changed", "data": {"project": str(project.pk)}}) in sent
+
+
+@pytest.mark.django_db
+def test_a_notification_travels_down_the_socket_as_plain_json(monkeypatch, django_capture_on_commit_callbacks):
+    """Redis and the socket carry JSON only: the recipient's UUID made every
+    live notification fail (logged, never seen) - so no banner arrived."""
+    import json
+
+    from apps.notifications import service
+
+    sent = []
+
+    class Layer:
+        async def group_send(self, group, message):
+            sent.append(json.loads(json.dumps(message)))  # as strict as the wire
+
+    monkeypatch.setattr("apps.notifications.signals.get_channel_layer", lambda: Layer())
+    monkeypatch.setattr("apps.notifications.signals.send_push_to_user", lambda *a, **k: None)
+    who = User.objects.create_user(username="wire-a", password="x", role="ops_manager")
+    with django_capture_on_commit_callbacks(execute=True):
+        service.notify([who], kind="approval_requested", title="Budget needs you", actionable=True)
+    assert [m["notification"]["title"] for m in sent] == ["Budget needs you"]
+    assert sent[0]["notification"]["recipient"] == str(who.pk)
