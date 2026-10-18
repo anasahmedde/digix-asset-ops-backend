@@ -95,7 +95,12 @@ class User(AbstractUser):
                 allowed.update(keys)
             else:
                 allowed.difference_update(keys)
-        return frozenset(allowed)
+        # Whatever is held brings what it cannot be used without: a person
+        # who may approve budgets sees project costs, even if that was
+        # withdrawn from them on its own.
+        from .capabilities import with_requirements
+
+        return frozenset(with_requirements(allowed))
 
     def can(self, capability: str) -> bool:
         return capability in self.capabilities

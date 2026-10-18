@@ -31,6 +31,7 @@ class BOMAllocationSerializer(serializers.ModelSerializer):
 
 
 class ProjectBOMLineSerializer(HidesMoney, serializers.ModelSerializer):
+    money_capability = "view_project_costs"
     asset_type_name = serializers.CharField(source="asset_type.name", read_only=True, default=None)
     device_model_name = serializers.CharField(source="device_model.name", read_only=True, default=None)
     material_type_name = serializers.CharField(source="material_type.name", read_only=True, default=None)
@@ -137,6 +138,7 @@ class _PhaseFollowsTheWorkMixin:
 
 
 class ProjectListSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
+    money_capability = "view_project_costs"
     date_order = (
         ("target_date", "start_date", "the start date"),
         ("rental_end_date", "start_date", "the start date"),
@@ -180,6 +182,7 @@ class ProjectListSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, se
 
 
 class ProjectDetailSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, serializers.ModelSerializer):
+    money_capability = "view_project_costs"
     date_order = (
         ("target_date", "start_date", "the start date"),
         ("rental_end_date", "start_date", "the start date"),
@@ -259,6 +262,7 @@ class ProjectDetailSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, 
 
 
 class ProjectCostLineSerializer(HidesMoney, serializers.ModelSerializer):
+    money_capability = "view_project_costs"
     """An overhead line on a project's cost plan."""
 
     amount = serializers.SerializerMethodField()

@@ -14,6 +14,7 @@ from rest_framework.response import Response
 
 from common.permissions import CapabilityGate, can, can_for_project, is_project_manager
 from apps.notifications import service as notices
+from common.money import scrub_project_costs, viewer_sees_project_costs
 from . import activity as project_log
 
 from .costing import project_devices
@@ -347,7 +348,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             totals["allocated"] += allocated
             totals["issued"] += issued
             totals["shortage"] += shortage
-        return Response({"lines": lines, "totals": totals})
+        return Response(scrub_project_costs({"lines": lines, "totals": totals}, {"request": request}))
 
     def _execution_blocked(self, project):
         """Execution decisions follow budget approval: a plan that exists but is
@@ -468,7 +469,9 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 ),
             })
 
-        return Response({"project": str(project.pk), "assets": assets, "totals": totals})
+        return Response(scrub_project_costs(
+            {"project": str(project.pk), "assets": assets, "totals": totals}, {"request": request},
+        ))
 
     @action(detail=True, methods=["post"], url_path="procure-asset")
     def procure_asset(self, request, pk=None):
@@ -518,7 +521,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     @action(detail=True, methods=["get", "patch"], url_path="plan")
     def plan(self, request, pk=None):
         """The project's cost plan; PATCH sets the contingency percentage."""
-        from common.money import COSTING_TOTALS, scrub
+        from common.money import scrub_project_costs, viewer_sees_project_costs
 
         if request.method == "PATCH":
             denied = self._require(request, self.get_object(), "plan_budget")
@@ -544,7 +547,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 project_log.log(project, "budget", f"Contingency: {plan.contingency_percent}% → {pct}%", user=request.user)
             plan.contingency_percent = pct
             plan.save(update_fields=["contingency_percent", "updated_at"])
-        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
+        return Response(scrub_project_costs(build_plan(project), {"request": request}))
 
     @action(detail=True, methods=["get"], url_path="actuals/document")
     def actuals_document(self, request, pk=None):
@@ -555,6 +558,8 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         from .documents import render_actuals_pdf
 
         project = self.get_object()
+        if not viewer_sees_project_costs({"request": request}):
+            return Response({"detail": "Project costs are not shown for your role."}, status=403)
         pdf = render_actuals_pdf(project, build_actuals(project))
         response = HttpResponse(pdf, content_type="application/pdf")
         response["Content-Disposition"] = f'attachment; filename="actual-cost-{project.name}.pdf"'
@@ -565,11 +570,13 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         """The cost plan as a PDF, for approval or the file."""
         from django.http import HttpResponse
 
-        from common.money import COSTING_TOTALS, scrub
+        from common.money import scrub_project_costs, viewer_sees_project_costs
         from .costing import build_plan
         from .documents import render_cost_plan_pdf
 
         project = self.get_object()
+        if not viewer_sees_project_costs({"request": request}):
+            return Response({"detail": "Project costs are not shown for your role."}, status=403)
         pdf = render_cost_plan_pdf(project, build_plan(project))
         response = HttpResponse(pdf, content_type="application/pdf")
         response["Content-Disposition"] = f'attachment; filename="cost-plan-{project.name}.pdf"'
@@ -578,10 +585,10 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="boq")
     def boq(self, request, pk=None):
         """Bill of quantities: every component the whole project needs."""
-        from common.money import COSTING_TOTALS, scrub
+        from common.money import scrub_project_costs, viewer_sees_project_costs
         from .costing import build_boq
 
-        return Response(scrub(build_boq(self.get_object()), {"request": request}, also=COSTING_TOTALS))
+        return Response(scrub_project_costs(build_boq(self.get_object()), {"request": request}))
 
     @action(detail=True, methods=["get"], url_path="boq/document")
     def boq_document(self, request, pk=None):
@@ -591,6 +598,8 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         from .documents import render_boq_pdf
 
         project = self.get_object()
+        if not viewer_sees_project_costs({"request": request}):
+            return Response({"detail": "Project costs are not shown for your role."}, status=403)
         pdf = render_boq_pdf(project, build_boq(project))
         response = HttpResponse(pdf, content_type="application/pdf")
         response["Content-Disposition"] = f'attachment; filename="boq-{project.name}.pdf"'
@@ -700,10 +709,10 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="actuals")
     def actuals(self, request, pk=None):
         """What the project is actually costing, against what was approved."""
-        from common.money import COSTING_TOTALS, scrub
+        from common.money import scrub_project_costs, viewer_sees_project_costs
         from .costing import build_actuals
 
-        return Response(scrub(build_actuals(self.get_object()), {"request": request}, also=COSTING_TOTALS))
+        return Response(scrub_project_costs(build_actuals(self.get_object()), {"request": request}))
 
     def perform_destroy(self, instance):
         """A project with a signed-off budget behind it is closed, not deleted.
@@ -732,7 +741,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="submit-budget")
     def submit_budget(self, request, pk=None):
         """Send the estimate up for approval."""
-        from common.money import COSTING_TOTALS, scrub
+        from common.money import scrub_project_costs, viewer_sees_project_costs
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -769,7 +778,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             link=f"/projects?project={project.pk}&tab=planning", ref=f"budget:{project.pk}",
             data={"project": str(project.pk)},
         )
-        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
+        return Response(scrub_project_costs(build_plan(project), {"request": request}))
 
     @action(detail=True, methods=["post"], url_path="approve-budget")
     def approve_budget(self, request, pk=None):
@@ -780,7 +789,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         return self._decide_budget(request, approve=False)
 
     def _decide_budget(self, request, *, approve):
-        from common.money import COSTING_TOTALS, scrub
+        from common.money import scrub_project_costs, viewer_sees_project_costs
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -831,7 +840,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             message=(f"PKR {summary['total']:,.0f} signed off" if approve else notes) + f" — {notices.who(request.user)}",
             link=f"/projects?project={project.pk}&tab=planning", data={"project": str(project.pk)},
         )
-        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
+        return Response(scrub_project_costs(build_plan(project), {"request": request}))
 
     @action(detail=True, methods=["post"], url_path="revise-budget")
     def revise_budget(self, request, pk=None):
@@ -839,7 +848,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
         Execution locks again until the revised figure is approved.
         """
-        from common.money import COSTING_TOTALS, scrub
+        from common.money import scrub_project_costs, viewer_sees_project_costs
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
@@ -875,7 +884,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             "decision_notes", "updated_at",
         ])
         project_log.log(project, "budget", "Budget reopened for changes - execution waits for the revised approval", user=request.user)
-        return Response(scrub(build_plan(project), {"request": request}, also=COSTING_TOTALS))
+        return Response(scrub_project_costs(build_plan(project), {"request": request}))
 
     @action(detail=False, methods=["get"])
     def dashboard_stats(self, request):
