@@ -120,8 +120,30 @@ class UserViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # Seeing who works here is a capability. An external client portal
     # login does not hold it, and used to read the whole directory.
     read_capability = "view_team"
+    # Names only, for pickers: the storekeeper names who collects stock
+    # without needing the whole directory.
+    action_capabilities = {"names": ("view_team", "issue_stock")}
     permission_classes = [IsAuthenticated, IsSelfOrSuperAdmin, CapabilityGate]
     filterset_fields = ["role", "is_active", "is_field_staff"]
+
+    @action(detail=False, methods=["get"])
+    def names(self, request):
+        """Everyone on the team who can collect: name and role, nothing more."""
+        from .models import RoleDefinition
+
+        # Custom roles have their own names, as the Teams page shows them.
+        labels = dict(RoleDefinition.objects.values_list("key", "label"))
+        people = (
+            User.objects.filter(is_active=True)
+            .exclude(role__in=[User.Role.CLIENT_VIEWER, User.Role.VENDOR, User.Role.SUPER_ADMIN])
+            .exclude(is_superuser=True)
+            .order_by("first_name", "last_name", "username")
+        )
+        return Response([
+            {"id": str(u.pk), "name": u.get_full_name().strip() or u.username,
+             "role": labels.get(u.role) or u.role.replace("_", " ").title()}
+            for u in people
+        ])
 
     def perform_destroy(self, instance):
         """Remove an account - once nobody is left hanging from it.
