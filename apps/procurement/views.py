@@ -47,9 +47,9 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     read_capability = "view_procurement"
     write_capability = "raise_po"
     action_capabilities = {
-        # A delivery is booked in by whoever raised the order or runs the
-        # store; checking it over is the inspector's step, in Inventory.
-        "receive": ("raise_po", "receive_goods"),
+        # Booking a delivery in is checking it against the order and
+        # writing the GRN: "Inspect deliveries", as Roles & Rights says.
+        "receive": "inspect_goods",
         "requisitions": "view_procurement",
         "send_back_requisition": "raise_po",
         # Agreeing a price is deliberately not a procurement right: the whole

@@ -21,6 +21,9 @@ from apps.inventory.models import GoodsReceipt, GoodsReceiptLine
 
 from .models import PurchaseOrder
 
+# The note a complete asset's receipt line gets: it needs no inspection.
+REGISTERED_DIRECTLY = "Complete asset — entered the registry directly."
+
 RECEIVABLE_STATUSES = (
     PurchaseOrder.Status.APPROVED,
     PurchaseOrder.Status.ORDERED,
@@ -202,7 +205,7 @@ def receive_against_po(purchase_order, *, user, lines, reference="", notes=""):
                 # A complete asset goes straight onto the registry — there is
                 # no shelf for it to be received onto afterwards.
                 receipt_lines[-1].inspection_status = GoodsReceiptLine.Inspection.PASSED
-                receipt_lines[-1].inspection_notes = "Complete asset — entered the registry directly."
+                receipt_lines[-1].inspection_notes = REGISTERED_DIRECTLY
                 receipt_lines[-1].inspected_by = user
                 receipt_lines[-1].inspected_at = timezone.now()
                 receipt_lines[-1].stocked_at = timezone.now()
