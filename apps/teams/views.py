@@ -769,6 +769,9 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             return Response(
                 {"detail": "There is nothing to approve yet — the estimate comes to zero."}, status=400
             )
+        blocked = self._production_missing(summary)
+        if blocked is not None:
+            return blocked
         plan.status = ProjectBudget.Status.SUBMITTED
         plan.submitted_by = request.user
         plan.submitted_at = timezone.now()
@@ -793,6 +796,18 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     def reject_budget(self, request, pk=None):
         return self._decide_budget(request, approve=False)
 
+    @staticmethod
+    def _production_missing(summary):
+        """An asset built in-house with no production cost in the estimate."""
+        missing = summary.get("production_missing") or []
+        if not missing:
+            return None
+        return Response({"detail": (
+            f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} built in-house but the estimate has "
+            "no production cost for it. Lay out its production route with the cost of each operation "
+            "(on the asset), then send the budget for approval."
+        )}, status=400)
+
     def _decide_budget(self, request, *, approve):
         from common.money import scrub_project_costs, viewer_sees_project_costs
         from .costing import build_plan, get_or_create_plan
@@ -813,6 +828,12 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             return Response({"notes": ["Say why the budget is being sent back."]}, status=400)
 
         summary = build_plan(project)
+        # Signing it off needs the same as sending it: a cost for making
+        # every asset built in-house. Sending it back is always possible.
+        if approve:
+            blocked = self._production_missing(summary)
+            if blocked is not None:
+                return blocked
         plan.status = ProjectBudget.Status.APPROVED if approve else ProjectBudget.Status.REJECTED
         plan.decided_by = request.user
         plan.decided_at = timezone.now()
