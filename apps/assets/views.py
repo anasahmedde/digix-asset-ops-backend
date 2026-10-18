@@ -160,6 +160,16 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         device = serializer.save()
+        # The registration is journalled as the asset is saved, before the
+        # request's user can be attached; name the registrar on it now.
+        from apps.accounts.models import AuditLog
+
+        DeviceLifecycleEvent.objects.filter(
+            device=device, description="Registered", performed_by__isnull=True,
+        ).update(performed_by=self.request.user)
+        AuditLog.objects.filter(
+            resource_type="device", resource_id=str(device.pk), action=AuditLog.Action.CREATE, user__isnull=True,
+        ).update(user=self.request.user)
         # The people above the registrar hear of a new asset, for information.
         inform_line(
             self.request.user,

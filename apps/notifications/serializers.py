@@ -61,6 +61,18 @@ class StickyNoteSerializer(serializers.ModelSerializer):
     """A note as the board shows it: what it says, and who said it."""
 
     author_name = serializers.SerializerMethodField()
+    # The answers on it, oldest first.
+    replies = serializers.SerializerMethodField()
+
+    def get_replies(self, obj):
+        user = self.context["request"].user
+        return [
+            {
+                "id": str(r.pk), "body": r.body, "created_at": r.created_at,
+                "author_name": r.author.get_full_name() or r.author.username, "mine": r.author_id == user.id,
+            }
+            for r in obj.replies.all()
+        ]
     mentioned_names = serializers.SerializerMethodField()
     mine = serializers.SerializerMethodField()
     # Ticked off or not; writing it stamps (or clears) done_at.
@@ -93,7 +105,7 @@ class StickyNoteSerializer(serializers.ModelSerializer):
         model = StickyNote
         fields = [
             "id", "scope", "body", "author", "author_name", "mine",
-            "mentions", "mentioned_names", "done", "done_at", "created_at", "updated_at",
+            "mentions", "mentioned_names", "done", "done_at", "replies", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "author", "done_at", "created_at", "updated_at"]
 

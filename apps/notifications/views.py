@@ -181,19 +181,54 @@ class StickyNoteViewSet(viewsets.ModelViewSet):
                 Q(scope=StickyNote.Scope.TEAM) | Q(author=user)
             )
             .select_related("author")
-            .prefetch_related("mentions")
+            .prefetch_related("mentions", "replies__author")
         )
+
+    @action(detail=True, methods=["post"])
+    def reply(self, request, pk=None):
+        """Answer a team note. Its author and whoever it tags are told."""
+        from .models import StickyNoteReply
+        from .service import tell
+
+        note = self.get_object()
+        if note.scope != StickyNote.Scope.TEAM:
+            raise PermissionDenied("Only a team note takes replies.")
+        body = (request.data.get("body") or "").strip()
+        if not body:
+            return Response({"body": ["Write the reply."]}, status=status.HTTP_400_BAD_REQUEST)
+        StickyNoteReply.objects.create(note=note, author=request.user, body=body[:2000])
+        who = request.user.get_full_name() or request.user.username
+        tell(
+            [note.author, *note.mentions.all()], exclude=[request.user], kind=Notification.Type.SYSTEM,
+            title=f"{who} replied on a team note", message=f"{body[:200]} — on: {note.body[:80]}",
+            link="/", ref=f"note:{note.pk}", data={"note": str(note.pk)},
+        )
+        note = self.get_queryset().get(pk=note.pk)
+        return Response(self.get_serializer(note).data, status=status.HTTP_201_CREATED)
 
     def perform_create(self, serializer):
         note = serializer.save(author=self.request.user)
-        self._tell_the_tagged(note)
+        self._tag_the_named(note)
+        self._tell_the_tagged(note, set())
 
     def perform_update(self, serializer):
         # Ticking a note off is anybody's on that board; changing its words is the author's.
         if set(serializer.validated_data) - {"done"}:
             self._author_only(serializer.instance)
+        before = set(serializer.instance.mentions.values_list("pk", flat=True))
+        was_done = serializer.instance.done_at is not None
         note = serializer.save()
-        self._tell_the_tagged(note)
+        # Somebody else ticking it off is the answer the author was waiting for.
+        if note.scope == StickyNote.Scope.TEAM and not was_done and note.done_at and note.author_id != self.request.user.id:
+            from .service import tell
+
+            who = self.request.user.get_full_name() or self.request.user.username
+            tell([note.author], kind=Notification.Type.SYSTEM, title=f"{who} marked your note done",
+                 message=note.body[:200], link="/", ref=f"note:{note.pk}", data={"note": str(note.pk)})
+        self._tag_the_named(note)
+        # Only somebody newly tagged hears about it: ticking a note off, or
+        # fixing a typo, does not tell everyone on it all over again.
+        self._tell_the_tagged(note, before)
 
     def perform_destroy(self, instance):
         self._author_only(instance)
@@ -203,7 +238,26 @@ class StickyNoteViewSet(viewsets.ModelViewSet):
         if note.author_id != self.request.user.id:
             raise PermissionDenied("A note belongs to whoever wrote it.")
 
-    def _tell_the_tagged(self, note):
+    @staticmethod
+    def _tag_the_named(note):
+        """@Full Name in the text tags that person, whether or not they were
+        picked from the list: a name typed out in full was being shown on the
+        board and never reaching the person."""
+        if note.scope != StickyNote.Scope.TEAM or "@" not in note.body:
+            return
+        from apps.accounts.models import User
+
+        text = note.body.casefold()
+        # ponytail: scans every active account per note; fine for a company's
+        # staff, index by name if it ever runs to thousands.
+        named = [
+            u for u in User.objects.filter(is_active=True).exclude(pk=note.author_id)
+            if any(f"@{n}".casefold() in text for n in {u.get_full_name().strip(), u.username} if n)
+        ]
+        if named:
+            note.mentions.add(*named)
+
+    def _tell_the_tagged(self, note, before: set):
         """A tag is only useful if it reaches the person tagged."""
         if note.scope != StickyNote.Scope.TEAM:
             return
@@ -214,7 +268,7 @@ class StickyNoteViewSet(viewsets.ModelViewSet):
         # and opens the board, rather than sitting in the list until the
         # next refresh.
         tell(
-            list(note.mentions.exclude(pk=note.author_id)), kind=Notification.Type.SYSTEM,
+            list(note.mentions.exclude(pk=note.author_id).exclude(pk__in=before)), kind=Notification.Type.SYSTEM,
             title=f"{who} tagged you on a team note", message=note.body[:300],
             link="/", ref=f"note:{note.pk}", data={"note": str(note.pk)},
         )

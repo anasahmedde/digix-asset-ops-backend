@@ -174,6 +174,22 @@ class StickyNote(TimeStampedModel):
         return f"{self.get_scope_display()} · {self.body[:40]}"
 
 
+class StickyNoteReply(TimeStampedModel):
+    """An answer on a team note: "Done", "Assets registered", a question back."""
+
+    note = models.ForeignKey(StickyNote, on_delete=models.CASCADE, related_name="replies")
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="sticky_note_replies"
+    )
+    body = models.TextField()
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.author} on {self.note_id}: {self.body[:40]}"
+
+
 class CalendarEvent(TimeStampedModel):
     """A date somebody wants to see coming: a delivery, a visit, a meeting.
 
