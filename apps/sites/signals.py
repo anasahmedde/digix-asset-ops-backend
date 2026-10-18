@@ -123,9 +123,13 @@ def stamp_installation_completion(sender, instance: InstallationStep, **kwargs):
     """
     from django.utils import timezone
 
+    from .models import HandoverRecord
+
     installation = instance.installation
     statuses = list(installation.steps.values_list("status", flat=True))
-    done = (
+    # A job handed over to the client is complete, whatever its checklist says
+    # (every step skipped left nothing "completed" to count).
+    done = HandoverRecord.objects.filter(installation=installation).exists() or (
         bool(statuses)
         and all(s in (InstallationStep.StepStatus.COMPLETED, InstallationStep.StepStatus.SKIPPED) for s in statuses)
         and any(s == InstallationStep.StepStatus.COMPLETED for s in statuses)

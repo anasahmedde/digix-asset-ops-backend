@@ -807,6 +807,12 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             from .signals import _anchor_client_warranties
 
             installation.refresh_from_db()
+            # The handover is the end of the job. With every work step skipped
+            # and no handover step on the checklist, nothing above stamped it,
+            # so the field app kept asking the installer to check in.
+            if installation.completed_at is None:
+                installation.completed_at = clock.now()
+                installation.save(update_fields=["completed_at", "updated_at"])
             _anchor_client_warranties(installation)
 
             device.refresh_from_db()

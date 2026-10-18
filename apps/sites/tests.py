@@ -1992,3 +1992,29 @@ def test_helpers_named_with_the_asset_assignment_land_on_the_installation(ops, t
     job = DeviceInstallation.objects.get(device=device)
     assert job.installed_by == tech
     assert list(job.helpers.values_list("pk", flat=True)) == [helper.pk]
+
+
+def test_a_handover_completes_a_job_whose_steps_were_all_skipped(installation, ops):
+    """Every work step skipped and no handover step on the checklist: the
+    handover still finishes the job, so the field app stops asking the
+    installer to check in."""
+    installation.steps.filter(step_type=InstallationStep.StepType.HANDOVER).delete()
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.SKIPPED
+        step.save()
+    installation.refresh_from_db()
+    assert installation.completed_at is None, "nothing completed yet"
+
+    resp = _client(ops).post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Mr.rizwan", "acceptance_notes": "", "signed_document": _signed_page()},
+        format="multipart",
+    )
+    assert resp.status_code == 201, resp.data
+    installation.refresh_from_db()
+    assert installation.completed_at is not None
+    # Touching a step afterwards does not reopen a job the client accepted.
+    step = installation.steps.first()
+    step.save()
+    installation.refresh_from_db()
+    assert installation.completed_at is not None
