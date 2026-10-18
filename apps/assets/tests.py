@@ -3034,3 +3034,35 @@ def test_a_quantity_increase_is_decided_up_the_askers_line():
     ask(awais)
     rows = client["lad-ahmer"].get(f"/api/teams/projects/{project.id}/requirements/").data["assets"][0]["components"]
     assert rows[0]["may_decide_increase"] is False
+
+
+@_pytest.mark.django_db
+def test_only_those_above_the_supervisor_undo_a_requirement_decision():
+    """Waseem decides how a line is met but cannot take the decision back;
+    the Group Head, the Operations Head and the project's manager can."""
+    from apps.assets.models import AssetComponent, Device
+    from apps.teams.models import Project
+
+    head = User.objects.create_user(username="undo-head", password="x", role="group_head")
+    ops = User.objects.create_user(username="undo-ops", password="x", role="ops_manager")
+    sup = User.objects.create_user(username="undo-sup", password="x", role="supervisor")
+    lead_sup = User.objects.create_user(username="undo-lead", password="x", role="supervisor")
+    project = Project.objects.create(name="Undo", status="planning", manager=lead_sup)
+    device = Device.objects.create(asset_code="AST-UNDO-1", serial_number="UNDO-1", project=project)
+    line = AssetComponent.objects.create(device=device, name="Bracket", quantity=4,
+                                         fulfilment=AssetComponent.Fulfilment.PROCUREMENT)
+
+    def undo(user):
+        c = APIClient()
+        c.force_authenticate(user)
+        return c.post(f"/api/assets/components/{line.id}/reset-fulfilment/", {}, format="json").status_code
+
+    def may_undo(user):
+        c = APIClient()
+        c.force_authenticate(user)
+        return c.get(f"/api/teams/projects/{project.id}/requirements/").data["may_undo"]
+
+    assert undo(sup) == 403 and may_undo(sup) is False
+    for who in (head, ops, lead_sup):
+        assert may_undo(who) is True, who.username
+    assert undo(ops) == 200

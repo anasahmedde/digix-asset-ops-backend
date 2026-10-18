@@ -474,7 +474,10 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             })
 
         return Response(scrub_project_costs(
-            {"project": str(project.pk), "assets": assets, "totals": totals}, {"request": request},
+            {"project": str(project.pk), "assets": assets, "totals": totals,
+             # Whether this viewer may take decisions back (the undo buttons).
+             "may_undo": can_for_project(request.user, project, "undo_requirement_decisions")},
+            {"request": request},
         ))
 
     @action(detail=True, methods=["post"], url_path="procure-asset")
@@ -488,7 +491,9 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         from apps.assets.models import Device
 
         project = self.get_object()
-        denied = self._require(request, project, "decide_requirements")
+        denied = self._require(
+            request, project, "undo_requirement_decisions" if request.data.get("undo") else "decide_requirements",
+        )
         if denied is not None:
             return denied
         blocked = self._execution_blocked(project)
