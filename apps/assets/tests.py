@@ -2977,3 +2977,60 @@ def test_registering_an_asset_names_who_registered_it():
     assert r.status_code == 201, r.content
     ev = DeviceLifecycleEvent.objects.get(device_id=r.data["id"], description="Registered")
     assert ev.performed_by == ops
+
+
+@_pytest.mark.django_db
+def test_a_quantity_increase_is_decided_up_the_askers_line():
+    """Waseem asks: Ahmer or Awais above him decide. Ahmer asks: Awais. Awais
+    asks, with nobody above him: Awais himself - never Ahmer, who reports to him."""
+    from apps.assets.models import AssetComponent, Device
+    from apps.notifications.models import Notification
+    from apps.teams.models import Project
+
+    awais = User.objects.create_user(username="lad-awais", password="x", role="group_head")
+    ahmer = User.objects.create_user(username="lad-ahmer", password="x", role="ops_manager", reports_to=awais)
+    waseem = User.objects.create_user(username="lad-waseem", password="x", role="supervisor", reports_to=ahmer)
+    project = Project.objects.create(name="Ladder", status="planning", manager=ahmer)
+    device = Device.objects.create(asset_code="AST-LAD-1", serial_number="LAD-1", project=project)
+    component = AssetComponent.objects.create(device=device, name="Cat6 Cable", quantity=5)
+    client = {}
+    for u in (awais, ahmer, waseem):
+        client[u.username] = APIClient()
+        client[u.username].force_authenticate(u)
+
+    def ask(who):
+        r = client[who.username].post(f"/api/assets/components/{component.id}/increase-quantity/",
+                                      {"additional": 1, "reason": "damaged"}, format="json")
+        assert r.status_code == 200, r.content
+
+    def decide(who):
+        return client[who.username].post(f"/api/assets/components/{component.id}/approve-increase/", {}, format="json")
+
+    def asked():
+        return set(Notification.objects.filter(ref=f"increase:{component.id}", resolved_at__isnull=True)
+                   .values_list("recipient__username", flat=True))
+
+    # Awais, at the top, asks: Ahmer below him may not decide it; Awais does.
+    ask(awais)
+    assert asked() == set()
+    assert decide(ahmer).status_code == 403
+    assert decide(awais).status_code == 200
+    # Ahmer asks: Awais above him decides, Ahmer does not sign his own.
+    ask(ahmer)
+    assert asked() == {"lad-awais"}
+    assert decide(ahmer).status_code == 403
+    assert decide(awais).status_code == 200
+    # Waseem asks: both above him are asked and either decides.
+    ask(waseem)
+    assert asked() == {"lad-ahmer", "lad-awais"}
+    assert decide(waseem).status_code == 403
+    assert decide(ahmer).status_code == 200
+    # The project's requirements say who may press Approve.
+    ask(waseem)
+    for who, may in ((ahmer, True), (awais, True)):
+        rows = client[who.username].get(f"/api/teams/projects/{project.id}/requirements/").data["assets"][0]["components"]
+        assert rows[0]["may_decide_increase"] is may
+    decide(ahmer)
+    ask(awais)
+    rows = client["lad-ahmer"].get(f"/api/teams/projects/{project.id}/requirements/").data["assets"][0]["components"]
+    assert rows[0]["may_decide_increase"] is False
