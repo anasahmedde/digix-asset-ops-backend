@@ -184,6 +184,10 @@ class ProjectDetailSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, 
         ("target_date", "start_date", "the start date"),
         ("rental_end_date", "start_date", "the start date"),
     )
+    # A project is planned from today: a start or target already gone is
+    # refused when it is set or changed. A late project's old dates still
+    # save untouched when something else on it is edited.
+    future_dates = ("start_date", "target_date")
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     # Who the work is for, with the contact the team will actually ring.
     client_contact_person = serializers.CharField(

@@ -2961,3 +2961,19 @@ def test_a_bought_asset_lists_its_po_and_goods_received_notes():
     for d in docs:
         r = c.get("/api" + d["url"])
         assert r.status_code == 200 and r["Content-Type"] == "application/pdf", d
+
+
+@pytest.mark.django_db
+def test_registering_an_asset_names_who_registered_it():
+    """The registration line on the asset (and on its project's log) carries
+    the person who registered it, not "Not recorded"."""
+    from apps.assets.models import AssetType, DeviceLifecycleEvent
+
+    ops = User.objects.create_user(username="reg-ops", password="x", role="ops_manager", first_name="Ahmer")
+    c = APIClient()
+    c.force_authenticate(ops)
+    r = c.post("/api/assets/devices/", {"asset_type": str(AssetType.objects.create(name="Reg Kind").id),
+                                        "display_name": "Standee", "source": "inhouse"}, format="json")
+    assert r.status_code == 201, r.content
+    ev = DeviceLifecycleEvent.objects.get(device_id=r.data["id"], description="Registered")
+    assert ev.performed_by == ops

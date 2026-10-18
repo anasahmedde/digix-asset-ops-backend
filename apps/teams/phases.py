@@ -58,6 +58,13 @@ def phase_progress(project) -> dict:
         project_devices(project).prefetch_related("components", "production_steps")
     )
     device_ids = [d.pk for d in devices]
+    # An asset out of the workshop (in stock or further on) is built and
+    # supplied whatever its record says; one still in procurement or
+    # production is not, until its own work says so.
+    unbuilt = (Device.Status.PROCURED, Device.Status.IN_PRODUCTION)
+
+    def made(device):
+        return device.status not in unbuilt
 
     # ── Planning: the estimate is agreed when the budget is signed off ──
     plan = ProjectBudget.objects.filter(project=project).first()
@@ -79,8 +86,9 @@ def phase_progress(project) -> dict:
         components = list(device.components.all())
         wanted = sum(c.quantity for c in components)
         if not wanted:
-            # Nothing to buy for it, so nothing is holding it up.
-            shares.append(1.0)
+            # No parts listed yet - in planning that is a list still to be
+            # made, not a list already met. It counts once the asset is built.
+            shares.append(1.0 if made(device) else 0.0)
             continue
         shares.append(
             sum(min(c.issued_quantity, c.quantity) for c in components) / wanted
@@ -97,8 +105,10 @@ def phase_progress(project) -> dict:
             continue
         steps = list(device.production_steps.all())
         if not steps:
-            # Built here, but with no route on it: nothing to make.
-            shares.append(1.0)
+            # No route laid out yet: not built until it leaves the workshop.
+            # Counting it as made showed a project still in planning as a
+            # third of the way through production.
+            shares.append(1.0 if made(device) else 0.0)
             continue
         finished = sum(1 for s in steps if s.status in ("completed", "skipped"))
         shares.append(finished / len(steps))

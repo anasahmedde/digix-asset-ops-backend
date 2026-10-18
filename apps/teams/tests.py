@@ -1746,3 +1746,43 @@ def test_a_project_keeps_a_history_of_who_did_what_end_to_end():
     asset = next(r for r in rows if r["action"] == "asset")
     assert "Installed → Active" in asset["text"] and asset["actor"] == "log-tech"
     assert [r["at"] for r in rows] == sorted((r["at"] for r in rows), reverse=True), "newest first"
+
+
+@pytest.mark.django_db
+def test_a_new_project_cannot_start_in_the_past():
+    """Planned from today. An existing project's old start date still saves
+    when something else on it is edited."""
+    ops = User.objects.create_user(username="past-ops", password="x", role="ops_manager")
+    c = _client(ops)
+    yesterday = (timezone.localdate() - timedelta(days=1)).isoformat()
+    r = c.post("/api/teams/projects/", {"name": "Late start", "start_date": yesterday}, format="json")
+    assert r.status_code == 400 and "start_date" in r.data
+    r = c.post("/api/teams/projects/", {"name": "Late target", "target_date": yesterday}, format="json")
+    assert r.status_code == 400 and "target_date" in r.data
+
+    old = Project.objects.create(name="Running", start_date=timezone.localdate() - timedelta(days=30))
+    assert c.patch(f"/api/teams/projects/{old.id}/", {"description": "still fine"}, format="json").status_code == 200
+
+
+@pytest.mark.django_db
+def test_an_asset_with_no_route_yet_is_not_counted_as_built():
+    """A project still in planning: its in-house asset has parts listed but no
+    route laid out. Production read 1 of N built; it is not built until its
+    route is done or it has left the workshop."""
+    from apps.assets.models import AssetComponent, AssetType
+    from apps.teams.models import ProjectScopeItem
+    from apps.teams.phases import phase_progress
+
+    project = Project.objects.create(name="Planning only")
+    device = Device.objects.create(asset_type=AssetType.objects.create(name="Route Kind"),
+                                   source="inhouse", status="in_production")
+    AssetComponent.objects.create(device=device, name="Panel", quantity=2)
+    ProjectScopeItem.objects.create(project=project, device=device)
+
+    bars = phase_progress(project)
+    assert bars["production"]["percent"] == 0 and bars["production"]["done"] == 0
+    assert bars["procurement"]["percent"] == 0
+
+    device.status = "in_stock"
+    device.save(update_fields=["status"])
+    assert phase_progress(project)["production"]["percent"] == 100, "out of the workshop: built"
