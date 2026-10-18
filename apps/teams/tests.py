@@ -641,12 +641,25 @@ def test_budget_approval_gates_execution():
     r = c.post(f"/api/assets/components/{component.id}/fulfil-from-stock/", {}, format="json")
     assert r.status_code == 200, r.content
 
-    # Revising reopens the plan and locks execution again.
+    # Revising is the approver's call, not the planner's...
     r = c.post(f"/api/teams/projects/{project.id}/revise-budget/", {}, format="json")
+    assert r.status_code == 403
+    # ...it reopens the plan and locks execution again...
+    r = h.post(f"/api/teams/projects/{project.id}/revise-budget/", {}, format="json")
     assert r.status_code == 200, r.content
+    assert r.data["status"] == "draft"
     player = device.components.get(name="Plan Player")
     r = c.post(f"/api/assets/components/{player.id}/mark-for-procurement/", {}, format="json")
     assert r.status_code == 400
+    # ...and the lead who planned it is asked to revise and send it up again.
+    from apps.notifications.models import Notification
+
+    ask = Notification.objects.get(ref=f"budget-revise:{project.id}", resolved_at__isnull=True)
+    assert ask.is_actionable and ask.recipient == ops
+    r = c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json")
+    assert r.status_code == 200, r.content
+    ask.refresh_from_db()
+    assert ask.resolved_at is not None
 
 
 
@@ -1703,9 +1716,12 @@ def test_the_approver_does_not_submit_and_a_submitted_budget_waits_for_the_appro
     assert r.status_code == 403, r.content
     r = o.post(f"/api/teams/projects/{project.pk}/submit-budget/", {}, format="json")
     assert r.status_code == 200, r.content
-    # The planner cannot reopen it now...
+    # The planner cannot reopen it, ever - revising is the approver's call...
     r = o.post(f"/api/teams/projects/{project.pk}/revise-budget/", {}, format="json")
-    assert r.status_code == 400 and "awaiting approval" in r.json()["detail"]
+    assert r.status_code == 403
+    # ...and while it waits on them, their answer is a send-back with a reason.
+    r = h.post(f"/api/teams/projects/{project.pk}/revise-budget/", {}, format="json")
+    assert r.status_code == 400 and "Send it back" in r.json()["detail"]
     # ...and the approver cannot send it back without a reason.
     r = h.post(f"/api/teams/projects/{project.pk}/reject-budget/", {}, format="json")
     assert r.status_code == 400
