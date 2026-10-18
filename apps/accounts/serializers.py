@@ -240,7 +240,10 @@ class RoleDefinitionSerializer(serializers.ModelSerializer):
         unknown = sorted(set(value) - ALL_KEYS)
         if unknown:
             raise serializers.ValidationError(f"No such capability: {', '.join(unknown)}.")
-        return sorted(set(value))
+        # A right is saved with the rights it cannot be used without.
+        from .capabilities import with_requirements
+
+        return sorted(with_requirements(value))
 
     def validate(self, attrs):
         from .capabilities import SUPER_ADMIN_ONLY

@@ -514,3 +514,28 @@ def test_the_administrator_arranges_the_menu_for_everyone():
     r = client(admin).put("/api/accounts/menu-order/", {"order": order + ["/maintenance"]}, format="json")
     assert r.status_code == 200 and r.data["order"] == order, "duplicates dropped"
     assert client(tech).get("/api/accounts/menu-order/").data["order"] == order, "everyone gets it"
+
+
+@pytest.mark.django_db
+def test_a_right_brings_the_prices_it_decides_on():
+    """Approving budgets sees project costs; approving orders sees prices -
+    saved that way on the role, and held even if withdrawn on its own."""
+    from apps.accounts.models import UserCapability
+    from apps.accounts.roles import forget
+
+    admin = User.objects.create_superuser(username="req-admin", password="x", role="super_admin")
+    c = APIClient()
+    c.force_authenticate(admin)
+    try:
+        r = c.post("/api/accounts/roles/", {"label": "Budget signer", "capabilities": ["approve_budget", "approve_po"]},
+                   format="json")
+        assert r.status_code == 201, r.content
+        assert {"view_project_costs", "view_prices"} <= set(r.data["capabilities"]), "saved with what they need"
+        forget()
+
+        signer = User.objects.create_user(username="req-signer", password="x", role=r.data["key"])
+        UserCapability.objects.create(user=signer, capability="view_project_costs", allowed=False)
+        assert signer.can("approve_budget") and signer.can("view_project_costs"), "cannot be taken away while approving budgets"
+    finally:
+        # The rights map is cached; leave it to be read again from a clean database.
+        forget()

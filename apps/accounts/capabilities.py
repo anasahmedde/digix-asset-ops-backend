@@ -58,6 +58,10 @@ CAPABILITIES: tuple[Capability, ...] = (
     # --- Projects ------------------------------------------------------------
     _c("view_projects", "See projects", "Projects",
        "Project list, scope, progress, sites and costing.", "view"),
+    _c("view_project_costs", "See project costs", "Projects",
+       "Every amount on a project: the budget and costing, actual spend, the bill of "
+       "quantities, prices on its requirements, and their documents. Unticked, a project "
+       "shows no money at all.", "view"),
     _c("edit_projects", "Run projects", "Projects",
        "Create projects, set scope and sites, assign the manager and target dates."),
     _c("plan_budget", "Plan and submit budgets", "Projects",
@@ -333,12 +337,44 @@ def defaults_for(role: str) -> frozenset[str]:
     return ROLE_DEFAULTS.get(role, frozenset())
 
 
+#: Rights that cannot be used without seeing the money they decide on.
+#: Holding one holds these too: approving a budget you cannot read is not
+#: approving it. Ticked with it on the Roles & Rights grid, and locked on.
+REQUIRES: dict[str, tuple[str, ...]] = {
+    # Project money
+    "plan_budget": ("view_project_costs",),
+    "approve_budget": ("view_project_costs",),
+    "approve_quantity_increase": ("view_project_costs",),
+    "agree_project_variance": ("view_project_costs", "view_prices"),
+    # Prices everywhere else
+    "edit_prices": ("view_prices",),
+    "view_margins": ("view_prices",),
+    "raise_po": ("view_prices",),
+    "approve_po": ("view_prices",),
+    "raise_work_order": ("view_prices",),
+    "approve_work_order": ("view_prices",),
+    "agree_stock_variance": ("view_prices",),
+    "approve_ticket_cost": ("view_prices",),
+    "manage_quotations": ("view_prices",),
+    "view_finance": ("view_prices",),
+    "manage_finance": ("view_prices",),
+}
+
+
+def with_requirements(keys) -> set[str]:
+    """These rights, and every right they cannot be used without."""
+    out = set(keys or ())
+    for key in list(out):
+        out.update(REQUIRES.get(key, ()))
+    return out
+
+
 def expand(keys) -> frozenset[str]:
     """Read a stored list, translating any key that has since been renamed."""
     out = set()
     for key in keys or ():
         out.update(RENAMED.get(key, (key,)))
-    return frozenset(out & ALL_KEYS)
+    return frozenset(with_requirements(out) & ALL_KEYS)
 
 
 def catalogue() -> list[dict]:
@@ -352,6 +388,8 @@ def catalogue() -> list[dict]:
             "description": c.description,
             "sensitive": c.sensitive,
             "super_admin_only": c.super_admin_only,
+            # What it cannot be used without; the grid ticks and locks those.
+            "requires": list(REQUIRES.get(c.key, ())),
         }
         for c in CAPABILITIES
     ]
