@@ -543,3 +543,32 @@ def test_a_right_brings_the_prices_it_decides_on():
     finally:
         # The rights map is cached; leave it to be read again from a clean database.
         forget()
+
+
+@pytest.mark.django_db
+def test_the_storekeeper_can_name_who_collects_without_the_directory():
+    """Issuing stock asks who takes it away. A storekeeper without "See team"
+    still gets the names (and only the names); a client login gets nothing."""
+    from rest_framework.test import APIClient
+
+    from apps.accounts.models import RoleDefinition
+
+    RoleDefinition.objects.update_or_create(key="qa_store", defaults={"label": "QA Store", "capabilities": ["issue_stock"]})
+    keeper = User.objects.create_user(username="names-keeper", password="x", role="qa_store")
+    User.objects.create_user(username="names-tech", password="x", role="technician", first_name="Waseem")
+    client_login = User.objects.create_user(username="names-client", password="x", role="client_viewer")
+    from apps.accounts import roles
+    try:
+        roles.forget()
+        c = APIClient()
+        c.force_authenticate(keeper)
+        assert c.get("/api/accounts/users/").status_code == 403
+        r = c.get("/api/accounts/users/names/")
+        assert r.status_code == 200, r.content
+        assert {"name": "Waseem", "role": "Technician"}.items() <= next(p for p in r.data if p["name"] == "Waseem").items()
+        assert set(r.data[0]) == {"id", "name", "role"}
+        assert "names-client" not in [p["name"] for p in r.data]
+        c.force_authenticate(client_login)
+        assert c.get("/api/accounts/users/names/").status_code == 403
+    finally:
+        roles.forget()
