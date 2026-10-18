@@ -28,8 +28,8 @@ MONEY_FIELDS = frozenset({
 })
 
 
-def viewer_sees_prices(context) -> bool:
-    """Whether whoever asked for this payload may see money."""
+def viewer_sees_prices(context, capability: str = "view_prices") -> bool:
+    """Whether whoever asked for this payload may see money (of this kind)."""
     request = context.get("request") if context else None
     user = getattr(request, "user", None)
     if user is None or not getattr(user, "is_authenticated", False):
@@ -37,7 +37,7 @@ def viewer_sees_prices(context) -> bool:
     # Anything that is not one of our users (a token, a service) is left as
     # it was rather than silently blanked.
     can = getattr(user, "can", None)
-    return can("view_prices") if callable(can) else True
+    return can(capability) if callable(can) else True
 
 
 def scrub(data, context=None, *, also=()):
@@ -70,6 +70,46 @@ def _blank(node, names):
 # What a cost document calls its bottom line.
 COSTING_TOTALS = ("total", "subtotal", "grand_total", "sum", "overall")
 
+#: Numbers on a project's costing that are counts, not money: they stay.
+NOT_MONEY = frozenset({
+    "quantity", "actual_quantity", "allocated_quantity", "issued_quantity", "shortage",
+    "required", "allocated", "issued", "outstanding", "lines", "unpriced_lines",
+    "step_number", "contingency_percent", "percent", "progress",
+})
+
+
+def viewer_sees_project_costs(context) -> bool:
+    return viewer_sees_prices(context, "view_project_costs")
+
+
+def scrub_project_costs(data, context=None):
+    """Every amount on a project, for whoever may not see project costs.
+
+    Blanked by kind as well as by name: a project's costing grew fields the
+    name list did not know (asset_total, materials_total, installation_cost),
+    and those reached people the rest was hidden from. Any decimal that is
+    not a count is money here.
+    """
+    if viewer_sees_project_costs(context):
+        return data
+    return _blank_amounts(data, MONEY_FIELDS | frozenset(COSTING_TOTALS))
+
+
+def _blank_amounts(node, names):
+    from decimal import Decimal
+
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if k in names or (isinstance(v, (Decimal, float)) and k not in NOT_MONEY):
+                out[k] = None
+            else:
+                out[k] = _blank_amounts(v, names)
+        return out
+    if isinstance(node, (list, tuple)):
+        return [_blank_amounts(v, names) for v in node]
+    return node
+
 
 class HidesMoney:
     """Blank the amounts unless the reader is allowed to see them.
@@ -78,9 +118,12 @@ class HidesMoney:
     context, so a purchase order's lines are covered by the order's check.
     """
 
+    #: The right that shows these amounts. Project payloads use their own.
+    money_capability = "view_prices"
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        if viewer_sees_prices(self.context):
+        if viewer_sees_prices(self.context, self.money_capability):
             return data
         for name in MONEY_FIELDS & set(data):
             data[name] = None

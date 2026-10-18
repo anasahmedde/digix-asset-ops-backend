@@ -1786,3 +1786,56 @@ def test_an_asset_with_no_route_yet_is_not_counted_as_built():
     device.status = "in_stock"
     device.save(update_fields=["status"])
     assert phase_progress(project)["production"]["percent"] == 100, "out of the workshop: built"
+
+
+@pytest.mark.django_db
+def test_see_project_costs_shows_every_project_amount_or_none():
+    """One right decides: without it a project shows no money anywhere (the
+    costing, the parts summary, the PDFs); with it, all of it."""
+    from apps.accounts.models import UserCapability
+    from apps.assets.models import AssetType
+    from apps.teams.models import ProjectBOMLine, ProjectCostLine, ProjectScopeItem
+
+    project = Project.objects.create(name="Costed", budget=1000)
+    device = Device.objects.create(asset_type=AssetType.objects.create(name="Cost Kind"), source="inhouse",
+                                   status="in_production", planned_installation_cost=5000)
+    ProjectScopeItem.objects.create(project=project, device=device)
+    ProjectCostLine.objects.create(project=project, cost_type="Travel", description="Travel", quantity=1, unit_cost=2500)
+    ProjectBOMLine.objects.create(project=project, description="Cable", quantity=3, unit_price=40)
+
+    # Sees projects and nothing that decides on their money.
+    viewer = User.objects.create_user(username="cost-blind", password="x", role="technician")
+    UserCapability.objects.create(user=viewer, capability="view_projects", allowed=True)
+    assert viewer.can("view_projects") and not viewer.can("view_project_costs")
+    c = _client(viewer)
+
+    def amounts(node, found):
+        from decimal import Decimal
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, (int, float, Decimal, str)) and not isinstance(v, bool) and k not in (
+                    "quantity", "step_number", "lines", "unpriced_lines", "contingency_percent", "id", "project",
+                ):
+                    try:
+                        if float(v) and k not in ("asset_code", "name", "description"):
+                            found.append(k)
+                    except (TypeError, ValueError):
+                        pass
+                amounts(v, found)
+        elif isinstance(node, list):
+            for x in node:
+                amounts(x, found)
+        return found
+
+    plan = c.get(f"/api/teams/projects/{project.id}/plan/").data
+    assert amounts(plan, []) == [], amounts(plan, [])
+    assert c.get(f"/api/teams/projects/{project.id}/bom-summary/").data["lines"][0]["unit_price"] is None
+    assert c.get(f"/api/teams/projects/{project.id}/").data["budget"] is None
+    for doc in ("plan/document", "actuals/document", "boq/document"):
+        assert c.get(f"/api/teams/projects/{project.id}/{doc}/").status_code == 403, doc
+
+    UserCapability.objects.create(user=viewer, capability="view_project_costs", allowed=True)
+    viewer.refresh_from_db()
+    plan = c.get(f"/api/teams/projects/{project.id}/plan/").data
+    assert amounts(plan, []), "ticked: the amounts are there"
+    assert c.get(f"/api/teams/projects/{project.id}/plan/document/").status_code == 200
