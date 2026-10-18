@@ -214,6 +214,9 @@ CAPABILITIES: tuple[Capability, ...] = (
        "Registers, who is in, and corrections.", "view"),
     _c("manage_attendance", "Correct attendance", "People",
        "Add or correct attendance records for other people."),
+    _c("use_field_app", "Use the field app", "People",
+       "Sign in to the DIGIX field app on a phone: jobs, site check-ins, Time in / Time out. "
+       "Taking it away signs the phone out."),
     _c("view_team", "See the team", "People",
        "The employee list and the organogram.", "view"),
     _c("manage_team", "Manage people", "People",
@@ -267,14 +270,16 @@ _VIEW_ALL = _keys(*(c.key for c in CAPABILITIES if c.kind == "view" and not c.se
 # but the Group Head signs the money off, the field has its own work and
 # nothing else, and prices are a management concern by default.
 ROLE_DEFAULTS: dict[str, frozenset[str]] = {
-    "super_admin": ALL_KEYS,
+    # The field app is for the people in the field: technicians by default,
+    # anyone else once it is ticked for them.
+    "super_admin": ALL_KEYS - _keys("use_field_app"),
     # Signs the money off; Operations raise the orders. Logins are the
     # Super Admin's (authority matrix, gate 9).
-    "group_head": ALL_KEYS - _keys("manage_logins", "raise_po", "raise_work_order"),
+    "group_head": ALL_KEYS - _keys("manage_logins", "raise_po", "raise_work_order", "use_field_app"),
     # Runs assets, projects, sites, procurement and maintenance; the three
     # signatures (budget, PO, WO) and logins stay above.
     "ops_manager": ALL_KEYS - _keys(
-        "approve_budget", "approve_po", "approve_work_order", "manage_logins",
+        "approve_budget", "approve_po", "approve_work_order", "manage_logins", "use_field_app",
     ),
     "marketing_head": _VIEW_ALL | _keys(
         "edit_prices", "raise_ticket", "work_tickets", "relay_client_decision", "close_ticket",
@@ -309,7 +314,7 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
         # Asking for a part means naming one, so the person asking has to be
         # able to see what the store carries. It is a list of materials, not
         # of money - prices are `view_prices`, which they do not have.
-        "view_stock", "request_material",
+        "view_stock", "request_material", "use_field_app",
         "view_assets", "work_production", "view_installations", "edit_installation",
         "activate_asset", "view_tickets", "raise_ticket", "work_tickets",
         "view_maintenance", "work_maintenance", "view_team", "view_attendance",
