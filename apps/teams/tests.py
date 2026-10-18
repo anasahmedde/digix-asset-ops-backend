@@ -1746,3 +1746,19 @@ def test_a_project_keeps_a_history_of_who_did_what_end_to_end():
     asset = next(r for r in rows if r["action"] == "asset")
     assert "Installed → Active" in asset["text"] and asset["actor"] == "log-tech"
     assert [r["at"] for r in rows] == sorted((r["at"] for r in rows), reverse=True), "newest first"
+
+
+@pytest.mark.django_db
+def test_a_new_project_cannot_start_in_the_past():
+    """Planned from today. An existing project's old start date still saves
+    when something else on it is edited."""
+    ops = User.objects.create_user(username="past-ops", password="x", role="ops_manager")
+    c = _client(ops)
+    yesterday = (timezone.localdate() - timedelta(days=1)).isoformat()
+    r = c.post("/api/teams/projects/", {"name": "Late start", "start_date": yesterday}, format="json")
+    assert r.status_code == 400 and "start_date" in r.data
+    r = c.post("/api/teams/projects/", {"name": "Late target", "target_date": yesterday}, format="json")
+    assert r.status_code == 400 and "target_date" in r.data
+
+    old = Project.objects.create(name="Running", start_date=timezone.localdate() - timedelta(days=30))
+    assert c.patch(f"/api/teams/projects/{old.id}/", {"description": "still fine"}, format="json").status_code == 200
