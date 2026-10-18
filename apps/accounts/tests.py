@@ -572,3 +572,35 @@ def test_the_storekeeper_can_name_who_collects_without_the_directory():
         assert c.get("/api/accounts/users/names/").status_code == 403
     finally:
         roles.forget()
+
+
+@pytest.mark.django_db
+def test_who_collects_is_the_project_managers_team():
+    """For a project's material: the project manager and everyone under them,
+    the manager first - not the whole company. No project: everyone."""
+    from rest_framework.test import APIClient
+
+    from apps.assets.models import AssetComponent, Device
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem, IssuanceRequest
+    from apps.teams.models import Project
+
+    awais = User.objects.create_user(username="col-awais", password="x", role="group_head", first_name="Awais")
+    ahmer = User.objects.create_user(username="col-ahmer", password="x", role="ops_manager", first_name="Ahmer", reports_to=awais)
+    waseem = User.objects.create_user(username="col-waseem", password="x", role="supervisor", first_name="Waseem", reports_to=ahmer)
+    User.objects.create_user(username="col-tech", password="x", role="technician", first_name="Zeeshan", reports_to=waseem)
+    User.objects.create_user(username="col-other", password="x", role="marketing", first_name="Hamza", reports_to=awais)
+    project = Project.objects.create(name="Collect", status="planning", manager=ahmer)
+    device = Device.objects.create(asset_code="AST-COL-1", serial_number="COL-1", project=project)
+    item = InventoryItem.objects.create(material_type=MaterialType.objects.create(name="Col Bracket", unit="piece"), quantity=50)
+    line = AssetComponent.objects.create(device=device, name="Bracket", quantity=10, inventory_item=item)
+    ir = IssuanceRequest.objects.create(item=item, quantity_requested=10, asset_component=line, requested_by=waseem)
+    loose = IssuanceRequest.objects.create(item=item, quantity_requested=1, requested_by=waseem)
+
+    c = APIClient()
+    c.force_authenticate(awais)
+    names = [p["name"] for p in c.get("/api/accounts/users/names/", {"request": str(ir.pk)}).data]
+    assert names == ["Ahmer", "Waseem", "Zeeshan"]
+    everyone = [p["name"] for p in c.get("/api/accounts/users/names/", {"request": str(loose.pk)}).data]
+    assert {"Awais", "Hamza", "Ahmer"} <= set(everyone)
+    assert c.get("/api/accounts/users/names/", {"request": "not-an-id"}).status_code == 200
