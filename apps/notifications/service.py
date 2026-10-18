@@ -175,21 +175,12 @@ def resolve(ref):
 def _push_resolved(ref, rows):
     """Tell every page still showing the request that it was answered, so it
     leaves their bar and their screen reloads - not only the decider's."""
-    from asgiref.sync import async_to_sync
-    from channels.layers import get_channel_layer
+    from .signals import _send
 
-    layer = get_channel_layer()
-    if layer is None:
-        return
     for row in rows:
-        try:
-            async_to_sync(layer.group_send)(f"notifications_{row['recipient_id']}", {
-                "type": "send_notification",
-                "notification": {"type": "resolved", "id": str(row["pk"]), "ref": ref,
-                                 "link": row["link"], "data": row["data"]},
-            })
-        except Exception:  # noqa: BLE001 - a dropped socket must not fail the request
-            logger.exception("resolved push failed for %s", ref)
+        _send(f"notifications_{row['recipient_id']}", {
+            "type": "resolved", "id": str(row["pk"]), "ref": ref, "link": row["link"], "data": row["data"],
+        })
 
 
 def line_above(user):

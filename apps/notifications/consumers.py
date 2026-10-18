@@ -35,11 +35,14 @@ class NotificationConsumer(AsyncJsonWebsocketConsumer):
 
         self.group_name = f"notifications_{self.user_id}"
         await self.channel_layer.group_add(self.group_name, self.channel_name)
+        # "Project X changed": screens open on it reload (no details travel).
+        await self.channel_layer.group_add("everyone", self.channel_name)
         await self.accept()
 
     async def disconnect(self, close_code):
         if self.group_name:
             await self.channel_layer.group_discard(self.group_name, self.channel_name)
+            await self.channel_layer.group_discard("everyone", self.channel_name)
 
     async def receive_json(self, content, **kwargs):
         msg_type = content.get("type")
