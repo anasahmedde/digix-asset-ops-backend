@@ -165,9 +165,31 @@ def resolve(ref):
     """The thing moved: nothing is waiting on it any more."""
     if not ref:
         return 0
-    return Notification.objects.filter(ref=ref, is_actionable=True, resolved_at__isnull=True).update(
-        resolved_at=timezone.now()
-    )
+    waiting = Notification.objects.filter(ref=ref, is_actionable=True, resolved_at__isnull=True)
+    rows = list(waiting.values("pk", "recipient_id", "link", "data"))
+    done = waiting.update(resolved_at=timezone.now())
+    _push_resolved(ref, rows)
+    return done
+
+
+def _push_resolved(ref, rows):
+    """Tell every page still showing the request that it was answered, so it
+    leaves their bar and their screen reloads - not only the decider's."""
+    from asgiref.sync import async_to_sync
+    from channels.layers import get_channel_layer
+
+    layer = get_channel_layer()
+    if layer is None:
+        return
+    for row in rows:
+        try:
+            async_to_sync(layer.group_send)(f"notifications_{row['recipient_id']}", {
+                "type": "send_notification",
+                "notification": {"type": "resolved", "id": str(row["pk"]), "ref": ref,
+                                 "link": row["link"], "data": row["data"]},
+            })
+        except Exception:  # noqa: BLE001 - a dropped socket must not fail the request
+            logger.exception("resolved push failed for %s", ref)
 
 
 def line_above(user):
