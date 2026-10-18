@@ -5,6 +5,7 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.exceptions import PermissionDenied, ValidationError
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
@@ -128,7 +129,13 @@ class UserViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def names(self, request):
-        """Everyone on the team who can collect: name and role, nothing more."""
+        """Everyone on the team who can collect: name and role, nothing more.
+
+        ``?request=<material request>``: only the team of the manager of the
+        project it is for - the manager and everyone under them - since that
+        is who works on it. A request with no project, or a project with no
+        manager, keeps the whole list.
+        """
         from .models import RoleDefinition
 
         # Custom roles have their own names, as the Teams page shows them.
@@ -139,11 +146,45 @@ class UserViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             .exclude(is_superuser=True)
             .order_by("first_name", "last_name", "username")
         )
+        lead = self._project_manager_of_request(request.query_params.get("request"))
+        if lead is not None:
+            boss_of = dict(User.objects.values_list("pk", "reports_to_id"))
+
+            def on_team(uid):
+                seen, boss = set(), uid
+                while boss is not None and boss not in seen:
+                    if boss == lead.pk:
+                        return True
+                    seen.add(boss)
+                    boss = boss_of.get(boss)
+                return False
+
+            people = sorted((u for u in people if on_team(u.pk)), key=lambda u: u.pk != lead.pk)
         return Response([
             {"id": str(u.pk), "name": u.get_full_name().strip() or u.username,
              "role": labels.get(u.role) or u.role.replace("_", " ").title()}
             for u in people
         ])
+
+    @staticmethod
+    def _project_manager_of_request(request_id):
+        """The manager of the project a material request is for, if any."""
+        if not request_id:
+            return None
+        from apps.inventory.models import IssuanceRequest
+
+        try:
+            ir = IssuanceRequest.objects.filter(pk=request_id).first()
+        except (ValueError, DjangoValidationError):
+            return None
+        if ir is None:
+            return None
+        project = ir.project if ir.project_id else None
+        if project is None:
+            device = (ir.asset_component.device if ir.asset_component_id
+                      else ir.maintenance_schedule.device if ir.maintenance_schedule_id else None)
+            project = device.project_on if device is not None else None
+        return project.manager if project is not None and project.manager_id else None
 
     def perform_destroy(self, instance):
         """Remove an account - once nobody is left hanging from it.
