@@ -1992,3 +1992,55 @@ def test_helpers_named_with_the_asset_assignment_land_on_the_installation(ops, t
     job = DeviceInstallation.objects.get(device=device)
     assert job.installed_by == tech
     assert list(job.helpers.values_list("pk", flat=True)) == [helper.pk]
+
+
+def test_a_handover_completes_a_job_whose_steps_were_all_skipped(installation, ops):
+    """Every work step skipped and no handover step on the checklist: the
+    handover still finishes the job, so the field app stops asking the
+    installer to check in."""
+    installation.steps.filter(step_type=InstallationStep.StepType.HANDOVER).delete()
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.SKIPPED
+        step.save()
+    installation.refresh_from_db()
+    assert installation.completed_at is None, "nothing completed yet"
+
+    resp = _client(ops).post(
+        f"/api/sites/installations/{installation.pk}/handover/",
+        {"accepted_by_name": "Mr.rizwan", "acceptance_notes": "", "signed_document": _signed_page()},
+        format="multipart",
+    )
+    assert resp.status_code == 201, resp.data
+    installation.refresh_from_db()
+    assert installation.completed_at is not None
+    # Touching a step afterwards does not reopen a job the client accepted.
+    step = installation.steps.first()
+    step.save()
+    installation.refresh_from_db()
+    assert installation.completed_at is not None
+
+
+def test_the_activity_log_shows_when_the_crew_checked_in_and_out(installation, ops):
+    """The installer's and helpers' check-ins at the site, with their times;
+    someone else's, or a check-in somewhere else, stays out."""
+    from apps.attendance.models import AttendanceRecord
+
+    tech = installation.installed_by
+    helper = User.objects.create_user(username="act-helper", password="x", role="technician", first_name="Sharoon")
+    stranger = User.objects.create_user(username="act-stranger", password="x", role="technician")
+    installation.helpers.add(helper)
+    other_site = Site.objects.create(name="Elsewhere", city="Lahore")
+    AttendanceRecord.objects.create(user=tech, site=installation.site, check_type="check_in")
+    AttendanceRecord.objects.create(user=helper, site=installation.site, check_type="check_in")
+    AttendanceRecord.objects.create(user=helper, site=installation.site, check_type="check_out")
+    AttendanceRecord.objects.create(user=stranger, site=installation.site, check_type="check_in")
+    AttendanceRecord.objects.create(user=tech, site=other_site, check_type="check_in")
+
+    rows = _client(ops).get(f"/api/sites/installations/{installation.pk}/activity/").json()
+    texts = [r["text"] for r in rows if r["action"] in ("checked_in", "checked_out")]
+    assert sorted(texts) == sorted([
+        "Checked in at Install Site (installer)",
+        "Checked in at Install Site (helper)",
+        "Checked out of Install Site (helper)",
+    ])
+    assert all(r["at"] for r in rows), "every line has its time"

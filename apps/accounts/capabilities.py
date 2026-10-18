@@ -71,6 +71,9 @@ CAPABILITIES: tuple[Capability, ...] = (
     _c("decide_requirements", "Decide how requirements are met", "Projects",
        "Take parts from stock, send them to procurement, choose in-house or vendor "
        "for each operation, and request more than was planned."),
+    _c("undo_requirement_decisions", "Undo requirement decisions", "Projects",
+       "Take back a stock or procurement decision on a requirement - returning anything "
+       "already issued - or take a complete asset back from Procurement.", "approve", True),
     _c("approve_quantity_increase", "Approve quantity increases", "Projects",
        "Allow a project to need more of a part than the approved plan said.", "approve", True),
     _c("agree_project_variance", "Agree prices over the project plan", "Projects",
@@ -327,7 +330,7 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
 # What a project's manager may do on their own project without holding the
 # capability outright: the organogram made them answerable for it.
 PROJECT_MANAGER_CAPABILITIES = _keys(
-    "view_projects", "edit_projects", "plan_budget", "decide_requirements",
+    "view_projects", "edit_projects", "plan_budget", "decide_requirements", "undo_requirement_decisions",
     "approve_quantity_increase", "agree_project_variance", "record_client_warranty",
     "assign_installation", "view_procurement", "view_work_orders", "view_installations",
 )
@@ -348,6 +351,7 @@ REQUIRES: dict[str, tuple[str, ...]] = {
     "plan_budget": ("view_projects", "view_project_costs"),
     "approve_budget": ("view_projects", "view_project_costs"),
     "decide_requirements": ("view_projects",),
+    "undo_requirement_decisions": ("view_projects",),
     "approve_quantity_increase": ("view_projects", "view_project_costs"),
     "agree_project_variance": ("view_projects", "view_project_costs", "view_prices"),
     "record_client_warranty": ("view_projects",),
