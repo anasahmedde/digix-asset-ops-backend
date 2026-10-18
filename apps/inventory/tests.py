@@ -2108,8 +2108,21 @@ def test_the_goods_received_note_names_who_received_and_inspected(inspector, rec
     pypdf = pytest.importorskip("pypdf")  # not in requirements/base.txt; read it where installed
     text = "".join(page.extract_text() for page in pypdf.PdfReader(BytesIO(r.content)).pages)
     for expected in ("GOODS RECEIVED NOTE", line.receipt.grn_number, received_line["po"].po_number,
-                     "Insp Supplier", "DN-1", "Batch BATCH-9", "grn-store", "insp-supervisor", "All good"):
+                     "Insp Supplier", "DN-1", "Batch BATCH-9", "grn-store", "insp-supervisor", "All good",
+                     # Bought for nothing but the shelf: what it is for, and where it went.
+                     "Stock replenishment", "Sent to", "Inventory"):
         assert expected in text, expected
+    assert "Stored by" not in text
+
+
+def test_a_grn_says_which_project_the_goods_were_bought_for(ordered_requirement):
+    """The FOR column and "Sent to" name the project; the shelf otherwise."""
+    from apps.inventory.documents import bought_for, sent_to
+
+    po_item = ordered_requirement["line"].po_item
+    assert bought_for(po_item) == [("project", "Auto Project")]
+    assert sent_to(po_item) == ["Auto Project"]
+    assert sent_to(None) == ["Inventory"] and bought_for(None) == [("stock", "Stock replenishment")]
 
 
 def test_the_requester_is_told_who_took_the_material_away(ops, items):
