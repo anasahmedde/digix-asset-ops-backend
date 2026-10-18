@@ -771,6 +771,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         plan.decision_notes = ""
         plan.save(update_fields=["status", "submitted_by", "submitted_at", "decision_notes", "updated_at"])
         project_log.log(project, "budget", f"Budget submitted for approval - PKR {summary['total']:,.0f}", user=request.user)
+        notices.resolve(f"budget-revise:{project.pk}")
         notices.ask(
             "approve_budget", exclude=[request.user],
             title=f"Budget for {project.name} needs your approval",
@@ -844,26 +845,27 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="revise-budget")
     def revise_budget(self, request, pk=None):
-        """Reopen an approved or pending budget for changes.
+        """Reopen an approved budget for changes - the approver's call.
 
-        Execution locks again until the revised figure is approved.
+        Whoever signs budgets off decides it needs revising; the planner then
+        changes it and sends it up again. Execution locks until the revised
+        figure is approved.
         """
         from common.money import scrub_project_costs, viewer_sees_project_costs
         from .costing import build_plan, get_or_create_plan
 
         project = self.get_object()
-        denied = self._require(request, project, "plan_budget")
+        denied = self._require(request, project, "approve_budget")
         if denied is not None:
             return denied
         plan = get_or_create_plan(project)
         if plan.is_editable:
             return Response({"detail": "The budget is already open for changes."}, status=400)
-        # Once sent up it is the approver's: they approve it or send it
-        # back with a reason. The planner cannot quietly change what is
-        # being signed.
-        if plan.status == ProjectBudget.Status.SUBMITTED and not request.user.is_superuser:
+        # Waiting on the approver: their answer is approve, or send it back
+        # with a reason - which reopens it too.
+        if plan.status == ProjectBudget.Status.SUBMITTED:
             return Response(
-                {"detail": "This budget is awaiting approval. It comes back to you when the approver sends it back."},
+                {"detail": "This budget is waiting for your decision. Send it back with a reason to have it revised."},
                 status=400,
             )
         notices.resolve(f"budget:{project.pk}")
@@ -884,6 +886,18 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             "decision_notes", "updated_at",
         ])
         project_log.log(project, "budget", "Budget reopened for changes - execution waits for the revised approval", user=request.user)
+        # Back to the lead who planned it: revise, then send it up again.
+        about = dict(
+            title=f"Budget for {project.name} reopened for changes",
+            message=f"Revise it and send it for approval again — {notices.who(request.user)}",
+            link=f"/projects?project={project.pk}&tab=planning", ref=f"budget-revise:{project.pk}",
+            data={"project": str(project.pk)},
+        )
+        leads = [u for u in (plan.submitted_by, project.manager) if u is not None]
+        if leads:
+            notices.notify(leads, kind="approval_decided", actionable=True, exclude=[request.user], **about)
+        else:
+            notices.ask("plan_budget", project=project, exclude=[request.user], kind="approval_decided", **about)
         return Response(scrub_project_costs(build_plan(project), {"request": request}))
 
     @action(detail=False, methods=["get"])
