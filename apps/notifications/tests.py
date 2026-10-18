@@ -159,23 +159,27 @@ def test_opening_something_important_informs_the_line_above():
 @pytest.mark.django_db
 def test_waiting_on_names_whose_desk_a_request_is_on():
     """Filed under a ref: the people still holding it; answered: nobody.
-    Nothing filed: whoever holds the deciding right."""
+    Nothing filed: whoever holds the deciding right. The Administrator is
+    never named: they can decide anything, so it says nothing."""
     from rest_framework.test import APIClient
 
     from apps.notifications.service import ask, resolve
 
     head = User.objects.create_user(username="desk-head", password="x", role="group_head")
     ops = User.objects.create_user(username="desk-ops", password="x", role="ops_manager")
+    User.objects.create_user(username="desk-admin", password="x", role="super_admin")
     ask("approve_budget", exclude=[ops], title="Budget needs you", ref="budget:desk-test")
     c = APIClient()
     c.force_authenticate(ops)
     r = c.get("/api/notifications/notifications/waiting-on/", {"ref": "budget:desk-test"})
     assert [p["name"] for p in r.data] == ["desk-head"]
+    assert Notification.objects.filter(ref="budget:desk-test", recipient__username="desk-admin").exists()
     resolve("budget:desk-test")
     r = c.get("/api/notifications/notifications/waiting-on/", {"ref": "budget:desk-test"})
     assert r.data == []
     r = c.get("/api/notifications/notifications/waiting-on/", {"capability": "approve_po"})
-    assert "desk-head" in [p["name"] for p in r.data]
+    names = [p["name"] for p in r.data]
+    assert "desk-head" in names and "desk-admin" not in names
 
 
 @pytest.mark.django_db
