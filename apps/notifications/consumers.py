@@ -44,7 +44,10 @@ class NotificationConsumer(AsyncJsonWebsocketConsumer):
     async def receive_json(self, content, **kwargs):
         msg_type = content.get("type")
 
-        if msg_type == "mark_read":
+        if msg_type == "ping":
+            # The page's keep-alive: traffic both ways, so the proxy keeps the socket.
+            await self.send_json({"type": "pong"})
+        elif msg_type == "mark_read":
             notification_id = content.get("notification_id")
             if notification_id and self.user_id:
                 from channels.db import database_sync_to_async

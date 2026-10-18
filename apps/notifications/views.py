@@ -72,6 +72,13 @@ class NotificationViewSet(viewsets.ModelViewSet):
         capability = (request.query_params.get("capability") or "").strip()
         if not ref and not capability:
             return Response([])
+
+        from apps.accounts.models import User
+
+        def named(u):
+            # The Administrator can decide anything, so naming them on every
+            # request says nothing: the desk is the people whose job it is.
+            return u.role != User.Role.SUPER_ADMIN and not u.is_superuser
         if not ref:
             # Nothing filed: the desk is everyone who holds the right to decide.
             from .service import holders_of
@@ -79,7 +86,7 @@ class NotificationViewSet(viewsets.ModelViewSet):
             return Response([
                 {"id": str(p.pk), "name": p.get_full_name() or p.username,
                  "role": (p.role or "").replace("_", " ").title(), "since": None}
-                for p in holders_of(capability)
+                for p in holders_of(capability) if named(p)
             ])
         rows = (
             Notification.objects.filter(ref=ref, is_actionable=True, resolved_at__isnull=True)
@@ -87,7 +94,7 @@ class NotificationViewSet(viewsets.ModelViewSet):
         )
         seen, out = set(), []
         for n in rows:
-            if n.recipient_id in seen:
+            if n.recipient_id in seen or not named(n.recipient):
                 continue
             seen.add(n.recipient_id)
             out.append({
