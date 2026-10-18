@@ -907,13 +907,16 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         serializer = IssuanceRequestIssueSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         issuance_request = self.get_object()
+        # Who took it away. The notices below read it from here: the issue
+        # result never carried it, so "received by" was always left out.
+        received_by = (serializer.validated_data.get("received_by") or "").strip()
 
         with transaction.atomic():
             result = issue_against_request(
                 issuance_request,
                 request.user,
                 serializer.validated_data["quantity"],
-                received_by=serializer.validated_data.get("received_by", ""),
+                received_by=received_by,
                 notes=serializer.validated_data.get("notes", ""),
             )
 
@@ -929,14 +932,14 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
             log(part.schedule, "part_issued", (
                 f"Store issued {result['quantity']} {part.unit} of {part.what} ({issuance_request.request_number})"
                 + (f" - serials {', '.join(result['serials'])}" if result.get("serials") else "")
-                + (f", received by {result['received_by']}" if result.get("received_by") else "")
+                + (f", received by {received_by}" if received_by else "")
             ), user=request.user, visit=part.visit)
         if issuance_request.requested_by_id:
             notices.tell(
                 [issuance_request.requested_by], exclude=[request.user], kind="request_answered",
                 title=f"Issued: {issuance_request.what}",
                 message=f"{result['quantity']} handed over by {notices.who(request.user)}"
-                        + (f" to {result.get('received_by') or ''}" if result.get("received_by") else ""),
+                        + (f" · received by {received_by}" if received_by else ""),
                 link="/inventory?tab=requests", data={"request": str(issuance_request.pk)},
             )
         return Response({
