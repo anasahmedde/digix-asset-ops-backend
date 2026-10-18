@@ -1228,8 +1228,12 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
 
         label = self.INCREASE_REASONS[reason]
         project = _project_of(component.device)
-        notices.ask(
-            "approve_quantity_increase", exclude=[request.user], project=project,
+        # Up the asker's line only: a request goes to the people above them.
+        from .services import increase_deciders
+
+        notices.notify(
+            increase_deciders(component), kind="approval_requested", actionable=True, email=True,
+            exclude=[request.user],
             title=f"Quantity increase needs approval: {component.name}",
             message=f"+{additional} on {component.device.asset_code} · {label}" + (f" — {notes}" if notes else ""),
             link=(f"/projects?project={project.pk}&tab=execution" if project else f"/assets?device={component.device_id}"),
@@ -1252,13 +1256,23 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
 
     def _increase_decision(self, request, component):
         """Guard shared by the two decisions on a requested increase."""
-        if not can_for_project(request.user, _project_of(component.device), "approve_quantity_increase"):
-            return Response(
-                {"detail": "Only a manager can decide a quantity increase."}, status=403
-            )
+        from .services import increase_deciders, may_decide_increase
+
         if not component.pending_increase:
             return Response(
                 {"detail": "Nothing is waiting for approval on this line."}, status=400
+            )
+        # Decided above the asker, never below: a subordinate does not sign
+        # off their manager's request.
+        if not may_decide_increase(request.user, component):
+            names = ", ".join(
+                u.get_full_name() or u.username for u in increase_deciders(component)
+                if u.role != u.Role.SUPER_ADMIN and not u.is_superuser
+            )
+            return Response(
+                {"detail": "This increase is decided above the person who asked for it"
+                           + (f" — {names}." if names else ".")},
+                status=403,
             )
         return None
 

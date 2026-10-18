@@ -61,3 +61,37 @@ def finish_build_if_done(device: Device, user=None) -> bool:
     device.status = Device.Status.IN_STOCK
     device.save(update_fields=["status", "updated_at"])
     return True
+
+
+INCREASE_RIGHT = "approve_quantity_increase"
+
+
+def increase_deciders(component):
+    """Who decides a requested quantity increase: whoever holds the right on
+    the asker's reporting line above them - never someone below. The top of
+    the line, with nobody above, decides their own. A line where nobody above
+    holds the right falls back to every holder but the asker, so the request
+    is never stranded."""
+    from apps.assets.serializers import _project_of
+    from apps.notifications.service import holders_of, line_above
+    from common.permissions import can_for_project
+
+    project = _project_of(component.device)
+    asker = component.increase_requested_by
+    if asker is None:
+        return list(holders_of(INCREASE_RIGHT, project=project))
+    above = [u for u in line_above(asker) if u.is_active and can_for_project(u, project, INCREASE_RIGHT)]
+    if above:
+        return above
+    if asker.reports_to_id is None and can_for_project(asker, project, INCREASE_RIGHT):
+        return [asker]
+    return [u for u in holders_of(INCREASE_RIGHT, project=project) if u.pk != asker.pk]
+
+
+def may_decide_increase(user, component) -> bool:
+    """The Administrator decides anything; anyone else must be a decider."""
+    from apps.accounts.models import User
+
+    if user.is_superuser or user.role == User.Role.SUPER_ADMIN:
+        return True
+    return any(u.pk == user.pk for u in increase_deciders(component))
