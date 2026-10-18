@@ -1374,7 +1374,8 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         from apps.inventory.services import return_stock_for_component
 
         component = self.get_object()
-        denied = self._require(request, component, "decide_requirements")
+        # Deciding is the supervisor's; taking a decision back is above them.
+        denied = self._require(request, component, "undo_requirement_decisions")
         if denied is not None:
             return denied
         notices.resolve(f"procure:{component.pk}")
