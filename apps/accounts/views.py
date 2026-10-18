@@ -68,6 +68,12 @@ class CustomTokenObtainPairView(TokenObtainPairView):
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
+        # Signing in on the phone needs "Use the field app".
+        from common.field_app import REFUSAL, from_field_app, may_use_field_app
+
+        if from_field_app(request) and not may_use_field_app(user):
+            return Response({"detail": REFUSAL}, status=status.HTTP_403_FORBIDDEN)
+
         try:
             # The account's own spelling, whatever case it was typed in.
             serializer = self.get_serializer(data={User.USERNAME_FIELD: user.get_username(), "password": password})

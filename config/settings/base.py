@@ -164,7 +164,8 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # ---------------------------------------------------------------------------
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        # JWT, plus "Use the field app" for requests from the phone app.
+        "common.field_app.FieldAppJWTAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
@@ -207,7 +208,7 @@ SIMPLE_JWT = {
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=["http://localhost:3000"])
 from corsheaders.defaults import default_headers  # noqa: E402
 
-CORS_ALLOW_HEADERS = (*default_headers, "x-recorded-at", "x-idempotency-key")
+CORS_ALLOW_HEADERS = (*default_headers, "x-recorded-at", "x-idempotency-key", "x-client")
 
 # ---------------------------------------------------------------------------
 # Channels (WebSocket)
