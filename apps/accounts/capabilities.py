@@ -351,13 +351,20 @@ REQUIRES: dict[str, tuple[str, ...]] = {
     "approve_quantity_increase": ("view_projects", "view_project_costs"),
     "agree_project_variance": ("view_projects", "view_project_costs", "view_prices"),
     "record_client_warranty": ("view_projects",),
+    # Procurement: an order is raised on the purchase orders page, to a
+    # vendor picked from the vendor list, for items out of the stock list.
+    "raise_po": ("view_prices", "view_procurement", "view_suppliers", "view_stock"),
+    "approve_po": ("view_prices", "view_procurement"),
+    "cancel_po": ("view_procurement",),
+    "inspect_goods": ("view_stock",),
+    "manage_suppliers": ("view_suppliers",),
+    # Work orders: the same, on the work orders page, to a workshop vendor.
+    "raise_work_order": ("view_prices", "view_work_orders", "view_suppliers"),
+    "approve_work_order": ("view_prices", "view_work_orders"),
+    "inspect_work": ("view_work_orders",),
     # Prices everywhere else
     "edit_prices": ("view_prices",),
     "view_margins": ("view_prices",),
-    "raise_po": ("view_prices",),
-    "approve_po": ("view_prices",),
-    "raise_work_order": ("view_prices",),
-    "approve_work_order": ("view_prices",),
     "agree_stock_variance": ("view_prices",),
     "approve_ticket_cost": ("view_prices",),
     "manage_quotations": ("view_prices",),

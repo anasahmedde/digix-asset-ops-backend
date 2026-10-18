@@ -2110,3 +2110,19 @@ def test_the_goods_received_note_names_who_received_and_inspected(inspector, rec
     for expected in ("GOODS RECEIVED NOTE", line.receipt.grn_number, received_line["po"].po_number,
                      "Insp Supplier", "DN-1", "Batch BATCH-9", "grn-store", "insp-supervisor", "All good"):
         assert expected in text, expected
+
+
+def test_the_requester_is_told_who_took_the_material_away(ops, items):
+    """Arshad hands the parts to Sharjeel: the person who asked for them reads
+    both names - who issued, and who received."""
+    from apps.inventory.models import IssuanceRequest
+    from apps.notifications.models import Notification
+
+    waseem = User.objects.create_user(username="recv-waseem", password="x", role="supervisor")
+    item = items[1]  # 50 mounts in stock
+    req = IssuanceRequest.objects.create(item=item, quantity_requested=5, requested_by=waseem, purpose="Site")
+    r = _client(ops).post(f"/api/inventory/issuance-requests/{req.id}/issue/",
+                          {"quantity": 5, "received_by": "Sharjeel"}, format="json")
+    assert r.status_code == 200, r.content
+    told = Notification.objects.get(recipient=waseem, title__startswith="Issued:")
+    assert "handed over by" in told.message and "received by Sharjeel" in told.message
