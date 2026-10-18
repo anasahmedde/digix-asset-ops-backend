@@ -611,6 +611,15 @@ def test_budget_approval_gates_execution():
     assert r.status_code == 400
     assert "execution starts once it is approved" in r.data["detail"]
 
+    # Built in-house with no production route: the estimate is missing what
+    # making it costs, so it cannot go up.
+    r = c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json")
+    assert r.status_code == 400 and "no production cost" in r.data["detail"], r.content
+    assert c.get(f"/api/teams/projects/{project.id}/plan/").json()["production_missing"] == [device.asset_code]
+    from apps.assets.models import ProductionStep
+
+    ProductionStep.objects.create(device=device, step_number=1, name="Frame welding", planned_cost=1500)
+
     r = c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json")
     assert r.status_code == 200, r.content
     assert r.data["status"] == "submitted"
@@ -786,13 +795,16 @@ def test_actual_costs_are_recorded_against_the_approved_budget():
     c.post("/api/teams/cost-lines/", {
         "project": str(project.id), "cost_type": "Travelling", "quantity": "2", "unit_cost": "1000",
     }, format="json")
+    from apps.assets.models import ProductionStep
+
+    ProductionStep.objects.create(device=device, step_number=1, name="Frame welding", planned_cost=1500)
     c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json")
     h.post(f"/api/teams/projects/{project.id}/approve-budget/", {"notes": "ok"}, format="json")
 
     # Nothing issued yet: the actuals are zero even though the estimate is not.
     actuals = c.get(f"/api/teams/projects/{project.id}/actuals/").json()
     assert Decimal(actuals["materials_actual"]) == Decimal("0")
-    assert Decimal(actuals["estimate_total"]) == Decimal("2580.00")
+    assert Decimal(actuals["estimate_total"]) == Decimal("4080.00")  # with 1500 to build it
 
     # Draw the cable from stock: the store issuing it is what makes it a cost.
     from apps.inventory.models import IssuanceRequest
@@ -826,7 +838,7 @@ def test_actual_costs_are_recorded_against_the_approved_budget():
     assert Decimal(actuals["materials_actual"]) == Decimal("480.00")      # 4 x 120
     assert Decimal(actuals["overheads_actual_total"]) == Decimal("8600.00")  # 3x1200 + 5000
     assert Decimal(actuals["actual_total"]) == Decimal("9080.00")
-    assert Decimal(actuals["variance_vs_approved"]) == Decimal("6500.00")  # over the 2580 approved
+    assert Decimal(actuals["variance_vs_approved"]) == Decimal("5000.00")  # over the 4080 approved
 
     # The planned figures are still frozen.
     r = c.patch(f"/api/teams/cost-lines/{line.id}/", {"unit_cost": "9999"}, format="json")
@@ -1198,6 +1210,9 @@ def test_approving_the_budget_moves_the_project_off_planning():
     c, h = _C(), _C()
     c.force_authenticate(ops)
     h.force_authenticate(head)
+    from apps.assets.models import ProductionStep
+
+    ProductionStep.objects.create(device=device, step_number=1, name="Frame welding", planned_cost=1500)
     assert c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json").status_code == 200
     assert h.post(f"/api/teams/projects/{project.id}/approve-budget/", {}, format="json").status_code == 200
 

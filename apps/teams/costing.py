@@ -251,6 +251,12 @@ def build_plan(project):
         "contingency_amount": contingency,
         "total": total,
         "unpriced_lines": unpriced,
+        # Built in-house with nothing on the production route, or a route
+        # costing nothing: the estimate is missing what it costs to make it.
+        "production_missing": [
+            a["asset_code"] for a in assets
+            if not a["vendor_asset"] and (not a["steps"] or a["production_total"] <= 0)
+        ],
         "approved_total": plan.approved_total,
         "submitted_by": _name(plan.submitted_by),
         # The id as well as the name: the screen has to know whether the
