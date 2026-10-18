@@ -194,3 +194,60 @@ def test_a_note_can_be_ticked_off_by_anyone_on_its_board():
     assert r.status_code == 403
     r = a.patch(f"/api/notifications/sticky-notes/{note['id']}/", {"done": False}, format="json")
     assert r.status_code == 200 and r.data["done"] is False
+
+
+@pytest.mark.django_db
+def test_a_name_typed_out_in_a_team_note_tags_that_person_once():
+    """Typing "@Waseem AllahRakha" without picking from the list still tags
+    Waseem and tells him; ticking the note off does not tell him again."""
+    from apps.notifications.models import Notification
+    from rest_framework.test import APIClient
+
+    author = User.objects.create_user(username="note-author", password="x", first_name="Ahmer")
+    waseem = User.objects.create_user(username="waseem", password="x", first_name="Waseem", last_name="AllahRakha")
+    User.objects.create_user(username="bystander", password="x", first_name="Other")
+    c = APIClient()
+    c.force_authenticate(author)
+    r = c.post("/api/notifications/sticky-notes/",
+               {"scope": "team", "body": "@Waseem AllahRakha please register the assets for Outfitters"}, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["mentioned_names"] == ["Waseem AllahRakha"]
+    told = Notification.objects.filter(recipient=waseem, title__icontains="tagged you")
+    assert told.count() == 1
+    assert not Notification.objects.filter(recipient__username="bystander").exists()
+
+    c.patch(f"/api/notifications/sticky-notes/{r.data['id']}/", {"done": True}, format="json")
+    assert told.count() == 1, "ticking it off is not a second tag"
+    # Private notes tag nobody.
+    c.post("/api/notifications/sticky-notes/", {"scope": "self", "body": "@Waseem AllahRakha remember"}, format="json")
+    assert told.count() == 1
+
+
+@pytest.mark.django_db
+def test_a_tagged_person_replies_and_ticks_off_and_the_author_hears():
+    """Waseem answers the note ("Done, assets registered") and ticks it off;
+    the author is told of both. Private notes take no replies."""
+    from rest_framework.test import APIClient
+
+    from apps.notifications.models import Notification
+
+    author = User.objects.create_user(username="reply-author", password="x", first_name="Ahmer")
+    waseem = User.objects.create_user(username="reply-waseem", password="x", first_name="Waseem")
+    a, w = APIClient(), APIClient()
+    a.force_authenticate(author)
+    w.force_authenticate(waseem)
+    note = a.post("/api/notifications/sticky-notes/", {"scope": "team", "body": "@Waseem register the assets",
+                                                      "mentions": [str(waseem.pk)]}, format="json").data
+
+    r = w.post(f"/api/notifications/sticky-notes/{note['id']}/reply/", {"body": "Done, assets registered"}, format="json")
+    assert r.status_code == 201, r.content
+    assert [x["body"] for x in r.data["replies"]] == ["Done, assets registered"]
+    assert r.data["replies"][0]["author_name"] == "Waseem"
+    assert Notification.objects.filter(recipient=author, title="Waseem replied on a team note").count() == 1
+    assert not Notification.objects.filter(recipient=waseem, title__icontains="replied").exists(), "not told of their own reply"
+
+    w.patch(f"/api/notifications/sticky-notes/{note['id']}/", {"done": True}, format="json")
+    assert Notification.objects.filter(recipient=author, title="Waseem marked your note done").count() == 1
+
+    private = a.post("/api/notifications/sticky-notes/", {"scope": "self", "body": "mine"}, format="json").data
+    assert a.post(f"/api/notifications/sticky-notes/{private['id']}/reply/", {"body": "x"}, format="json").status_code == 403
