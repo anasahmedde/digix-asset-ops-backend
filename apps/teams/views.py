@@ -375,6 +375,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         """
         from apps.assets.models import AssetComponent, Device
         from apps.assets.serializers import AssetComponentSerializer, ProductionStepSerializer
+        from apps.assets.services import may_decide_increase
 
         project = self.get_object()
         # An asset reaches a project two ways: its own `project` field, or a
@@ -436,6 +437,9 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             components = list(device.components.all())
             rows = AssetComponentSerializer(components, many=True).data
             for component, row in zip(components, rows):
+                # Only those above the asker may decide; the screen offers
+                # Approve to them alone.
+                row["may_decide_increase"] = bool(component.pending_increase) and may_decide_increase(request.user, component)
                 totals["required"] += component.quantity
                 totals["issued"] += component.issued_quantity
                 totals["outstanding"] += component.outstanding_quantity
