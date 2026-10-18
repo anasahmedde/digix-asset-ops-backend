@@ -604,3 +604,27 @@ def test_who_collects_is_the_project_managers_team():
     everyone = [p["name"] for p in c.get("/api/accounts/users/names/", {"request": str(loose.pk)}).data]
     assert {"Awais", "Hamza", "Ahmer"} <= set(everyone)
     assert c.get("/api/accounts/users/names/", {"request": "not-an-id"}).status_code == 200
+
+
+@pytest.mark.django_db
+def test_raising_an_order_brings_the_pages_and_vendors_it_needs():
+    """Waseem given Raise purchase orders can see the orders, the vendors and
+    the stock list - and can open the vendor list the order form reads."""
+    from apps.accounts.capabilities import with_requirements
+    from apps.accounts.models import RoleDefinition
+    from apps.accounts.roles import forget
+
+    assert {"view_procurement", "view_suppliers", "view_stock", "view_prices"} <= with_requirements({"raise_po"})
+    assert {"view_work_orders", "view_suppliers", "view_prices"} <= with_requirements({"raise_work_order"})
+    assert "view_procurement" in with_requirements({"approve_po"})
+    assert "view_work_orders" in with_requirements({"approve_work_order"})
+    try:
+        RoleDefinition.objects.update_or_create(key="qa_buyer", defaults={"label": "QA Buyer", "capabilities": ["raise_po"]})
+        forget()
+        waseem = User.objects.create_user(username="po-waseem", password="x", role="qa_buyer")
+        c = APIClient()
+        c.force_authenticate(waseem)
+        assert c.get("/api/suppliers/").status_code == 200
+        assert c.get("/api/procurement/purchase-orders/").status_code == 200
+    finally:
+        forget()
