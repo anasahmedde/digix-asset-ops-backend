@@ -1,0 +1,80 @@
+name: Backup Database
+
+# On-demand pg_dump of the production database. The dump stays ON THE SERVER
+# under /opt/digix/backups — it is deliberately never uploaded as a workflow
+# artifact, because it contains real client records and the CredentialVault
+# rows are stored in plaintext.
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: "Short label for the filename, e.g. before-test-data-clear"
+        required: false
+        default: "manual"
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Dump the production database
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          command_timeout: 30m
+          envs: LABEL
+          script: |
+            set -euo pipefail
+            cd /opt/digix
+
+            # compose defaults, overridden by .env when it sets them
+            PGUSER="$(sed -n 's/^POSTGRES_USER=//p' .env | head -1)"
+            PGDB="$(sed -n 's/^POSTGRES_DB=//p' .env | head -1)"
+            PGUSER="${PGUSER:-digix}"
+            PGDB="${PGDB:-digix_asset_mgmt}"
+
+            mkdir -p backups
+
+            AVAIL_KB="$(df -Pk /opt/digix | awk 'NR==2{print $4}')"
+            echo "Free space: $((AVAIL_KB / 1024)) MB"
+            if [ "$AVAIL_KB" -lt 2097152 ]; then
+              echo "Less than 2 GB free - refusing to dump."
+              exit 1
+            fi
+
+            SAFE_LABEL="$(printf '%s' "${LABEL:-manual}" | tr -cs 'a-zA-Z0-9-' '-')"
+            OUT="backups/digix-${SAFE_LABEL}-$(date -u +%Y%m%d-%H%M%S).sql.gz"
+
+            echo "Dumping ${PGDB} as ${PGUSER} -> ${OUT}"
+            docker compose --env-file .env exec -T db \
+              pg_dump -U "$PGUSER" -d "$PGDB" --no-owner --no-acl \
+              | gzip -9 > "$OUT"
+
+            # a truncated dump is worse than none, so prove it is readable
+            gzip -t "$OUT"
+            echo "--- dump written ---"
+            ls -lh "$OUT"
+            echo "uncompressed size: $(gzip -l "$OUT" | awk 'NR==2{print $2}') bytes"
+            echo "final line (should be a complete statement, not a cut-off):"
+            gzip -dc "$OUT" | tail -1
+
+            echo "--- row counts, largest tables ---"
+            docker compose --env-file .env exec -T db \
+              psql -U "$PGUSER" -d "$PGDB" -P pager=off -c \
+              "select relname as table, n_live_tup as rows
+                 from pg_stat_user_tables
+                where n_live_tup > 0
+                order by n_live_tup desc
+                limit 30;"
+
+            echo "--- all dumps on disk ---"
+            ls -lh backups/
+
+            echo
+            echo "To restore this dump:"
+            echo "  cd /opt/digix"
+            echo "  gzip -dc ${OUT} | docker compose --env-file .env exec -T db psql -U ${PGUSER} -d ${PGDB}"
+        env:
+          LABEL: ${{ inputs.label }}
