@@ -113,14 +113,17 @@ def return_leftovers(device, *, user, rows):
 
     from .models import DeviceLifecycleEvent
 
+    if device.leftovers_settled_at:
+        who = device.leftovers_settled_by.get_full_name() if device.leftovers_settled_by else "someone"
+        raise serializers.ValidationError({"detail": (
+            f"The leftovers were settled on {device.leftovers_settled_at:%d %b %Y} by {who}."
+        )})
     unfinished = device.production_steps.exclude(status__in=FINISHED_STEPS)
     if unfinished.exists():
         raise serializers.ValidationError({"detail": (
             "Leftovers go back once the production route is finished - "
             f"{unfinished.order_by('step_number').first().name} is not done yet."
         )})
-    if not rows:
-        raise serializers.ValidationError({"rows": ["Say what is coming back."]})
     lines = {str(c.pk): c for c in device.components.select_related("inventory_item", "inventory_unit_type")}
     coming_back, touched = [], []
     for row in rows:
@@ -156,10 +159,19 @@ def return_leftovers(device, *, user, rows):
             "quantity": quantity, "serials": serials,
         })
         touched.append((line, quantity, serials))
-    if not coming_back:
-        raise serializers.ValidationError({"rows": ["Return at least one."]})
-
     project = device.project_on
+    if not coming_back:
+        # Nothing left over: the step is settled all the same.
+        _settle(device, user, "")
+        DeviceLifecycleEvent.objects.create(
+            device=device, event_type=DeviceLifecycleEvent.EventType.NOTE,
+            description="Production leftovers settled: nothing came back to the store", performed_by=user,
+        )
+        if project is not None:
+            from apps.teams import activity as project_log
+
+            project_log.log(project, "returned", f"{device.asset_code}: no production leftovers", user=user)
+        return None
     receipt = record_return(
         source=GoodsReceipt.Source.PROJECT_RETURN,
         rows=coming_back,
@@ -167,6 +179,7 @@ def return_leftovers(device, *, user, rows):
         notes="Left over from production.",
         user=user,
     )
+    _settle(device, user, receipt.grn_number)
     for line, quantity, serials in touched:
         line.returned_quantity += quantity
         line.returned_serials = list(line.returned_serials or []) + serials
@@ -183,3 +196,20 @@ def return_leftovers(device, *, user, rows):
 
         project_log.log(project, "returned", f"{device.asset_code}: production leftovers returned - {what} ({receipt.grn_number})", user=user)
     return receipt
+
+
+def _settle(device, user, grn):
+    from django.utils import timezone
+
+    device.leftovers_settled_at = timezone.now()
+    device.leftovers_settled_by = user
+    device.leftovers_grn = grn
+    device.save(update_fields=["leftovers_settled_at", "leftovers_settled_by", "leftovers_grn", "updated_at"])
+
+
+def leftovers_pending(device) -> bool:
+    """Built in-house with parts issued for it, and not squared up yet."""
+    return (
+        device.source == device.Source.INHOUSE and not device.leftovers_settled_at
+        and device.components.filter(issued_quantity__gt=0).exists()
+    )

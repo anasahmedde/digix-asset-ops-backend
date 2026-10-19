@@ -3114,3 +3114,38 @@ def test_production_leftovers_go_back_to_the_store():
     # The same unit cannot come back twice, nor more than is left.
     assert give_back(sup, [{"component": str(unit.id), "quantity": 1, "serials": ["PL-2"]}]).status_code == 400
     assert give_back(sup, [{"component": str(wire.id), "quantity": 8}]).status_code == 400
+
+
+@_pytest.mark.django_db
+def test_leftovers_are_settled_once_and_then_installation_opens():
+    """The supervisor squares up the build's parts once - with returns, or
+    "nothing left over" - and only then can the asset be assigned to install."""
+    from apps.assets.models import AssetComponent, Device, MaterialType, ProductionStep
+    from apps.assets.services import leftovers_pending
+    from apps.inventory.models import InventoryItem
+    from apps.teams.models import Project
+
+    sup = User.objects.create_user(username="ls-sup", password="x", role="supervisor")
+    ops = User.objects.create_user(username="ls-ops", password="x", role="ops_manager")
+    project = Project.objects.create(name="Settle", status="planning")
+    device = Device.objects.create(asset_code="AST-LS-1", serial_number="LS-1", project=project,
+                                   source="inhouse", status="in_stock")
+    cable = InventoryItem.objects.create(material_type=MaterialType.objects.create(name="LS Cable", unit="meter"), quantity=0)
+    AssetComponent.objects.create(device=device, name="LS Cable", quantity=4, inventory_item=cable, issued_quantity=4)
+    ProductionStep.objects.create(device=device, step_number=1, name="Assembly", status="completed")
+    c = APIClient()
+
+    assert leftovers_pending(device)
+    c.force_authenticate(ops)
+    r = c.post(f"/api/assets/devices/{device.id}/transition/",
+               {"status": "assigned", "reason": "go", "assigned_technician": str(ops.id)}, format="json")
+    assert r.status_code == 400 and "leftover" in str(r.data), r.content
+
+    c.force_authenticate(sup)
+    r = c.post(f"/api/assets/devices/{device.id}/return-leftovers/", {"rows": []}, format="json")
+    assert r.status_code == 200 and r.data["return_grn"] is None, r.content
+    assert r.data["leftovers_settled_by_name"] and r.data["leftovers_settled_at"]
+    device.refresh_from_db()
+    assert not leftovers_pending(device)
+    again = c.post(f"/api/assets/devices/{device.id}/return-leftovers/", {"rows": []}, format="json")
+    assert again.status_code == 400 and "settled" in str(again.data)

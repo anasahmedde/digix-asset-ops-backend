@@ -284,6 +284,14 @@ class Device(TimeStampedModel):
         help_text="What installing and activating this asset actually cost",
     )
     installation_date = models.DateField(null=True, blank=True)
+    # Once the build is done the supervisor squares up the parts issued for
+    # it - what came back to the store, or that nothing did. Installation is
+    # assigned only after that.
+    leftovers_settled_at = models.DateTimeField(null=True, blank=True)
+    leftovers_settled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    leftovers_grn = models.CharField(max_length=50, blank=True)
     installed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="installed_devices", help_text="Who installed this asset",

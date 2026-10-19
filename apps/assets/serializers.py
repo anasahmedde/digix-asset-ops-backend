@@ -535,6 +535,12 @@ class DeviceListSerializer(serializers.ModelSerializer):
 
 
 class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
+    leftovers_settled_by_name = serializers.SerializerMethodField()
+
+    def get_leftovers_settled_by_name(self, obj):
+        u = obj.leftovers_settled_by
+        return (u.get_full_name() or u.username) if u else None
+
     # What this asset has cost: building it, from the project's own costing,
     # and keeping it running, from the maintenance register.
     cost_of_ownership = serializers.SerializerMethodField()
@@ -691,6 +697,7 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
             "current_site", "site_name", "assigned_client", "client_name",
             "clients", "client_names",
             "project", "project_name", "project_on", "project_contract_type", "project_rental_end_date", "project_sites",
+            "leftovers_settled_at", "leftovers_settled_by_name", "leftovers_grn",
             "components",
             "assigned_technician", "technician_name", "technician_employee_id",
             "technician_job_title", "technician_phone",

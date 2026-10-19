@@ -234,7 +234,7 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         receipt = return_leftovers(device, user=request.user, rows=request.data.get("rows") or [])
         device.refresh_from_db()
         body = DeviceDetailSerializer(device, context=self.get_serializer_context()).data
-        body["return_grn"] = receipt.grn_number
+        body["return_grn"] = receipt.grn_number if receipt else None
         return Response(body)
 
     @action(detail=True, methods=["post"], url_path="transition")
@@ -273,6 +273,15 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 {"detail": "You do not have permission to change asset status."},
                 status=status.HTTP_403_FORBIDDEN,
             )
+        # Installation waits until the build's leftover parts are squared up.
+        if new_status == Device.Status.ASSIGNED:
+            from .services import leftovers_pending
+
+            if leftovers_pending(device):
+                return Response({"detail": (
+                    "Settle the leftover parts from production first - return what was not used, "
+                    "or say nothing is left over - then assign the installation."
+                )}, status=status.HTTP_400_BAD_REQUEST)
         ser.is_valid(raise_exception=True)
         new_status = ser.validated_data["status"]
         update_fields = ["status", "updated_at"]
