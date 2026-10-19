@@ -1,0 +1,120 @@
+name: Report Seed Data
+
+# READ-ONLY. Counts how much of the production database matches the fingerprint
+# left by `manage.py seed_data`, and how much other data now points at those
+# rows. Nothing here writes or deletes: the psql session runs with a read-only
+# transaction so a stray statement cannot modify anything.
+#
+# The seed command leaves no marker column, so these fingerprints are the only
+# handle we have:
+#   users      email ends @digix.pk        (admin, ops_manager, tech1, tech2,
+#                                           finance_user, warehouse, viewer)
+#   clients    code CLT-001 .. CLT-005
+#   suppliers  code SUP-001 .. SUP-004
+#   devices    serial_number SN-2026-PK-00001 .. 00045
+on:
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Count seeded rows and what references them
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            cd /opt/digix
+
+            PGUSER="$(sed -n 's/^POSTGRES_USER=//p' .env | head -1)"
+            PGDB="$(sed -n 's/^POSTGRES_DB=//p' .env | head -1)"
+            PGUSER="${PGUSER:-digix}"
+            PGDB="${PGDB:-digix_asset_mgmt}"
+
+            docker compose --env-file .env exec -T db \
+              psql -U "$PGUSER" -d "$PGDB" -P pager=off -v ON_ERROR_STOP=1 <<'SQL'
+            begin transaction read only;
+
+            \echo '=== seeded vs real, by entity ==='
+            select 'users'     as entity,
+                   count(*) filter (where email like '%@digix.pk') as seeded,
+                   count(*) filter (where email not like '%@digix.pk' or email is null) as other,
+                   count(*) as total
+              from accounts_user
+            union all
+            select 'clients',
+                   count(*) filter (where code like 'CLT-00%'),
+                   count(*) filter (where code not like 'CLT-00%' or code is null),
+                   count(*)
+              from clients_client
+            union all
+            select 'suppliers',
+                   count(*) filter (where code like 'SUP-00%'),
+                   count(*) filter (where code not like 'SUP-00%' or code is null),
+                   count(*)
+              from suppliers_supplier
+            union all
+            select 'devices',
+                   count(*) filter (where serial_number like 'SN-2026-PK-%'),
+                   count(*) filter (where serial_number not like 'SN-2026-PK-%' or serial_number is null),
+                   count(*)
+              from assets_device;
+
+            \echo ''
+            \echo '=== the seeded users (these own records elsewhere) ==='
+            select id, username, email, role, is_active, date_joined::date, last_login::date
+              from accounts_user
+             where email like '%@digix.pk'
+             order by username;
+
+            \echo ''
+            \echo '=== seeded clients and suppliers ==='
+            select 'client' as kind, code, name from clients_client   where code like 'CLT-00%'
+            union all
+            select 'supplier',       code, name from suppliers_supplier where code like 'SUP-00%'
+            order by kind, code;
+
+            \echo ''
+            \echo '=== blast radius: rows pointing at a seeded DEVICE ==='
+            select format(
+                     'select %L as referencing_table, count(*) as rows_at_seeded_devices from %I t where t.%I in (select id from assets_device where serial_number like ''SN-2026-PK-%%'')',
+                     c.table_name, c.table_name, c.column_name)
+              from information_schema.columns c
+              join information_schema.tables t
+                on t.table_name = c.table_name and t.table_schema = c.table_schema
+             where c.table_schema = 'public'
+               and c.column_name = 'device_id'
+               and t.table_type = 'BASE TABLE'
+             order by c.table_name;
+            \gexec
+
+            \echo ''
+            \echo '=== blast radius: rows pointing at a seeded CLIENT ==='
+            select format(
+                     'select %L as referencing_table, count(*) as rows_at_seeded_clients from %I t where t.%I in (select id from clients_client where code like ''CLT-00%%'')',
+                     c.table_name, c.table_name, c.column_name)
+              from information_schema.columns c
+              join information_schema.tables t
+                on t.table_name = c.table_name and t.table_schema = c.table_schema
+             where c.table_schema = 'public'
+               and c.column_name = 'client_id'
+               and t.table_type = 'BASE TABLE'
+             order by c.table_name;
+            \gexec
+
+            \echo ''
+            \echo '=== newest rows in the tables this month built ==='
+            select 'maintenance_maintenancevisit' as t, count(*) as rows, max(created_at)::date as newest from maintenance_maintenancevisit
+            union all select 'attendance_attendancerecord', count(*), max(created_at)::date from attendance_attendancerecord
+            union all select 'teams_project',               count(*), max(created_at)::date from teams_project
+            union all select 'inventory_issuancerequest',   count(*), max(created_at)::date from inventory_issuancerequest
+            union all select 'tickets_ticket',              count(*), max(created_at)::date from tickets_ticket;
+
+            rollback;
+            SQL
+
+            echo "Report complete - nothing was modified."
