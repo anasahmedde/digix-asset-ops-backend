@@ -311,6 +311,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "inventory_item", "inventory_item_name", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name", "available_quantity", "free_quantity",
             "fulfilment", "issued_quantity", "outstanding_quantity", "stock_requested_quantity", "procure_quantity", "undecided_quantity",
+            "returned_quantity", "returned_serials", "issued_serials",
             "purchase_order_item", "po_number", "po_stocked_quantity", "procure_requests", "planned_unit_price",
             "pending_increase", "increase_reason", "increase_notes",
             "increase_requested_by_name", "increase_requested_at",
@@ -323,6 +324,16 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "purchase_order_item",
         ]
         extra_kwargs = {"name": {"required": False}}
+
+    issued_serials = serializers.SerializerMethodField()
+
+    def get_issued_serials(self, obj):
+        """Which units left the store for this line - what can come back."""
+        if not obj.inventory_unit_type_id or not obj.issued_quantity:
+            return []
+        from apps.inventory.models import IssuanceRequest
+
+        return [s for ir in IssuanceRequest.objects.filter(asset_component=obj) for s in (ir.issued_serials or [])]
 
     def get_available_quantity(self, obj):
         if obj.inventory_unit_type_id:

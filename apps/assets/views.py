@@ -220,6 +220,23 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
 
     # ── Status transition (guarded state machine) ─────────────────────
 
+    @action(detail=True, methods=["post"], url_path="return-leftovers")
+    def return_leftovers(self, request, pk=None):
+        """Parts issued for the build and not used, back to the store."""
+        from .services import return_leftovers
+
+        device = self.get_object()
+        if not can_for_project(request.user, _project_of(device), "decide_requirements"):
+            return Response(
+                {"detail": "Returning leftovers is for the supervisor, the project's manager, or whoever decides requirements."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        receipt = return_leftovers(device, user=request.user, rows=request.data.get("rows") or [])
+        device.refresh_from_db()
+        body = DeviceDetailSerializer(device, context=self.get_serializer_context()).data
+        body["return_grn"] = receipt.grn_number
+        return Response(body)
+
     @action(detail=True, methods=["post"], url_path="transition")
     def transition(self, request, pk=None):
         """Move the device through the status machine, journalling the flip.

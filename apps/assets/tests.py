@@ -3066,3 +3066,51 @@ def test_only_those_above_the_supervisor_undo_a_requirement_decision():
     for who in (head, ops, lead_sup):
         assert may_undo(who) is True, who.username
     assert undo(ops) == 200
+
+
+@_pytest.mark.django_db
+def test_production_leftovers_go_back_to_the_store():
+    """Once the route is finished, the supervisor sends unused parts back:
+    counted lines by quantity, unique ones by the serials issued for this
+    asset. They wait in Receiving under one return receipt."""
+    from apps.assets.models import AssetComponent, Device, MaterialType, ProductionStep
+    from apps.inventory.models import GoodsReceipt, InventoryItem, InventoryUnitType, IssuanceRequest
+    from apps.teams.models import Project
+
+    sup = User.objects.create_user(username="lo-sup", password="x", role="supervisor")
+    tech = User.objects.create_user(username="lo-tech", password="x", role="technician")
+    project = Project.objects.create(name="Leftovers", status="planning")
+    device = Device.objects.create(asset_code="AST-LO-1", serial_number="LO-1", project=project, source="inhouse")
+    cable = InventoryItem.objects.create(material_type=MaterialType.objects.create(name="LO Cable", unit="meter"), quantity=0)
+    player = InventoryUnitType.objects.create(name="LO Player")
+    wire = AssetComponent.objects.create(device=device, name="LO Cable", quantity=10, inventory_item=cable, issued_quantity=10)
+    unit = AssetComponent.objects.create(device=device, name="LO Player", quantity=2, inventory_unit_type=player, issued_quantity=2)
+    IssuanceRequest.objects.create(unit_type=player, quantity_requested=2, quantity_issued=2, asset_component=unit,
+                                   issued_serials=["PL-1", "PL-2"])
+    step = ProductionStep.objects.create(device=device, step_number=1, name="Assembly", status="in_progress")
+
+    def give_back(user, rows):
+        c = APIClient()
+        c.force_authenticate(user)
+        return c.post(f"/api/assets/devices/{device.id}/return-leftovers/", {"rows": rows}, format="json")
+
+    rows = [{"component": str(wire.id), "quantity": 3}, {"component": str(unit.id), "quantity": 1, "serials": ["PL-2"]}]
+    r = give_back(sup, rows)
+    assert r.status_code == 400 and "route is finished" in str(r.data), r.content
+    step.status = "completed"
+    step.save()
+
+    assert give_back(tech, rows).status_code == 403
+    assert give_back(sup, [{"component": str(unit.id), "quantity": 1, "serials": ["PL-9"]}]).status_code == 400
+    assert give_back(sup, [{"component": str(wire.id), "quantity": 11}]).status_code == 400
+
+    r = give_back(sup, rows)
+    assert r.status_code == 200, r.content
+    receipt = GoodsReceipt.objects.get(grn_number=r.data["return_grn"])
+    assert receipt.source == GoodsReceipt.Source.PROJECT_RETURN
+    wire.refresh_from_db()
+    unit.refresh_from_db()
+    assert (wire.returned_quantity, unit.returned_quantity, unit.returned_serials) == (3, 1, ["PL-2"])
+    # The same unit cannot come back twice, nor more than is left.
+    assert give_back(sup, [{"component": str(unit.id), "quantity": 1, "serials": ["PL-2"]}]).status_code == 400
+    assert give_back(sup, [{"component": str(wire.id), "quantity": 8}]).status_code == 400
