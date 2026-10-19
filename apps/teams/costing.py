@@ -391,7 +391,7 @@ def build_actuals(project):
             )
         for component in ([] if vendor_asset else device.components.all()):
             price, source = component_actual(component)
-            issued = component.issued_quantity
+            issued = component.issued_quantity - component.returned_quantity
             line_total = money(price * issued) if (price is not None and issued) else None
             if line_total:
                 asset_total += line_total

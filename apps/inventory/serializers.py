@@ -520,6 +520,8 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
     source = serializers.CharField(source="receipt.source", read_only=True, default=None)
     source_display = serializers.CharField(source="receipt.get_source_display", read_only=True, default=None)
     reference = serializers.CharField(source="receipt.reference", read_only=True, default=None)
+    # Why it came in - "Left over from production." on a return.
+    receipt_notes = serializers.CharField(source="receipt.notes", read_only=True, default=None)
     received_at = serializers.DateTimeField(source="receipt.created_at", read_only=True, default=None)
     received_by_name = serializers.SerializerMethodField()
     routed_to_display = serializers.CharField(source="get_routed_to_display", read_only=True, default=None)
@@ -683,7 +685,7 @@ class GoodsReceiptLineSerializer(serializers.ModelSerializer):
             "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",
             "inspected_by", "inspected_by_name", "inspected_at", "inspection_notes", "warranty_months",
             "stocked_unit_count", "kind", "known_component", "component_code", "created_at",
-            "source", "source_display", "reference", "received_at", "received_by_name",
+            "source", "source_display", "reference", "receipt_notes", "received_at", "received_by_name",
             "routed_to_display", "inspection_status_display", "stocked_item_sku", "storage_location", "stocked_units",
             "stocked_code", "stocked_name",
         ]

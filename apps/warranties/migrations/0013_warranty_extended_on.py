@@ -19,7 +19,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('warranties', '0012_claims_have_their_own_record'),
-        ('assets', '__latest__'),
+        ('assets', '0032_alter_device_status'),
     ]
 
     operations = [
