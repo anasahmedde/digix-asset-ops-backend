@@ -284,6 +284,14 @@ class Device(TimeStampedModel):
         help_text="What installing and activating this asset actually cost",
     )
     installation_date = models.DateField(null=True, blank=True)
+    # Once the build is done the supervisor squares up the parts issued for
+    # it - what came back to the store, or that nothing did. Installation is
+    # assigned only after that.
+    leftovers_settled_at = models.DateTimeField(null=True, blank=True)
+    leftovers_settled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    leftovers_grn = models.CharField(max_length=50, blank=True)
     installed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="installed_devices", help_text="Who installed this asset",
@@ -530,8 +538,9 @@ class ProductionStep(TimeStampedModel):
     # The moves a person makes on an in-house operation. A step on a work
     # order is not moved by hand: Work Order Raised and Completed follow the
     # work order itself (see workorders.signals).
+    # Started before it is finished: a pending operation only starts.
     VALID_TRANSITIONS = {
-        Status.PENDING: (Status.IN_PROGRESS, Status.COMPLETED),
+        Status.PENDING: (Status.IN_PROGRESS,),
         Status.IN_PROGRESS: (Status.COMPLETED,),
         Status.SENT_OUT: (),
         Status.RETURNED: (Status.IN_PROGRESS, Status.COMPLETED),
@@ -657,7 +666,19 @@ class ProductionStep(TimeStampedModel):
             return ()
         if self.status not in (self.Status.COMPLETED, self.Status.SKIPPED) and self.materials_pending:
             return ()  # the parts are not here yet
+        if self.status not in (self.Status.COMPLETED, self.Status.SKIPPED) and self.previous_unfinished:
+            return ()  # the route runs in order
         return self.VALID_TRANSITIONS.get(self.status, ())
+
+    @property
+    def previous_unfinished(self):
+        """The earliest operation before this one that is not finished yet -
+        the route runs in order, so this one waits for it."""
+        return (
+            self.device.production_steps.filter(step_number__lt=self.step_number)
+            .exclude(status__in=(self.Status.COMPLETED, self.Status.SKIPPED))
+            .order_by("step_number").first()
+        )
 
     @property
     def hold_reason(self) -> str:
@@ -676,6 +697,9 @@ class ProductionStep(TimeStampedModel):
                 "This asset is not on a project, so nobody has said how this operation is "
                 "done. Add it to a project's scope and decide there."
             )
+        before = self.previous_unfinished
+        if before is not None:
+            return f"Waiting for step {before.step_number} ({before.name}) to finish - the route runs in order."
         waiting = self.materials_pending
         if waiting:
             named = ", ".join(waiting[:3]) + ("…" if len(waiting) > 3 else "")
@@ -776,6 +800,10 @@ class AssetComponent(TimeStampedModel):
     issued_quantity = models.PositiveIntegerField(
         default=0, help_text="How much of the requirement has actually left the warehouse"
     )
+    # Issued for the build but not used: sent back to the store once the
+    # route is finished, unique pieces by serial.
+    returned_quantity = models.PositiveIntegerField(default=0)
+    returned_serials = models.JSONField(default=list, blank=True)
     purchase_order_item = models.ForeignKey(
         "procurement.PurchaseOrderItem", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="asset_components", help_text="PO line raised to cover this requirement",

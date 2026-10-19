@@ -311,6 +311,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "inventory_item", "inventory_item_name", "inventory_item_sku",
             "inventory_unit_type", "inventory_unit_type_name", "available_quantity", "free_quantity",
             "fulfilment", "issued_quantity", "outstanding_quantity", "stock_requested_quantity", "procure_quantity", "undecided_quantity",
+            "returned_quantity", "returned_serials", "issued_serials",
             "purchase_order_item", "po_number", "po_stocked_quantity", "procure_requests", "planned_unit_price",
             "pending_increase", "increase_reason", "increase_notes",
             "increase_requested_by_name", "increase_requested_at",
@@ -323,6 +324,16 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "purchase_order_item",
         ]
         extra_kwargs = {"name": {"required": False}}
+
+    issued_serials = serializers.SerializerMethodField()
+
+    def get_issued_serials(self, obj):
+        """Which units left the store for this line - what can come back."""
+        if not obj.inventory_unit_type_id or not obj.issued_quantity:
+            return []
+        from apps.inventory.models import IssuanceRequest
+
+        return [s for ir in IssuanceRequest.objects.filter(asset_component=obj) for s in (ir.issued_serials or [])]
 
     def get_available_quantity(self, obj):
         if obj.inventory_unit_type_id:
@@ -493,13 +504,14 @@ class DeviceListSerializer(serializers.ModelSerializer):
         return client.name if client is not None else None
     client_names = serializers.SerializerMethodField()
     project_name = serializers.SerializerMethodField()
+    project_on = serializers.SerializerMethodField()
     warranty_status = serializers.SerializerMethodField()
 
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     class Meta:
         model = Device
         fields = [
-            "id", "asset_code", "serial_number", "display_name", "project", "project_name",
+            "id", "asset_code", "serial_number", "display_name", "project", "project_name", "project_on",
             "asset_type", "asset_type_name",
             "device_model", "device_model_name",
             "status", "status_display", "source", "image", "display_image", "current_site", "site_name",
@@ -513,11 +525,22 @@ class DeviceListSerializer(serializers.ModelSerializer):
     def get_project_name(self, obj):
         return _project_name(obj)
 
+    def get_project_on(self, obj):
+        """The project's id, however the asset reached it - for a link."""
+        project = _project_of(obj)
+        return str(project.pk) if project is not None else None
+
     def get_warranty_status(self, obj):
         return _warranty_status(obj)
 
 
 class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
+    leftovers_settled_by_name = serializers.SerializerMethodField()
+
+    def get_leftovers_settled_by_name(self, obj):
+        u = obj.leftovers_settled_by
+        return (u.get_full_name() or u.username) if u else None
+
     # What this asset has cost: building it, from the project's own costing,
     # and keeping it running, from the maintenance register.
     cost_of_ownership = serializers.SerializerMethodField()
@@ -544,6 +567,7 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
         return client.name if client is not None else None
     client_names = serializers.SerializerMethodField()
     project_name = serializers.SerializerMethodField()
+    project_on = serializers.SerializerMethodField()
     # Contract chip (PR-01): rental/sold context from the parent project.
     project_contract_type = serializers.CharField(
         source="project.contract_type", read_only=True, default=None
@@ -672,7 +696,8 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
             "invoice_reference", "batch_number",
             "current_site", "site_name", "assigned_client", "client_name",
             "clients", "client_names",
-            "project", "project_name", "project_contract_type", "project_rental_end_date", "project_sites",
+            "project", "project_name", "project_on", "project_contract_type", "project_rental_end_date", "project_sites",
+            "leftovers_settled_at", "leftovers_settled_by_name", "leftovers_grn",
             "components",
             "assigned_technician", "technician_name", "technician_employee_id",
             "technician_job_title", "technician_phone",
@@ -809,6 +834,11 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
 
     def get_project_name(self, obj):
         return _project_name(obj)
+
+    def get_project_on(self, obj):
+        """The project's id, however the asset reached it - for a link."""
+        project = _project_of(obj)
+        return str(project.pk) if project is not None else None
 
     def get_requires_production(self, obj):
         return obj.source == Device.Source.INHOUSE

@@ -80,7 +80,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('sites', '0017_step_started_by'),
-        ('assets', '__latest__'),
+        ('assets', '0032_alter_device_status'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
