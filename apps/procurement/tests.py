@@ -15,6 +15,16 @@ def _client(user):
     return c
 
 
+def _priced(payload, price="100"):
+    """A price for every requested line that has none - the buyer types one
+    for each line now; a blank no longer falls back to the reference."""
+    prices = dict(payload.get("prices") or {})
+    for key in ("components", "devices", "reorders"):
+        for pk in payload.get(key) or []:
+            prices.setdefault(str(pk), price)
+    return {**payload, "prices": prices}
+
+
 @pytest.fixture
 def people(db):
     return {
@@ -1022,11 +1032,11 @@ def test_flagged_requirements_appear_as_requisitions(people, requisitions):
 @pytest.mark.django_db
 def test_raise_a_po_from_requisitions(people, requisitions, supplier):
     c = _client(people["finance"])
-    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+    r = c.post("/api/procurement/purchase-orders/raise-po/", _priced({
             "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier": str(supplier.pk),
         "components": [str(requisitions["generic"].pk), str(requisitions["unique"].pk)],
-    }, format="json")
+    }), format="json")
     assert r.status_code == 201, r.content
     assert r.data["po_number"].startswith("PO")
     assert len(r.data["items"]) == 2
@@ -1037,8 +1047,8 @@ def test_raise_a_po_from_requisitions(people, requisitions, supplier):
     assert "Req Cable" in by_desc, [(i["line_title"], i["line_detail"], i["description"]) for i in r.data["items"]]
     assert by_desc["Req Cable"]["quantity"] == 20
     assert by_desc["Req Player"]["quantity"] == 3
-    # Prices default from the inventory records.
-    assert float(by_desc["Req Player"]["unit_price"]) == 4000
+    # The price on each line is the one the buyer typed - never a fallback.
+    assert float(by_desc["Req Player"]["unit_price"]) == 100
 
     # Each requirement now points at its PO line.
     requisitions["generic"].refresh_from_db()
@@ -1046,12 +1056,24 @@ def test_raise_a_po_from_requisitions(people, requisitions, supplier):
 
 
 @pytest.mark.django_db
+def test_a_po_needs_a_price_on_every_requested_line(people, requisitions, supplier):
+    c = _client(people["finance"])
+    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+        "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
+        "supplier": str(supplier.pk),
+        "components": [str(requisitions["generic"].pk), str(requisitions["unique"].pk)],
+        "prices": {str(requisitions["generic"].pk): "120"},
+    }, format="json")
+    assert r.status_code == 400 and "Req Player" in str(r.data["prices"]) and "Req Cable" not in str(r.data["prices"])
+
+
+@pytest.mark.django_db
 def test_requisitions_can_be_filtered_to_unordered(people, requisitions, supplier):
     c = _client(people["finance"])
-    c.post("/api/procurement/purchase-orders/raise-po/", {
+    c.post("/api/procurement/purchase-orders/raise-po/", _priced({
             "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier": str(supplier.pk), "components": [str(requisitions["generic"].pk)],
-    }, format="json")
+    }), format="json")
 
     r = c.get("/api/procurement/purchase-orders/requisitions/", {"unordered": "true"})
     assert r.status_code == 200, r.content
@@ -1062,8 +1084,8 @@ def test_requisitions_can_be_filtered_to_unordered(people, requisitions, supplie
 def test_a_requirement_cannot_be_ordered_twice(people, requisitions, supplier):
     c = _client(people["finance"])
     payload = {"supplier": str(supplier.pk), "components": [str(requisitions["generic"].pk)]}
-    assert c.post("/api/procurement/purchase-orders/raise-po/", payload, format="json").status_code == 201
-    again = c.post("/api/procurement/purchase-orders/raise-po/", payload, format="json")
+    assert c.post("/api/procurement/purchase-orders/raise-po/", _priced(payload), format="json").status_code == 201
+    again = c.post("/api/procurement/purchase-orders/raise-po/", _priced(payload), format="json")
     assert again.status_code == 400, again.content
     assert "Already on a purchase order" in str(again.data["components"])
 
@@ -1072,9 +1094,9 @@ def test_a_requirement_cannot_be_ordered_twice(people, requisitions, supplier):
 def test_raise_po_validates_its_input(people, requisitions, supplier):
     c = _client(people["finance"])
     assert c.post("/api/procurement/purchase-orders/raise-po/",
-                  {"components": [str(requisitions["generic"].pk)]}, format="json").status_code == 400
+                  _priced({"components": [str(requisitions["generic"].pk)]}), format="json").status_code == 400
     assert c.post("/api/procurement/purchase-orders/raise-po/",
-                  {"supplier": str(supplier.pk), "components": []}, format="json").status_code == 400
+                  _priced({"supplier": str(supplier.pk), "components": []}), format="json").status_code == 400
 
 
 @pytest.mark.django_db
@@ -1083,10 +1105,10 @@ def test_receiving_a_product_line_only_needs_serials(people, requisitions, suppl
     from apps.inventory.models import InventoryUnit
 
     c = _client(people["finance"])
-    po_resp = c.post("/api/procurement/purchase-orders/raise-po/", {
+    po_resp = c.post("/api/procurement/purchase-orders/raise-po/", _priced({
             "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier": str(supplier.pk), "components": [str(requisitions["unique"].pk)],
-    }, format="json")
+    }), format="json")
     assert po_resp.status_code == 201, po_resp.content
     po_id = po_resp.data["id"]
     item_id = po_resp.data["items"][0]["id"]
@@ -1148,10 +1170,10 @@ def test_clearing_a_decision_lets_it_be_procured_again(people, requisitions, sup
 
     component = requisitions["generic"]
     c = _client(people["finance"])
-    assert c.post("/api/procurement/purchase-orders/raise-po/", {
+    assert c.post("/api/procurement/purchase-orders/raise-po/", _priced({
             "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier": str(supplier.pk), "components": [str(component.pk)],
-    }, format="json").status_code == 201
+    }), format="json").status_code == 201
     component.refresh_from_db()
     assert component.purchase_order_item_id is not None
 
@@ -1208,8 +1230,8 @@ def test_approval_stamps_the_order_date_and_lines_say_what_they_buy(people, supp
     device = Device.objects.create(asset_type=kind, display_name="Lobby Wall", source=Device.Source.VENDOR_SUPPLIED,
                                    serial_number="PO-LINE-1", diagonal_inches="55.0")
     c = _client(people["ops"])
-    r = c.post("/api/procurement/purchase-orders/raise-po/", {
-            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery","supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)], "prices": {}}, format="json")
+    r = c.post("/api/procurement/purchase-orders/raise-po/", _priced({
+            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery","supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)], "prices": {}}), format="json")
     assert r.status_code == 201, r.content
     line = r.data["items"][0]
     assert line["description"].startswith("Lobby Wall (PO Line Display")
@@ -1265,8 +1287,8 @@ def test_procurement_can_send_a_line_back_to_the_project():
     # On an order already: stays until that order is cancelled.
     c.post(f"/api/assets/components/{comp.id}/mark-for-procurement/", {"quantity": 2}, format="json")
     supplier = Supplier.objects.create(name="SB Supplier")
-    r = c.post("/api/procurement/purchase-orders/raise-po/", {
-            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery","supplier": str(supplier.id), "components": [str(comp.id)], "devices": []}, format="json")
+    r = c.post("/api/procurement/purchase-orders/raise-po/", _priced({
+            "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery","supplier": str(supplier.id), "components": [str(comp.id)], "devices": []}), format="json")
     assert r.status_code == 201, r.content
     r = c.post("/api/procurement/purchase-orders/requisitions/send-back/", {"component": str(comp.id), "reason": "no"}, format="json")
     assert r.status_code == 400 and "cancel that order first" in r.data["detail"]
@@ -1299,11 +1321,11 @@ def test_receiving_a_complete_asset_asks_for_no_serial_number(people, supplier):
     assert device.serial_number is None
 
     ops = _client(people["ops"])
-    r = ops.post("/api/procurement/purchase-orders/raise-po/", {
+    r = ops.post("/api/procurement/purchase-orders/raise-po/", _priced({
             "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "supplier": str(supplier.pk), "components": [], "devices": [str(device.pk)],
         "prices": {str(device.pk): "9000.00"},
-    }, format="json")
+    }), format="json")
     assert r.status_code == 201, r.content
     po_id, item_id = r.data["id"], r.data["items"][0]["id"]
 
@@ -1467,14 +1489,14 @@ def test_an_order_can_buy_an_asset_already_registered():
 def over_plan(db, people, supplier, requisitions):
     """A draft order whose component line is priced above the plan."""
     c = _client(people["finance"])
-    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+    r = c.post("/api/procurement/purchase-orders/raise-po/", _priced({
         "supplier": str(supplier.pk),
         "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "components": [str(requisitions["generic"].pk)],
         # The plan priced it from the inventory opening cost of 25.
         "prices": {str(requisitions["generic"].pk): "40"},
         "variance_reasons": {str(requisitions["generic"].pk): "Only quote we could get"},
-    }, format="json")
+    }), format="json")
     assert r.status_code == 201, r.content
     po = PurchaseOrder.objects.get(pk=r.data["id"])
     return {"po": po, "item": po.items.first()}
@@ -1494,12 +1516,12 @@ def test_raising_over_the_plan_flags_the_line_for_the_project(over_plan):
 @pytest.mark.django_db
 def test_a_line_within_the_plan_needs_nobody(people, supplier, requisitions):
     c = _client(people["finance"])
-    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+    r = c.post("/api/procurement/purchase-orders/raise-po/", _priced({
         "supplier": str(supplier.pk),
         "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "components": [str(requisitions["generic"].pk)],
         "prices": {str(requisitions["generic"].pk): "22"},
-    }, format="json")
+    }), format="json")
     assert r.status_code == 201, r.content
     item = PurchaseOrder.objects.get(pk=r.data["id"]).items.first()
     assert item.variance_status == PurchaseOrderItem.VarianceStatus.NOT_REQUIRED
@@ -1610,12 +1632,12 @@ def test_a_stock_reorder_over_the_last_price_goes_to_inventory(people, supplier)
     item = InventoryItem.objects.create(material_type=material, quantity=1, unit_cost=500)
     rr = ReorderRequest.objects.create(item=item, quantity=10, reason="Below reorder level")
 
-    r = _client(people["finance"]).post("/api/procurement/purchase-orders/raise-po/", {
+    r = _client(people["finance"]).post("/api/procurement/purchase-orders/raise-po/", _priced({
         "supplier": str(supplier.pk),
         "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "reorders": [str(rr.pk)],
         "prices": {str(rr.pk): "600"},
-    }, format="json")
+    }), format="json")
     assert r.status_code == 201, r.content
     line = PurchaseOrder.objects.get(pk=r.data["id"]).items.first()
     assert line.variance_owner == PurchaseOrderItem.VarianceOwner.INVENTORY
@@ -1662,12 +1684,12 @@ def test_terms_typed_for_a_deal_reach_the_order_and_the_page(people, supplier, r
     from apps.setup.models import PaymentTerms
 
     c = _client(people["finance"])
-    r = c.post("/api/procurement/purchase-orders/raise-po/", {
+    r = c.post("/api/procurement/purchase-orders/raise-po/", _priced({
         "supplier": str(supplier.pk),
         "expected_delivery": str(timezone.localdate()), "payment_terms_note": "100% on delivery",
         "components": [str(requisitions["generic"].pk)],
         "payment_terms_note": "  30% on order, balance on commissioning  ",
-    }, format="json")
+    }), format="json")
     assert r.status_code == 201, r.content
     assert r.data["payment_terms"] is None
     assert r.data["payment_terms_note"] == "30% on order, balance on commissioning"

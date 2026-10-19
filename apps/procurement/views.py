@@ -572,6 +572,24 @@ class PurchaseOrderViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 {"devices": [f"Already on a purchase order: {', '.join(bought)}"]}, status=400
             )
 
+        # The buyer types the price the supplier quoted for every line. A blank
+        # used to fall back to the reference (or last) price, so an order
+        # went out at a figure nobody had entered.
+        def priced(key) -> bool:
+            raw = prices.get(str(key))
+            try:
+                return raw not in (None, "") and Decimal(str(raw)) > 0
+            except (InvalidOperation, ValueError):
+                return False
+
+        unpriced = (
+            [c.name for c in components if not priced(c.pk)]
+            + [d.display_name or d.asset_code for d in devices if not priced(d.pk)]
+            + [rr.name for rr in reorders if not priced(rr.pk)]
+        )
+        if unpriced:
+            return Response({"prices": [f"Enter the unit price for: {', '.join(unpriced)}."]}, status=400)
+
         def price_for(key, fallback):
             raw = prices.get(str(key))
             if raw in (None, ""):
