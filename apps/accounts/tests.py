@@ -662,3 +662,49 @@ def test_only_those_given_the_field_app_may_use_it():
     UserCapability.objects.create(user=tech, capability="use_field_app", allowed=False)
     assert c.get("/api/accounts/users/me/", **phone).status_code == 403, "taken away: the phone is stopped"
     assert c.get("/api/accounts/users/me/").status_code == 200, "the website still works for them"
+
+
+def _signature_png():
+    import io
+
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGBA", (300, 100), (0, 0, 0, 0)).save(buf, format="PNG")
+    return SimpleUploadedFile("sign.png", buf.getvalue(), content_type="image/png")
+
+
+@pytest.mark.django_db
+def test_a_signature_is_uploaded_once_and_printed_on_the_documents_signed(tmp_path, settings):
+    """Each person's signature, uploaded by them or by whoever manages people,
+    lands on the signing line above their name - here a PO's Approved by."""
+    from apps.procurement.documents import render_purchase_order_pdf
+    from apps.procurement.models import PurchaseOrder
+    from apps.suppliers.models import Supplier
+
+    settings.MEDIA_ROOT = str(tmp_path)
+    head = User.objects.create_user(username="sig-head", password="x", role="group_head", first_name="Awais")
+    tech = User.objects.create_user(username="sig-tech", password="x", role="technician")
+    other = User.objects.create_user(username="sig-other", password="x", role="technician")
+    c = APIClient()
+
+    c.force_authenticate(other)
+    assert c.post(f"/api/accounts/users/{tech.id}/signature/", {"signature": _signature_png()},
+                  format="multipart").status_code == 403, "not someone else's"
+    c.force_authenticate(tech)
+    r = c.post(f"/api/accounts/users/{tech.id}/signature/", {"signature": _signature_png()}, format="multipart")
+    assert r.status_code == 200 and r.data["signature"], r.content
+    c.force_authenticate(head)  # manages people
+    r = c.post(f"/api/accounts/users/{head.id}/signature/", {"signature": _signature_png()}, format="multipart")
+    assert r.status_code == 200, r.content
+
+    po = PurchaseOrder.objects.create(supplier=Supplier.objects.create(name="Sig Supplier"), status="approved")
+    without = render_purchase_order_pdf(po)
+    po.approved_by = User.objects.get(pk=head.pk)
+    po.save(update_fields=["approved_by"])
+    with_sign = render_purchase_order_pdf(po)
+    assert with_sign.count(b"/Subtype /Image") > without.count(b"/Subtype /Image"), "the signature is on the PO"
+
+    r = c.delete(f"/api/accounts/users/{head.id}/signature/")
+    assert r.status_code == 200 and not r.data["signature"]

@@ -93,7 +93,7 @@ class UserSerializer(DateOrder, serializers.ModelSerializer):
         model = User
         fields = [
             "id", "username", "email", "first_name", "last_name",
-            "full_name", "role", "role_label", "job_title", "phone", "avatar", "is_field_staff",
+            "full_name", "role", "role_label", "job_title", "phone", "avatar", "signature", "is_field_staff",
             "employee_id", "cnic", "join_date", "leaving_date",
             "reports_to", "reports_to_name", "direct_report_count", "capabilities",
             "supplier", "supplier_name",

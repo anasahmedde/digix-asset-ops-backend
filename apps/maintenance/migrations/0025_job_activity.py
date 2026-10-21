@@ -104,8 +104,8 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('maintenance', '0024_job_follows_open_visit'),
-        ('tickets', '__latest__'),
-        ('inventory', '__latest__'),
+        ('tickets', '0021_pending_review_reads_in_review'),
+        ('inventory', '0035_stockmovement_unit_cost'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
