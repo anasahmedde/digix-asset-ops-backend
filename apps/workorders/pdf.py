@@ -232,9 +232,11 @@ def build_work_order_pdf(work_order) -> bytes:
     story += [Spacer(1, 14 * mm)]
     prepared_by = work_order.created_by
     approved_by = work_order.approved_by
+    from common.signatures import signature_of
+
     sign = Table(
         [
-            [Paragraph("", s["body"]), Paragraph("", s["body"])],
+            [signature_of(prepared_by), signature_of(approved_by)],
             [Paragraph("Prepared by", s["label"]), Paragraph("Approved by", s["label"])],
             [
                 Paragraph(prepared_by.get_full_name() or prepared_by.username if prepared_by else "", s["body"]),
@@ -247,6 +249,7 @@ def build_work_order_pdf(work_order) -> bytes:
         ("LINEBELOW", (0, 0), (0, 0), 0.5, INK),
         ("LINEBELOW", (1, 0), (1, 0), 0.5, INK),
         ("TOPPADDING", (0, 0), (-1, 0), 12),
+        ("VALIGN", (0, 0), (-1, 0), "BOTTOM"),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
         ("RIGHTPADDING", (0, 0), (0, -1), 14),
     ]))

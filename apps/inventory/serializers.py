@@ -141,7 +141,7 @@ class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
             "unit_cost", "min_stock_level", "is_high_value",
             "default_has_warranty", "default_warranty_type", "default_warranty_months",
             "supplier", "supplier_name",
-            "in_stock_count", "storage_locations", "latest_cost", "opening_quantity", "opening_serials", "notes",
+            "in_stock_count", "storage_location", "storage_locations", "latest_cost", "opening_quantity", "opening_serials", "notes",
             "is_active", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "type_code", "created_at", "updated_at"]
@@ -224,6 +224,7 @@ class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
                     model_name=unit_type.model_name,
                     supplier=unit_type.supplier,
                     purchase_price=unit_type.unit_cost,
+                    storage_location=unit_type.storage_location,
                     notes="Opening stock.",
                 )
         return unit_type
@@ -233,7 +234,16 @@ class InventoryUnitTypeSerializer(HidesMoney, serializers.ModelSerializer):
         # is not something an edit can replay.
         validated_data.pop("opening_quantity", None)
         validated_data.pop("opening_serials", None)
-        return super().update(instance, validated_data)
+        before = instance.storage_location
+        unit_type = super().update(instance, validated_data)
+        # A new place for the product moves what is on the shelf with it.
+        if unit_type.storage_location and unit_type.storage_location != before:
+            from .models import InventoryUnit
+
+            unit_type.units.filter(status=InventoryUnit.Status.IN_STOCK).update(
+                storage_location=unit_type.storage_location,
+            )
+        return unit_type
 
     def validate_name(self, value):
         value = (value or "").strip()

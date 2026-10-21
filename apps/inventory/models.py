@@ -98,6 +98,10 @@ class InventoryUnitType(TimeStampedModel):
         default=dict, blank=True, help_text="Free-form technical details captured when the item is opened"
     )
     unit_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # Where its units are kept, e.g. Rack A3 - as a generic component has.
+    # Setting it moves the units on the shelf there; a unit received later
+    # starts here.
+    storage_location = models.CharField(max_length=100, blank=True)
     min_stock_level = models.IntegerField(default=0)
 
     # Counted on the dashboard's in-hand stock figure. Off by default: which

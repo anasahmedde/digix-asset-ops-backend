@@ -192,6 +192,12 @@ def render_handover_pdf(installation) -> bytes:
               if record.performed_by_id else "—"),
              ("Notes", record.acceptance_notes or "—")),
         ], s))
+        # Our side's signature: whoever recorded the handover.
+        if record.performed_by_id and record.performed_by.signature:
+            from common.signatures import signature_of
+
+            accept += [Spacer(1, 3 * mm), signature_of(record.performed_by),
+                       Paragraph(f"For DIGIX - {record.performed_by.get_full_name() or record.performed_by.username}", s["terms"])]
     else:
         name_cell, name_label = _signing_row("Name and position", s, 84 * mm)
         sign_cell, sign_label = _signing_row("Signature", s, 84 * mm)

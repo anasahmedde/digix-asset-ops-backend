@@ -2139,3 +2139,20 @@ def test_the_requester_is_told_who_took_the_material_away(ops, items):
     assert r.status_code == 200, r.content
     told = Notification.objects.get(recipient=waseem, title__startswith="Issued:")
     assert "handed over by" in told.message and "received by Sharjeel" in told.message
+
+
+def test_a_unique_product_has_a_storage_location_its_units_follow(ops):
+    """Like a generic component, a unique product says where it is kept;
+    moving it moves the units on the shelf, not the ones already issued."""
+    from apps.inventory.models import InventoryUnit, InventoryUnitType
+
+    product = InventoryUnitType.objects.create(name="Intel NUC", storage_location="Rack A1")
+    shelf = InventoryUnit.objects.create(unit_type=product, serial_number="NUC-1", storage_location="Rack A1")
+    gone = InventoryUnit.objects.create(unit_type=product, serial_number="NUC-2", storage_location="Rack A1",
+                                        status=InventoryUnit.Status.ISSUED)
+    r = _client(ops).patch(f"/api/inventory/products/{product.id}/", {"storage_location": "Rack B4"}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["storage_location"] == "Rack B4"
+    shelf.refresh_from_db()
+    gone.refresh_from_db()
+    assert (shelf.storage_location, gone.storage_location) == ("Rack B4", "Rack A1")

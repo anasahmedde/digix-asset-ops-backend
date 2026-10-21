@@ -285,9 +285,11 @@ def render_issue_slip_pdf(issuance_request) -> bytes:
 
     # --- Signatures: who handed it over, who took it, who authorised -----
     story += [Spacer(1, 10 * mm)]
+    from common.signatures import person_named, signature_of
+
     sign = Table(
         [
-            [Paragraph("", s["body"]), Paragraph("", s["body"]), Paragraph("", s["body"])],
+            [signature_of(req.issued_by), signature_of(person_named(req.received_by)), Paragraph("", s["body"])],
             [Paragraph("Issued by (store)", s["label"]), Paragraph("Received by", s["label"]), Paragraph("Authorised by", s["label"])],
             [Paragraph(_who(req.issued_by), s["body"]), Paragraph(issued_to, s["body"]), Paragraph("", s["body"])],
         ],
@@ -298,6 +300,7 @@ def render_issue_slip_pdf(issuance_request) -> bytes:
         ("LINEBELOW", (1, 0), (1, 0), 0.5, INK),
         ("LINEBELOW", (2, 0), (2, 0), 0.5, INK),
         ("TOPPADDING", (0, 0), (-1, 0), 12),
+        ("VALIGN", (0, 0), (-1, 0), "BOTTOM"),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
         ("RIGHTPADDING", (0, 0), (-1, -1), 10),
     ]))
@@ -460,10 +463,15 @@ def render_goods_receipt_pdf(receipt) -> bytes:
         name for x in lines
         for name in (sent_to(x.po_item) if x.po_item_id or not returned else ["Inventory"])
     ))
+    from common.signatures import signature_of
+
+    inspector_users = list({x.inspected_by_id: x.inspected_by for x in lines if x.inspected_by_id}.values())
     story += [Spacer(1, 10 * mm)]
     sign = Table(
         [
-            [Paragraph("", s["body"]) for _ in range(4)],
+            [Paragraph("", s["body"]), signature_of(receipt.received_by, width=36 * mm),
+             signature_of(inspector_users[0] if len(inspector_users) == 1 else None, width=36 * mm),
+             Paragraph("", s["body"])],
             [Paragraph(x, s["label"]) for x in ("Delivered by (supplier)", "Received by", "Inspected by", "Sent to")],
             [Paragraph(supplier.name if supplier else "", s["body"]), Paragraph(_who(receipt.received_by), s["body"]),
              Paragraph(inspectors, s["body"]), Paragraph(destinations, s["body"])],
@@ -472,8 +480,8 @@ def render_goods_receipt_pdf(receipt) -> bytes:
     )
     sign.setStyle(TableStyle(
         [("LINEBELOW", (i, 0), (i, 0), 0.5, INK) for i in range(4)]
-        + [("TOPPADDING", (0, 0), (-1, 0), 12), ("LEFTPADDING", (0, 0), (-1, -1), 0),
-           ("RIGHTPADDING", (0, 0), (-1, -1), 8)]
+        + [("TOPPADDING", (0, 0), (-1, 0), 12), ("VALIGN", (0, 0), (-1, 0), "BOTTOM"),
+           ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 8)]
     ))
     story += [sign]
     doc.build(story)

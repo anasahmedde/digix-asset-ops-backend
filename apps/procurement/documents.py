@@ -286,9 +286,11 @@ def render_purchase_order_pdf(purchase_order, *, show_prices: bool = True) -> by
     story += [Spacer(1, 14 * mm)]
     ordered_by = purchase_order.ordered_by
     approved_by = purchase_order.approved_by
+    from common.signatures import signature_of
+
     sign = Table(
         [
-            [Paragraph("", s["body"]), Paragraph("", s["body"])],
+            [signature_of(ordered_by), signature_of(approved_by)],
             [Paragraph("Prepared by", s["label"]), Paragraph("Approved by", s["label"])],
             [
                 Paragraph(ordered_by.get_full_name() or ordered_by.username if ordered_by else "", s["body"]),
@@ -301,6 +303,7 @@ def render_purchase_order_pdf(purchase_order, *, show_prices: bool = True) -> by
         ("LINEBELOW", (0, 0), (0, 0), 0.5, INK),
         ("LINEBELOW", (1, 0), (1, 0), 0.5, INK),
         ("TOPPADDING", (0, 0), (-1, 0), 12),
+        ("VALIGN", (0, 0), (-1, 0), "BOTTOM"),
         ("LEFTPADDING", (0, 0), (-1, -1), 0),
         ("RIGHTPADDING", (0, 0), (0, -1), 14),
     ]))
