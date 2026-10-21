@@ -3,6 +3,7 @@ from django.db import transaction
 from common.noops import RefusesSilentNoOps
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import SAFE_METHODS, BasePermission, IsAuthenticated
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -323,6 +324,34 @@ class UserViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     def me(self, request):
         serializer = UserSerializer(request.user, context=self.get_serializer_context())
         return Response(serializer.data)
+
+    @action(detail=True, methods=["post", "delete"], url_path="signature",
+            parser_classes=[MultiPartParser, FormParser])
+    def signature(self, request, pk=None):
+        """Upload (or remove) the signature printed on this person's documents.
+
+        Their own, or anyone's for whoever manages people (the object check
+        is IsSelfOrSuperAdmin)."""
+        user = self.get_object()
+        if request.method == "DELETE":
+            if user.signature:
+                user.signature.delete(save=False)
+            user.signature = None
+            user.save(update_fields=["signature"])
+            return Response(UserSerializer(user, context=self.get_serializer_context()).data)
+        picture = request.FILES.get("signature")
+        if picture is None:
+            return Response({"signature": ["Attach the signature image."]}, status=status.HTTP_400_BAD_REQUEST)
+        if (picture.content_type or "") not in ("image/png", "image/jpeg", "image/webp"):
+            return Response({"signature": ["Use a PNG or JPG image (a PNG with a clear background prints best)."]},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if picture.size > 2 * 1024 * 1024:
+            return Response({"signature": ["Keep the image under 2 MB."]}, status=status.HTTP_400_BAD_REQUEST)
+        if user.signature:
+            user.signature.delete(save=False)
+        user.signature = picture
+        user.save(update_fields=["signature"])
+        return Response(UserSerializer(user, context=self.get_serializer_context()).data)
 
     @action(detail=False, methods=["post"], url_path="change-password")
     def change_password(self, request):

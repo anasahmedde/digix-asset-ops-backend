@@ -32,6 +32,8 @@ class User(AbstractUser):
     job_title = models.CharField(max_length=100, blank=True)
     phone = models.CharField(max_length=20, blank=True)
     avatar = models.ImageField(upload_to="avatars/", blank=True)
+    # Placed on the documents this person signs: approved by, received by...
+    signature = models.ImageField(upload_to="signatures/", blank=True)
     is_field_staff = models.BooleanField(default=False)
     # HR fields (EM-01): company employee number, national ID, employment dates.
     employee_id = models.CharField(max_length=50, blank=True, db_index=True)

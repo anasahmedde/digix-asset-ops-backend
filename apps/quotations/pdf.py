@@ -132,7 +132,13 @@ def build_quotation_pdf(quotation) -> bytes:
             Spacer(1, 8),
         ]
 
-    elements += [Spacer(1, 16), Paragraph("Authorised signature: ______________________________", small)]
+    # Signed by whoever raised it, when their signature is on file.
+    from common.signatures import signature_of
+
+    signer = quotation.created_by
+    elements += [Spacer(1, 16), signature_of(signer),
+                 Paragraph("Authorised signature: ______________________________"
+                           + (f"<br/>{signer.get_full_name() or signer.username}" if signer else ""), small)]
 
     doc.build(elements)
     return buffer.getvalue()

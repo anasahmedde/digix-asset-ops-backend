@@ -213,6 +213,30 @@ def render_cost_plan_pdf(project, plan: dict) -> bytes:
     ]))
     story.append(total)
 
+    # Who sent the budget up and who signed it off, with their signatures.
+    from common.signatures import signature_of
+
+    budget = getattr(project, "cost_plan", None)
+    prepared = budget.submitted_by if budget is not None else None
+    approved = budget.decided_by if budget is not None and budget.status == "approved" else None
+    if prepared or approved:
+        story.append(Spacer(1, 12 * mm))
+        sign = Table(
+            [
+                [signature_of(prepared), signature_of(approved)],
+                [Paragraph("Prepared by", s["cell"]), Paragraph("Approved by", s["cell"])],
+                [Paragraph((prepared.get_full_name() or prepared.username) if prepared else "", s["cell"]),
+                 Paragraph((approved.get_full_name() or approved.username) if approved else "", s["cell"])],
+            ],
+            colWidths=[87 * mm, 87 * mm],
+        )
+        sign.setStyle(TableStyle([
+            ("LINEBELOW", (0, 0), (0, 0), 0.5, INK), ("LINEBELOW", (1, 0), (1, 0), 0.5, INK),
+            ("VALIGN", (0, 0), (-1, 0), "BOTTOM"), ("TOPPADDING", (0, 0), (-1, 0), 12),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (0, -1), 14),
+        ]))
+        story.append(sign)
+
     doc.build(story)
     return buf.getvalue()
 
