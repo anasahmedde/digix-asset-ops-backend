@@ -588,6 +588,11 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
             InventoryUnit.objects.filter(pk__in=[u.pk for u in result["units"]]).update(
                 storage_location=where,
             )
+            # The first place given for a product becomes the product's own.
+            for product in {u.unit_type for u in result["units"] if u.unit_type_id}:
+                if where and not product.storage_location:
+                    product.storage_location = where
+                    product.save(update_fields=["storage_location", "updated_at"])
             line.refresh_from_db()
             line.stocked_at = timezone.now()
             line.stocked_by = request.user
