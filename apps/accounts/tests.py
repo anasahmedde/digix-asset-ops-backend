@@ -350,7 +350,8 @@ def test_four_eyes_rule_still_applies_to_the_group_head(group_head):
     ProjectCostLine.objects.create(project=project, cost_type="Travelling", quantity=1, unit_cost=1000)
     c = _client(group_head)
     r = c.post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json")
-    assert r.status_code == 403 and "approve budgets" in str(r.data)
+    # Budgets are planned by Operations (Roles & Rights, 22 Oct 2026).
+    assert r.status_code == 403
 
     ops = User.objects.create_user(username="acc-ops-4eyes", password="x", role="ops_manager")
     assert _client(ops).post(f"/api/teams/projects/{project.id}/submit-budget/", {}, format="json").status_code == 200

@@ -49,7 +49,7 @@ def _money(value) -> str:
 
 def _masthead(title, project, s, width_left=110):
     head = Table(
-        [[Paragraph(title, s["title"]), Paragraph(f"<b>{COMPANY_NAME}</b>", s["company"])]],
+        [[Paragraph(title, s["title"]), Paragraph("", s["company"])]],
         colWidths=[width_left * mm, (174 - width_left) * mm],
     )
     head.setStyle(TableStyle([
@@ -119,7 +119,7 @@ def render_cost_plan_pdf(project, plan: dict) -> bytes:
     status = plan.get("status_display") or "Draft"
     approved = plan.get("approved_total")
     story.append(Paragraph(
-        f"<b>Status:</b> {status}" + (f" · <b>Approved at:</b> {_money(approved)}" if approved else ""),
+        f"<b>Status:</b> {status}",
         s["body"],
     ))
     story.append(Spacer(1, 4 * mm))

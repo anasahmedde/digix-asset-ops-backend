@@ -84,7 +84,7 @@ def build_work_order_pdf(work_order) -> bytes:
     masthead = Table(
         [[
             Paragraph("WORK ORDER", s["title"]),
-            Paragraph(f"<b>{_company_name()}</b>", s["company"]),
+            Paragraph("", s["company"]),
         ]],
         colWidths=[100 * mm, 74 * mm],
     )

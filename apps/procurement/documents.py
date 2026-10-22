@@ -126,7 +126,7 @@ def render_purchase_order_pdf(purchase_order, *, show_prices: bool = True) -> by
     masthead = Table(
         [[
             Paragraph("PURCHASE ORDER", s["title"]),
-            Paragraph(f"<b>{COMPANY_NAME}</b>", s["company"]),
+            Paragraph("", s["company"]),
         ]],
         colWidths=[100 * mm, 74 * mm],
     )
