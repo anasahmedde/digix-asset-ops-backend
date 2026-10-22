@@ -24,11 +24,9 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from django.utils import timezone
-
 from common.branding import letterhead
 
-from apps.procurement.documents import BAND, COMPANY_NAME, RULE, _styles
+from apps.procurement.documents import RULE, _styles
 
 # A line somebody writes on. Long enough to sign across.
 _RULE_LINE = colors.HexColor("#9ca3af")
@@ -84,20 +82,7 @@ def render_handover_pdf(installation) -> bytes:
     body = [letterhead()]
 
     # ── Letterhead ──
-    head = Table(
-        [[
-            Paragraph(f"<b>{COMPANY_NAME}</b>", s["company"]),
-            Paragraph("HANDOVER<br/>CERTIFICATE", s["title"]),
-        ]],
-        colWidths=[105 * mm, 69 * mm], hAlign="LEFT",
-    )
-    head.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-    ]))
-    body.append(head)
+    body.append(Paragraph("HANDOVER CERTIFICATE", s["title"]))
     body.append(Spacer(1, 4 * mm))
     rule = Table([[""]], colWidths=[174 * mm])
     rule.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 1, RULE)]))
@@ -115,63 +100,6 @@ def render_handover_pdf(installation) -> bytes:
          # An asset reaches a project by its own link or a Scope row; ask it.
          ("Project", project.name if (project := device.project_on) else "—")),
     ], s))
-    body.append(Spacer(1, 5 * mm))
-
-    # ── What was done ──
-    # The checklist as it stands when this is printed - steps added, moved or
-    # removed during the job included - numbered in order as the screens
-    # number it, then the two stages every job ends with.
-    from .serializers import LIVE_STATUSES
-
-    steps = [
-        st for st in installation.steps.all().order_by("step_number")
-        if st.step_type != st.StepType.HANDOVER
-    ]
-    live_event = (
-        device.lifecycle_events.filter(event_type="status_change", to_value="active")
-        .order_by("-created_at").first()
-    )
-    live = device.status in LIVE_STATUSES or record is not None
-    live_on = (
-        timezone.localtime(live_event.created_at).date() if live_event
-        else record.handover_date if record is not None else None
-    )
-    body.append(Paragraph("<b>Installation steps</b>", s["section"]))
-    rows = [[
-        Paragraph("#", s["head"]),
-        Paragraph("Step", s["head"]),
-        Paragraph("Status", s["head"]),
-        Paragraph("Completed", s["head"]),
-    ]]
-    for n, step in enumerate(steps, 1):
-        done = getattr(step, "completed_at", None)
-        rows.append([
-            Paragraph(str(n), s["cell"]),
-            Paragraph(step.custom_label or step.get_step_type_display(), s["cell"]),
-            Paragraph(step.get_status_display(), s["cell"]),
-            Paragraph(done.strftime("%d %b %Y") if done else "—", s["cell"]),
-        ])
-    rows.append([
-        Paragraph(str(len(steps) + 1), s["cell"]), Paragraph("Active", s["cell"]),
-        Paragraph("Completed" if live else "Pending", s["cell"]),
-        Paragraph(live_on.strftime("%d %b %Y") if live and live_on else "—", s["cell"]),
-    ])
-    rows.append([
-        Paragraph(str(len(steps) + 2), s["cell"]), Paragraph("Handover", s["cell"]),
-        Paragraph("Completed" if record is not None else "On signature of this document", s["cell"]),
-        Paragraph(record.handover_date.strftime("%d %b %Y") if record is not None else "—", s["cell"]),
-    ])
-    table = Table(rows, colWidths=[12 * mm, 84 * mm, 39 * mm, 39 * mm], hAlign="LEFT")
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), BAND),
-        ("LINEBELOW", (0, 0), (-1, 0), 0.6, RULE),
-        ("LINEBELOW", (0, 1), (-1, -2), 0.3, RULE),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    body.append(table)
     body.append(Spacer(1, 5 * mm))
 
     # ── The acceptance ──
@@ -223,7 +151,7 @@ def render_handover_pdf(installation) -> bytes:
     body.append(KeepTogether(accept))
     body.append(Spacer(1, 8 * mm))
     body.append(Paragraph(
-        f"{COMPANY_NAME} · {device.asset_code} · this document is the record of acceptance "
+        f"{device.asset_code} · this document is the record of acceptance "
         "and is filed against the installation.",
         s["label"],
     ))

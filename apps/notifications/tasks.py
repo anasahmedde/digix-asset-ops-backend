@@ -203,7 +203,8 @@ def warn_expiring_warranties():
         if Notification.objects.filter(ref=ref).exists():
             continue
         ask(
-            "manage_warranties", kind=Notification.Type.WORKFLOW_UPDATE, email=False,
+            "manage_client_warranties" if w.warranty_type == "client" else "manage_vendor_warranties",
+            kind=Notification.Type.WORKFLOW_UPDATE, email=False,
             title=f"{w.get_warranty_type_display()} on {w.device.asset_code} ends {w.end_date:%d %b}",
             message=f"{w.reference_number} · {(w.end_date - today).days} days left",
             link="/warranties", ref=ref, data={"warranty": str(w.pk)},
@@ -214,7 +215,7 @@ def warn_expiring_warranties():
         if Notification.objects.filter(ref=ref).exists():
             continue
         ask(
-            "manage_warranties", kind=Notification.Type.WORKFLOW_UPDATE, email=False,
+            "manage_vendor_warranties", kind=Notification.Type.WORKFLOW_UPDATE, email=False,
             title=f"Component warranty on {u.serial_number} ends {u.warranty_end:%d %b}",
             message=f"{u.warranty_reference} · {(u.warranty_end - today).days} days left",
             link="/warranties?tab=components", ref=ref, data={"unit": str(u.pk)},

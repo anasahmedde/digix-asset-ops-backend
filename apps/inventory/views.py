@@ -283,7 +283,7 @@ class InventoryUnitViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CapabilityGate]
     read_capability = "view_stock"
     write_capability = "manage_stock"
-    action_capabilities = {"set_warranty": "manage_warranties", "extend_warranty": "manage_warranties"}
+    action_capabilities = {"set_warranty": "manage_vendor_warranties", "extend_warranty": "manage_vendor_warranties"}
     filterset_fields = ["status", "location", "category", "material_type", "brand", "supplier", "has_warranty", "unit_type"]
     search_fields = ["unit_code", "serial_number", "model_name", "batch_number", "material_type__name", "brand__name"]
     ordering_fields = ["created_at", "serial_number", "purchase_date", "warranty_end"]

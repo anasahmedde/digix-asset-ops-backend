@@ -55,7 +55,7 @@ def render_bom_pdf(device) -> bytes:
     masthead = Table(
         [[
             Paragraph("BILL OF MATERIALS", s["title"]),
-            Paragraph(f"<b>{_company_name()}</b>", s["company"]),
+            Paragraph("", s["company"]),
         ]],
         colWidths=[110 * mm, 64 * mm],
     )

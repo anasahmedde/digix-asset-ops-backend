@@ -19,7 +19,8 @@ def _client(user):
 @pytest.fixture
 def people(db):
     return {
-        "ops": User.objects.create_user(username="qt-ops", password="x", role="ops_manager"),
+        # Client quotations are Marketing's (Roles & Rights, 22 Oct 2026).
+        "ops": User.objects.create_user(username="qt-ops", password="x", role="marketing"),
         "tech": User.objects.create_user(username="qt-tech", password="x", role="technician"),
     }
 

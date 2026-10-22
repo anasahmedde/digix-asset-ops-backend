@@ -182,9 +182,15 @@ CAPABILITIES: tuple[Capability, ...] = (
        "For your own reports, unless you act across teams.", "approve"),
 
     # --- Warranty ------------------------------------------------------------
-    _c("view_warranties", "See warranty cover", "Warranty",
-       "Client, vendor and component warranties, and claims.", "view"),
-    _c("manage_warranties", "Record warranty cover", "Warranty",
+    # Client cover is Marketing's, vendor cover Operations' - seen and
+    # managed separately (client's Roles & Rights, 22 Oct 2026).
+    _c("view_client_warranties", "See client warranties", "Warranty",
+       "The cover given to clients on their assets, and how much of it is left.", "view"),
+    _c("view_vendor_warranties", "See vendor warranties", "Warranty",
+       "Vendor and component cover on assets and parts, and the claims on it.", "view"),
+    _c("manage_client_warranties", "Manage client warranties", "Warranty",
+       "Extend or reissue the cover given to a client."),
+    _c("manage_vendor_warranties", "Manage vendor warranties", "Warranty",
        "Add vendor and component cover, extend it, reissue it."),
     _c("raise_claim", "Raise warranty claims", "Warranty",
        "Claim on a vendor's cover for a failed asset or part."),
@@ -198,10 +204,10 @@ CAPABILITIES: tuple[Capability, ...] = (
        "Add and edit client records."),
     _c("manage_sites", "Manage sites", "Commercial",
        "Add and edit sites, zones and site contacts."),
-    _c("view_quotations", "See quotations", "Commercial",
-       "Quotations and what became of them.", "view"),
-    _c("manage_quotations", "Work quotations", "Commercial",
-       "Draft, revise, send and accept quotations."),
+    _c("view_quotations", "See client quotations", "Commercial",
+       "Quotations given to clients, their prices, and what became of them.", "view"),
+    _c("manage_quotations", "Work client quotations", "Commercial",
+       "Draft, revise, send and accept quotations to clients."),
 
     # --- Finance -------------------------------------------------------------
     _c("view_finance", "See invoices and payments", "Finance",
@@ -211,7 +217,9 @@ CAPABILITIES: tuple[Capability, ...] = (
 
     # --- People --------------------------------------------------------------
     _c("view_attendance", "See attendance", "People",
-       "Registers, who is in, and corrections.", "view"),
+       "Registers and who is in - for yourself and the people under you on the reporting line.", "view"),
+    _c("view_all_attendance", "See every team's attendance", "People",
+       "Attendance of everybody, not only the people under you on the reporting line.", "admin", True),
     _c("manage_attendance", "Correct attendance", "People",
        "Add or correct attendance records for other people."),
     _c("use_field_app", "Use the field app", "People",
@@ -254,6 +262,9 @@ KINDS = ("view", "work", "approve", "admin")
 # person is read as the new ones, and the data migration rewrites it.
 RENAMED: dict[str, tuple[str, ...]] = {
     "approve_spend": ("approve_po", "approve_work_order", "approve_budget"),
+    # One warranty right became a client one and a vendor one.
+    "view_warranties": ("view_client_warranties", "view_vendor_warranties"),
+    "manage_warranties": ("manage_client_warranties", "manage_vendor_warranties"),
 }
 
 
@@ -275,22 +286,32 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
     "super_admin": ALL_KEYS - _keys("use_field_app"),
     # Signs the money off; Operations raise the orders. Logins are the
     # Super Admin's (authority matrix, gate 9).
-    "group_head": ALL_KEYS - _keys("manage_logins", "raise_po", "raise_work_order", "use_field_app"),
+    # Budget and planning are Operations', inspection the Supervisor's, the
+    # GRN the store's, quotations and client cover Marketing's, vendor cover
+    # Operations' (client's Roles & Rights, 22 Oct 2026).
+    "group_head": ALL_KEYS - _keys(
+        "manage_logins", "raise_po", "raise_work_order", "use_field_app", "plan_budget",
+        "inspect_goods", "receive_goods", "manage_quotations", "manage_client_warranties",
+        "manage_vendor_warranties", "view_all_attendance",
+    ),
     # Runs assets, projects, sites, procurement and maintenance; the three
     # signatures (budget, PO, WO) and logins stay above.
     "ops_manager": ALL_KEYS - _keys(
         "approve_budget", "approve_po", "approve_work_order", "manage_logins", "use_field_app",
+        "manage_quotations", "view_client_warranties", "manage_client_warranties",
+        "record_client_warranty", "inspect_goods", "receive_goods", "view_all_attendance",
     ),
-    "marketing_head": _VIEW_ALL | _keys(
+    "marketing_head": (_VIEW_ALL - _keys("view_vendor_warranties")) | _keys(
         "edit_prices", "raise_ticket", "work_tickets", "relay_client_decision", "close_ticket",
-        "manage_clients", "manage_sites", "manage_quotations", "manage_warranties",
+        "manage_clients", "manage_sites", "manage_quotations", "manage_client_warranties",
         "record_client_warranty", "manage_permissions", "act_across_teams", "export_data",
         "receive_alerts",
     ),
     "marketing": _keys(
         "view_assets", "view_projects", "view_installations", "view_tickets", "raise_ticket",
         "work_tickets", "relay_client_decision", "view_clients", "view_quotations",
-        "manage_quotations", "view_team", "view_warranties",
+        "manage_quotations", "view_team", "view_client_warranties", "manage_client_warranties",
+        "record_client_warranty",
     ),
     "finance": _VIEW_ALL | _keys(
         "edit_prices", "view_margins", "raise_po", "view_finance", "manage_finance", "export_data",
@@ -301,14 +322,14 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
         "agree_project_variance", "view_installations", "edit_installation", "activate_asset",
         "close_installation", "view_tickets", "raise_ticket", "work_tickets", "review_tickets",
         "close_ticket", "view_maintenance", "manage_maintenance", "assign_maintenance",
-        "work_maintenance", "review_maintenance", "view_warranties", "raise_claim",
+        "work_maintenance", "review_maintenance", "view_vendor_warranties", "raise_claim",
         "view_team", "manage_permissions", "view_attendance", "view_clients", "view_suppliers",
     ),
     "warehouse": _keys(
-        "view_stock", "manage_stock", "receive_goods", "inspect_goods", "request_material",
+        "view_stock", "manage_stock", "receive_goods", "request_material",
         "issue_stock", "agree_stock_variance", "view_procurement", "view_suppliers",
         # The store moves assets into stock, dispatches them and handles RMAs.
-        "view_assets", "move_asset_stage", "view_tickets", "view_warranties", "raise_claim", "view_team",
+        "view_assets", "move_asset_stage", "view_tickets", "view_vendor_warranties", "raise_claim", "view_team",
     ),
     "technician": _keys(
         # Asking for a part means naming one, so the person asking has to be
@@ -319,13 +340,13 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
         "activate_asset", "view_tickets", "raise_ticket", "work_tickets",
         "view_maintenance", "work_maintenance", "view_team", "view_attendance",
         # Whether the part being replaced is still under the vendor's warranty.
-        "view_warranties",
+        "view_vendor_warranties",
     ),
     # A client portal login is scoped to its own client by `for_client`,
     # so `view_clients` here means "your own record", not "the client list".
     "client_viewer": _keys(
         "view_assets", "view_projects", "view_installations", "view_tickets", "raise_ticket",
-        "view_clients", "view_warranties",
+        "view_clients", "view_client_warranties",
     ),
     # Scoped by the viewsets to the tickets and installations given to their
     # own supplier, so this is "your own work", not the register.
@@ -376,7 +397,12 @@ REQUIRES: dict[str, tuple[str, ...]] = {
     "view_margins": ("view_prices",),
     "agree_stock_variance": ("view_prices",),
     "approve_ticket_cost": ("view_prices",),
-    "manage_quotations": ("view_prices",),
+    "manage_quotations": ("view_quotations",),
+    "manage_client_warranties": ("view_client_warranties",),
+    "manage_vendor_warranties": ("view_vendor_warranties",),
+    "raise_claim": ("view_vendor_warranties",),
+    "decide_claim": ("view_vendor_warranties",),
+    "view_all_attendance": ("view_attendance",),
     "view_finance": ("view_prices",),
     "manage_finance": ("view_prices",),
 }

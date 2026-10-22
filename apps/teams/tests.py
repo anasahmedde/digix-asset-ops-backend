@@ -1543,7 +1543,7 @@ def test_a_project_waits_on_the_warranty_it_promised_the_client(db):
     from apps.teams.models import Project, ProjectScopeItem
 
     User = get_user_model()
-    ops = User.objects.create_user(username="cw-ops", password="x", role="ops_manager")
+    ops = User.objects.create_user(username="cw-ops", password="x", role="marketing")  # client warranties are Marketing's
     client = APIClient()
     client.force_authenticate(ops)
 
@@ -1609,7 +1609,7 @@ def test_the_contract_term_covers_every_asset_without_typing_each(db):
     from apps.teams.models import Project, ProjectScopeItem
 
     User = get_user_model()
-    ops = User.objects.create_user(username="term-ops", password="x", role="ops_manager")
+    ops = User.objects.create_user(username="term-ops", password="x", role="marketing")  # client warranties are Marketing's
     client = APIClient()
     client.force_authenticate(ops)
 

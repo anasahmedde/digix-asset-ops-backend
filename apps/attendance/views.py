@@ -10,6 +10,23 @@ from rest_framework.response import Response
 from .models import AttendanceRecord, DutyRecord
 from .serializers import AttendanceRecordSerializer, DutyRecordSerializer
 
+def team_under(user) -> list:
+    """Everyone below this person on the reporting line, at every level."""
+    from apps.accounts.models import User
+
+    below = {}
+    for pk, boss in User.objects.values_list("pk", "reports_to_id"):
+        below.setdefault(boss, []).append(pk)
+    out, todo = [], list(below.get(user.pk, []))
+    while todo:
+        pk = todo.pop()
+        if pk in out or pk == user.pk:
+            continue
+        out.append(pk)
+        todo.extend(below.get(pk, []))
+    return out
+
+
 class AttendanceRecordViewSet(viewsets.ModelViewSet):
     # Reading this is a permission, not just a menu entry.
     read_capability = "view_attendance"
@@ -29,12 +46,10 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = AttendanceRecord.objects.select_related("user", "site")
         user = self.request.user
-        if user.is_superuser or can(user, "manage_attendance") or can(user, "act_across_teams"):
+        if user.is_superuser or can(user, "view_all_attendance"):
             return qs.all()
-        # A lead sees their own line's register; everybody sees their own.
-        from django.db.models import Q
-
-        return qs.filter(Q(user=user) | Q(user__reports_to=user))
+        # Own team only: yourself and everyone under you on the reporting line.
+        return qs.filter(user_id__in=[user.pk, *team_under(user)])
 
     def perform_create(self, serializer):
         from .presence import on_duty
@@ -112,9 +127,10 @@ class DutyRecordViewSet(mixins.CreateModelMixin, mixins.ListModelMixin, viewsets
     def get_queryset(self):
         qs = DutyRecord.objects.select_related("user")
         user = self.request.user
-        if user.is_superuser or can(user, "manage_attendance") or can(user, "act_across_teams"):
+        if user.is_superuser or can(user, "view_all_attendance"):
             return qs.all()
-        return qs.filter(user__reports_to=user)
+        # The people under you on the reporting line, at every level.
+        return qs.filter(user_id__in=team_under(user))
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)

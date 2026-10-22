@@ -7,6 +7,10 @@ from common.dates import DateOrder
 
 
 class QuotationItemSerializer(HidesMoney, serializers.ModelSerializer):
+    # A quotation shows its own prices to whoever may see quotations - not
+    # only to those who see every price in the system.
+    money_capability = "view_quotations"
+
     """Nested under QuotationSerializer (mirrors the Wave-1 PO item pattern).
 
     ``id`` is writable so nested updates can upsert: rows carrying an existing
@@ -36,6 +40,10 @@ class QuotationItemSerializer(HidesMoney, serializers.ModelSerializer):
 
 
 class QuotationSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
+    # A quotation shows its own prices to whoever may see quotations - not
+    # only to those who see every price in the system.
+    money_capability = "view_quotations"
+
     future_dates = ("valid_until",)
     items = QuotationItemSerializer(many=True, required=False)
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)

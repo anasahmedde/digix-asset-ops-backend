@@ -42,8 +42,8 @@ def build_quotation_pdf(quotation) -> bytes:
     company = _company()
 
     # ── Header: company + quotation number ───────────────────────────
-    company_name = company.name if company else "DIGIX Asset Management"
-    company_lines = [company_name]
+    # The issuer's details when they are set up; no stock name line otherwise.
+    company_lines = [company.name] if company else []
     if company:
         if company.address:
             company_lines.append(company.address)
