@@ -1934,8 +1934,8 @@ def test_progress_counts_active_and_handover_and_ignores_skipped_steps(installat
 
 @pytest.mark.django_db
 def test_the_handover_document_lists_the_steps_as_they_are_now(ops, installation):
-    """Steps added during the job appear on the certificate, numbered in
-    order, followed by Active and Handover."""
+    """The client's Roles & Rights document (22 Oct 2026): the certificate is
+    the acceptance only - the installation steps stay in the app."""
     pypdf = pytest.importorskip("pypdf")
     from io import BytesIO
 
@@ -1946,8 +1946,8 @@ def test_the_handover_document_lists_the_steps_as_they_are_now(ops, installation
     r = _client(ops).get(f"/api/sites/installations/{installation.id}/handover-document/")
     assert r.status_code == 200, r.content
     text = "".join(p.extract_text() for p in pypdf.PdfReader(BytesIO(r.content)).pages)
-    assert "Installation steps" in text and "Extra bracket" in text
-    assert "Active" in text and "On signature" in text
+    assert "HANDOVER CERTIFICATE" in text and "Acceptance" in text
+    assert "Installation steps" not in text and "Extra bracket" not in text
 
 
 @pytest.mark.django_db

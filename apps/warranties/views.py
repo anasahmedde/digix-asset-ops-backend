@@ -8,7 +8,7 @@ from rest_framework.response import Response
 
 from common.exports import EXPORT_MAX_ROWS, export_params, log_export, xlsx_response
 from apps.notifications import service as notices
-from common.permissions import CapabilityGate
+from common.permissions import CapabilityGate, can
 
 from .models import Warranty, WarrantyClaim
 from .serializers import WarrantyClaimSerializer, WarrantySerializer
@@ -31,13 +31,27 @@ class WarrantyViewSet(viewsets.ModelViewSet):
     ).all()
     serializer_class = WarrantySerializer
     permission_classes = [IsAuthenticated, CapabilityGate]
-    read_capability = "view_warranties"
-    write_capability = "manage_warranties"
+    read_capability = ("view_client_warranties", "view_vendor_warranties")
+    write_capability = ("manage_client_warranties", "manage_vendor_warranties")
     filterset_fields = ["warranty_type", "device", "supplier"]
     search_fields = [
         "reference_number", "vendor_reference", "coverage_details", "device__asset_code", "device__display_name",
     ]
     ordering_fields = ["end_date", "start_date"]
+
+    def perform_create(self, serializer):
+        _may_manage(self.request.user, serializer.validated_data.get("warranty_type", Warranty.WarrantyType.MANUFACTURER))
+        serializer.save()
+
+    def perform_update(self, serializer):
+        _may_manage(self.request.user, serializer.instance.warranty_type)
+        if "warranty_type" in serializer.validated_data:
+            _may_manage(self.request.user, serializer.validated_data["warranty_type"])
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        _may_manage(self.request.user, instance.warranty_type)
+        instance.delete()
 
     def get_queryset(self):
         from .services import expire_lapsed
@@ -46,11 +60,13 @@ class WarrantyViewSet(viewsets.ModelViewSet):
         # background job next gets round to it.
         expire_lapsed()
         qs = super().get_queryset()
-        role = getattr(self.request.user, "role", None)
-        if role in CLIENT_SIDE_ROLES:
-            qs = qs.filter(warranty_type__in=CLIENT_TYPES)
-        elif role in SUPPLIER_SIDE_ROLES:
-            qs = qs.filter(warranty_type__in=SUPPLIER_TYPES)
+        # Each side of the ledger shows to whoever may see it: client cover
+        # to "See client warranties", vendor cover to "See vendor warranties".
+        user = self.request.user
+        if not user.is_superuser:
+            types = (CLIENT_TYPES if can(user, "view_client_warranties") else ()) + (
+                SUPPLIER_TYPES if can(user, "view_vendor_warranties") else ())
+            qs = qs.filter(warranty_type__in=types)
         # ?side=client|supplier — lets dual-side roles narrow to one side of
         # the ledger. Handled here so list AND export share it; unknown
         # values are ignored.
@@ -100,6 +116,7 @@ class WarrantyViewSet(viewsets.ModelViewSet):
         The original is marked ``reissued``; the replacement starts today and
         links back via ``reissued_from``.
         """
+        _may_manage(request.user, self.get_object().warranty_type)
         original = self.get_object()
         if original.status not in (Warranty.Status.EXPIRED, Warranty.Status.ACTIVE):
             return Response(
@@ -146,6 +163,7 @@ class WarrantyViewSet(viewsets.ModelViewSet):
         from .services import extended_expiry, extension_entry, term_months
 
         warranty = self.get_object()
+        _may_manage(request.user, warranty.warranty_type)
         if warranty.status in (Warranty.Status.VOID, Warranty.Status.REISSUED):
             return Response(
                 {"detail": f"A {warranty.get_status_display().lower()} warranty cannot be extended."},
@@ -173,6 +191,17 @@ class WarrantyViewSet(viewsets.ModelViewSet):
         return Response(WarrantySerializer(warranty).data)
 
 
+def _may_manage(user, warranty_type):
+    """Client cover is managed by whoever manages client warranties, vendor
+    and manufacturer cover by whoever manages vendor warranties."""
+    from rest_framework.exceptions import PermissionDenied
+
+    needed = "manage_client_warranties" if warranty_type in CLIENT_TYPES else "manage_vendor_warranties"
+    if not (user.is_superuser or can(user, needed)):
+        side = "client" if warranty_type in CLIENT_TYPES else "vendor"
+        raise PermissionDenied(f"Managing {side} warranties is not one of your rights.")
+
+
 class WarrantyClaimViewSet(viewsets.ModelViewSet):
     """Claims on vendor and component warranties: raise, send, decide, settle."""
 
@@ -181,7 +210,7 @@ class WarrantyClaimViewSet(viewsets.ModelViewSet):
     ).all()
     serializer_class = WarrantyClaimSerializer
     permission_classes = [IsAuthenticated, CapabilityGate]
-    read_capability = "view_warranties"
+    read_capability = "view_vendor_warranties"
     write_capability = "decide_claim"
     action_capabilities = {"create": "raise_claim", "transition": "decide_claim"}
     filterset_fields = ["status", "supplier", "device", "warranty", "inventory_unit"]

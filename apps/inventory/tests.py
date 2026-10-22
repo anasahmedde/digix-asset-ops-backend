@@ -7,9 +7,20 @@ from apps.assets.models import MaterialType
 from apps.inventory.models import InventoryItem
 
 
+def _grant(user, *caps):
+    """Rights ticked for one person - the roles split inspection (Supervisor)
+    and receiving (store), but a person can be given either."""
+    from apps.accounts.models import UserCapability
+
+    for cap in caps:
+        UserCapability.objects.create(user=user, capability=cap, allowed=True)
+    return user
+
+
 @pytest.fixture
 def ops(db):
-    return User.objects.create_user(username="inv-ops", password="x", role="ops_manager")
+    user = User.objects.create_user(username="inv-ops", password="x", role="ops_manager")
+    return _grant(user, "inspect_goods", "receive_goods")
 
 
 def _client(user):
@@ -1558,7 +1569,7 @@ def test_a_returned_unit_goes_back_under_its_own_serial():
 
     from apps.inventory.models import GoodsReceipt, InventoryUnit
 
-    user = User.objects.create_user(username="return-wh", password="x", role="warehouse")
+    user = _grant(User.objects.create_user(username="return-wh", password="x", role="warehouse"), "inspect_goods")
     c = APIClient()
     c.force_authenticate(user)
     from apps.inventory.models import InventoryCategory
@@ -1751,7 +1762,8 @@ def test_rejected_goods_stay_owed_and_never_reach_the_store(db):
     from apps.suppliers.models import Supplier
 
     User = get_user_model()
-    buyer = User.objects.create_user(username="grn-ops", password="x", role="ops_manager")
+    buyer = _grant(User.objects.create_user(username="grn-ops", password="x", role="ops_manager"),
+                   "inspect_goods", "receive_goods")
     client = APIClient()
     client.force_authenticate(buyer)
 
@@ -1806,6 +1818,9 @@ def test_rejected_goods_stay_owed_and_never_reach_the_store(db):
     assert stock.quantity == 7
     # Where it was put is on the stock row, for whoever has to find it.
     assert stock.storage_location == "Rack A3"
+    # The store took it in; the one who inspected it is still the inspector.
+    line.refresh_from_db()
+    assert line.stocked_by_id == store.pk and line.inspected_by_id == buyer.pk
 
     # And it cannot be received twice.
     again = r.post(f"/api/inventory/receipt-lines/{line.pk}/receive/", {}, format="json")
@@ -1823,7 +1838,8 @@ def test_units_received_carry_the_warranty_given_at_inspection(db):
     from apps.suppliers.models import Supplier
 
     User = get_user_model()
-    buyer = User.objects.create_user(username="wty-ops", password="x", role="ops_manager")
+    buyer = _grant(User.objects.create_user(username="wty-ops", password="x", role="ops_manager"),
+                   "inspect_goods", "receive_goods")
     client = APIClient()
     client.force_authenticate(buyer)
     product = InventoryUnitType.objects.create(name="Warranty Player", model_name="WP-1")
@@ -2098,6 +2114,10 @@ def test_the_goods_received_note_names_who_received_and_inspected(inspector, rec
     line.receipt.save(update_fields=["received_by"])
     _client(inspector).post(f"/api/inventory/receipt-lines/{line.id}/inspect/",
                             {"route": "generic", "accepted_quantity": 10, "notes": "All good"}, format="json")
+    # "Received by" on the GRN is the store person who took it into stock.
+    from django.utils import timezone
+
+    type(line).objects.filter(pk=line.pk).update(stocked_by=store, stocked_at=timezone.now())
 
     c = _client(inspector)
     assert c.get(f"/api/inventory/receipts/{line.receipt_id}/").data["received_by_name"] == "grn-store"

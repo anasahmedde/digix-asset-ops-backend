@@ -518,8 +518,11 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
     line.routed_to = route if accepted_quantity else ""
     line.accepted_quantity = accepted_quantity
     line.rejected_quantity = rejected_quantity
-    line.inspected_by = user
-    line.inspected_at = timezone.now()
+    # The store taking in what the Supervisor already passed keeps the
+    # Supervisor as the inspector.
+    if line.inspected_at is None:
+        line.inspected_by = user
+        line.inspected_at = timezone.now()
     line.inspection_notes = notes
     line.save(update_fields=[
         "inspection_status", "routed_to", "accepted_quantity", "rejected_quantity",

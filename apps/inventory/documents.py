@@ -10,6 +10,7 @@ every unit issued rather than just a count.
 from __future__ import annotations
 
 import io
+import re
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -171,7 +172,7 @@ def render_issue_slip_pdf(issuance_request) -> bytes:
 
     masthead = Table(
         [[Paragraph("MATERIAL ISSUE SLIP", s["title"]),
-          Paragraph(f"<b>{COMPANY_NAME}</b>", s["company"])]],
+          Paragraph("", s["company"])]],
         colWidths=[110 * mm, 64 * mm],
     )
     masthead.setStyle(TableStyle([
@@ -334,6 +335,11 @@ def _stamp(user, at):
 def render_goods_receipt_pdf(receipt) -> bytes:
     """The goods received note: what arrived, against which order, who
     received it, and what inspection and the store made of each line."""
+    # The GRN is the store's step: "Received by" is whoever took the goods
+    # into stock (the inspector who booked the delivery signs as Inspected by).
+    storers = list({x.stocked_by_id: x.stocked_by
+                    for x in receipt.lines.select_related("stocked_by") if x.stocked_by_id}.values())
+    received_names = ", ".join(_who(u) for u in storers) or "Not yet received into stock"
     from apps.procurement.lines import describe_item
 
     from .serializers import GoodsReceiptLineSerializer
@@ -351,7 +357,7 @@ def render_goods_receipt_pdf(receipt) -> bytes:
     )
     story: list = [letterhead()]
     masthead = Table(
-        [[Paragraph("GOODS RECEIVED NOTE", s["title"]), Paragraph(f"<b>{COMPANY_NAME}</b>", s["company"])]],
+        [[Paragraph("GOODS RECEIVED NOTE", s["title"]), Paragraph("", s["company"])]],
         colWidths=[110 * mm, 64 * mm],
     )
     masthead.setStyle(TableStyle([
@@ -373,7 +379,7 @@ def render_goods_receipt_pdf(receipt) -> bytes:
     facts = Table(
         [
             field("GRN No.", receipt.grn_number) + field("Received On", when.strftime("%d %b %Y, %H:%M")),
-            field("Received By", _who(receipt.received_by)) + field("Source", receipt.get_source_display()),
+            field("Received By", received_names) + field("Source", receipt.get_source_display()),
             field("Purchase Order", po.po_number if po else "—") + field("Supplier", supplier.name if supplier else "—"),
             field("Order Date", po.order_date.strftime("%d %b %Y") if po and po.order_date else "—")
             + field("Delivery Ref.", receipt.reference),
@@ -442,7 +448,9 @@ def render_goods_receipt_pdf(receipt) -> bytes:
         # What it was bought for - a project, a maintenance job, the shelf -
         # then why inspection said what it said.
         notes = [("Project: " + words) if kind == "project" else words for kind, words in line_for(line)]
-        notes += [x for x in (line.inspection_notes,) if x]
+        # A return's line carries its product as "unit_type:<id>" for the
+        # inspector's form - not for the page.
+        notes += [x for x in (re.sub(r"\s*unit_type:\S+", "", line.inspection_notes or "").strip(),) if x]
         rows.append([
             Paragraph(str(n), s["cell"]),
             Paragraph(status, s["cell"]),
@@ -469,11 +477,11 @@ def render_goods_receipt_pdf(receipt) -> bytes:
     story += [Spacer(1, 10 * mm)]
     sign = Table(
         [
-            [Paragraph("", s["body"]), signature_of(receipt.received_by, width=36 * mm),
+            [Paragraph("", s["body"]), signature_of(storers[0] if len(storers) == 1 else None, width=36 * mm),
              signature_of(inspector_users[0] if len(inspector_users) == 1 else None, width=36 * mm),
              Paragraph("", s["body"])],
             [Paragraph(x, s["label"]) for x in ("Delivered by (supplier)", "Received by", "Inspected by", "Sent to")],
-            [Paragraph(supplier.name if supplier else "", s["body"]), Paragraph(_who(receipt.received_by), s["body"]),
+            [Paragraph(supplier.name if supplier else "", s["body"]), Paragraph(", ".join(_who(u) for u in storers), s["body"]),
              Paragraph(inspectors, s["body"]), Paragraph(destinations, s["body"])],
         ],
         colWidths=[43.5 * mm] * 4,
