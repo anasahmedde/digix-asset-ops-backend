@@ -63,7 +63,7 @@ CAPABILITIES: tuple[Capability, ...] = (
        "quantities, prices on its requirements, and their documents. Unticked, a project "
        "shows no money at all.", "view"),
     _c("edit_projects", "Run projects", "Projects",
-       "Create projects, set scope and sites, assign the manager and target dates."),
+       "Create projects, set scope and sites, assign the manager and closing dates."),
     _c("plan_budget", "Plan and submit budgets", "Projects",
        "Build the cost plan, add overheads, and send the budget up for approval."),
     _c("approve_budget", "Approve budgets", "Projects",
