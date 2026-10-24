@@ -3149,3 +3149,39 @@ def test_leftovers_are_settled_once_and_then_installation_opens():
     assert not leftovers_pending(device)
     again = c.post(f"/api/assets/devices/{device.id}/return-leftovers/", {"rows": []}, format="json")
     assert again.status_code == 400 and "settled" in str(again.data)
+
+
+@pytest.mark.django_db
+def test_a_component_is_replaced_by_one_of_its_own_kind_until_execution(admin_client, project_build):
+    """Replace keeps the line and its quantity and swaps the part - a stock
+    item for a stock item, a unique product for a unique product - and is
+    frozen with the build once execution starts."""
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem, InventoryUnitType
+
+    generic, unique = project_build["generic"], project_build["unique"]
+    cable = InventoryItem.objects.create(
+        material_type=MaterialType.objects.create(name="Comp Cable 5m", unit="meter"), quantity=7,
+    )
+    player = InventoryUnitType.objects.create(name="Comp Player Two", model_name="MP-10")
+    url = lambda c: f"/api/assets/components/{c.id}/replace/"  # noqa: E731
+
+    r = admin_client.post(url(generic), {"inventory_item": str(cable.id)}, format="json")
+    assert r.status_code == 200, r.content
+    assert (r.data["name"], r.data["quantity"], r.data["unit"]) == ("Comp Cable 5m", 4, "meter")
+    assert r.data["inventory_item"] == cable.id or str(r.data["inventory_item"]) == str(cable.id)
+
+    # Same kind only, a different part, and not one already on the asset.
+    assert admin_client.post(url(unique), {"inventory_item": str(cable.id)}, format="json").status_code == 400
+    assert admin_client.post(url(generic), {"inventory_item": str(cable.id)}, format="json").status_code == 400
+    r = admin_client.post(url(unique), {"inventory_unit_type": str(player.id)}, format="json")
+    assert r.status_code == 200 and r.data["quantity"] == 2, r.content
+
+    # Execution: the build definition is fixed, replace included.
+    _ask_store(admin_client, generic, 1)
+    _store_issues(admin_client, generic)
+    project_build["device"].refresh_from_db()
+    assert project_build["device"].is_locked
+    r = admin_client.post(url(unique), {"inventory_unit_type": str(project_build["unique"].inventory_unit_type_id)},
+                          format="json")
+    assert r.status_code == 403 and "in execution" in r.data["detail"]

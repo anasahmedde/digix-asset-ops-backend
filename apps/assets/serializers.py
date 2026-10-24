@@ -258,6 +258,19 @@ class DeviceImageSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
+def describe_requirement(item=None, product=None):
+    """A component line's name, type, unit and supplier, read off the stock
+    item or unique product it points at."""
+    source = product or item
+    category = getattr(source, "category", None)
+    return {
+        "unit": (product.unit if product else (source.material_type.unit if source.material_type_id else "")) or "piece",
+        "name": str(product) if product else (source.material_type.name if source.material_type_id else source.sku),
+        "component_type": category.name if category else "",
+        "supplier": getattr(source, "supplier", None),
+    }
+
+
 class AssetComponentSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     # Read-only here: cover is recorded in the Warranties section, and for a
@@ -426,24 +439,9 @@ class AssetComponentSerializer(serializers.ModelSerializer):
                     })
 
             # Describe the requirement from whichever record it points at.
-            source = product or item
-            if not attrs.get("unit"):
-                attrs["unit"] = (
-                    product.unit if product
-                    else (source.material_type.unit if source.material_type_id else "")
-                ) or "piece"
-            if not attrs.get("name"):
-                if product:
-                    attrs["name"] = str(product)
-                else:
-                    attrs["name"] = (
-                        source.material_type.name if source.material_type_id else source.sku
-                    )
-            if not attrs.get("component_type"):
-                category = getattr(source, "category", None)
-                attrs["component_type"] = category.name if category else ""
-            if not attrs.get("supplier"):
-                attrs["supplier"] = getattr(source, "supplier", None)
+            for field, value in describe_requirement(item, product).items():
+                if not attrs.get(field):
+                    attrs[field] = value
         return attrs
 
     # Requirements do not move stock, so nothing is consumed on create; and
