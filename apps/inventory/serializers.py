@@ -3,6 +3,7 @@ from rest_framework import serializers
 from common.money import HidesMoney
 
 from .models import (
+    PigeonHole,
     ReorderRequest,
     GoodsReceipt,
     GoodsReceiptLine,
@@ -946,10 +947,10 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         if type_id is None:
             return []
         units = (
-            InventoryUnit.objects
-            .filter(unit_type_id=type_id, status=InventoryUnit.Status.IN_STOCK)
-            .order_by("created_at")[:25]
-        )
+            InventoryUnit.objects.filter(pigeon_hole_id=obj.pigeon_hole_id, status=InventoryUnit.Status.RESERVED)
+            if obj.pigeon_hole_id else
+            InventoryUnit.objects.filter(unit_type_id=type_id, status=InventoryUnit.Status.IN_STOCK)
+        ).order_by("created_at")[:25]
         return [
             {"serial_number": u.serial_number, "unit_code": u.unit_code}
             for u in units
@@ -1025,6 +1026,13 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
     po_received_quantity = serializers.SerializerMethodField()
     # For a unique item: every serial handed over, with where each unit stands now.
     issued_units = serializers.SerializerMethodField()
+    # Into the project's pigeon hole, or out of it - which project's, by its ID.
+    pigeon_project = serializers.SerializerMethodField()
+
+    def get_pigeon_project(self, obj):
+        if not (obj.into_pigeon_hole or obj.pigeon_hole_id) or obj.project_id is None:
+            return None
+        return obj.project.project_code or obj.project.name
 
     def get_issued_units(self, obj):
         serials = obj.issued_serials or []
@@ -1075,7 +1083,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = IssuanceRequest
-        fields = [
+        fields = ["into_pigeon_hole", "pigeon_hole", "pigeon_project", 
             "id", "request_number", "what",
             "item", "item_sku", "item_name", "unit_type", "unit_type_name", "unit",
             "quantity_requested", "quantity_issued", "outstanding_quantity", "available_quantity",
@@ -1089,7 +1097,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             "procured", "po_received_quantity",
             "status", "status_display", "notes", "created_at", "updated_at",
         ]
-        read_only_fields = [
+        read_only_fields = ["into_pigeon_hole", "pigeon_hole", 
             "id", "request_number", "quantity_issued", "issued_by", "issued_serials", "issued_units", "handovers",
             "last_issued_at", "received_by", "status", "requested_by", "created_at", "updated_at",
         ]
@@ -1183,3 +1191,67 @@ class ReorderRequestSerializer(serializers.ModelSerializer):
             if live.exists():
                 raise serializers.ValidationError({"detail": "A reorder request for this component is already open."})
         return attrs
+
+
+class PigeonHoleSerializer(serializers.ModelSerializer):
+    """What a project keeps in its pigeon hole, and what has gone in and out."""
+
+    project_code = serializers.CharField(source="project.project_code", read_only=True)
+    project_name = serializers.CharField(source="project.name", read_only=True)
+    what = serializers.SerializerMethodField()
+    code = serializers.SerializerMethodField()
+    kind = serializers.SerializerMethodField()
+    unit = serializers.SerializerMethodField()
+    serials = serializers.SerializerMethodField()
+    kept = serializers.SerializerMethodField()
+    issued = serializers.SerializerMethodField()
+    pending_in = serializers.SerializerMethodField()
+    pending_out = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PigeonHole
+        fields = [
+            "id", "project", "project_code", "project_name", "item", "unit_type", "what", "code", "kind", "unit",
+            "quantity", "serials", "kept", "issued", "pending_in", "pending_out", "updated_at",
+        ]
+        read_only_fields = fields
+
+    def _requests(self, obj, into):
+        if into:
+            return IssuanceRequest.objects.filter(
+                into_pigeon_hole=True, project_id=obj.project_id, item_id=obj.item_id, unit_type_id=obj.unit_type_id,
+            ).exclude(status=IssuanceRequest.Status.CANCELLED)
+        return obj.requests.exclude(status=IssuanceRequest.Status.CANCELLED)
+
+    def get_what(self, obj):
+        if obj.item_id:
+            return obj.item.material_type.name if obj.item.material_type_id else obj.item.sku
+        return str(obj.unit_type)
+
+    def get_code(self, obj):
+        return obj.item.sku if obj.item_id else obj.unit_type.type_code
+
+    def get_kind(self, obj):
+        return "generic" if obj.item_id else "unique"
+
+    def get_unit(self, obj):
+        if obj.item_id:
+            return (obj.item.material_type.unit if obj.item.material_type_id else "") or "piece"
+        return obj.unit_type.unit or "piece"
+
+    def get_serials(self, obj):
+        if obj.item_id:
+            return []
+        return list(obj.units.filter(status=InventoryUnit.Status.RESERVED).values_list("serial_number", flat=True))
+
+    def get_kept(self, obj):
+        return sum(r.quantity_issued for r in self._requests(obj, True))
+
+    def get_issued(self, obj):
+        return sum(r.quantity_issued for r in self._requests(obj, False))
+
+    def get_pending_in(self, obj):
+        return sum(r.outstanding_quantity for r in self._requests(obj, True))
+
+    def get_pending_out(self, obj):
+        return sum(r.outstanding_quantity for r in self._requests(obj, False))

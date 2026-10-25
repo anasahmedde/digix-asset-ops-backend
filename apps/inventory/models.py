@@ -196,6 +196,10 @@ class InventoryUnit(TimeStampedModel):
     unit_type = models.ForeignKey(
         InventoryUnitType, on_delete=models.PROTECT, null=True, blank=True, related_name="units"
     )
+    # Held (status Reserved) in a project's pigeon hole, or issued out of it.
+    pigeon_hole = models.ForeignKey(
+        "inventory.PigeonHole", on_delete=models.SET_NULL, null=True, blank=True, related_name="units"
+    )
 
     # Optional: goods bought against a serialized PO line are identified by
     # brand + model rather than a material type, so a unit needs one or the
@@ -611,6 +615,17 @@ class IssuanceRequest(TimeStampedModel):
     # Every hand-over, one by one: when, how much, to whom, by whom, which
     # serials. `received_by` keeps the latest name for the list; this is the record.
     handovers = models.JSONField(default=list, blank=True)
+    # The pigeon hole, both ways. Into: the store sets the quantity aside for
+    # the project (decided on a line of its bill of material) instead of
+    # handing it to somebody. Out of: issued from what the project keeps
+    # there, not from general stock.
+    into_pigeon_hole = models.BooleanField(default=False)
+    pigeon_component = models.ForeignKey(
+        "assets.AssetComponent", on_delete=models.SET_NULL, null=True, blank=True, related_name="pigeon_requests",
+    )
+    pigeon_hole = models.ForeignKey(
+        "inventory.PigeonHole", on_delete=models.PROTECT, null=True, blank=True, related_name="requests",
+    )
 
     status = models.CharField(
         max_length=12, choices=Status.choices, default=Status.PENDING, db_index=True
@@ -639,6 +654,8 @@ class IssuanceRequest(TimeStampedModel):
     @property
     def available_quantity(self):
         """What the warehouse can actually cover right now."""
+        if self.pigeon_hole_id:
+            return self.pigeon_hole.quantity
         if self.item_id:
             return self.item.quantity
         if self.unit_type_id:
@@ -662,6 +679,33 @@ class IssuanceRequest(TimeStampedModel):
                 "material_request", model=type(self), field="request_number"
             )
         super().save(*args, **kwargs)
+
+
+class PigeonHole(TimeStampedModel):
+    """Contingency stock kept apart in the store for one project.
+
+    Bought or drawn for the project, it is the project's own: set aside in
+    case the job physically changes and needs more of a part, and issued
+    only for that project, through the store like any other material.
+    Counted out of general stock while it sits here.
+    """
+
+    project = models.ForeignKey("teams.Project", on_delete=models.PROTECT, related_name="pigeon_holes")
+    item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT, null=True, blank=True, related_name="pigeon_holes")
+    unit_type = models.ForeignKey(
+        InventoryUnitType, on_delete=models.PROTECT, null=True, blank=True, related_name="pigeon_holes",
+    )
+    # On hand in the pigeon hole now (for a unique item: the units held).
+    quantity = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["-updated_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["project", "item", "unit_type"], name="one_pigeon_hole_per_project_item"),
+        ]
+
+    def __str__(self):
+        return f"{self.project} · {self.item or self.unit_type}"
 
 
 class ReorderRequest(TimeStampedModel):

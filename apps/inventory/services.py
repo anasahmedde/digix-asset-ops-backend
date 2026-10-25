@@ -587,6 +587,11 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
             )
         })
 
+    # Set aside for a project: nobody takes it away, the pigeon hole holds it.
+    if request_row.into_pigeon_hole and not (received_by or "").strip():
+        project = request_row.project
+        received_by = f"Pigeon hole · {(project.project_code or project.name) if project else 'project'}"
+
     # Material for a job goes to whoever is on that job. Handing it to anybody
     # else leaves the parts with one person and the work with another, and the
     # job's own record of who holds what says something untrue.
@@ -605,9 +610,13 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
 
     serials = []
 
+    if request_row.into_pigeon_hole:
+        serials = _into_pigeon_hole(request_row, user, quantity, notes)
+    elif request_row.pigeon_hole_id:
+        serials = _out_of_pigeon_hole(request_row, quantity)
     # A request raised against a build moves that requirement along, so it goes
     # through the same path the requirement has always used.
-    if request_row.asset_component_id:
+    elif request_row.asset_component_id:
         component = request_row.asset_component
         if request_row.awaiting_procurement and component.outstanding_quantity > 0:
             po_item = component.purchase_order_item
@@ -705,6 +714,71 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
         "status", "updated_at",
     ])
     return {"quantity": quantity, "serials": serials}
+
+
+def _into_pigeon_hole(request_row, user, quantity, notes=""):
+    """Move stock from the shelf into the project's pigeon hole. It leaves
+    general stock - it is the project's now - but stays in the store."""
+    from .models import PigeonHole
+
+    hole, _ = PigeonHole.objects.get_or_create(
+        project_id=request_row.project_id, item_id=request_row.item_id, unit_type_id=request_row.unit_type_id,
+    )
+    hole = PigeonHole.objects.select_for_update().get(pk=hole.pk)
+    serials = []
+    if request_row.item_id:
+        item = InventoryItem.objects.select_for_update().get(pk=request_row.item_id)
+        if item.quantity < quantity:
+            raise serializers.ValidationError({
+                "quantity": f"Only {item.quantity} in stock — keep what you have, or procure the rest."
+            })
+        item.quantity -= quantity
+        item.save(update_fields=["quantity", "updated_at"])
+        StockMovement.objects.create(
+            item=item, movement_type=StockMovement.MovementType.OUT, quantity=quantity,
+            reference=request_row.request_number, performed_by=user,
+            notes=notes or f"Kept in the pigeon hole for {request_row.project}",
+        )
+    else:
+        units = list(
+            InventoryUnit.objects.select_for_update()
+            .filter(unit_type_id=request_row.unit_type_id, status=InventoryUnit.Status.IN_STOCK)
+            .order_by("created_at")[:quantity]
+        )
+        if len(units) < quantity:
+            raise serializers.ValidationError({
+                "quantity": f"Only {len(units)} unit(s) in stock — keep what you have, or procure the rest."
+            })
+        for unit in units:
+            unit.status = InventoryUnit.Status.RESERVED
+            unit.pigeon_hole = hole
+            unit.save(update_fields=["status", "pigeon_hole", "updated_at"])
+            serials.append(unit.serial_number)
+    hole.quantity += quantity
+    hole.save(update_fields=["quantity", "updated_at"])
+    return serials
+
+
+def _out_of_pigeon_hole(request_row, quantity):
+    """Issue from what the project keeps in its pigeon hole."""
+    from .models import PigeonHole
+
+    hole = PigeonHole.objects.select_for_update().get(pk=request_row.pigeon_hole_id)
+    if hole.quantity < quantity:
+        raise serializers.ValidationError({"quantity": f"Only {hole.quantity} left in this pigeon hole."})
+    serials = []
+    if hole.unit_type_id:
+        units = list(
+            InventoryUnit.objects.select_for_update()
+            .filter(pigeon_hole=hole, status=InventoryUnit.Status.RESERVED).order_by("created_at")[:quantity]
+        )
+        for unit in units:
+            unit.status = InventoryUnit.Status.ISSUED
+            unit.save(update_fields=["status", "updated_at"])
+            serials.append(unit.serial_number)
+    hole.quantity -= quantity
+    hole.save(update_fields=["quantity", "updated_at"])
+    return serials
 
 
 def batches_for(item):

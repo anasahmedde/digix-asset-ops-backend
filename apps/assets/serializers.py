@@ -315,6 +315,19 @@ class AssetComponentSerializer(serializers.ModelSerializer):
     increase_requested_by_name = serializers.CharField(
         source="increase_requested_by.get_full_name", read_only=True, default=None
     )
+    # Kept apart for the project as contingency: set aside so far, and still
+    # waiting on the store.
+    pigeon_kept = serializers.SerializerMethodField()
+    pigeon_pending = serializers.SerializerMethodField()
+
+    def _pigeon(self, obj):
+        return [r for r in obj.pigeon_requests.all() if r.status != "cancelled"]
+
+    def get_pigeon_kept(self, obj):
+        return sum(r.quantity_issued for r in self._pigeon(obj))
+
+    def get_pigeon_pending(self, obj):
+        return sum(r.outstanding_quantity for r in self._pigeon(obj))
 
     class Meta:
         model = AssetComponent
@@ -327,7 +340,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "returned_quantity", "returned_serials", "issued_serials",
             "purchase_order_item", "po_number", "po_stocked_quantity", "procure_requests", "planned_unit_price",
             "pending_increase", "increase_reason", "increase_notes",
-            "increase_requested_by_name", "increase_requested_at",
+            "increase_requested_by_name", "increase_requested_at", "pigeon_kept", "pigeon_pending",
             "inventory_unit", "inventory_unit_code", "source_label",
             "active_warranty", "unit",
             "notes", "created_at",

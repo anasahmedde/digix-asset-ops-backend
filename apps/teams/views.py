@@ -387,7 +387,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             .prefetch_related(
                 "components__inventory_item__material_type",
                 "components__inventory_unit_type",
-                "components__purchase_order_item__purchase_order",
+                "components__purchase_order_item__purchase_order", "components__pigeon_requests",
                 "production_steps__work_orders", "production_steps__workshop",
             )
         )
