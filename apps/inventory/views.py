@@ -7,6 +7,7 @@ from django.utils import timezone
 from common.noops import RefusesSilentNoOps
 from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -29,6 +30,7 @@ from .models import (
     StockMovement,
 )
 from .serializers import (
+    PigeonHoleSerializer,
     ReorderRequestSerializer,
     GoodsReceiptLineInspectSerializer,
     GoodsReceiptLineReceiveSerializer,
@@ -684,6 +686,61 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
         })
 
 
+class PigeonHoleViewSet(viewsets.ReadOnlyModelViewSet):
+    """What each project keeps in its pigeon hole, and the way out of it:
+    a material request, issued by the store like any other."""
+
+    serializer_class = PigeonHoleSerializer
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    action_capabilities = {"request_issue": None}
+    filterset_fields = ["project"]
+
+    def get_queryset(self):
+        from .models import PigeonHole
+
+        qs = PigeonHole.objects.select_related(
+            "project", "item__material_type", "unit_type",
+        ).prefetch_related("requests")
+        if self.request.query_params.get("held") == "true":
+            qs = qs.filter(quantity__gt=0)
+        return qs
+
+    @action(detail=True, methods=["post"], url_path="request")
+    def request_issue(self, request, pk=None):
+        """Ask the store for some of what the project keeps here."""
+        hole = self.get_object()
+        user = request.user
+        if not (can_for_project(user, hole.project, "decide_requirements") or can(user, "issue_stock")):
+            raise PermissionDenied("Drawing on a project's pigeon hole is for its manager or the store.")
+        try:
+            quantity = int(request.data.get("quantity"))
+        except (TypeError, ValueError):
+            return Response({"quantity": ["Must be a whole number."]}, status=400)
+        waiting = sum(r.outstanding_quantity for r in hole.requests.exclude(status=IssuanceRequest.Status.CANCELLED))
+        free = hole.quantity - waiting
+        if quantity < 1:
+            return Response({"quantity": ["Ask for at least one."]}, status=400)
+        if quantity > free:
+            return Response({"quantity": [
+                f"Only {max(free, 0)} free in this pigeon hole" + (f" ({waiting} already asked for)." if waiting else ".")
+            ]}, status=400)
+        purpose = str(request.data.get("purpose") or "").strip()
+        label = hole.project.project_code or hole.project.name
+        asked = IssuanceRequest.objects.create(
+            item=hole.item, unit_type=hole.unit_type, quantity_requested=quantity,
+            source=IssuanceRequest.Source.PROJECT, project=hole.project, pigeon_hole=hole,
+            purpose=f"From pigeon hole · {label}" + (f" · {purpose}" if purpose else ""), requested_by=user,
+        )
+        notices.ask(
+            "issue_stock", exclude=[user], kind="request_raised",
+            title=f"From pigeon hole: {asked.what}",
+            message=f"{quantity} for {label} · {asked.request_number}",
+            link="/inventory?tab=requests", ref=f"issue:{asked.pk}", data={"request": str(asked.pk)},
+        )
+        return Response(IssuanceRequestSerializer(asked).data, status=201)
+
+
 class StockMovementViewSet(viewsets.ModelViewSet):
     queryset = StockMovement.objects.select_related(
         "item", "performed_by", "goods_receipt_line__receipt__purchase_order__supplier",
@@ -942,9 +999,11 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         if issuance_request.requested_by_id:
             notices.tell(
                 [issuance_request.requested_by], exclude=[request.user], kind="request_answered",
-                title=f"Issued: {issuance_request.what}",
-                message=f"{result['quantity']} handed over by {notices.who(request.user)}"
-                        + (f" · received by {received_by}" if received_by else ""),
+                title=(f"Kept in pigeon hole: {issuance_request.what}" if issuance_request.into_pigeon_hole
+                       else f"Issued: {issuance_request.what}"),
+                message=(f"{result['quantity']} set aside by {notices.who(request.user)}" if issuance_request.into_pigeon_hole
+                         else f"{result['quantity']} handed over by {notices.who(request.user)}"
+                         + (f" · received by {received_by}" if received_by else "")),
                 link="/inventory?tab=requests", data={"request": str(issuance_request.pk)},
             )
         return Response({

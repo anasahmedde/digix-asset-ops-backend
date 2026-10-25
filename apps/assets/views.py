@@ -1003,6 +1003,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         # How a requirement is met is the project's call: checked inside,
         # where the project is known, so its manager's word counts.
         "fulfil_from_stock": None, "mark_for_procurement": None, "reset_fulfilment": None,
+        "keep_in_pigeon_hole": None,
     }
     filterset_fields = ["device", "component_type", "inventory_item", "inventory_unit", "inventory_unit_type"]
     search_fields = ["name", "serial_number"]
@@ -1174,6 +1175,52 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             "requested": quantity,
             "request_number": issuance_request.request_number,
         })
+
+    @action(detail=True, methods=["post"], url_path="pigeon-hole")
+    def keep_in_pigeon_hole(self, request, pk=None):
+        """Keep some of this part apart for the project, as contingency.
+
+        The store is asked, like any material request, and sets the quantity
+        aside in the project's pigeon hole rather than handing it over. Short
+        on the shelf, the store procures it the usual way.
+        """
+        from apps.inventory.models import IssuanceRequest
+
+        component = self.get_object()
+        denied = self._require(request, component, "decide_requirements")
+        if denied is not None:
+            return denied
+        blocked = _budget_block_response(component)
+        if blocked is not None:
+            return blocked
+        project = component.device.project_on
+        if project is None:
+            return Response({"detail": "This asset is on no project, so there is no pigeon hole to keep it in."}, status=400)
+        if not (component.inventory_item_id or component.inventory_unit_type_id):
+            return Response({"detail": "This line is not tied to a stock item, so there is nothing to keep."}, status=400)
+        try:
+            quantity = int(request.data.get("quantity"))
+        except (TypeError, ValueError):
+            return Response({"quantity": ["Must be a whole number."]}, status=400)
+        if quantity < 1:
+            return Response({"quantity": ["Keep at least one."]}, status=400)
+        asked = IssuanceRequest.objects.create(
+            item=component.inventory_item, unit_type=component.inventory_unit_type,
+            quantity_requested=quantity, source=IssuanceRequest.Source.PROJECT,
+            purpose=f"Pigeon hole · {component.device.asset_code} · {component.name}",
+            project=project, into_pigeon_hole=True, pigeon_component=component, requested_by=request.user,
+        )
+        notices.ask(
+            "issue_stock", exclude=[request.user], kind="request_raised",
+            title=f"Keep in pigeon hole: {component.name}",
+            message=f"{quantity} for {project.project_code or project.name} · {asked.request_number}",
+            link="/inventory?tab=requests", ref=f"issue:{asked.pk}", data={"request": str(asked.pk)},
+        )
+        component = AssetComponent.objects.prefetch_related("pigeon_requests").get(pk=component.pk)
+        return Response({
+            "component": AssetComponentSerializer(component).data,
+            "requested": quantity, "request_number": asked.request_number,
+        }, status=201)
 
     @action(detail=True, methods=["post"], url_path="mark-for-procurement")
     def mark_for_procurement(self, request, pk=None):
