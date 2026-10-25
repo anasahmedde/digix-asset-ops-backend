@@ -190,6 +190,31 @@ class InstallationStep(TimeStampedModel):
     def __str__(self):
         return f"{self.installation} - Step {self.step_number}: {self.get_step_type_display()}"
 
+    def unfinished_checks(self) -> list[str]:
+        return [c.text for c in self.checks.all() if c.done_at is None]
+
+    def has_evidence(self) -> bool:
+        return self.photos.exists()
+
+
+class InstallationStepCheck(TimeStampedModel):
+    """One thing to be done and ticked within a step. A step is complete only
+    when everything on its checklist is ticked and a photo shows the work."""
+
+    step = models.ForeignKey(InstallationStep, on_delete=models.CASCADE, related_name="checks")
+    text = models.CharField(max_length=300)
+    position = models.PositiveSmallIntegerField(default=0)
+    done_at = models.DateTimeField(null=True, blank=True)
+    done_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+
+    class Meta:
+        ordering = ["position", "created_at"]
+
+    def __str__(self):
+        return self.text
+
 
 class InstallationDelay(TimeStampedModel):
     """A logged delay during an installation, attributable to a cause (esp. the client)."""
@@ -226,9 +251,14 @@ class InstallationPhoto(TimeStampedModel):
         POST_INSTALL = "post_install", "Post-Installation"
         VERIFICATION = "verification", "Verification"
         HANDOVER = "handover", "Handover"
+        EVIDENCE = "evidence", "Step Evidence"
 
     installation = models.ForeignKey(
         DeviceInstallation, on_delete=models.CASCADE, related_name="photos"
+    )
+    # The step this photo is evidence for: the work it shows was done.
+    step = models.ForeignKey(
+        InstallationStep, on_delete=models.SET_NULL, null=True, blank=True, related_name="photos",
     )
     photo_type = models.CharField(max_length=20, choices=PhotoType.choices)
     image = models.ImageField(upload_to=upload_to_path)
@@ -315,6 +345,8 @@ class InstallationRouteTemplateStep(TimeStampedModel):
     custom_label = models.CharField(max_length=200, blank=True)
     assigned_team = models.CharField(max_length=200, blank=True)
     description = models.TextField(blank=True)
+    # The step's checklist, carried to every job laid out from this template.
+    checklist = models.JSONField(default=list, blank=True)
 
     class Meta:
         ordering = ["step_number"]

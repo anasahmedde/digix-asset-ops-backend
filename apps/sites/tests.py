@@ -1618,6 +1618,7 @@ def test_steps_are_done_in_order_and_say_who_did_them(ops, tech, installation):
     r = _client(ops).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json")
     assert r.status_code == 200, r.content
     assert r.data["started_by_name"] == me
+    _evidence(first)
     r = _client(tech).patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json")
     assert r.status_code == 200, r.content
     assert r.data["completed_by_name"] == me
@@ -1630,6 +1631,7 @@ def test_steps_are_done_in_order_and_say_who_did_them(ops, tech, installation):
     assert "not skipped" in str(r.data["status"])
     for st in (steps[1], later):
         _client(tech).patch(f"/api/sites/installation-steps/{st.id}/", {"status": "in_progress"}, format="json")
+        _evidence(st)
         r = _client(tech).patch(f"/api/sites/installation-steps/{st.id}/", {"status": "completed"}, format="json")
         assert r.status_code == 200, r.content
 
@@ -1655,6 +1657,7 @@ def test_an_in_house_build_can_go_live_once_its_checklist_is_done(ops, tech, ins
 
     for step in installation.steps.exclude(step_type="handover").order_by("step_number"):
         _client(tech).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "in_progress"}, format="json")
+        _evidence(step)
         r = _client(tech).patch(f"/api/sites/installation-steps/{step.id}/", {"status": "completed"}, format="json")
         assert r.status_code == 200, r.content
     device.refresh_from_db()
@@ -1771,6 +1774,7 @@ def test_a_step_is_started_before_it_is_finished(db):
     begun = client.patch(f"/api/sites/installation-steps/{step.pk}/",
                          {"status": "in_progress"}, format="json")
     assert begun.status_code == 200, begun.content
+    _evidence(step)
     done = client.patch(f"/api/sites/installation-steps/{step.pk}/",
                         {"status": "completed"}, format="json")
     assert done.status_code == 200, done.content
@@ -1834,6 +1838,7 @@ def test_handover_stays_last_and_never_blocks_the_steps_before_it(tech, installa
 
     # Every step up to Handover can be worked in turn; Handover never blocks.
     for st in installation.steps.exclude(step_type="handover").order_by("step_number"):
+        _evidence(st)
         for status in ("in_progress", "completed"):
             r = c.patch(f"/api/sites/installation-steps/{st.id}/", {"status": status}, format="json")
             assert r.status_code == 200, (st.step_type, status, r.content)
@@ -1874,6 +1879,7 @@ def test_an_installation_keeps_a_history_of_who_did_what_and_when(ops, tech, ins
     first = installation.steps.order_by("step_number").first()
     c = _client(tech)
     assert c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json").status_code == 200
+    _evidence(first)
     assert c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json").status_code == 200
     r = _client(ops).patch(f"/api/sites/installations/{installation.id}/", {"position_label": "Main entrance"}, format="json")
     assert r.status_code == 200, r.content
@@ -2044,3 +2050,56 @@ def test_the_activity_log_shows_when_the_crew_checked_in_and_out(installation, o
         "Checked out of Install Site (helper)",
     ])
     assert all(r["at"] for r in rows), "every line has its time"
+
+
+GIF = bytes.fromhex("47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b")  # a 1x1 picture
+
+
+def _evidence(step):
+    """A photo of the finished work on the step - completing it needs one."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from apps.sites.models import InstallationPhoto
+
+    return InstallationPhoto.objects.create(
+        installation=step.installation, step=step, photo_type="evidence",
+        image=SimpleUploadedFile("evidence.gif", GIF, content_type="image/gif"),
+    )
+
+
+@pytest.mark.django_db
+def test_a_step_is_complete_only_with_its_checklist_ticked_and_a_photo_of_the_work(ops, tech, installation):
+    """The office puts items on a step's checklist; the installer ticks them
+    while the step is under way, uploads a photo of the finished work, and
+    only then completes it - and only then does the next step start."""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    first, second = list(installation.steps.exclude(step_type="handover").order_by("step_number"))[:2]
+    c = _client(tech)
+    r = _client(ops).post(f"/api/sites/installation-steps/{first.id}/checks/", {"text": "Brackets torqued"}, format="json")
+    assert r.status_code == 201, r.content
+    item = r.data["checks"][0]["id"]
+    url = f"/api/sites/installation-steps/{first.id}/checks/{item}/"
+    assert c.patch(url, {"done": True}, format="json").status_code == 400, "not before the step starts"
+
+    assert c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json").status_code == 200
+    r = c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json")
+    assert r.status_code == 400 and "Brackets torqued" in str(r.data["status"])
+    r = c.patch(url, {"done": True}, format="json")
+    assert r.status_code == 200 and r.data["checks"][0]["done"] is True, r.content
+    r = c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json")
+    assert r.status_code == 400 and "evidence" in str(r.data["status"])
+    r = c.patch(f"/api/sites/installation-steps/{second.id}/", {"status": "in_progress"}, format="json")
+    assert r.status_code == 400, "the next step waits on this one"
+
+    r = c.post("/api/sites/installation-photos/", {
+        "installation": str(installation.id), "step": str(first.id), "photo_type": "evidence",
+        "image": SimpleUploadedFile("done.gif", GIF, content_type="image/gif"),
+    }, format="multipart")
+    assert r.status_code == 201, r.content
+    r = c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json")
+    assert r.status_code == 200, r.content
+    assert len(r.data["evidence"]) == 1
+    assert c.patch(f"/api/sites/installation-steps/{second.id}/", {"status": "in_progress"}, format="json").status_code == 200
+    # A finished step's checklist is the record of the work.
+    assert c.patch(url, {"done": False}, format="json").status_code == 400

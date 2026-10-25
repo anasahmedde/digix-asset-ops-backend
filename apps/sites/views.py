@@ -1,5 +1,6 @@
 from apps.notifications.service import inform_line, who as _who
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from django.db.models import Count, Q
 from django.utils import timezone
 from common.scoping import for_client
@@ -240,7 +241,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             "device__asset_type", "device__assigned_client", "device__project",
             "installed_by", "vendor", "site", "zone",
         )
-        .prefetch_related("photos", "steps", "delays", "device__clients", "helpers")
+        .prefetch_related("photos", "steps__checks__done_by", "steps__photos", "delays", "device__clients", "helpers")
         .all()
     )
     permission_classes = [IsAuthenticated, CapabilityGate]
@@ -501,6 +502,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                     custom_label=step.custom_label,
                     assigned_team=step.assigned_team,
                     description=step.description,
+                    checklist=[c.text for c in step.checks.all()],
                 )
         return Response({
             "asset_type": asset_type.name,
@@ -533,20 +535,12 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
                 status=drf_status.HTTP_400_BAD_REQUEST,
             )
 
+        from .signals import steps_from_template
+
         with transaction.atomic():
             installation.steps.all().delete()
             lines = list(template.steps.all())
-            InstallationStep.objects.bulk_create([
-                InstallationStep(
-                    installation=installation,
-                    step_type=line.step_type,
-                    custom_label=line.custom_label,
-                    assigned_team=line.assigned_team,
-                    description=line.description,
-                    step_number=index + 1,
-                )
-                for index, line in enumerate(lines)
-            ])
+            steps_from_template(installation, lines)
         installation.refresh_from_db()
         installation._prefetched_objects_cache = {}
         activity.log(installation, "steps_added", f"Standard checklist applied ({len(lines)} steps)", user=request.user)
@@ -986,6 +980,17 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
                 "Start this step before completing it — a step that was never "
                 "started has no record of the work behind it."
             )})
+        # Done means shown to be done: every item on the step's checklist
+        # ticked, and a photo of the finished work as evidence. Until then
+        # the step stays open and the next one does not start.
+        if new_status == InstallationStep.StepStatus.COMPLETED and step.status != new_status:
+            open_checks = step.unfinished_checks()
+            if open_checks:
+                raise _VE({"status": f"Tick the checklist first: {', '.join(open_checks)}."})
+            if not step.has_evidence():
+                raise _VE({"status": (
+                    "Upload a photo of the finished work as evidence before completing this step."
+                )})
 
         extra = {}
         if new_status == InstallationStep.StepStatus.IN_PROGRESS and step.started_by_id is None:
@@ -1004,6 +1009,74 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
             }.get(step.status, step.get_status_display().lower())
             activity.log(step.installation, f"step_{step.status}", f"{activity.step_name(step)} {moved}",
                          user=self.request.user, step=step)
+
+    # -- The step's checklist ------------------------------------------------
+
+    def _step_reply(self, step, code=drf_status.HTTP_200_OK):
+        step = InstallationStep.objects.prefetch_related("checks__done_by", "photos").get(pk=step.pk)
+        return Response(self.get_serializer(step).data, status=code)
+
+    @action(detail=True, methods=["post"], url_path="checks")
+    def add_check(self, request, pk=None):
+        """Put an item on the step's checklist: the office, or the job's installer."""
+        from django.db.models import Max
+        from rest_framework.exceptions import ValidationError as _VE
+
+        from .models import InstallationStepCheck
+
+        step = self.get_object()
+        refuse_if_closed_out(step.installation)
+        self._may_change_checklist(step.installation)
+        if step.status == InstallationStep.StepStatus.COMPLETED:
+            raise _VE({"detail": "This step is complete; its checklist is now the record of what was done."})
+        text = str(request.data.get("text") or "").strip()
+        if not text:
+            raise _VE({"text": "Say what has to be checked."})
+        last = step.checks.aggregate(m=Max("position"))["m"]
+        InstallationStepCheck.objects.create(step=step, text=text[:300], position=0 if last is None else last + 1)
+        activity.log(step.installation, "check_added", f"{activity.step_name(step)}: checklist item added - {text[:120]}",
+                     user=request.user, step=step)
+        return self._step_reply(step, drf_status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"checks/(?P<check_id>[^/.]+)")
+    def check(self, request, pk=None, check_id=None):
+        """Tick or untick an item (whoever works the step, while it is under
+        way), rename it, or take an unticked one off."""
+        from rest_framework.exceptions import ValidationError as _VE
+
+        step = self.get_object()
+        item = get_object_or_404(step.checks, pk=check_id)
+        installation = step.installation
+        refuse_if_closed_out(installation)
+        if step.status == InstallationStep.StepStatus.COMPLETED:
+            raise _VE({"detail": "This step is complete; its checklist is now the record of what was done."})
+        if request.method == "DELETE":
+            self._may_change_checklist(installation)
+            if item.done_at:
+                raise _VE({"detail": "That item has been ticked; untick it before taking it off."})
+            item.delete()
+            return self._step_reply(step)
+        if "text" in request.data:
+            self._may_change_checklist(installation)
+            text = str(request.data.get("text") or "").strip()
+            if not text:
+                raise _VE({"text": "Say what has to be checked."})
+            item.text = text[:300]
+            item.save(update_fields=["text", "updated_at"])
+        if "done" in request.data:
+            if not may_advance_installation(request.user, installation):
+                raise PermissionDenied("Only the people working this installation tick its checklist.")
+            self._from_the_site(installation)
+            if step.status != InstallationStep.StepStatus.IN_PROGRESS:
+                raise _VE({"detail": "Start the step before ticking its checklist."})
+            done = str(request.data.get("done")).lower() in ("true", "1", "yes")
+            item.done_at = clock.now() if done else None
+            item.done_by = request.user if done else None
+            item.save(update_fields=["done_at", "done_by", "updated_at"])
+            activity.log(installation, "check_done" if done else "check_undone",
+                         f"{activity.step_name(step)}: {'ticked' if done else 'unticked'} - {item.text[:120]}",
+                         user=request.user, step=step)
+        return self._step_reply(step)
 
     def perform_destroy(self, instance):
         """Remove the step, then close the gap it leaves in the numbering."""
@@ -1036,7 +1109,11 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
     # Adding a step and taking an unworked one off are open to the job's own
     # installer too, checked against the installation in perform_create and
     # perform_destroy: the phone offers both, and the gate refused them.
-    action_capabilities = {"update": None, "partial_update": None, "create": None, "destroy": None}
+    action_capabilities = {
+        "update": None, "partial_update": None, "create": None, "destroy": None,
+        # The checklist: who may add, tick or remove is decided inside.
+        "add_check": None, "check": None,
+    }
 
     def get_permissions(self):
         if self.action in ("update", "partial_update"):
@@ -1103,5 +1180,22 @@ class InstallationPhotoViewSet(viewsets.ModelViewSet):
             installation = serializer.validated_data["installation"]
             if not user.supplier_id or installation.vendor_id != user.supplier_id:
                 raise PermissionDenied("Vendors can only add photos to their own installations.")
+        step = serializer.validated_data.get("step")
+        if step is not None:
+            installation = serializer.validated_data["installation"]
+            if getattr(user, "role", "") != "vendor" and not may_advance_installation(user, installation):
+                raise PermissionDenied("Only the people working this installation add evidence to its steps.")
+            if installation.installed_by_id == user.id and not can(user, "act_across_teams"):
+                from apps.attendance.presence import require_on_site
+
+                require_on_site(user, installation.site)
+            if step.status == InstallationStep.StepStatus.NOT_STARTED:
+                from rest_framework.exceptions import ValidationError as _VE
+
+                raise _VE({"step": "Start the step before adding evidence of the work."})
+            photo = serializer.save(taken_by=user, photo_type=InstallationPhoto.PhotoType.EVIDENCE)
+            activity.log(photo.installation, "evidence", f"{activity.step_name(step)}: evidence photo added",
+                         user=user, step=step)
+            return
         photo = serializer.save(taken_by=user)
         activity.log(photo.installation, "photo", f"{photo.get_photo_type_display()} photo added", user=user)
