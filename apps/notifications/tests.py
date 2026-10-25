@@ -110,11 +110,11 @@ def test_calendar_holds_planned_events_and_project_dates_and_reminds_once():
     if (today + timedelta(days=1)).month == today.month:
         assert ("event", "Client walkthrough") in kinds
     if (today + timedelta(days=2)).month == today.month:
-        assert ("project_target", "Cal Project - delivery") in kinds
+        assert ("project_target", "Cal Project - closing date") in kinds
 
     assert remind_calendar_dates() == 2
     assert Notification.objects.filter(recipient=ops, title__startswith="Reminder: Client walkthrough").count() == 1
-    assert Notification.objects.filter(recipient=ops, title__startswith="Cal Project is due").count() == 1
+    assert Notification.objects.filter(recipient=ops, title__startswith="Cal Project closes").count() == 1
     assert remind_calendar_dates() == 0  # told once
 
 

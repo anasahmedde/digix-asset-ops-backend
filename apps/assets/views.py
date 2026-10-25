@@ -1050,6 +1050,46 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         super().perform_destroy(instance)
 
 
+    @action(detail=True, methods=["post"])
+    def replace(self, request, pk=None):
+        """Swap the part on a line for another of the same kind - a stock item
+        for a stock item, a unique product for a unique product. The quantity
+        stays; frozen with the rest of the build once execution starts."""
+        from apps.assets.serializers import describe_requirement
+        from apps.inventory.models import InventoryItem, InventoryUnitType, IssuanceRequest
+
+        component = self.get_object()
+        self._refuse_if_locked(component.device)
+        unique = component.inventory_unit_type_id is not None
+        if not unique and component.inventory_item_id is None:
+            return Response({"detail": "This line is not tied to a stock item, so there is nothing to swap."}, status=400)
+        key = "inventory_unit_type" if unique else "inventory_item"
+        new = (InventoryUnitType if unique else InventoryItem).objects.filter(pk=request.data.get(key) or None).first()
+        if new is None:
+            return Response({key: ["Pick the unique item to use instead." if unique else "Pick the stock item to use instead."]}, status=400)
+        if new.pk == getattr(component, f"{key}_id"):
+            return Response({key: ["That is the part already on this line."]}, status=400)
+        decided = component.fulfilment != AssetComponent.Fulfilment.PENDING or component.issuance_requests.exclude(
+            status=IssuanceRequest.Status.CANCELLED).exists()
+        if decided:
+            return Response({"detail": (
+                f"How '{component.name}' is met is already decided ({component.get_fulfilment_display()}) - "
+                "undo that decision first, then replace it."
+            )}, status=400)
+        clash = component.device.components.exclude(pk=component.pk).filter(**{key: new}).first()
+        if clash is not None:
+            return Response({key: [
+                f"'{clash.name}' is already on this asset (×{clash.quantity}) - increase that line instead."
+            ]}, status=400)
+
+        setattr(component, key, new)
+        for field, value in describe_requirement(None if unique else new, new if unique else None).items():
+            setattr(component, field, value)
+        # A different part is priced afresh in the budget.
+        component.planned_unit_price = None
+        component.save()
+        return Response(AssetComponentSerializer(component, context=self.get_serializer_context()).data)
+
     @action(detail=True, methods=["post"], url_path="fulfil-from-stock")
     def fulfil_from_stock(self, request, pk=None):
         denied = self._require(request, self.get_object(), "decide_requirements")

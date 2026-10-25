@@ -341,7 +341,7 @@ class CalendarEventViewSet(viewsets.ModelViewSet):
             projects = Project.objects.exclude(status__in=["completed", "on_hold"])
             for p in projects.filter(target_date__range=(first, last)):
                 items.append({
-                    "id": f"project-target:{p.pk}", "kind": "project_target", "title": f"{p.name} - delivery",
+                    "id": f"project-target:{p.pk}", "kind": "project_target", "title": f"{p.name} - closing date",
                     "date": p.target_date.isoformat(), "time": None, "project": str(p.pk), "project_name": p.name,
                     "notes": "", "mine": False,
                 })

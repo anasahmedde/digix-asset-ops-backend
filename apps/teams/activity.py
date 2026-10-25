@@ -57,7 +57,7 @@ def describe(instance) -> str:
 #: Fields an edit is reported on, in the words the screen uses.
 EDITED = {
     "name": "Name", "status": "Status", "phase": "Phase", "manager": "Project manager",
-    "client": "Client", "site": "Site", "start_date": "Start date", "target_date": "Target date",
+    "client": "Client", "site": "Site", "start_date": "Start date", "target_date": "Closing date",
     "completed_date": "Completed", "contract_type": "Contract", "location": "Location",
     "client_warranty_months": "Client warranty (months)", "rental_end_date": "Rental ends",
 }
