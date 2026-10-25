@@ -3185,3 +3185,55 @@ def test_a_component_is_replaced_by_one_of_its_own_kind_until_execution(admin_cl
     r = admin_client.post(url(unique), {"inventory_unit_type": str(project_build["unique"].inventory_unit_type_id)},
                           format="json")
     assert r.status_code == 403 and "in execution" in r.data["detail"]
+
+
+
+@pytest.mark.django_db
+def test_a_project_keeps_contingency_in_its_pigeon_hole_and_draws_on_it_through_the_store(admin_client, project_build):
+    """Keep N of a BOM line apart for the project: the store sets it aside out
+    of general stock; later the project asks for some of it and the store
+    issues it to a named person, from the pigeon hole and not the shelf."""
+    from apps.inventory.models import InventoryItem, InventoryUnit, PigeonHole
+
+    generic, unique = project_build["generic"], project_build["unique"]
+    item = InventoryItem.objects.get(pk=generic.inventory_item_id)
+    on_shelf = item.quantity
+
+    r = admin_client.post(f"/api/assets/components/{generic.id}/pigeon-hole/", {"quantity": 3}, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["component"]["pigeon_pending"] == 3
+    request_id = admin_client.get("/api/inventory/issuance-requests/", {"page_size": 50}).data["results"][0]["id"]
+    r = admin_client.post(f"/api/inventory/issuance-requests/{request_id}/issue/", {"quantity": 3}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.data["request"]["received_by"].startswith("Pigeon hole")
+    item.refresh_from_db()
+    assert item.quantity == on_shelf - 3, "set aside, it leaves general stock"
+    hole = PigeonHole.objects.get(project=project_build["project"], item=item)
+    assert hole.quantity == 3
+    generic.refresh_from_db()
+    assert generic.issued_quantity == 0 and generic.stock_requested_quantity == 0, "the build line is untouched"
+
+    # A unique part: the unit is held for the project, out of what the shelf offers.
+    free = unique.inventory_unit_type.in_stock_count
+    r = admin_client.post(f"/api/assets/components/{unique.id}/pigeon-hole/", {"quantity": 1}, format="json")
+    assert r.status_code == 201, r.content
+    rid = r.data["request_number"]
+    row = [x for x in admin_client.get("/api/inventory/issuance-requests/", {"page_size": 50}).data["results"] if x["request_number"] == rid][0]
+    assert admin_client.post(f"/api/inventory/issuance-requests/{row['id']}/issue/", {"quantity": 1}, format="json").status_code == 200
+    assert unique.inventory_unit_type.in_stock_count == free - 1
+    assert InventoryUnit.objects.filter(pigeon_hole__project=project_build["project"], status="reserved").count() == 1
+
+    holes = admin_client.get("/api/inventory/pigeon-holes/", {"project": str(project_build["project"].id)}).data
+    holes = holes.get("results", holes)
+    assert sorted(h["quantity"] for h in holes) == [1, 3]
+
+    # The need arises: ask the store for some of it, and it is issued like any request.
+    r = admin_client.post(f"/api/inventory/pigeon-holes/{hole.id}/request/", {"quantity": 5}, format="json")
+    assert r.status_code == 400 and "Only 3" in str(r.data["quantity"])
+    r = admin_client.post(f"/api/inventory/pigeon-holes/{hole.id}/request/", {"quantity": 2, "purpose": "Extra cabinet bracket"}, format="json")
+    assert r.status_code == 201, r.content
+    r = admin_client.post(f"/api/inventory/issuance-requests/{r.data['id']}/issue/", {"quantity": 2, "received_by": "Ali Tech"}, format="json")
+    assert r.status_code == 200, r.content
+    hole.refresh_from_db()
+    item.refresh_from_db()
+    assert hole.quantity == 1 and item.quantity == on_shelf - 3, "drawn from the pigeon hole, not the shelf"
