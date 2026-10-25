@@ -217,7 +217,7 @@ def teams_report(request, date_from, date_to):
         "columns": _cols(
             ("name", "Project"), ("status", "Status"), ("progress", "Progress"),
             ("client", "Client"), ("site", "Site"), ("manager", "Manager"),
-            ("target_date", "Target"),
+            ("target_date", "Closing date"),
         ),
         "rows": rows, "count": len(rows),
         "summary": {"total": qs.count(), "by_status": dict(qs.values_list("status").annotate(c=Count("id")))},

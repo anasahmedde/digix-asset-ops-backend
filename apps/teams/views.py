@@ -155,7 +155,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 title=f"You run {project.name}",
                 message=(
                     f"Client: {project.client.name}" if project.client_id else "No client set"
-                ) + (f" · target {project.target_date}" if project.target_date else ""),
+                ) + (f" · closing date {project.target_date}" if project.target_date else ""),
                 link=f"/projects?project={project.pk}&tab=execution", data={"project": str(project.pk)},
             )
     search_fields = ["name", "location", "description", "client__name", "site__name", "sites__name"]

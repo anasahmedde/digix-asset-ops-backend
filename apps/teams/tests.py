@@ -1772,7 +1772,7 @@ def test_a_project_keeps_a_history_of_who_did_what_end_to_end():
     texts = [r["text"] for r in rows]
     assert any(t.startswith("Project opened: Log project") for t in texts)
     edit = next(r for r in rows if r["action"] == "edited")
-    assert "Target date" in edit["text"] and edit["actor"] == "Ayesha Ops"
+    assert "Closing date" in edit["text"] and edit["actor"] == "Ayesha Ops"
     assert any(t.startswith("Team: log-tech (Member) added") for t in texts)
     asset = next(r for r in rows if r["action"] == "asset")
     assert "Installed → Active" in asset["text"] and asset["actor"] == "log-tech"

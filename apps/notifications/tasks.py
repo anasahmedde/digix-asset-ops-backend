@@ -267,8 +267,8 @@ def remind_calendar_dates():
         left = (project.target_date - today).days
         tell(
             [project.manager], kind=Notification.Type.SYSTEM, ref=ref, link=f"/?date={project.target_date}",
-            title=f"{project.name} is due {'today' if left == 0 else f'in {left} day' + ('s' if left != 1 else '')}",
-            message=f"Delivery date {project.target_date:%d %b %Y}.",
+            title=f"{project.name} closes {'today' if left == 0 else f'in {left} day' + ('s' if left != 1 else '')}",
+            message=f"Closing date {project.target_date:%d %b %Y}.",
         )
         sent += 1
     return sent
