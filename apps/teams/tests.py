@@ -1870,3 +1870,18 @@ def test_see_project_costs_shows_every_project_amount_or_none():
     plan = c.get(f"/api/teams/projects/{project.id}/plan/").data
     assert amounts(plan, []), "ticked: the amounts are there"
     assert c.get(f"/api/teams/projects/{project.id}/plan/document/").status_code == 200
+
+
+@pytest.mark.django_db
+def test_every_project_gets_its_own_number_when_created():
+    """A project is numbered once, on creation, and keeps that number."""
+    from apps.teams.models import Project
+
+    first = Project.objects.create(name="Numbered One")
+    second = Project.objects.create(name="Numbered Two")
+    assert first.project_code and second.project_code and first.project_code != second.project_code
+    code = first.project_code
+    first.name = "Renamed"
+    first.save(update_fields=["name"])
+    first.refresh_from_db()
+    assert first.project_code == code

@@ -36,6 +36,9 @@ class Project(TimeStampedModel):
         LOST = "lost", "Order Lost"
 
     name = models.CharField(max_length=300)
+    # The project's own number (PRJ-2026-0001), given once when it is created;
+    # the format is set in Setup › Numbering.
+    project_code = models.CharField(max_length=50, unique=True, blank=True, db_index=True, editable=False)
     phase = models.CharField(max_length=25, choices=Phase.choices, default=Phase.PLANNING)
     description = models.TextField(blank=True)
     location = models.CharField(max_length=300, blank=True)
@@ -82,6 +85,15 @@ class Project(TimeStampedModel):
 
     def __str__(self):
         return self.name
+
+    def save(self, *args, **kwargs):
+        if not self.project_code:
+            from common.codes import generate_code
+
+            self.project_code = generate_code("project", model=type(self), field="project_code")
+            if kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = {*kwargs["update_fields"], "project_code"}
+        super().save(*args, **kwargs)
 
     # The commercial ladder in delivery order (off-ramps excluded).
     MAIN_PHASE_ORDER = (
