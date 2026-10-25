@@ -168,7 +168,7 @@ class ProjectListSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, se
     class Meta:
         model = Project
         fields = [
-            "id", "name", "location", "image", "client", "client_name",
+            "id", "project_code", "name", "location", "image", "client", "client_name",
             "site", "site_name", "status", "status_display",
             "phase", "phase_display", "resume_phase", "progress",
             "contract_type", "contract_type_display", "rental_end_date",
@@ -222,7 +222,7 @@ class ProjectDetailSerializer(DateOrder, HidesMoney, _PhaseFollowsTheWorkMixin, 
     class Meta:
         model = Project
         fields = [
-            "id", "name", "description", "location", "image",
+            "id", "project_code", "name", "description", "location", "image",
             "client", "client_name", "client_contact_person", "client_contact_phone",
             "site", "site_name",
             "status", "status_display", "phase", "phase_display", "resume_phase",

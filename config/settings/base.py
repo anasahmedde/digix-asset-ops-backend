@@ -209,6 +209,8 @@ CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=["http://localho
 from corsheaders.defaults import default_headers  # noqa: E402
 
 CORS_ALLOW_HEADERS = (*default_headers, "x-recorded-at", "x-idempotency-key", "x-client")
+# Downloads keep the name the server gives them (dated, with the record's number).
+CORS_EXPOSE_HEADERS = ["Content-Disposition"]
 
 # ---------------------------------------------------------------------------
 # Channels (WebSocket)

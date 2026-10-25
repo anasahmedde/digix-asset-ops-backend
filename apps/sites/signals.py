@@ -43,17 +43,7 @@ def seed_steps(installation: DeviceInstallation) -> int:
     if template is not None:
         lines = list(template.steps.all())
         if lines:
-            InstallationStep.objects.bulk_create([
-                InstallationStep(
-                    installation=installation,
-                    step_type=line.step_type,
-                    custom_label=line.custom_label,
-                    assigned_team=line.assigned_team,
-                    description=line.description,
-                    step_number=index + 1,
-                )
-                for index, line in enumerate(lines)
-            ])
+            steps_from_template(installation, lines)
             return len(lines)
 
     InstallationStep.objects.bulk_create(
@@ -67,6 +57,29 @@ def seed_steps(installation: DeviceInstallation) -> int:
         ]
     )
     return len(DEFAULT_STEP_TYPES)
+
+
+def steps_from_template(installation, lines):
+    """Lay a job out from a saved template: its steps, each with its checklist."""
+    from .models import InstallationStepCheck
+
+    steps = InstallationStep.objects.bulk_create([
+        InstallationStep(
+            installation=installation,
+            step_type=line.step_type,
+            custom_label=line.custom_label,
+            assigned_team=line.assigned_team,
+            description=line.description,
+            step_number=index + 1,
+        )
+        for index, line in enumerate(lines)
+    ])
+    InstallationStepCheck.objects.bulk_create([
+        InstallationStepCheck(step=step, text=str(text)[:300], position=i)
+        for step, line in zip(steps, lines)
+        for i, text in enumerate(line.checklist or []) if str(text).strip()
+    ])
+    return steps
 
 
 @receiver(post_save, sender=DeviceInstallation)

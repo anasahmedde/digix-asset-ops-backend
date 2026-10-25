@@ -158,8 +158,8 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 ) + (f" · closing date {project.target_date}" if project.target_date else ""),
                 link=f"/projects?project={project.pk}&tab=execution", data={"project": str(project.pk)},
             )
-    search_fields = ["name", "location", "description", "client__name", "site__name", "sites__name"]
-    ordering_fields = ["created_at", "start_date", "target_date", "progress"]
+    search_fields = ["project_code", "name", "location", "description", "client__name", "site__name", "sites__name"]
+    ordering_fields = ["created_at", "project_code", "start_date", "target_date", "progress"]
 
     @staticmethod
     def _activity(project):

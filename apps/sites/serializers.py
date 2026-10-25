@@ -72,6 +72,23 @@ class InstallationStepSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     completed_by_name = serializers.SerializerMethodField()
     started_by_name = serializers.SerializerMethodField()
+    # What has to be ticked, and the photos that show the work was done:
+    # a step is completed only with every check ticked and evidence on it.
+    checks = serializers.SerializerMethodField()
+    evidence = serializers.SerializerMethodField()
+
+    def get_checks(self, obj):
+        return [{
+            "id": str(c.pk), "text": c.text, "done": c.done_at is not None, "done_at": c.done_at,
+            "done_by_name": (c.done_by.get_full_name() or c.done_by.username) if c.done_by_id else None,
+        } for c in obj.checks.all()]
+
+    def get_evidence(self, obj):
+        request = self.context.get("request")
+        return [{
+            "id": str(p.pk), "image": request.build_absolute_uri(p.image.url) if request else p.image.url,
+            "caption": p.caption, "created_at": p.created_at,
+        } for p in obj.photos.all() if p.image]
 
     def get_completed_by_name(self, obj):
         who = obj.completed_by
@@ -89,6 +106,7 @@ class InstallationStepSerializer(serializers.ModelSerializer):
             "assigned_team", "description",
             "started_at", "started_by", "started_by_name",
             "completed_at", "completed_by", "completed_by_name", "created_at",
+            "checks", "evidence",
         ]
         read_only_fields = [
             "id", "created_at", "started_by", "started_by_name", "completed_by", "completed_by_name",
@@ -102,10 +120,16 @@ class InstallationPhotoSerializer(serializers.ModelSerializer):
     class Meta:
         model = InstallationPhoto
         fields = [
-            "id", "installation", "photo_type", "image", "caption",
+            "id", "installation", "step", "photo_type", "image", "caption",
             "latitude", "longitude", "taken_by", "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+
+    def validate(self, attrs):
+        step = attrs.get("step")
+        if step is not None and step.installation_id != attrs["installation"].pk:
+            raise serializers.ValidationError({"step": "That step belongs to another installation."})
+        return attrs
 
 
 class InstallationDelaySerializer(serializers.ModelSerializer):
