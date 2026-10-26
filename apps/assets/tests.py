@@ -3237,3 +3237,43 @@ def test_a_project_keeps_contingency_in_its_pigeon_hole_and_draws_on_it_through_
     hole.refresh_from_db()
     item.refresh_from_db()
     assert hole.quantity == 1 and item.quantity == on_shelf - 3, "drawn from the pigeon hole, not the shelf"
+
+
+@pytest.mark.django_db
+def test_an_asset_counts_its_visits_and_whose_side_the_issues_were_on(admin_client):
+    """The Overview reads the visits made (not the ones only planned), the
+    last one, and whose side each issue was on; the visits list filters by
+    asset; the asset's cost is hidden from someone who may not see prices."""
+    from django.utils import timezone
+    from rest_framework.test import APIClient
+
+    from apps.accounts.models import User
+    from apps.assets.models import AssetType, Device
+    from apps.maintenance.models import MaintenanceSchedule, MaintenanceVisit
+    from apps.sites.models import Site
+
+    device = Device.objects.create(asset_type=AssetType.objects.create(name="OV Screen"), asset_code="AST-OV-1")
+    job = MaintenanceSchedule.objects.create(
+        title="Monthly check", device=device, site=Site.objects.create(name="OV Site", address="x"),
+        next_due=timezone.localdate(), maintenance_type="preventive",
+    )
+    now = timezone.now()
+    for i, side in enumerate(("client", "ours", "")):
+        MaintenanceVisit.objects.create(
+            schedule=job, due_date=timezone.localdate(), status="completed", sequence=10 + i,
+            started_at=now - timezone.timedelta(days=3 - i), completed_at=now - timezone.timedelta(days=3 - i), issue_side=side,
+        )
+    r = admin_client.get(f"/api/assets/devices/{device.id}/")
+    assert r.status_code == 200, r.content
+    summary = r.data["visit_summary"]
+    assert (summary["total"], summary["client_side"], summary["our_side"], summary["not_recorded"]) == (3, 1, 1, 1)
+    assert summary["last_visit"] is not None and r.data["cost_of_ownership"] is not None
+    visits = admin_client.get("/api/maintenance/visits/", {"schedule__device": str(device.id)}).data
+    visits = visits.get("results", visits)
+    assert {v["issue_side"] for v in visits if v["started_at"]} == {"client", "ours", ""}
+
+    viewer = User.objects.create_user(username="ov-marketing", password="x", role="marketing")
+    c = APIClient()
+    c.force_authenticate(viewer)
+    r = c.get(f"/api/assets/devices/{device.id}/")
+    assert r.status_code == 200 and r.data["cost_of_ownership"] is None

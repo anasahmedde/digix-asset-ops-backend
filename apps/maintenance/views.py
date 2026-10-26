@@ -590,8 +590,9 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
     ).prefetch_related("record__components_used", "record__photos", "purchases__bought_by").all()
     serializer_class = MaintenanceVisitSerializer
     permission_classes = [IsAuthenticated, CanPlanOrStartARound]
-    filterset_fields = ["schedule", "status", "assigned_to"]
-    ordering_fields = ["due_date", "created_at"]
+    # schedule__device: every visit an asset has had, for its page.
+    filterset_fields = ["schedule", "status", "assigned_to", "schedule__device"]
+    ordering_fields = ["due_date", "created_at", "started_at"]
 
     def perform_destroy(self, instance):
         raise drf_serializers.ValidationError(
@@ -839,6 +840,13 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 {"detail": "This visit is reviewed by the technician's own supervisor, or by whoever acts across teams."},
                 status=drf_status.HTTP_403_FORBIDDEN,
             )
+        # Whose side the issue was on, as the reviewer reads the visit.
+        side = request.data.get("issue_side") or ""
+        if side not in ("", *MaintenanceVisit.IssueSide.values):
+            return Response({"issue_side": ["Say 'client' or 'ours'."]}, status=drf_status.HTTP_400_BAD_REQUEST)
+        if side:
+            MaintenanceVisit.objects.filter(pk=visit.pk).update(issue_side=side)
+            visit.issue_side = side
         if not self._corrective(visit):
             # A round is reviewed the same way a breakdown is: accepted, or
             # sent back for another visit with a reason on the record.

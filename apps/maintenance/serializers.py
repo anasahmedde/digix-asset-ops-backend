@@ -327,6 +327,19 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     def get_helper_names(self, obj):
         return [h.get_full_name() or h.username for h in obj.helpers.all()]
 
+    def to_representation(self, instance):
+        from common.money import MONEY_FIELDS, viewer_sees_prices
+
+        data = super().to_representation(instance)
+        # The mixin blanks the visit's own figures; its lines carry figures too.
+        if not viewer_sees_prices(self.context, self.money_capability):
+            for key in ("cost_lines", "component_costs", "purchases"):
+                for line in data.get(key) or []:
+                    if isinstance(line, dict):
+                        for name in MONEY_FIELDS & set(line):
+                            line[name] = None
+        return data
+
     def validate(self, attrs):
         lead = attrs.get("assigned_to", getattr(self.instance, "assigned_to", None))
         if lead is not None and lead in (attrs.get("helpers") or []):
@@ -349,6 +362,9 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     photos = serializers.SerializerMethodField()
     # Corrective: the evidence and the verdicts the office reviews.
     visit_photos = MaintenanceVisitPhotoSerializer(source="photos", many=True, read_only=True)
+    issue_side_display = serializers.CharField(source="get_issue_side_display", read_only=True)
+    maintenance_type = serializers.CharField(source="schedule.maintenance_type", read_only=True)
+    maintenance_type_display = serializers.CharField(source="schedule.get_maintenance_type_display", read_only=True)
     # What the technician bought on site for this visit, receipts and all.
     purchases = MaintenancePurchaseSerializer(many=True, read_only=True)
     review_decision_display = serializers.CharField(
@@ -434,6 +450,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
             "reviewed_at", "visit_photos", "purchases", "has_before_photo", "has_after_photo",
             "asset_verified_at", "asset_verified_by_name",
             "component_costs", "cost_lines", "on_site",
+            "issue_side", "issue_side_display", "maintenance_type", "maintenance_type_display",
             "created_at", "updated_at",
         ]
         # A round is closed out by recording the visit, not by editing it here.
@@ -444,7 +461,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
             # Everything below is written by the lifecycle, never by a PATCH:
             # a verdict somebody could edit is not a verdict.
             "sequence", "completed_at", "resolved", "remarks", "review_decision",
-            "review_reason", "review_note", "reviewed_by", "reviewed_at",
+            "review_reason", "review_note", "reviewed_by", "reviewed_at", "issue_side",
         ]
 
     def _name(self, user):

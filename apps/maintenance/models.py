@@ -293,6 +293,15 @@ class MaintenanceVisit(TimeStampedModel):
     resolved = models.BooleanField(null=True, blank=True)
     remarks = models.TextField(blank=True)
 
+    class IssueSide(models.TextChoices):
+        CLIENT = "client", "Client side"
+        OURS = "ours", "Our side"
+
+    # Whose side the fault was on - the client's (power, misuse, the site)
+    # or ours (the product, the workmanship). Recorded when the office
+    # reviews the visit; blank on visits reviewed before it was asked.
+    issue_side = models.CharField(max_length=10, choices=IssueSide.choices, blank=True, default="")
+
     # What the office decided about it.
     review_decision = models.CharField(
         max_length=12, choices=Review.choices, blank=True, default="",
