@@ -716,6 +716,57 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
     return {"quantity": quantity, "serials": serials}
 
 
+def write_off(user, *, reason, notes, item=None, unit=None, quantity=1):
+    """Take stock off the books, and keep a record of what it was worth.
+
+    Caller must wrap in ``transaction.atomic()``.
+    """
+    from decimal import Decimal
+
+    from .models import StockWriteOff
+
+    if reason not in StockWriteOff.Reason.values:
+        raise serializers.ValidationError({"reason": "Say why: obsolete, damaged, stolen or lost."})
+    if not (notes or "").strip():
+        raise serializers.ValidationError({"notes": "Say what happened - the write-off is on the record."})
+    label = StockWriteOff.Reason(reason).label
+    if item is not None:
+        item = InventoryItem.objects.select_for_update().get(pk=item.pk)
+        if quantity < 1:
+            raise serializers.ValidationError({"quantity": "Write off at least one."})
+        if quantity > item.quantity:
+            raise serializers.ValidationError({"quantity": f"Only {item.quantity} on hand."})
+        cost = item.unit_cost
+        record = StockWriteOff.objects.create(
+            item=item, quantity=quantity, reason=reason, notes=notes.strip(), unit_cost=cost,
+            value=None if cost is None else Decimal(cost) * quantity, written_off_by=user,
+        )
+        item.quantity -= quantity
+        item.save(update_fields=["quantity", "updated_at"])
+        # Down by an adjustment: the batches read it first-in, first-out, so
+        # the value left on the shelf stays right.
+        StockMovement.objects.create(
+            item=item, movement_type=StockMovement.MovementType.ADJUSTMENT, quantity=-quantity,
+            reference=record.reference, performed_by=user, unit_cost=cost,
+            notes=f"Written off - {label}: {notes.strip()}",
+        )
+        return record
+    unit = InventoryUnit.objects.select_for_update().get(pk=unit.pk)
+    if InventoryUnit.Status.WRITTEN_OFF not in InventoryUnit.VALID_TRANSITIONS.get(unit.status, ()):
+        raise serializers.ValidationError({"detail": (
+            f"{unit.serial_number or unit.unit_code} is {unit.get_status_display().lower()} - "
+            "only a unit in the store (in stock, returned or damaged) is written off."
+        )})
+    record = StockWriteOff.objects.create(
+        unit=unit, quantity=1, reason=reason, notes=notes.strip(), unit_cost=unit.purchase_price,
+        value=unit.purchase_price, written_off_by=user,
+    )
+    unit.status = InventoryUnit.Status.WRITTEN_OFF
+    unit.notes = ((unit.notes + "\n") if unit.notes else "") + f"Written off ({label}) on {record.reference}: {notes.strip()}"
+    unit.save(update_fields=["status", "notes", "updated_at"])
+    return record
+
+
 def _into_pigeon_hole(request_row, user, quantity, notes=""):
     """Move stock from the shelf into the project's pigeon hole. It leaves
     general stock - it is the project's now - but stays in the store."""

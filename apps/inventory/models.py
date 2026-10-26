@@ -168,6 +168,8 @@ class InventoryUnit(TimeStampedModel):
         DAMAGED = "damaged", "Damaged"
         SCRAPPED = "scrapped", "Scrapped"
         CONVERTED = "converted", "Registered as Asset"
+        # Taken off the books: obsolete, damaged beyond use, stolen or lost.
+        WRITTEN_OFF = "written_off", "Written Off"
 
     class WarrantyType(models.TextChoices):
         # Mirrors warranties.Warranty.WarrantyType so the two registers can be
@@ -180,13 +182,14 @@ class InventoryUnit(TimeStampedModel):
     # Explicit state machine, per the platform standard — status changes go
     # through the /transition/ action, never a free dropdown.
     VALID_TRANSITIONS = {
-        Status.IN_STOCK: (Status.RESERVED, Status.ISSUED, Status.DAMAGED, Status.SCRAPPED, Status.CONVERTED),
+        Status.IN_STOCK: (Status.RESERVED, Status.ISSUED, Status.DAMAGED, Status.SCRAPPED, Status.CONVERTED, Status.WRITTEN_OFF),
         Status.RESERVED: (Status.IN_STOCK, Status.ISSUED, Status.DAMAGED),
         Status.ISSUED: (Status.RETURNED, Status.DAMAGED, Status.SCRAPPED),
-        Status.RETURNED: (Status.IN_STOCK, Status.DAMAGED, Status.SCRAPPED),
-        Status.DAMAGED: (Status.IN_STOCK, Status.SCRAPPED),
+        Status.RETURNED: (Status.IN_STOCK, Status.DAMAGED, Status.SCRAPPED, Status.WRITTEN_OFF),
+        Status.DAMAGED: (Status.IN_STOCK, Status.SCRAPPED, Status.WRITTEN_OFF),
         Status.SCRAPPED: (),
         Status.CONVERTED: (),
+        Status.WRITTEN_OFF: (),
     }
 
     unit_code = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
@@ -679,6 +682,41 @@ class IssuanceRequest(TimeStampedModel):
                 "material_request", model=type(self), field="request_number"
             )
         super().save(*args, **kwargs)
+
+
+class StockWriteOff(TimeStampedModel):
+    """Stock taken off the books - obsolete, damaged beyond use, stolen or
+    lost - with who did it, why, and what it was worth. Generic stock goes
+    down by an adjustment movement; a unique unit is marked Written Off."""
+
+    class Reason(models.TextChoices):
+        OBSOLETE = "obsolete", "Obsolete"
+        DAMAGED = "damaged", "Damaged"
+        STOLEN = "stolen", "Stolen"
+        LOST = "lost", "Lost / missing"
+
+    reference = models.CharField(max_length=50, unique=True, blank=True, db_index=True)
+    item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT, null=True, blank=True, related_name="write_offs")
+    unit = models.OneToOneField(InventoryUnit, on_delete=models.PROTECT, null=True, blank=True, related_name="write_off")
+    quantity = models.PositiveIntegerField(default=1)
+    reason = models.CharField(max_length=10, choices=Reason.choices)
+    notes = models.TextField()
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    value = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    written_off_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="stock_write_offs",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def save(self, *args, **kwargs):
+        if not self.reference:
+            self.reference = generate_code("stock_write_off", model=type(self), field="reference")
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.reference} · {self.item or self.unit} · {self.get_reason_display()}"
 
 
 class PigeonHole(TimeStampedModel):

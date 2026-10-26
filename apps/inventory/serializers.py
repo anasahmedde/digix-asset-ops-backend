@@ -4,6 +4,7 @@ from common.money import HidesMoney
 
 from .models import (
     PigeonHole,
+    StockWriteOff,
     ReorderRequest,
     GoodsReceipt,
     GoodsReceiptLine,
@@ -1191,6 +1192,36 @@ class ReorderRequestSerializer(serializers.ModelSerializer):
             if live.exists():
                 raise serializers.ValidationError({"detail": "A reorder request for this component is already open."})
         return attrs
+
+
+class StockWriteOffSerializer(serializers.ModelSerializer):
+    """One write-off on the register."""
+
+    reason_display = serializers.CharField(source="get_reason_display", read_only=True)
+    what = serializers.SerializerMethodField()
+    code = serializers.SerializerMethodField()
+    serial_number = serializers.CharField(source="unit.serial_number", read_only=True, default=None)
+    written_off_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StockWriteOff
+        fields = [
+            "id", "reference", "item", "unit", "what", "code", "serial_number", "quantity", "reason", "reason_display",
+            "notes", "unit_cost", "value", "written_off_by", "written_off_by_name", "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_what(self, obj):
+        if obj.item_id:
+            return obj.item.material_type.name if obj.item.material_type_id else obj.item.sku
+        return str(obj.unit.unit_type) if obj.unit.unit_type_id else obj.unit.unit_code
+
+    def get_code(self, obj):
+        return obj.item.sku if obj.item_id else obj.unit.unit_code
+
+    def get_written_off_by_name(self, obj):
+        who = obj.written_off_by
+        return (who.get_full_name() or who.username) if who else None
 
 
 class PigeonHoleSerializer(serializers.ModelSerializer):
