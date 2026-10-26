@@ -537,8 +537,9 @@ class MaintenancePurchaseViewSet(viewsets.ModelViewSet):
             )
         bought = serializer.save(schedule=visit.schedule, bought_by=user)
         activity.log(visit.schedule, "purchase", (
-            f"Bought on site: {bought.quantity} x {bought.description} for PKR {bought.amount:,.2f}"
-            + (f" at {bought.shop}" if bought.shop else "")
+            (f"Bought on site: {bought.quantity} x {bought.description}" if bought.kind == bought.Kind.PART
+             else f"{bought.get_kind_display()}: {bought.description}")
+            + f" for PKR {bought.amount:,.2f}" + (f" at {bought.shop}" if bought.shop else "")
         ), user=user, visit=visit)
 
     def perform_destroy(self, instance):

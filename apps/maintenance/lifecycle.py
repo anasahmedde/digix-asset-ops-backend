@@ -848,13 +848,15 @@ def component_costs(visit: MaintenanceVisit, prices=None):
             "unit_cost": unit,
             "amount": (unit * qty).quantize(Decimal("0.01")) if unit is not None else Decimal("0.00"),
         })
-    # Bought on site: the receipt says what it cost, so it prices itself.
+    # Bought on site, and the visit's other costs the technician paid: each
+    # says what it came to, so it prices itself.
     for bought in visit.purchases.all():
         qty = Decimal(bought.quantity)
+        label = "Bought on site" if bought.kind == bought.Kind.PART else bought.get_kind_display()
         out.append({
             "part_request": None,
             "purchase": str(bought.pk),
-            "description": f"Bought on site: {bought.description}" + (f" ({bought.shop})" if bought.shop else ""),
+            "description": f"{label}: {bought.description}" + (f" ({bought.shop})" if bought.shop else ""),
             "quantity": qty,
             "unit_cost": (bought.amount / qty).quantize(Decimal("0.01")),
             "amount": bought.amount,

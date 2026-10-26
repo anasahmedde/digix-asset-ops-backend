@@ -262,18 +262,30 @@ class MaintenanceRecordPhotoSerializer(serializers.ModelSerializer):
 
 
 class MaintenancePurchaseSerializer(serializers.ModelSerializer):
-    """Bought on site: what, how many, what was paid, where, and the proof."""
+    """A cost of the visit the technician paid: a part bought on site (what,
+    how many, the receipt and a photo), or travel, labour, hire or another
+    expense (what, what it came to, and the receipt where there is one)."""
 
     bought_by_name = serializers.SerializerMethodField()
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
 
     class Meta:
         model = MaintenancePurchase
         fields = [
-            "id", "schedule", "visit", "description", "quantity", "amount", "shop",
+            "id", "schedule", "visit", "kind", "kind_display", "description", "quantity", "amount", "shop",
             "receipt", "photo", "bought_by", "bought_by_name", "created_at",
         ]
         read_only_fields = ["id", "schedule", "bought_by", "bought_by_name", "created_at"]
-        extra_kwargs = {"receipt": {"required": True}, "photo": {"required": True}}
+
+    def validate(self, attrs):
+        kind = attrs.get("kind", getattr(self.instance, "kind", MaintenancePurchase.Kind.PART))
+        if self.instance is None and kind == MaintenancePurchase.Kind.PART:
+            # A part bought for the job: a figure without the receipt or the
+            # part itself is a claim, not a record.
+            missing = {f: "Required for a part bought on site." for f in ("receipt", "photo") if not attrs.get(f)}
+            if missing:
+                raise serializers.ValidationError(missing)
+        return attrs
 
     def get_bought_by_name(self, obj):
         who = obj.bought_by
