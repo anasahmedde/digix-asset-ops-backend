@@ -86,7 +86,39 @@ def _settle_requests_for_component(component, issued, *, exclude=None):
             req.save(update_fields=["status", "notes", "updated_at"])
 
 
-def issue_stock_for_component(component, user, quantity, *, via_request=None):
+def take_units(available, quantity, unit_ids=None, *, short):
+    """The serial numbers going out: the ones the store picked, or the
+    oldest first when nobody picked.
+
+    ``available`` is what may go - in stock of that product, or held in the
+    pigeon hole. A picked serial outside it is refused by its number, so a
+    unit taken by somebody else since the list was opened never leaves
+    twice. ``short(found)`` says what to tell when there are not enough.
+    """
+    qs = available.select_for_update()
+    if not unit_ids:
+        units = list(qs.order_by("created_at")[:quantity])
+        if len(units) < quantity:
+            raise serializers.ValidationError({"quantity": short(len(units))})
+        return units
+    ids = list(dict.fromkeys(str(u) for u in unit_ids))
+    if len(ids) != quantity:
+        raise serializers.ValidationError({"unit_ids": (
+            f"Pick {quantity} serial number{'' if quantity == 1 else 's'} for a quantity of {quantity} - "
+            f"{len(ids)} picked."
+        )})
+    found = {str(u.pk): u for u in qs.filter(pk__in=ids)}
+    gone = [i for i in ids if i not in found]
+    if gone:
+        names = InventoryUnit.objects.filter(pk__in=gone).values_list("serial_number", flat=True)
+        raise serializers.ValidationError({"unit_ids": (
+            f"{', '.join(n or '?' for n in names) or 'A picked unit'} cannot go from here any more - "
+            "it was issued or moved since the list was opened. Pick again."
+        )})
+    return [found[i] for i in ids]
+
+
+def issue_stock_for_component(component, user, quantity, *, via_request=None, unit_ids=None):
     """Draw ``quantity`` out of the warehouse to cover an asset requirement.
 
     This is the only place a component moves stock, and it runs when the
@@ -94,6 +126,7 @@ def issue_stock_for_component(component, user, quantity, *, via_request=None):
     requirement itself is written down. Caller must wrap in transaction.atomic().
     ``via_request`` is the store request being served, if any; other open
     requests for the same requirement are settled by what was issued.
+    ``unit_ids``: the serials the store picked; the oldest go otherwise.
     """
     device_code = component.device.asset_code
 
@@ -129,20 +162,16 @@ def issue_stock_for_component(component, user, quantity, *, via_request=None):
             notes=f"Issued to asset {device_code} for '{component.name}'",
         )
     elif component.inventory_unit_type_id:
-        # Take that many in-stock serials of the opened product, oldest first.
-        units = list(
-            InventoryUnit.objects.select_for_update()
-            .filter(unit_type_id=component.inventory_unit_type_id,
-                    status=InventoryUnit.Status.IN_STOCK)
-            .order_by("created_at")[:quantity]
+        # The serials the store picked, or the oldest in stock.
+        units = take_units(
+            InventoryUnit.objects.filter(unit_type_id=component.inventory_unit_type_id,
+                                         status=InventoryUnit.Status.IN_STOCK),
+            quantity, unit_ids,
+            short=lambda n: (
+                f"Only {n} unit(s) of {component.inventory_unit_type} in stock — "
+                f"procure the shortfall instead."
+            ),
         )
-        if len(units) < quantity:
-            raise serializers.ValidationError({
-                "quantity": (
-                    f"Only {len(units)} unit(s) of {component.inventory_unit_type} in stock — "
-                    f"procure the shortfall instead."
-                )
-            })
         for unit in units:
             unit.status = InventoryUnit.Status.ISSUED
             # Which asset it went into: the requirement knows its device.
@@ -564,12 +593,29 @@ def _requests_ready_to_issue(po_item, accepted_quantity, trace):
     return numbers
 
 
-def issue_against_request(request_row, user, quantity, *, received_by="", notes=""):
+def units_for_request(request_row):
+    """The serial numbers that may go out against this request, or None for
+    stock counted by quantity."""
+    if request_row.pigeon_hole_id and not request_row.into_pigeon_hole:
+        hole = request_row.pigeon_hole
+        if not hole.unit_type_id:
+            return None
+        return InventoryUnit.objects.filter(pigeon_hole=hole, status=InventoryUnit.Status.RESERVED)
+    type_id = request_row.unit_type_id
+    if not type_id and request_row.asset_component_id:
+        type_id = request_row.asset_component.inventory_unit_type_id
+    if not type_id or request_row.item_id:
+        return None
+    return InventoryUnit.objects.filter(unit_type_id=type_id, status=InventoryUnit.Status.IN_STOCK)
+
+
+def issue_against_request(request_row, user, quantity, *, received_by="", notes="", unit_ids=None):
     """Hand over ``quantity`` against a material request.
 
     The store is the only place stock leaves from, so this is where the
     warehouse actually moves. A request that cannot be met in full is issued
-    in part and the balance stays on the queue.
+    in part and the balance stays on the queue. ``unit_ids`` are the serial
+    numbers the store picked for a unique item; without them the oldest go.
 
     Caller must wrap in ``transaction.atomic()``.
     """
@@ -611,9 +657,9 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
     serials = []
 
     if request_row.into_pigeon_hole:
-        serials = _into_pigeon_hole(request_row, user, quantity, notes)
+        serials = _into_pigeon_hole(request_row, user, quantity, notes, unit_ids)
     elif request_row.pigeon_hole_id:
-        serials = _out_of_pigeon_hole(request_row, quantity)
+        serials = _out_of_pigeon_hole(request_row, quantity, unit_ids)
     # A request raised against a build moves that requirement along, so it goes
     # through the same path the requirement has always used.
     elif request_row.asset_component_id:
@@ -653,7 +699,7 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
                     f"{component.device.asset_code} — issue that much."
                 )
             })
-        result = issue_stock_for_component(component, user, quantity, via_request=request_row)
+        result = issue_stock_for_component(component, user, quantity, via_request=request_row, unit_ids=unit_ids)
         serials = [u.serial_number for u in result["units"]]
     elif request_row.item_id:
         item = InventoryItem.objects.select_for_update().get(pk=request_row.item_id)
@@ -672,15 +718,11 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
             notes=notes or f"Issued against {request_row.request_number}",
         )
     elif request_row.unit_type_id:
-        units = list(
-            InventoryUnit.objects.select_for_update()
-            .filter(unit_type_id=request_row.unit_type_id, status=InventoryUnit.Status.IN_STOCK)
-            .order_by("created_at")[:quantity]
+        units = take_units(
+            InventoryUnit.objects.filter(unit_type_id=request_row.unit_type_id, status=InventoryUnit.Status.IN_STOCK),
+            quantity, unit_ids,
+            short=lambda n: f"Only {n} unit(s) in stock — issue what you have, or wait for a delivery.",
         )
-        if len(units) < quantity:
-            raise serializers.ValidationError({
-                "quantity": f"Only {len(units)} unit(s) in stock — issue what you have, or wait for a delivery."
-            })
         for unit in units:
             unit.status = InventoryUnit.Status.ISSUED
             unit.save(update_fields=["status", "updated_at"])
@@ -767,7 +809,7 @@ def write_off(user, *, reason, notes, item=None, unit=None, quantity=1):
     return record
 
 
-def _into_pigeon_hole(request_row, user, quantity, notes=""):
+def _into_pigeon_hole(request_row, user, quantity, notes="", unit_ids=None):
     """Move stock from the shelf into the project's pigeon hole. It leaves
     general stock - it is the project's now - but stays in the store."""
     from .models import PigeonHole
@@ -791,15 +833,11 @@ def _into_pigeon_hole(request_row, user, quantity, notes=""):
             notes=notes or f"Kept in the pigeon hole for {request_row.project}",
         )
     else:
-        units = list(
-            InventoryUnit.objects.select_for_update()
-            .filter(unit_type_id=request_row.unit_type_id, status=InventoryUnit.Status.IN_STOCK)
-            .order_by("created_at")[:quantity]
+        units = take_units(
+            InventoryUnit.objects.filter(unit_type_id=request_row.unit_type_id, status=InventoryUnit.Status.IN_STOCK),
+            quantity, unit_ids,
+            short=lambda n: f"Only {n} unit(s) in stock — keep what you have, or procure the rest.",
         )
-        if len(units) < quantity:
-            raise serializers.ValidationError({
-                "quantity": f"Only {len(units)} unit(s) in stock — keep what you have, or procure the rest."
-            })
         for unit in units:
             unit.status = InventoryUnit.Status.RESERVED
             unit.pigeon_hole = hole
@@ -810,7 +848,7 @@ def _into_pigeon_hole(request_row, user, quantity, notes=""):
     return serials
 
 
-def _out_of_pigeon_hole(request_row, quantity):
+def _out_of_pigeon_hole(request_row, quantity, unit_ids=None):
     """Issue from what the project keeps in its pigeon hole."""
     from .models import PigeonHole
 
@@ -819,9 +857,11 @@ def _out_of_pigeon_hole(request_row, quantity):
         raise serializers.ValidationError({"quantity": f"Only {hole.quantity} left in this pigeon hole."})
     serials = []
     if hole.unit_type_id:
-        units = list(
-            InventoryUnit.objects.select_for_update()
-            .filter(pigeon_hole=hole, status=InventoryUnit.Status.RESERVED).order_by("created_at")[:quantity]
+        # Counted too: the hole's figure only goes down by what really left.
+        units = take_units(
+            InventoryUnit.objects.filter(pigeon_hole=hole, status=InventoryUnit.Status.RESERVED),
+            quantity, unit_ids,
+            short=lambda n: f"Only {n} unit(s) are held in this pigeon hole.",
         )
         for unit in units:
             unit.status = InventoryUnit.Status.ISSUED
