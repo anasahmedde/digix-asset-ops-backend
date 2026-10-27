@@ -103,6 +103,34 @@ def test_assignment_is_operations_only(people):
 
 
 @pytest.mark.django_db
+def test_a_new_ticket_reaches_whoever_hands_tickets_out(people):
+    """On an asset with its own technician the job goes straight to them -
+    and whoever assigns tickets still hears that a ticket was raised. On an
+    asset with nobody of its own, it waits on them to assign it."""
+    from apps.assets.models import Device
+    from apps.notifications.models import Notification
+
+    ops, mkt, tech = people["ops"], people["marketing"], people["tech"]
+    own = Device.objects.create(
+        asset_code="TKT-OWN-1", serial_number="TKT-OWN-SN-1", status=Device.Status.ACTIVE, assigned_technician=tech,
+    )
+    r = _client(mkt).post("/api/tickets/", {**_about(), "title": "screen dark", "device": str(own.id)}, format="json")
+    assert r.status_code == 201, r.content
+    body = r.json()
+    assert Notification.objects.filter(recipient=tech, notification_type="maintenance_reminder").exists()
+    told = Notification.objects.get(recipient=ops, ticket_id=body["id"])
+    assert body["ticket_number"] in told.title and "wf-tech" in told.title
+    assert told.link == f"/tickets?open={body['id']}" and not told.is_actionable
+    # The one who raised it is not told about their own ticket.
+    assert not Notification.objects.filter(recipient=mkt, ticket_id=body["id"]).exists()
+
+    r = _client(mkt).post("/api/tickets/", {**_about(), "title": "nobody's asset"}, format="json")
+    assert r.status_code == 201, r.content
+    waiting = Notification.objects.get(recipient=ops, ticket_id=r.json()["id"])
+    assert waiting.is_actionable and "awaiting assignment" in waiting.title
+
+
+@pytest.mark.django_db
 def test_status_not_writable_via_patch(people):
     c = _client(people["ops"])
     tid = c.post("/api/tickets/", {**_about(), "title": "patch-guard"}, format="json").json()["id"]
