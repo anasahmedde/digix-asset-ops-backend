@@ -293,6 +293,15 @@ class MaintenanceVisit(TimeStampedModel):
     resolved = models.BooleanField(null=True, blank=True)
     remarks = models.TextField(blank=True)
 
+    class IssueSide(models.TextChoices):
+        CLIENT = "client", "Client side"
+        OURS = "ours", "Our side"
+
+    # Whose side the fault was on - the client's (power, misuse, the site)
+    # or ours (the product, the workmanship). Recorded when the office
+    # reviews the visit; blank on visits reviewed before it was asked.
+    issue_side = models.CharField(max_length=10, choices=IssueSide.choices, blank=True, default="")
+
     # What the office decided about it.
     review_decision = models.CharField(
         max_length=12, choices=Review.choices, blank=True, default="",
@@ -580,16 +589,28 @@ class MaintenancePurchase(TimeStampedModel):
     purchase is priced into the visit's cost when the office accepts it.
     """
 
+    class Kind(models.TextChoices):
+        PART = "part", "Part bought"
+        TRAVEL = "travel", "Travel & fuel"
+        LABOUR = "labour", "Labour"
+        HIRE = "hire", "Equipment hire"
+        OTHER = "other", "Other expense"
+
     schedule = models.ForeignKey(MaintenanceSchedule, on_delete=models.CASCADE, related_name="purchases")
     visit = models.ForeignKey(MaintenanceVisit, on_delete=models.CASCADE, related_name="purchases")
+    # A part bought for the job, or another cost of the visit the technician
+    # paid: getting there, a hand hired, a lift. Every one is priced into the
+    # visit when the office accepts it, and so into what the asset has cost.
+    kind = models.CharField(max_length=10, choices=Kind.choices, default=Kind.PART)
     # What was bought, in the technician's words: make, model, size.
     description = models.CharField(max_length=255)
     quantity = models.PositiveIntegerField(default=1)
     # What was paid in all, as the receipt says.
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     shop = models.CharField(max_length=200, blank=True)
-    receipt = models.FileField(upload_to="maintenance/purchases/receipts/")
-    photo = models.ImageField(upload_to="maintenance/purchases/photos/")
+    # A part needs both; another cost needs neither, though a receipt is kept when there is one.
+    receipt = models.FileField(upload_to="maintenance/purchases/receipts/", blank=True)
+    photo = models.ImageField(upload_to="maintenance/purchases/photos/", blank=True)
     bought_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="maintenance_purchases",
     )

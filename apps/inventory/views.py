@@ -18,6 +18,7 @@ from apps.notifications import service as notices
 from common.permissions import CapabilityGate, can, can_any, can_for_project
 
 from .models import (
+    StockWriteOff,
     ReorderRequest,
     GoodsReceipt,
     GoodsReceiptLine,
@@ -31,6 +32,7 @@ from .models import (
 )
 from .serializers import (
     PigeonHoleSerializer,
+    StockWriteOffSerializer,
     ReorderRequestSerializer,
     GoodsReceiptLineInspectSerializer,
     GoodsReceiptLineReceiveSerializer,
@@ -71,7 +73,7 @@ class InventoryItemViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # had view_stock withdrawn could otherwise request from an empty picker.
     read_capability = ASKS_FOR_PARTS
     # Costs and the full export stay with the store.
-    action_capabilities = {"export": "view_stock", "batches": "view_stock"}
+    action_capabilities = {"export": "view_stock", "batches": "view_stock", "write_off": "adjust_stock"}
     # Coalesce so unpriced items sort as zero value instead of NULLs-first.
     queryset = (
         InventoryItem.objects.select_related("material_type", "category")
@@ -128,6 +130,20 @@ class InventoryItemViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             elif value in ("false", "0"):
                 qs = qs.filter(quantity__gt=F("min_stock_level"))
         return qs
+
+    @action(detail=True, methods=["post"], url_path="write-off")
+    def write_off(self, request, pk=None):
+        """Take some of this stock off the books: obsolete, damaged, stolen or lost."""
+        from .services import write_off
+
+        try:
+            quantity = int(request.data.get("quantity"))
+        except (TypeError, ValueError):
+            return Response({"quantity": ["Must be a whole number."]}, status=400)
+        with transaction.atomic():
+            record = write_off(request.user, item=self.get_object(), quantity=quantity,
+                               reason=request.data.get("reason"), notes=str(request.data.get("notes") or ""))
+        return Response(StockWriteOffSerializer(record).data, status=201)
 
     @action(detail=True, methods=["get"])
     def batches(self, request, pk=None):
@@ -269,7 +285,7 @@ class InventoryUnitTypeViewSet(viewsets.ModelViewSet):
 
 # Statuses that mean the unit is no longer on the shelf. Each one is a way of
 # leaving: handed over, written off, or turned into an asset in its own right.
-GONE_FROM_STORE = ("issued", "scrapped", "converted")
+GONE_FROM_STORE = ("issued", "scrapped", "converted", "written_off")
 
 
 class InventoryUnitViewSet(viewsets.ModelViewSet):
@@ -285,7 +301,20 @@ class InventoryUnitViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CapabilityGate]
     read_capability = "view_stock"
     write_capability = "manage_stock"
-    action_capabilities = {"set_warranty": "manage_vendor_warranties", "extend_warranty": "manage_vendor_warranties"}
+    action_capabilities = {
+        "set_warranty": "manage_vendor_warranties", "extend_warranty": "manage_vendor_warranties",
+        "write_off": "adjust_stock",
+    }
+
+    @action(detail=True, methods=["post"], url_path="write-off")
+    def write_off(self, request, pk=None):
+        """Take this unit off the books: obsolete, damaged, stolen or lost."""
+        from .services import write_off
+
+        with transaction.atomic():
+            record = write_off(request.user, unit=self.get_object(),
+                               reason=request.data.get("reason"), notes=str(request.data.get("notes") or ""))
+        return Response(StockWriteOffSerializer(record).data, status=201)
     filterset_fields = ["status", "location", "category", "material_type", "brand", "supplier", "has_warranty", "unit_type"]
     search_fields = ["unit_code", "serial_number", "model_name", "batch_number", "material_type__name", "brand__name"]
     ordering_fields = ["created_at", "serial_number", "purchase_date", "warranty_end"]
@@ -684,6 +713,18 @@ class GoodsReceiptLineViewSet(viewsets.ReadOnlyModelViewSet):
             # Material requests waiting on this line: the store issues against them.
             "ready_requests": result.get("ready_requests", []),
         })
+
+
+class StockWriteOffViewSet(viewsets.ReadOnlyModelViewSet):
+    """The write-off register: everything taken off the books, why, and its value."""
+
+    serializer_class = StockWriteOffSerializer
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_stock"
+    filterset_fields = ["reason", "item"]
+    queryset = StockWriteOff.objects.select_related(
+        "item__material_type", "unit__unit_type", "written_off_by",
+    ).all()
 
 
 class PigeonHoleViewSet(viewsets.ReadOnlyModelViewSet):

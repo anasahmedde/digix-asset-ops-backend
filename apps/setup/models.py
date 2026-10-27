@@ -77,6 +77,7 @@ class NumberingScheme(TimeStampedModel):
         VENDOR_WARRANTY = "vendor_warranty", "Vendor Warranty"
         COMPONENT_WARRANTY = "component_warranty", "Component Warranty"
         WARRANTY_CLAIM = "warranty_claim", "Warranty Claim"
+        STOCK_WRITE_OFF = "stock_write_off", "Stock Write-off"
 
     entity = models.CharField(max_length=30, choices=Entity.choices, unique=True)
     prefix = models.CharField(max_length=12)
