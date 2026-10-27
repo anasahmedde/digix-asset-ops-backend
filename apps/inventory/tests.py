@@ -2176,3 +2176,45 @@ def test_a_unique_product_has_a_storage_location_its_units_follow(ops):
     shelf.refresh_from_db()
     gone.refresh_from_db()
     assert (shelf.storage_location, gone.storage_location) == ("Rack B4", "Rack A1")
+
+
+@pytest.mark.django_db
+def test_stock_is_written_off_with_a_reason_and_its_value_on_the_register(ops, items):
+    """Obsolete, damaged, stolen or lost: generic stock goes down by an
+    adjustment, a unique unit is marked Written Off, and the register keeps
+    who, why and what it was worth. Only with the Adjust stock right."""
+    from apps.inventory.models import InventoryItem, InventoryUnit, InventoryUnitType, StockMovement
+
+    item = items[0]
+    item.unit_cost = 120
+    item.save(update_fields=["unit_cost"])
+    on_hand = item.quantity
+    c = _client(ops)
+    r = c.post(f"/api/inventory/items/{item.id}/write-off/", {"quantity": 2, "reason": "stolen", "notes": ""}, format="json")
+    assert r.status_code == 400 and "notes" in r.data, "what happened is on the record"
+    r = c.post(f"/api/inventory/items/{item.id}/write-off/", {"quantity": on_hand + 1, "reason": "stolen", "notes": "x"}, format="json")
+    assert r.status_code == 400
+    r = c.post(f"/api/inventory/items/{item.id}/write-off/", {"quantity": 2, "reason": "stolen", "notes": "Gone from rack B overnight"}, format="json")
+    assert r.status_code == 201, r.content
+    assert r.data["reference"] and float(r.data["value"]) == 240.0
+    item.refresh_from_db()
+    assert item.quantity == on_hand - 2
+    move = StockMovement.objects.get(reference=r.data["reference"])
+    assert move.movement_type == "adjustment" and move.quantity == -2
+
+    kind = InventoryUnitType.objects.create(name="WO Player", model_name="P-1")
+    unit = InventoryUnit.objects.create(serial_number="WO-1", unit_type=kind, purchase_price=900)
+    r = c.post(f"/api/inventory/units/{unit.id}/write-off/", {"reason": "obsolete", "notes": "Old firmware, no longer supported"}, format="json")
+    assert r.status_code == 201, r.content
+    unit.refresh_from_db()
+    assert unit.status == "written_off"
+    assert c.post(f"/api/inventory/units/{unit.id}/write-off/", {"reason": "lost", "notes": "x"}, format="json").status_code == 400
+
+    register = c.get("/api/inventory/write-offs/").data
+    register = register.get("results", register)
+    assert {row["reason"] for row in register} == {"stolen", "obsolete"}
+
+    from apps.accounts.models import User
+
+    tech = User.objects.create_user(username="wo-tech", password="x", role="technician")
+    assert _client(tech).post(f"/api/inventory/items/{item.id}/write-off/", {"quantity": 1, "reason": "lost", "notes": "x"}, format="json").status_code == 403

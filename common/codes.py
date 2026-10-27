@@ -54,6 +54,7 @@ _FALLBACK_PREFIXES = {
     "vendor_warranty": "VNW",
     "component_warranty": "CPW",
     "warranty_claim": "WCL",
+    "stock_write_off": "SWO",
 }
 
 

@@ -951,8 +951,15 @@ def test_a_part_bought_on_site_is_recorded_with_its_receipt_and_priced_in(fault)
     assert r.status_code == 201, r.content
     assert r.data["bought_by_name"] and r.data["receipt"] and r.data["photo"]
 
+    # The visit's other costs: getting there needs no part and no photo.
+    r = _client(tech).post("/api/maintenance/purchases/", {
+        "visit": str(visit.id), "kind": "travel", "description": "Fuel to site and back", "quantity": 1, "amount": "1500",
+    }, format="multipart")
+    assert r.status_code == 201, r.content
+    assert r.data["kind_display"] == "Travel & fuel"
+
     seen = _client(office).get(f"/api/maintenance/visits/{visit.id}/").data
-    assert [p["description"] for p in seen["purchases"]] == ["5V 40A power supply, Meanwell"]
+    assert [p["description"] for p in seen["purchases"]] == ["5V 40A power supply, Meanwell", "Fuel to site and back"]
     log = _client(office).get(f"/api/maintenance/schedules/{job.id}/activity/").data
     assert any(row["action"] == "purchase" and "3,400.00" in row["text"] for row in log)
 
@@ -968,11 +975,16 @@ def test_a_part_bought_on_site_is_recorded_with_its_receipt_and_priced_in(fault)
     visit.refresh_from_db()
     lines = list(MaintenanceCostLine.objects.filter(record=visit.record))
     bought = [x for x in lines if x.source == MaintenanceCostLine.Source.PURCHASE]
-    assert len(bought) == 1 and bought[0].amount == 3400
+    assert sorted(x.amount for x in bought) == [1500, 3400]
+    assert any(x.description.startswith("Travel & fuel") for x in bought)
     assert visit.record.cost == sum(x.amount for x in lines)
+    # And it is part of what the asset has cost.
+    from apps.assets.costs import maintenance_cost
+
+    assert maintenance_cost(job.device)["total"] >= 4900
 
     # Closed: what was bought stays on the record.
-    gone = _client(tech).delete(f"/api/maintenance/purchases/{MaintenancePurchase.objects.get().pk}/")
+    gone = _client(tech).delete(f"/api/maintenance/purchases/{MaintenancePurchase.objects.first().pk}/")
     assert gone.status_code == 400, gone.content
 
 
