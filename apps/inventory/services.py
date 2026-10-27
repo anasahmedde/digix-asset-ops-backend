@@ -259,13 +259,32 @@ def return_stock_for_component(component, user):
             notes=f"Returned from asset {device_code} ('{component.name}' requirement cleared)",
         )
     elif component.inventory_unit_type_id:
-        units = InventoryUnit.objects.select_for_update().filter(
-            unit_type_id=component.inventory_unit_type_id,
+        from django.db.models import Q
+
+        # Only the serials that went into this asset come back: those fitted
+        # to this line, or recorded on it. Taking the product's most recently
+        # issued units put back ones sitting in other assets.
+        units = list(InventoryUnit.objects.select_for_update().filter(
+            Q(fitted_to=component) | Q(pk=component.inventory_unit_id),
             status=InventoryUnit.Status.ISSUED,
-        ).order_by("-updated_at")[:component.issued_quantity]
+        ))
         for unit in units:
             unit.status = InventoryUnit.Status.IN_STOCK
-            unit.save(update_fields=["status", "updated_at"])
+            unit.fitted_to = None
+            unit.save(update_fields=["status", "fitted_to", "updated_at"])
+        # Issued before units said where they went: which serials those were
+        # is not known, so the store returns them by hand rather than a guess.
+        untraced = component.issued_quantity - len(units)
+        if untraced > 0:
+            from apps.assets.models import DeviceLifecycleEvent
+
+            DeviceLifecycleEvent.objects.create(
+                device=component.device, event_type=DeviceLifecycleEvent.EventType.NOTE, performed_by=user,
+                description=(
+                    f"{untraced} × {component.name} were issued before serial numbers were tracked against "
+                    "this asset - return them to stock by serial number from Inventory."
+                ),
+            )
 
     component.issued_quantity = 0
     component.inventory_unit = None
