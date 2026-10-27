@@ -897,7 +897,7 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CapabilityGate]
     read_capability = "view_stock"
     action_capabilities = {
-        "issue": "issue_stock", "send_back": "issue_stock",
+        "issue": "issue_stock", "send_back": "issue_stock", "units": "issue_stock",
         "destroy": "cancel_material_request", "cancel": "cancel_material_request",
         # The store, or whoever decides requirements, sends a short line to be bought.
         "procure": ("manage_stock", "request_material", "decide_requirements", "review_maintenance"),
@@ -1021,6 +1021,7 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
                 serializer.validated_data["quantity"],
                 received_by=received_by,
                 notes=serializer.validated_data.get("notes", ""),
+                unit_ids=serializer.validated_data.get("unit_ids") or None,
             )
 
         issuance_request.refresh_from_db()
@@ -1054,6 +1055,25 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
             "closed": result.get("closed", False),
             "reason": result.get("reason", ""),
         })
+
+    @action(detail=True, methods=["get"])
+    def units(self, request, pk=None):
+        """The serial numbers that may go out against this request, oldest
+        first: the store picks which ones it hands over."""
+        denied = self._store_only(request)
+        if denied is not None:
+            return denied
+        from .services import units_for_request
+
+        qs = units_for_request(self.get_object())
+        if qs is None:
+            return Response([])
+        # ponytail: first 500 only; page it if one product ever holds more.
+        return Response([
+            {"id": str(u.pk), "serial_number": u.serial_number, "unit_code": u.unit_code,
+             "storage_location": u.storage_location, "received_at": u.created_at}
+            for u in qs.order_by("created_at")[:500]
+        ])
 
     @action(detail=True, methods=["post"], url_path="send-back")
     def send_back(self, request, pk=None):

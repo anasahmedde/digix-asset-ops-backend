@@ -1679,6 +1679,35 @@ def test_resetting_a_decision_returns_issued_stock(admin_client, project_build, 
     ).exists()
 
 
+@pytest.mark.django_db
+def test_resetting_a_decision_returns_only_this_assets_serials(admin_client, project_build, stock_refs):
+    """Undoing a line puts back the serials that went into that asset - not
+    whichever of the product were issued last, which sit in another asset."""
+    from django.db import transaction
+
+    from apps.assets.models import AssetComponent, Device
+    from apps.inventory.models import InventoryUnit
+    from apps.inventory.services import issue_stock_for_component
+
+    mine = project_build["unique"]
+    other = Device.objects.create(
+        device_model=project_build["device"].device_model, serial_number="PB-SN-2", project=project_build["project"],
+    )
+    theirs = AssetComponent.objects.create(
+        device=other, name="Comp Media Player", quantity=1, inventory_unit_type=stock_refs["product"],
+    )
+    one, two = (InventoryUnit.objects.get(serial_number=f"PB-UNIT-{i}") for i in (1, 2))
+    with transaction.atomic():
+        issue_stock_for_component(mine, None, 1, unit_ids=[one.pk])
+        issue_stock_for_component(theirs, None, 1, unit_ids=[two.pk])  # issued last
+
+    r = admin_client.post(f"/api/assets/components/{mine.id}/reset-fulfilment/", {}, format="json")
+    assert r.status_code == 200, r.content
+    one.refresh_from_db(); two.refresh_from_db()
+    assert (one.status, one.fitted_to_id) == ("in_stock", None)
+    assert (two.status, two.fitted_to_id) == ("issued", theirs.pk)
+
+
 # ---------------------------------------------------------------------------
 # Registration: no serial typed in — the asset code is generated
 # ---------------------------------------------------------------------------
