@@ -2218,3 +2218,45 @@ def test_stock_is_written_off_with_a_reason_and_its_value_on_the_register(ops, i
 
     tech = User.objects.create_user(username="wo-tech", password="x", role="technician")
     assert _client(tech).post(f"/api/inventory/items/{item.id}/write-off/", {"quantity": 1, "reason": "lost", "notes": "x"}, format="json").status_code == 403
+
+
+@pytest.mark.django_db
+def test_the_store_picks_which_serial_numbers_go_out(ops):
+    """A unique item is a particular one: the store says which serials it
+    hands over, and only what is still on the shelf can go."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.inventory.models import InventoryUnit, InventoryUnitType, IssuanceRequest
+
+    t = InventoryUnitType.objects.create(name="Pick Player", model_name="PK-1")
+    base = timezone.now() - timedelta(days=1)
+    units = []
+    for i in range(4):
+        u = InventoryUnit.objects.create(serial_number=f"PK-SN-{i}", unit_type=t)
+        InventoryUnit.objects.filter(pk=u.pk).update(created_at=base + timedelta(minutes=i))
+        units.append(u)
+    req = IssuanceRequest.objects.create(unit_type=t, quantity_requested=3, purpose="QA", requested_by=ops)
+    c = _client(_grant(ops, "issue_stock"))
+
+    listed = c.get(f"/api/inventory/issuance-requests/{req.id}/units/")
+    assert listed.status_code == 200, listed.content
+    assert [u["serial_number"] for u in listed.json()] == [f"PK-SN-{i}" for i in range(4)]  # oldest first
+
+    url = f"/api/inventory/issuance-requests/{req.id}/issue/"
+    # Picked, not the oldest: the two newest go.
+    r = c.post(url, {"quantity": 2, "received_by": "Store", "unit_ids": [str(units[3].pk), str(units[2].pk)]}, format="json")
+    assert r.status_code == 200, r.content
+    assert r.json()["serials"] == ["PK-SN-3", "PK-SN-2"]
+    assert dict(InventoryUnit.objects.filter(unit_type=t).values_list("serial_number", "status")) == {
+        "PK-SN-0": "in_stock", "PK-SN-1": "in_stock", "PK-SN-2": "issued", "PK-SN-3": "issued",
+    }
+    # One that already went cannot go again, by name; the count must match.
+    r = c.post(url, {"quantity": 1, "received_by": "Store", "unit_ids": [str(units[3].pk)]}, format="json")
+    assert r.status_code == 400 and "PK-SN-3" in str(r.json()["unit_ids"])
+    r = c.post(url, {"quantity": 1, "received_by": "Store", "unit_ids": [str(units[0].pk), str(units[1].pk)]}, format="json")
+    assert r.status_code == 400 and "unit_ids" in r.json()
+    # Nobody picked: the oldest goes, as before.
+    r = c.post(url, {"quantity": 1, "received_by": "Store"}, format="json")
+    assert r.status_code == 200 and r.json()["serials"] == ["PK-SN-0"]

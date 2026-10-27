@@ -1144,6 +1144,9 @@ class IssuanceRequestIssueSerializer(serializers.Serializer):
     # its own technician, so a blank here is only refused when nobody is.
     received_by = serializers.CharField(max_length=200, required=False, allow_blank=True, default="")
     notes = serializers.CharField(required=False, allow_blank=True, default="")
+    # A unique item: the serial numbers the store picked. Without them the
+    # oldest in stock go.
+    unit_ids = serializers.ListField(child=serializers.UUIDField(), required=False, default=list)
 
     def validate_received_by(self, value):
         return (value or "").strip()

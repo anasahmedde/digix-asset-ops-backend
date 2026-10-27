@@ -350,16 +350,30 @@ def handle_ticket_notifications(sender, instance: Ticket, created: bool, **kwarg
         if not getattr(instance, "_assigned_via_job", False):
             _create_ticket_assignment_notification(instance)
 
-    # New unassigned ticket: park centrally and route to whoever assigns.
-    if created and not instance.assigned_to_id:
-        from .service import ask
+    # A new ticket always reaches whoever hands tickets out. Unassigned, it
+    # waits on them. On an asset with its own technician the job opened with
+    # it has already gone to them (the maintenance app's receiver runs
+    # first), and that used to be the only notice anyone got: the people
+    # who run tickets never heard one was raised.
+    if created:
+        from .service import ask, holders_of, tell, who
 
-        ask(
-            "assign_ticket", exclude=[instance.reported_by_id], kind=Notification.Type.TICKET_UPDATE,
-            title=f"New ticket awaiting assignment: {instance.ticket_number}",
-            message=instance.title, link=f"/tickets?open={instance.pk}", ref=f"ticket-assign:{instance.pk}",
-            ticket=instance, email=False,
-        )
+        about = f"{instance.title} · {instance.get_priority_display()} priority"
+        if not instance.assigned_to_id:
+            ask(
+                "assign_ticket", exclude=[instance.reported_by_id], kind=Notification.Type.TICKET_UPDATE,
+                title=f"New ticket awaiting assignment: {instance.ticket_number}",
+                message=about, link=f"/tickets?open={instance.pk}", ref=f"ticket-assign:{instance.pk}",
+                ticket=instance, email=False, data=_build_ticket_data(instance),
+            )
+        else:
+            tell(
+                holders_of("assign_ticket"), exclude=[instance.reported_by_id, instance.assigned_to_id],
+                kind=Notification.Type.TICKET_UPDATE,
+                title=f"New ticket {instance.ticket_number} — with {who(instance.assigned_to)}",
+                message=about, link=f"/tickets?open={instance.pk}",
+                ticket=instance, data=_build_ticket_data(instance),
+            )
     if not created and instance.assigned_to_id and prev_assigned != instance.assigned_to_id:
         from .service import resolve
 
