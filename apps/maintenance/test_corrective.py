@@ -1016,3 +1016,46 @@ def test_a_visit_worked_offline_keeps_the_times_it_happened(fault):
     started = next(row for row in log if row["action"] == "started")
     assert "recorded offline" in started["text"]
     assert abs((timezone.datetime.fromisoformat(started["at"]) - later).total_seconds()) < 1
+
+
+@pytest.mark.django_db
+def test_a_job_born_with_the_assets_technician_lets_them_start(team, live_asset):
+    """An asset with its own technician: the job opens on them, the ticket
+    reads Assigned, and they can start on site. It used to read Open with a
+    technician on it, and Open is not a state to start from."""
+    live_asset.assigned_technician = team["tech"]
+    live_asset.save(update_fields=["assigned_technician"])
+    kind, _ = TicketIssueType.objects.get_or_create(name="CM Fault")
+    r = _client(team["office"]).post("/api/tickets/", {
+        "title": "Panel dark", "device": str(live_asset.id),
+        "issue_type": str(kind.id), "category": "repair", "priority": "high",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    ticket = Ticket.objects.get(pk=r.data["id"])
+    job = MaintenanceSchedule.objects.get(ticket=ticket)
+    assert job.assigned_to == team["tech"]
+    assert ticket.status == Ticket.Status.ASSIGNED and ticket.assigned_to == team["tech"]
+    assert ticket.comments.filter(new_status=Ticket.Status.ASSIGNED).exists()
+
+    visit = job.visits.get()
+    assert visit.assigned_to == team["tech"]
+    tech = _client(team["tech"])
+    tech.post(f"/api/maintenance/visits/{visit.id}/photos/", {"kind": "before", "image": _png()}, format="multipart")
+    r = tech.post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
+    assert r.status_code == 200, r.content
+    ticket.refresh_from_db()
+    assert ticket.status == Ticket.Status.IN_PROGRESS
+
+
+@pytest.mark.django_db
+def test_handing_the_visit_to_somebody_assigns_the_ticket_too(fault):
+    """The office gives the open visit a technician by editing it, not
+    through Assign: the ticket follows the job to Assigned all the same."""
+    visit = fault["job"].visits.get()
+    r = _client(fault["office"]).patch(
+        f"/api/maintenance/visits/{visit.id}/", {"assigned_to": str(fault["tech"].id)}, format="json",
+    )
+    assert r.status_code == 200, r.content
+    fault["ticket"].refresh_from_db()
+    assert fault["ticket"].status == Ticket.Status.ASSIGNED
+    assert fault["ticket"].assigned_to == fault["tech"]

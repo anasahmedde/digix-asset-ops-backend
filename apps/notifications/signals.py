@@ -284,16 +284,16 @@ def notify_maintenance_assignee(sender, instance: MaintenanceSchedule, created: 
     if not instance.assigned_to_id or (not created and prev == instance.assigned_to_id):
         return
     # A corrective job is the ticket's work: the ticket carries the same
-    # technician - the ticket then tells them itself, with its own link -
-    # so the ticket list and every screen reading it agree.
+    # technician and reads Assigned - the ticket then tells them itself,
+    # with its own link - so the ticket list and every screen reading it
+    # agree, and the technician is let through to start.
     ticket = instance.ticket if instance.ticket_id else None
-    if ticket is not None and ticket.assigned_to_id != instance.assigned_to_id:
-        ticket.assigned_to_id = instance.assigned_to_id
-        if not ticket.assigned_at:
-            ticket.assigned_at = timezone.now()
+    if ticket is not None:
+        from apps.maintenance.lifecycle import land_assigned
+
         # The job's notice below is the one they get; the ticket stays quiet.
         ticket._assigned_via_job = True
-        ticket.save(update_fields=["assigned_to", "assigned_at", "updated_at"])
+        land_assigned(instance, getattr(ticket, "_transition_user", None))
     try:
         data = {"schedule_id": str(instance.id), "priority": instance.priority}
         if instance.device_id:
@@ -419,7 +419,8 @@ def handle_ticket_notifications(sender, instance: Ticket, created: bool, **kwarg
             _create_rejection_notification(instance)
         elif instance.status in RESOLVED_STATUSES:
             _resolve_ticket_notifications(instance)
-        elif instance.assigned_to_id:
+        elif instance.assigned_to_id and not getattr(instance, "_assigned_via_job", False):
+            # Assigned through its job: the job's notice is the one they get.
             _create_ticket_status_notification(instance)
 
 

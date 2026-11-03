@@ -282,6 +282,34 @@ def assign_round(job: MaintenanceSchedule, *, user, technician, due_date=None):
     return visit
 
 
+def land_assigned(job: MaintenanceSchedule, user=None) -> None:
+    """The ticket says what its job says: with a technician, it is Assigned.
+
+    A job is given a technician without the office pressing Assign - born
+    with the asset's own technician, or handed over through its visit. The
+    ticket used to keep the technician but stay Open, and Open is not a
+    state anybody can start from, so the technician was turned away on
+    site. Anything already past Assigned is left where it is.
+    """
+    ticket = _ticket_of(job)
+    if ticket is None or not job.assigned_to_id:
+        return
+    changed = []
+    if ticket.assigned_to_id != job.assigned_to_id:
+        ticket.assigned_to_id = job.assigned_to_id
+        changed.append("assigned_to")
+        if not ticket.assigned_at:
+            ticket.assigned_at = timezone.now()
+            changed.append("assigned_at")
+    if ticket.status == Ticket.Status.OPEN:
+        who = job.assigned_to.get_full_name() or job.assigned_to.username
+        ticket.status = Ticket.Status.ASSIGNED
+        ticket.save(update_fields=[*changed, "status", "updated_at"])
+        _say(ticket, user, f"Assigned to {who} on the maintenance job.", Ticket.Status.OPEN, Ticket.Status.ASSIGNED)
+    elif changed:
+        ticket.save(update_fields=[*changed, "updated_at"])
+
+
 @transaction.atomic
 def assign(job: MaintenanceSchedule, *, user, technician, due_date) -> MaintenanceVisit:
     """Give the work to somebody, with a date. This opens the next visit."""
