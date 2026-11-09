@@ -562,17 +562,29 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
     def get_visit_summary(self, obj):
         from apps.maintenance.models import MaintenanceVisit
 
+        from common.money import viewer_sees_prices
+
+        from .costs import money
+
         visits = list(
             MaintenanceVisit.objects.filter(schedule__device=obj, started_at__isnull=False)
-            .only("started_at", "completed_at", "issue_side").order_by("-started_at")
+            .select_related("record").only("started_at", "completed_at", "issue_side", "record__cost")
+            .order_by("-started_at")
         )
-        return {
+        summary = {
             "total": len(visits),
             "last_visit": (visits[0].completed_at or visits[0].started_at) if visits else None,
             "client_side": sum(1 for v in visits if v.issue_side == MaintenanceVisit.IssueSide.CLIENT),
             "our_side": sum(1 for v in visits if v.issue_side == MaintenanceVisit.IssueSide.OURS),
             "not_recorded": sum(1 for v in visits if not v.issue_side),
         }
+        # What the visits cost, as priced on each visit's record; None until
+        # the last visit is priced. Money only for those who may see prices.
+        if viewer_sees_prices(self.context, self.money_capability):
+            cost = lambda v: v.record.cost if v.record_id else None  # noqa: E731
+            summary["last_visit_cost"] = cost(visits[0]) if visits else None
+            summary["visits_cost"] = money(sum((cost(v) or 0) for v in visits))
+        return summary
 
     def get_cost_of_ownership(self, obj):
         from common.money import viewer_sees_prices
