@@ -118,6 +118,20 @@ def theirs(visit: MaintenanceVisit, user) -> bool:
     return visit.assigned_to_id == getattr(user, "pk", None) or is_admin(user)
 
 
+def technician_here(visit: MaintenanceVisit) -> bool:
+    """The visit's technician is checked in at its site. The work - start,
+    pause, resume, finish - happens only between their check-in and
+    check-out, whoever presses the button, so the man-hours are hours there."""
+    from django.conf import settings
+
+    from apps.attendance.presence import clocked_in_at
+
+    site = visit.schedule.site_id
+    if not getattr(settings, "FIELD_WORK_NEEDS_CHECK_IN", True) or not site:
+        return True
+    return bool(visit.assigned_to_id) and clocked_in_at(visit.assigned_to_id, site)
+
+
 # ── Reading the state ────────────────────────────────────────────────────
 
 def current_visit(job: MaintenanceSchedule) -> MaintenanceVisit | None:
@@ -139,7 +153,11 @@ def allowed_actions(job: MaintenanceSchedule, user) -> list[str]:
     """
     office = is_office(user)
     visit = current_visit(job)
-    mine = visit is not None and theirs(visit, user)
+    # The work buttons open only while the technician is checked in at the site.
+    mine = visit is not None and theirs(visit, user) and (
+        visit.status not in (MaintenanceVisit.Status.PLANNED, MaintenanceVisit.Status.IN_PROGRESS)
+        or technician_here(visit)
+    )
     ticket = _ticket_of(job)
     # Reviewing is the technician's own reporting line, or whoever acts
     # across teams - the same rule the review endpoint enforces, so a
@@ -1008,13 +1026,16 @@ def time_on_site(visit: MaintenanceVisit):
     # ponytail: two visits at one site in the same hours would each count
     # them; split by asset if crews start doing several at once.
     people = []
+    work = work_spells(visit) if visit.started_at else None
     for person in [visit.assigned_to, *visit.helpers.all()]:
         if person is None or any(p["id"] == str(person.pk) for p in people):
             continue
-        # The technician's are the work itself, start to done less pauses;
-        # a helper's are their time checked in at the site.
+        # The technician's are the work itself, start to done less pauses.
+        # A helper's are their time checked in at the site while that work
+        # ran: not before it started, not while it was paused, not after.
         lead = person.pk == visit.assigned_to_id
-        found = work_spells(visit) if lead and visit.started_at else spells(person.pk, site, begin, end)
+        mine = spells(person.pk, site, begin, end)
+        found = mine if work is None else work if lead else _overlap(mine, work)
         people.append({
             "id": str(person.pk), "name": person.get_full_name() or person.username,
             "lead": person.pk == visit.assigned_to_id, "hours": hours(found), "spells": found,
@@ -1026,28 +1047,55 @@ def time_on_site(visit: MaintenanceVisit):
     }
 
 
-def _labour_line(record, visit, labour):
-    """Hours on site at the reviewer's rate, as one line; None for no labour."""
+def _overlap(a, b):
+    """The stretches in both lists of spells."""
+    out = []
+    for x in a:
+        for y in b:
+            f, t = max(x["from"], y["from"]), min(x["to"], y["to"])
+            if t > f:
+                out.append({"from": f, "to": t, "reckoned": x["reckoned"] or y["reckoned"]})
+    return sorted(out, key=lambda s: s["from"])
+
+
+def _labour_lines(record, visit, labour):
+    """Man-hours at the reviewer's rate per hour: a line per person, since
+    the technician and each helper are paid at their own rate.
+
+    ``labour`` is {"people": [{"id", "hours", "rate"}]}, or the older
+    {"hours", "rate"} for the visit as one line. Hours left out are the
+    hours counted from the visit's times.
+    """
     from .models import MaintenanceCostLine
 
     if not labour:
-        return None
-    try:
-        rate = Decimal(str(labour.get("rate") or 0))
-        given = labour.get("hours")
-        hrs = Decimal(str(given)) if given not in (None, "") else Decimal(str((time_on_site(visit) or {}).get("hours", 0)))
-    except (InvalidOperation, TypeError):
-        raise ValidationError({"labour": ["Hours and the rate per hour are numbers."]})
-    if rate < 0 or hrs < 0:
-        raise ValidationError({"labour": ["Hours and the rate per hour are not negative."]})
-    if not rate or not hrs:
-        return None
-    hrs = hrs.quantize(Decimal("0.01"))
-    return MaintenanceCostLine(
-        record=record, source=MaintenanceCostLine.Source.LABOUR,
-        description=f"Man-hours: {hrs.normalize():f} h on site", quantity=hrs, unit_cost=rate,
-        amount=(hrs * rate).quantize(Decimal("0.01")),
-    )
+        return []
+    spent = time_on_site(visit) or {}
+    found = {p["id"]: p for p in spent.get("people", [])}
+    rows = labour.get("people")
+    if rows is None:
+        rows = [{"hours": labour.get("hours"), "rate": labour.get("rate")}]
+    out = []
+    for row in rows:
+        who = found.get(str(row.get("id"))) if row.get("id") else None
+        counted = who["hours"] if who else (0 if row.get("id") else spent.get("hours", 0))
+        try:
+            rate = Decimal(str(row.get("rate") or 0))
+            given = row.get("hours")
+            hrs = Decimal(str(given if given not in (None, "") else counted))
+        except (InvalidOperation, TypeError):
+            raise ValidationError({"labour": ["Hours and the rate per hour are numbers."]})
+        if rate < 0 or hrs < 0:
+            raise ValidationError({"labour": ["Hours and the rate per hour are not negative."]})
+        if not rate or not hrs:
+            continue
+        hrs = hrs.quantize(Decimal("0.01"))
+        out.append(MaintenanceCostLine(
+            record=record, source=MaintenanceCostLine.Source.LABOUR,
+            description=f"Man-hours: {who['name'] + ', ' if who else ''}{hrs.normalize():f} h on site",
+            quantity=hrs, unit_cost=rate, amount=(hrs * rate).quantize(Decimal("0.01")),
+        ))
+    return out
 
 
 def price_the_visit(record, visit: MaintenanceVisit, extra=None, prices=None, labour=None):
@@ -1079,9 +1127,7 @@ def price_the_visit(record, visit: MaintenanceVisit, extra=None, prices=None, la
             record=record, source=MaintenanceCostLine.Source.MANUAL,
             description=what, amount=amount.quantize(Decimal("0.01")),
         ))
-    work = _labour_line(record, visit, labour)
-    if work is not None:
-        lines.append(work)
+    lines += _labour_lines(record, visit, labour)
     MaintenanceCostLine.objects.bulk_create(lines)
     record.cost = sum((x.amount for x in lines), Decimal("0.00"))
     record.save(update_fields=["cost", "updated_at"])

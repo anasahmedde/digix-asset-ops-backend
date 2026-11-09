@@ -7,6 +7,7 @@ without its evidence, and a ticket cannot be raised on an asset that is not
 in service.
 """
 import io
+from decimal import Decimal
 
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -1276,3 +1277,79 @@ def test_checking_out_with_work_going_pauses_it(fault):
     visit.refresh_from_db()
     pause = visit.pauses.get()
     assert pause.automatic and pause.resumed_at is None
+
+
+@pytest.mark.django_db
+def test_paused_and_checked_out_the_work_waits_for_the_next_check_in(fault, settings):
+    """Paused, checked out: nobody resumes it - not the technician, not an
+    administrator on the web - until the technician checks in again. The
+    visit lists both stays at the site."""
+    from apps.accounts.models import User
+    from apps.attendance.models import AttendanceRecord
+    from apps.sites.models import Site
+
+    job, tech = fault["job"], fault["tech"]
+    here = Site.objects.create(name="Mall atrium", address="x")
+    job.site = here
+    job.save(update_fields=["site"])
+    AttendanceRecord.objects.create(user=tech, check_type="check_in", site=here)
+    visit = _started(fault)
+    settings.FIELD_WORK_NEEDS_CHECK_IN = True
+    url = f"/api/maintenance/visits/{visit.id}"
+    admin = User.objects.create_superuser(username="cm-admin", password="x")
+
+    assert _client(tech).post(f"{url}/pause/", {"reason": "Lunch"}, format="json").status_code == 200
+    AttendanceRecord.objects.create(user=tech, check_type="check_out", site=here)
+    gone = _client(admin).post(f"{url}/resume/", {}, format="json")
+    assert gone.status_code == 403 and "is not checked in at Mall atrium" in str(gone.data["detail"]), gone.content
+    assert _client(tech).post(f"{url}/resume/", {}, format="json").status_code == 403
+    job_data = _client(admin).get(f"/api/maintenance/schedules/{job.id}/").data
+    assert "resume" not in job_data["allowed_actions"], job_data["allowed_actions"]
+    assert _client(tech).get(f"{url}/").data["technician_here"] is False
+
+    AttendanceRecord.objects.create(user=tech, check_type="check_in", site=here)
+    assert "resume" in _client(admin).get(f"/api/maintenance/schedules/{job.id}/").data["allowed_actions"]
+    r = _client(tech).post(f"{url}/resume/", {}, format="json")
+    assert r.status_code == 200 and r.data["technician_here"] is True, r.content
+    stays = r.data["on_site"]["stays"]
+    assert len(stays) == 2 and stays[0]["checked_out_at"] and stays[1]["checked_out_at"] is None, stays
+
+
+@pytest.mark.django_db
+def test_a_helpers_hours_are_their_check_ins_while_the_work_ran_priced_at_their_own_rate(fault):
+    """Work 09:00-12:00, paused overnight, 09:00-11:00 next day. The helper
+    was checked in 08:00-13:00 and 08:30-10:00: 3 h + 1 h of that was work.
+    Each is priced at their own rate, as their own line."""
+    from datetime import datetime, timedelta
+
+    from apps.accounts.models import User
+    from apps.attendance.models import AttendanceRecord
+    from apps.maintenance import lifecycle
+    from apps.sites.models import Site
+
+    visit, tech = _started(fault), fault["tech"]
+    site = Site.objects.create(name="Helper Mall")
+    MaintenanceSchedule.objects.filter(pk=fault["job"].pk).update(site=site)
+    helper = User.objects.create_user(username="cm-helper", password="x", first_name="Hamid", role="technician")
+    visit.helpers.add(helper)
+    d = timezone.make_aware(datetime.combine(timezone.localdate() - timedelta(days=5), datetime.min.time()))
+    for kind, at in [("check_in", 8), ("check_out", 13), ("check_in", 24 + 8.5), ("check_out", 24 + 10)]:
+        rec = AttendanceRecord.objects.create(user=helper, check_type=kind, site=site)
+        AttendanceRecord.objects.filter(pk=rec.pk).update(created_at=d + timedelta(hours=at))
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(started_at=d + timedelta(hours=9))
+    visit.refresh_from_db()
+    lifecycle.pause(visit, user=tech, at=d + timedelta(hours=12))
+    lifecycle.resume(visit, user=tech, at=d + timedelta(days=1, hours=9))
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(completed_at=d + timedelta(days=1, hours=11))
+    visit.refresh_from_db()
+
+    spent = {p["id"]: p for p in lifecycle.time_on_site(visit)["people"]}
+    assert spent[str(tech.pk)]["hours"] == 5.0 and spent[str(helper.pk)]["hours"] == 4.0, spent
+
+    record = lifecycle._file_record(visit.schedule, visit, tech)
+    lifecycle.price_the_visit(record, visit, labour={"people": [
+        {"id": str(tech.pk), "rate": "1000"}, {"id": str(helper.pk), "rate": "400"},
+    ]})
+    lines = sorted((l.description, l.amount) for l in record.cost_lines.filter(source="labour"))
+    assert [a for _, a in lines] == [Decimal("1600.00"), Decimal("5000.00")], lines
+    assert any("Hamid" in d for d, _ in lines), lines

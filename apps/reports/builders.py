@@ -16,9 +16,10 @@ from __future__ import annotations
 from collections import Counter
 from decimal import Decimal
 
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.utils import timezone
 
+from apps.assets.serializers import _project_name, _project_of
 from common.permissions import can
 
 ROW_LIMIT = 5000
@@ -96,15 +97,15 @@ def _money(v):
 # ── Assets ───────────────────────────────────────────────────────────────
 
 @report("assets", title="Asset Register", group="Assets", capability="view_assets",
-        description="Every asset with its type, source, status, project and where it stands, and when it went in.",
+        description="Every asset with its type, source, status, project and where it stands, when it went in, and what it has cost to date.",
         filters=("date", "status", "project", "site"), date_label="Registered",
         statuses="assets.Device")
 def assets_report(request, f):
     from apps.assets.models import Device
 
     qs = _dated(Device.objects.select_related(
-        "asset_type", "device_model", "current_site", "assigned_client", "project",
-    ), f)
+        "asset_type", "current_site", "assigned_client", "project",
+    ).prefetch_related("project_scope_items__project", "components__inventory_unit"), f)
     if f.get("status"):
         qs = qs.filter(status=f["status"])
     if f.get("project"):
@@ -117,28 +118,36 @@ def assets_report(request, f):
         "asset_code": d.asset_code,
         "name": d.display_name,
         "type": d.asset_type.name if d.asset_type_id else "",
-        "model": str(d.device_model) if d.device_model_id else "",
-        "serial": d.serial_number,
+        # The serials of what it is built from; the asset's own when it has no components with one.
+        "serial": ", ".join(
+            s for s in ((c.serial_number or (c.inventory_unit.serial_number if c.inventory_unit_id else "")) for c in d.components.all()) if s
+        ) or d.serial_number or "",
         "source": d.get_source_display(),
         "status": d.get_status_display(),
-        "project": d.project.name if d.project_id else "",
+        "project": _project_name(d) or "",
         "site": d.current_site.name if d.current_site_id else "",
         "city": d.current_site.city if d.current_site_id else "",
         "client": d.assigned_client.name if d.assigned_client_id else "",
         "installed": d.installation_date,
         "registered": d.created_at,
-        "price": d.purchase_price,
     } for d in devices]
+    if prices:
+        _asset_costs(devices, rows)
     statuses = Counter(d.get_status_display() for d in devices)
     live = sum(1 for d in devices if d.status in ("installed", "active", "client_property"))
     columns = [
-        col("asset_code", "Asset ID"), col("name", "Asset name"), col("type", "Type"), col("model", "Model"),
+        col("asset_code", "Asset ID"), col("name", "Asset name"), col("type", "Type"),
         col("serial", "Serial no."), col("source", "Source"), col("status", "Status"), col("project", "Project"),
         col("site", "Site"), col("city", "City"), col("client", "Client"),
         col("installed", "Installed on", "date"), col("registered", "Registered", "date"),
     ]
     if prices:
-        columns.append(col("price", "Purchase price", "money"))
+        columns += [
+            col("manufacturing", "Manufacturing cost", "money", True),
+            col("installation", "Installation cost", "money", True),
+            col("maintenance", "Maintenance cost to date", "money", True),
+            col("total_cost", "Total cost incurred", "money", True),
+        ]
     return {
         "columns": columns, "rows": rows,
         "kpis": [
@@ -146,9 +155,45 @@ def assets_report(request, f):
             kpi("Installed / live", live, tone="good"),
             kpi("Being built or in stock", sum(1 for d in devices if d.status in ("procured", "in_production", "in_stock", "assigned"))),
             kpi("Under maintenance", sum(1 for d in devices if d.status == "under_maintenance"), tone="warn"),
-        ] + ([kpi("Asset value", sum((d.purchase_price or 0) for d in devices), "money")] if prices else []),
+        ] + ([kpi("Cost incurred to date", sum(r["total_cost"] for r in rows), "money")] if prices else []),
         "breakdown": breakdown("Assets by status", statuses),
     }
+
+
+def _asset_costs(devices, rows):
+    """What each asset has cost up to today, as on its Costs & Pricing tab:
+    making it (or buying it), putting it up, and keeping it running."""
+    from apps.assets.costs import money
+    from apps.maintenance.models import MaintenanceRecord
+    from apps.teams.costing import build_actuals
+
+    by_project = {}
+
+    def built(d):
+        project = _project_of(d)
+        if project is None:
+            return {}
+        if project.pk not in by_project:
+            # One costing per project, not per asset.
+            try:
+                found = build_actuals(project).get("assets", [])
+            except Exception:  # noqa: BLE001 - a half-set-up project leaves its assets blank
+                found = []
+            by_project[project.pk] = {str(a.get("id")): a for a in found}
+        return by_project[project.pk].get(str(d.pk), {})
+
+    kept = dict(
+        MaintenanceRecord.objects.filter(
+            schedule__device__in=devices,
+            status__in=(MaintenanceRecord.Status.COMPLETED, MaintenanceRecord.Status.PARTIAL),
+        ).order_by().values("schedule__device").annotate(spent=Sum("cost")).values_list("schedule__device", "spent")
+    )
+    for d, row in zip(devices, rows):
+        b = built(d)
+        row["installation"] = money(b.get("installation_actual"))
+        row["manufacturing"] = money(money(b.get("actual_total")) - row["installation"]) if b else money(d.purchase_price)
+        row["maintenance"] = money(kept.get(d.pk))
+        row["total_cost"] = row["manufacturing"] + row["installation"] + row["maintenance"]
 
 
 @report("installations", title="Installation Register", group="Assets", capability="view_installations",
@@ -161,7 +206,7 @@ def installations_report(request, f):
 
     qs = _dated(DeviceInstallation.objects.select_related(
         "device", "device__project", "site", "zone", "installed_by", "vendor", "handover",
-    ).prefetch_related("helpers"), f, "installed_at")
+    ).prefetch_related("helpers", "device__project_scope_items__project"), f, "installed_at")
     if f.get("project"):
         qs = qs.filter(Q(device__project_id=f["project"]) | Q(device__project_scope_items__project_id=f["project"])).distinct()
     if f.get("site"):
@@ -176,7 +221,7 @@ def installations_report(request, f):
         rows.append({
             "asset_code": inst.device.asset_code,
             "asset": inst.device.display_name,
-            "project": inst.device.project.name if inst.device.project_id else "",
+            "project": _project_name(inst.device) or "",
             "site": inst.site.name,
             "city": inst.site.city,
             "position": inst.position_label or (inst.zone.name if inst.zone_id else ""),
@@ -287,7 +332,7 @@ def visits_report(request, f):
     qs = MaintenanceVisit.objects.select_related(
         "schedule", "schedule__site", "schedule__device", "schedule__device__project",
         "schedule__ticket", "assigned_to",
-    ).exclude(status=MaintenanceVisit.Status.SKIPPED)
+    ).prefetch_related("schedule__device__project_scope_items__project").exclude(status=MaintenanceVisit.Status.SKIPPED)
     if f.get("date_from"):
         qs = qs.filter(Q(started_at__date__gte=f["date_from"]) | Q(started_at__isnull=True, due_date__gte=f["date_from"]))
     if f.get("date_to"):
@@ -312,7 +357,7 @@ def visits_report(request, f):
             return _name(v.assigned_to) if v.assigned_to_id else "Unassigned"
         if what == "site":
             return s.site.name if s.site_id else "No site"
-        return s.device.project.name if s.device_id and s.device.project_id else "No project"
+        return (_project_name(s.device) if s.device_id else None) or "No project"
 
     visits = list(qs.order_by("-due_date")[:ROW_LIMIT])
     timed = [h for h in (hours(v) for v in visits) if h is not None]
