@@ -951,7 +951,7 @@ def _labour_line(record, visit, labour):
     hrs = hrs.quantize(Decimal("0.01"))
     return MaintenanceCostLine(
         record=record, source=MaintenanceCostLine.Source.LABOUR,
-        description=f"Labour: {hrs.normalize():f} h on site", quantity=hrs, unit_cost=rate,
+        description=f"Man-hours: {hrs.normalize():f} h on site", quantity=hrs, unit_cost=rate,
         amount=(hrs * rate).quantize(Decimal("0.01")),
     )
 
