@@ -1059,3 +1059,23 @@ def test_handing_the_visit_to_somebody_assigns_the_ticket_too(fault):
     fault["ticket"].refresh_from_db()
     assert fault["ticket"].status == Ticket.Status.ASSIGNED
     assert fault["ticket"].assigned_to == fault["tech"]
+
+
+@pytest.mark.django_db
+def test_a_visit_held_while_its_ticket_reads_open_can_still_be_started(fault):
+    """Old data: the technician holds the visit, the job has nobody and the
+    ticket reads Open. Start puts the job and ticket on them and goes ahead."""
+    job, tech = fault["job"], fault["tech"]
+    visit = job.visits.get()
+    MaintenanceSchedule.objects.filter(pk=job.pk).update(assigned_to=None)
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(assigned_to=tech)
+    Ticket.objects.filter(pk=fault["ticket"].pk).update(status=Ticket.Status.OPEN, assigned_to=None)
+
+    c = _client(tech)
+    c.post(f"/api/maintenance/visits/{visit.id}/photos/", {"kind": "before", "image": _png()}, format="multipart")
+    r = c.post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
+    assert r.status_code == 200, r.content
+    job.refresh_from_db()
+    fault["ticket"].refresh_from_db()
+    assert job.assigned_to == tech
+    assert fault["ticket"].status == Ticket.Status.IN_PROGRESS and fault["ticket"].assigned_to == tech
