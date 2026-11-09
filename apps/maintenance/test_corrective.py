@@ -1193,3 +1193,25 @@ def test_a_reviewed_visit_can_be_priced_afterwards(fault):
     visit.refresh_from_db()
     assert visit.record.status == MaintenanceRecord.Status.PARTIAL
     assert visit.record.cost == Decimal("2000.00")
+
+
+@pytest.mark.django_db
+def test_the_technician_hears_a_part_answer_even_when_the_office_asked(fault):
+    """The office asks for a part on the technician's job; when it is
+    approved, the technician is told, not only the person who asked."""
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem
+    from apps.notifications.models import Notification
+
+    job, tech, office = fault["job"], fault["tech"], fault["office"]
+    _client(office).post(f"/api/maintenance/schedules/{job.id}/assign/",
+                         {"technician": str(tech.id), "due_date": str(timezone.localdate())}, format="json")
+    item = InventoryItem.objects.create(material_type=MaterialType.objects.get_or_create(name="CM Cable", unit="meter")[0], quantity=10)
+    asked = _client(office).post("/api/maintenance/part-requests/", {
+        "schedule": str(job.id), "quantity_requested": 1, "name": "Spare", "item": str(item.pk),
+    }, format="json")
+    assert asked.status_code == 201, asked.content
+    boss = User.objects.create_superuser(username="cm-boss", password="x")
+    r = _client(boss).post(f"/api/maintenance/part-requests/{asked.data['id']}/decide/", {"approve": True, "quantity": 1}, format="json")
+    assert r.status_code == 200, r.content
+    assert Notification.objects.filter(recipient=tech, notification_type="request_answered").exists()

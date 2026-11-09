@@ -309,9 +309,13 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
         )
         notices.resolve(f"part:{line.pk}")
         approved = ser.validated_data["approve"]
-        if line.requested_by_id:
+        # Whoever asked, and the technician doing the job - when the office
+        # asked on their behalf the technician still needs to know.
+        doing = line.visit.assigned_to if line.visit_id else line.schedule.assigned_to
+        told = list({u.pk: u for u in (line.requested_by, doing) if u is not None}.values())
+        if told:
             notices.tell(
-                [line.requested_by], exclude=[request.user], kind="request_answered",
+                told, exclude=[request.user], kind="request_answered",
                 title=f"Parts {'approved' if approved else 'turned down'}: {line.what}",
                 message=(f"{line.quantity_approved} released to the store's queue" if approved else (line.decision_note or "")),
                 link=f"/maintenance?schedule={line.schedule_id}", data={"part_request": str(line.pk)},
