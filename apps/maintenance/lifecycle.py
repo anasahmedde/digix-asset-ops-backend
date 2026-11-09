@@ -355,6 +355,14 @@ def assign(job: MaintenanceSchedule, *, user, technician, due_date) -> Maintenan
 def start(visit: MaintenanceVisit, *, user, where=None) -> MaintenanceVisit:
     """On site, work begins — once there is a photograph of what was found."""
     job = visit.schedule
+    # A visit someone holds while its ticket still reads Open (a job whose
+    # technician sat only on the visit, from before the two were kept in
+    # step): put the job and ticket on them now rather than refuse them.
+    if visit.assigned_to_id and job.ticket_id and job.ticket.status == Ticket.Status.OPEN:
+        if job.assigned_to_id != visit.assigned_to_id:
+            job.assigned_to_id = visit.assigned_to_id
+            job.save(update_fields=["assigned_to", "updated_at"])
+        land_assigned(job, user)
     ticket = _require(START, job)
     if not theirs(visit, user):
         raise PermissionDenied("Only the technician this visit was given to can start it.")
