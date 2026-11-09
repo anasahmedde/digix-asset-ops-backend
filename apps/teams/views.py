@@ -98,7 +98,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
     # inside each action, where the project is known).
     action_capabilities = {
         "update": None, "partial_update": None, "destroy": "edit_projects",
-        "client_warranties": None, "plan": None, "submit_budget": None, "revise_budget": None,
+        "client_warranties": None, "plan": None, "submit_budget": None,
         "approve_budget": "approve_budget", "reject_budget": "approve_budget",
         "procure_asset": None, "raise_work_order": None,
         "bom_summary": "view_projects", "actuals": "view_projects", "boq": "view_projects",
@@ -543,7 +543,7 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             plan = get_or_create_plan(project)
             if not plan.is_editable:
                 return Response(
-                    {"detail": f"The budget is {plan.get_status_display().lower()} — revise it to change it."},
+                    {"detail": plan.locked_reason},
                     status=drf_status.HTTP_400_BAD_REQUEST,
                 )
             try:
@@ -873,63 +873,6 @@ class ProjectViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         )
         return Response(scrub_project_costs(build_plan(project), {"request": request}))
 
-    @action(detail=True, methods=["post"], url_path="revise-budget")
-    def revise_budget(self, request, pk=None):
-        """Reopen an approved budget for changes - the approver's call.
-
-        Whoever signs budgets off decides it needs revising; the planner then
-        changes it and sends it up again. Execution locks until the revised
-        figure is approved.
-        """
-        from common.money import scrub_project_costs, viewer_sees_project_costs
-        from .costing import build_plan, get_or_create_plan
-
-        project = self.get_object()
-        denied = self._require(request, project, "approve_budget")
-        if denied is not None:
-            return denied
-        plan = get_or_create_plan(project)
-        if plan.is_editable:
-            return Response({"detail": "The budget is already open for changes."}, status=400)
-        # Waiting on the approver: their answer is approve, or send it back
-        # with a reason - which reopens it too.
-        if plan.status == ProjectBudget.Status.SUBMITTED:
-            return Response(
-                {"detail": "This budget is waiting for your decision. Send it back with a reason to have it revised."},
-                status=400,
-            )
-        notices.resolve(f"budget:{project.pk}")
-        plan.status = ProjectBudget.Status.DRAFT
-        # Reopening withdraws the approval. The figure that was signed off
-        # stayed on the plan, so a budget being rewritten still read as
-        # approved — for an amount nobody had agreed to any more. The
-        # project keeps `budget` as the last figure that was agreed, which
-        # is what reports compare actuals against.
-        plan.approved_total = None
-        plan.decided_by = None
-        plan.decided_at = None
-        plan.decision_notes = (
-            f"Reopened for changes by {request.user.get_full_name() or request.user.username}."
-        )
-        plan.save(update_fields=[
-            "status", "approved_total", "decided_by", "decided_at",
-            "decision_notes", "updated_at",
-        ])
-        project_log.log(project, "budget", "Budget reopened for changes - execution waits for the revised approval", user=request.user)
-        # Back to the lead who planned it: revise, then send it up again.
-        about = dict(
-            title=f"Budget for {project.name} reopened for changes",
-            message=f"Revise it and send it for approval again — {notices.who(request.user)}",
-            link=f"/projects?project={project.pk}&tab=planning", ref=f"budget-revise:{project.pk}",
-            data={"project": str(project.pk)},
-        )
-        leads = [u for u in (plan.submitted_by, project.manager) if u is not None]
-        if leads:
-            notices.notify(leads, kind="approval_decided", actionable=True, exclude=[request.user], **about)
-        else:
-            notices.ask("plan_budget", project=project, exclude=[request.user], kind="approval_decided", **about)
-        return Response(scrub_project_costs(build_plan(project), {"request": request}))
-
     @action(detail=False, methods=["get"])
     def dashboard_stats(self, request):
         # ponytail: judges every open project on each call; fine for dozens of
@@ -1254,4 +1197,4 @@ class ProjectCostLineViewSet(_ProjectSideTable):
         if plan is not None and not plan.is_editable and planned:
             from rest_framework.exceptions import ValidationError as _VE
 
-            raise _VE(f"The budget is {plan.get_status_display().lower()} — revise it before changing costs.")
+            raise _VE(plan.locked_reason)

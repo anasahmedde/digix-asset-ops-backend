@@ -37,13 +37,28 @@ def report(key, *, title, group, description, capability, filters=("date",), dat
     return register
 
 
+NEVER_SET = {
+    "assets.Device": {"in_transit", "lost_stolen", "rma"},
+    "tickets.Ticket": {
+        "on_hold", "blocked", "alignment_pending", "pending_ops_approval",
+        "pending_client_approval", "approved", "rejected",
+    },
+    "procurement.PurchaseOrder": {"ordered"},
+}
+
+
 def status_options(meta):
     from django.apps import apps
 
     if not meta["statuses"]:
         return []
     model = apps.get_model(meta["statuses"])
-    return [{"value": v, "label": str(label)} for v, label in model.Status.choices]
+    # Statuses nothing in the app moves a record to any more; offered only
+    # while some old record still carries one.
+    dead = NEVER_SET.get(meta["statuses"], set())
+    if dead:
+        dead = dead - set(model.objects.filter(status__in=dead).values_list("status", flat=True).distinct())
+    return [{"value": v, "label": str(label)} for v, label in model.Status.choices if v not in dead]
 
 
 def col(key, label, kind="text", total=None):
@@ -198,7 +213,7 @@ def installations_report(request, f):
 # ── Projects ─────────────────────────────────────────────────────────────
 
 @report("projects", title="Project Portfolio", group="Projects", capability="view_projects",
-        description="Every project with its phase, health, progress and dates — and budget against actual cost.",
+        description="Every project with its phase, status, progress and dates — and budget against actual cost.",
         filters=("date", "status"), date_label="Created",
         statuses="teams.Project")
 def projects_report(request, f):
@@ -237,7 +252,7 @@ def projects_report(request, f):
         rows.append(row)
     columns = [
         col("code", "Project ID"), col("name", "Project"), col("client", "Client"), col("sites", "Sites"),
-        col("manager", "Manager"), col("contract", "Contract"), col("phase", "Phase"), col("status", "Health"),
+        col("manager", "Manager"), col("contract", "Contract"), col("phase", "Phase"), col("status", "Status"),
         col("progress", "Progress", "percent"), col("start", "Start", "date"), col("closing", "Closing date", "date"),
         col("completed", "Completed", "date"), col("assets", "Assets", "int", total=True),
     ]
@@ -258,7 +273,7 @@ def projects_report(request, f):
             kpi("Approved budgets", sum((r["approved"] or 0) for r in rows), "money"),
             kpi("Actual cost", sum((r["actual"] or 0) for r in rows), "money"),
         ]
-    return {"columns": columns, "rows": rows, "kpis": kpis, "breakdown": breakdown("Projects by health", health)}
+    return {"columns": columns, "rows": rows, "kpis": kpis, "breakdown": breakdown("Projects by status", health)}
 
 
 # ── Maintenance & service ────────────────────────────────────────────────

@@ -52,7 +52,7 @@ def build_project_workbook(project, user, show_costs: bool) -> ReportBook:
             ("Client", project.client.name if project.client_id else "", "text"), ("Sites", sites, "text"),
             ("Project manager", _name(project.manager), "text"),
             ("Contract", project.get_contract_type_display() if project.contract_type else "", "text"),
-            ("Phase", project.get_phase_display(), "text"), ("Health", health, "text"),
+            ("Phase", project.get_phase_display(), "text"), ("Status", health, "text"),
             ("Progress", progress, "percent"), ("Description", project.description, "text"),
         ]),
         ("Dates", [
