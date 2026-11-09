@@ -339,6 +339,27 @@ class MaintenanceVisit(TimeStampedModel):
         return self.photos_of(MaintenanceVisitPhoto.Kind.AFTER) > 0
 
 
+class MaintenanceVisitPause(TimeStampedModel):
+    """Work on a visit stopped for a while - overnight, waiting on a part -
+    and picked up again. Man-hours leave these stretches out."""
+
+    visit = models.ForeignKey(MaintenanceVisit, on_delete=models.CASCADE, related_name="pauses")
+    paused_at = models.DateTimeField()
+    resumed_at = models.DateTimeField(null=True, blank=True)
+    paused_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    # Paused by checking out with the work still going, not by pressing Pause.
+    automatic = models.BooleanField(default=False)
+    reason = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ["paused_at"]
+
+    def __str__(self):
+        return f"{self.visit} paused {self.paused_at:%Y-%m-%d %H:%M}"
+
+
 class MaintenanceVisitPhoto(TimeStampedModel):
     """A photograph of one visit, and what it is a photograph of.
 
