@@ -1092,9 +1092,9 @@ def _stamp(model, when, **kw):
 
 @pytest.mark.django_db
 def test_labour_is_priced_from_time_on_site_with_a_forgotten_check_out_reckoned(fault):
-    """Checked in on day 1 and never out; back on day 2 and out at noon.
-    Day 1 ends at the last work done that day, day 2 starts at the first,
-    and the reviewer prices those hours at their rate."""
+    """Work started at 09:00 on day 1 and was never paused; back on day 2
+    and done at 11:30. Day 1 ends at the last work done that day, day 2
+    starts at the first, and the reviewer prices those hours at their rate."""
     from datetime import datetime, timedelta
     from decimal import Decimal
 
@@ -1108,7 +1108,8 @@ def test_labour_is_priced_from_time_on_site_with_a_forgotten_check_out_reckoned(
     MaintenanceSchedule.objects.filter(pk=job.pk).update(site=site)
     day1 = timezone.make_aware(datetime.combine(timezone.localdate() - timedelta(days=10), datetime.min.time()))
     at = lambda d, h, m=0: day1 + timedelta(days=d, hours=h, minutes=m)  # noqa: E731
-    MaintenanceVisit.objects.filter(pk=visit.pk).update(asset_verified_at=at(0, 9, 10), completed_at=at(1, 11, 30))
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(
+        asset_verified_at=at(0, 9), started_at=at(0, 9), completed_at=at(1, 11, 30))
     _stamp(AttendanceRecord, at(0, 9), user=tech, site=site, check_type="check_in")
     for when in (at(0, 12, 30), at(1, 10), at(1, 11, 30)):
         _stamp(MaintenanceActivity, when, schedule=job, visit=visit, action="photo", text="x", actor=tech)
@@ -1116,7 +1117,7 @@ def test_labour_is_priced_from_time_on_site_with_a_forgotten_check_out_reckoned(
 
     r = _client(fault["office"]).get(f"/api/maintenance/visits/{visit.id}/")
     spent = r.data["time_on_site"]
-    assert spent["hours"] == 5.5 and spent["reckoned"], spent  # 09:00-12:30, then 10:00-12:00
+    assert spent["hours"] == 5.0 and spent["reckoned"], spent  # 09:00-12:30, then 10:00-11:30
     assert [s["reckoned"] for s in spent["people"][0]["spells"]] == [True, True]
 
     r = _client(fault["office"]).post(f"/api/maintenance/visits/{visit.id}/review/", {
@@ -1124,9 +1125,9 @@ def test_labour_is_priced_from_time_on_site_with_a_forgotten_check_out_reckoned(
     }, format="json")
     assert r.status_code == 200, r.content
     work = [line for line in r.data["cost_lines"] if line["source"] == "labour"]
-    assert len(work) == 1 and Decimal(work[0]["amount"]) == Decimal("5500.00"), r.data["cost_lines"]
+    assert len(work) == 1 and Decimal(work[0]["amount"]) == Decimal("5000.00"), r.data["cost_lines"]
     visit.refresh_from_db()
-    assert visit.record.cost == Decimal("5500.00")
+    assert visit.record.cost == Decimal("5000.00")
 
 
 @pytest.mark.django_db
