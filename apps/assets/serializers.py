@@ -433,7 +433,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
                 })
             if item and product:
                 raise serializers.ValidationError(
-                    {"inventory_item": "Choose either a stock item or a unique product, not both."}
+                    {"inventory_item": "Choose either a generic item or a unique item, not both."}
                 )
             if (attrs.get("quantity") or 1) < 1:
                 raise serializers.ValidationError({"quantity": "Quantity must be at least 1."})

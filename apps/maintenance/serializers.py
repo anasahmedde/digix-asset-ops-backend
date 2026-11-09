@@ -232,7 +232,7 @@ class MaintenanceScheduleSerializer(DateOrder, serializers.ModelSerializer):
                         .filter(pk=row["inventory_item"]).first()
                     )
                     if item is None:
-                        raise serializers.ValidationError("That stock item no longer exists.")
+                        raise serializers.ValidationError("That generic item no longer exists.")
                     entry["inventory_item"] = str(item.pk)
                     entry["name"] = name or (item.material_type.name if item.material_type_id else item.sku)
                 elif row.get("inventory_unit_type"):
@@ -696,7 +696,7 @@ class MaintenancePartRequestSerializer(serializers.ModelSerializer):
         unit_type = attrs.get("unit_type") or getattr(self.instance, "unit_type", None)
         if item and unit_type:
             raise serializers.ValidationError(
-                {"item": "A line names one thing: a stock item or a unique product, not both."}
+                {"item": "A line names one thing: a generic item or a unique item, not both."}
             )
         if not item and not unit_type and not (attrs.get("name") or "").strip():
             raise serializers.ValidationError(
