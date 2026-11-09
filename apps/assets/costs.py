@@ -65,14 +65,17 @@ def build_or_buy_cost(device):
 def maintenance_cost(device):
     """What has been spent keeping it running, split by what kind of work.
 
-    Only accepted work counts: a visit is priced when the office accepts
-    it, and a visit still being argued over is not a cost yet.
+    Reviewed work counts: a visit is priced when the office accepts it, or
+    sends it back unresolved (the trip still cost what it cost). A visit
+    still waiting on the office is not a cost yet.
     """
     from apps.maintenance.models import MaintenanceRecord, MaintenanceSchedule
 
     done = (
         MaintenanceRecord.objects
-        .filter(schedule__device=device, status=MaintenanceRecord.Status.COMPLETED)
+        .filter(schedule__device=device, status__in=(
+            MaintenanceRecord.Status.COMPLETED, MaintenanceRecord.Status.PARTIAL,
+        ))
         .select_related("schedule")
     )
     out = {}

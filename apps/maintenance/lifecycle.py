@@ -618,6 +618,7 @@ def accept(
 @transaction.atomic
 def mark_unresolved(
     visit: MaintenanceVisit, *, user, reason: str, technician, next_due, note: str = "",
+    cost_lines=None, component_prices=None, labour=None,
 ) -> MaintenanceVisit:
     """Not fixed. Another trip, on the same ticket, decided here and now.
 
@@ -649,6 +650,12 @@ def mark_unresolved(
         "status", "review_decision", "reviewed_by", "reviewed_at",
         "review_reason", "review_note", "updated_at",
     ])
+    # Not fixed, but the trip was made and paid for: its cost is recorded
+    # all the same, as a partial record, so the asset's cost includes it.
+    from .models import MaintenanceRecord
+
+    record = _file_record(job, visit, user, status=MaintenanceRecord.Status.PARTIAL)
+    price_the_visit(record, visit, extra=cost_lines, prices=component_prices, labour=labour)
 
     nxt = MaintenanceVisit.objects.create(
         schedule=job, sequence=visit.sequence + 1, due_date=next_due,
@@ -772,6 +779,7 @@ def accept_round(
 @transaction.atomic
 def send_round_back(
     visit: MaintenanceVisit, *, user, reason: str, technician, next_due, note: str = "",
+    cost_lines=None, component_prices=None, labour=None,
 ):
     """The office is not satisfied: another round, with a reason on the record.
 
@@ -806,6 +814,12 @@ def send_round_back(
         "status", "review_decision", "reviewed_by", "reviewed_at",
         "review_reason", "review_note", "updated_at",
     ])
+    # Not fixed, but the trip was made and paid for: its cost is recorded
+    # all the same, as a partial record, so the asset's cost includes it.
+    from .models import MaintenanceRecord
+
+    record = _file_record(job, visit, user, status=MaintenanceRecord.Status.PARTIAL)
+    price_the_visit(record, visit, extra=cost_lines, prices=component_prices, labour=labour)
 
     nxt = MaintenanceVisit.objects.create(
         schedule=job, sequence=visit.sequence + 1, due_date=next_due,
@@ -994,8 +1008,9 @@ def price_the_visit(record, visit: MaintenanceVisit, extra=None, prices=None, la
     return record.cost
 
 
-def _file_record(job: MaintenanceSchedule, visit: MaintenanceVisit, user):
-    """The completion record the register keeps, written from the visit."""
+def _file_record(job: MaintenanceSchedule, visit: MaintenanceVisit, user, status=None):
+    """The record the register keeps, written from the visit: completed, or
+    partial for a visit that did not fix it."""
     from apps.warranties.services import derive_billability
 
     from .models import MaintenanceRecord
@@ -1009,7 +1024,7 @@ def _file_record(job: MaintenanceSchedule, visit: MaintenanceVisit, user):
         schedule=job,
         performed_by=visit.assigned_to or user,
         performed_at=visit.completed_at or timezone.now(),
-        status=MaintenanceRecord.Status.COMPLETED,
+        status=status or MaintenanceRecord.Status.COMPLETED,
         notes=visit.remarks,
         is_billable=billable,
         charge_to=charge or "",
