@@ -572,7 +572,7 @@ def complete(
 
 @transaction.atomic
 def accept(
-    visit: MaintenanceVisit, *, user, note: str = "", cost_lines=None, component_prices=None,
+    visit: MaintenanceVisit, *, user, note: str = "", cost_lines=None, component_prices=None, labour=None,
 ) -> MaintenanceVisit:
     """The office agrees it is fixed. The job is finished and so is the ticket."""
     from .services import return_to_service_if_done
@@ -602,7 +602,7 @@ def accept(
     job.save(update_fields=["status", "is_active", "updated_at"])
 
     record = _file_record(job, visit, user)
-    price_the_visit(record, visit, extra=cost_lines, prices=component_prices)
+    price_the_visit(record, visit, extra=cost_lines, prices=component_prices, labour=labour)
     return_to_service_if_done(record, user)
     _land(ticket, ACCEPT, user, (
         f"Visit {visit.sequence} accepted as resolved."
@@ -729,7 +729,7 @@ def complete_round(
 
 @transaction.atomic
 def accept_round(
-    visit: MaintenanceVisit, *, user, note: str = "", cost_lines=None, component_prices=None,
+    visit: MaintenanceVisit, *, user, note: str = "", cost_lines=None, component_prices=None, labour=None,
 ):
     """The office accepts the round: the register is written, the cycle rolls."""
     _office_only(user, "accept a round")
@@ -752,7 +752,7 @@ def accept_round(
     ])
 
     record = _file_record(job, visit, user)
-    price_the_visit(record, visit, extra=cost_lines, prices=component_prices)
+    price_the_visit(record, visit, extra=cost_lines, prices=component_prices, labour=labour)
     # Writing the register is what rolls the schedule on: the next round
     # opens from here, not from the moment the technician walked away.
     job.advance_after_completion((visit.completed_at or timezone.now()).date())
@@ -900,7 +900,63 @@ def component_costs(visit: MaintenanceVisit, prices=None):
     return out
 
 
-def price_the_visit(record, visit: MaintenanceVisit, extra=None, prices=None):
+def time_on_site(visit: MaintenanceVisit):
+    """How long the technician and helpers were at the site for this visit.
+
+    From their check-ins there, day by day, between the asset scan (or the
+    start of work) and Work done. A day nobody checked out of ends at the
+    last work they recorded that day, and is marked reckoned.
+    """
+    from apps.attendance.sessions import hours, spells
+
+    site = visit.schedule.site_id
+    begin = visit.asset_verified_at or visit.started_at
+    if not site or not begin:
+        return None
+    end = visit.completed_at or timezone.now()
+    # ponytail: two visits at one site in the same hours would each count
+    # them; split by asset if crews start doing several at once.
+    people = []
+    for person in [visit.assigned_to, *visit.helpers.all()]:
+        if person is None or any(p["id"] == str(person.pk) for p in people):
+            continue
+        found = spells(person.pk, site, begin, end)
+        people.append({
+            "id": str(person.pk), "name": person.get_full_name() or person.username,
+            "lead": person.pk == visit.assigned_to_id, "hours": hours(found), "spells": found,
+        })
+    return {
+        "hours": round(sum(p["hours"] for p in people), 2),
+        "reckoned": any(s["reckoned"] for p in people for s in p["spells"]),
+        "people": people,
+    }
+
+
+def _labour_line(record, visit, labour):
+    """Hours on site at the reviewer's rate, as one line; None for no labour."""
+    from .models import MaintenanceCostLine
+
+    if not labour:
+        return None
+    try:
+        rate = Decimal(str(labour.get("rate") or 0))
+        given = labour.get("hours")
+        hrs = Decimal(str(given)) if given not in (None, "") else Decimal(str((time_on_site(visit) or {}).get("hours", 0)))
+    except (InvalidOperation, TypeError):
+        raise ValidationError({"labour": ["Hours and the rate per hour are numbers."]})
+    if rate < 0 or hrs < 0:
+        raise ValidationError({"labour": ["Hours and the rate per hour are not negative."]})
+    if not rate or not hrs:
+        return None
+    hrs = hrs.quantize(Decimal("0.01"))
+    return MaintenanceCostLine(
+        record=record, source=MaintenanceCostLine.Source.LABOUR,
+        description=f"Labour: {hrs.normalize():f} h on site", quantity=hrs, unit_cost=rate,
+        amount=(hrs * rate).quantize(Decimal("0.01")),
+    )
+
+
+def price_the_visit(record, visit: MaintenanceVisit, extra=None, prices=None, labour=None):
     """Write the cost lines and total them onto the record."""
     from .models import MaintenanceCostLine
 
@@ -929,6 +985,9 @@ def price_the_visit(record, visit: MaintenanceVisit, extra=None, prices=None):
             record=record, source=MaintenanceCostLine.Source.MANUAL,
             description=what, amount=amount.quantize(Decimal("0.01")),
         ))
+    work = _labour_line(record, visit, labour)
+    if work is not None:
+        lines.append(work)
     MaintenanceCostLine.objects.bulk_create(lines)
     record.cost = sum((x.amount for x in lines), Decimal("0.00"))
     record.save(update_fields=["cost", "updated_at"])

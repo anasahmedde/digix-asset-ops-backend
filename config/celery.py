@@ -38,6 +38,11 @@ app.conf.beat_schedule = {
         "task": "apps.notifications.tasks.warn_expiring_warranties",
         "schedule": 86400.0,  # daily
     },
+    # A check-in or time-in nobody closed ends at that day's last work.
+    "close-forgotten-days": {
+        "task": "apps.attendance.tasks.close_forgotten_days",
+        "schedule": 3600.0,  # hourly; acts only on days already over
+    },
     "deactivate-left-employees": {
         "task": "apps.accounts.tasks.deactivate_left_employees",
         "schedule": 86400.0,  # daily
