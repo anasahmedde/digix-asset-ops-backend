@@ -1079,3 +1079,74 @@ def test_a_visit_held_while_its_ticket_reads_open_can_still_be_started(fault):
     fault["ticket"].refresh_from_db()
     assert job.assigned_to == tech
     assert fault["ticket"].status == Ticket.Status.IN_PROGRESS and fault["ticket"].assigned_to == tech
+
+
+def _stamp(model, when, **kw):
+    """A row dated in the past, as the phone would have sent it then."""
+    row = model.objects.create(**kw)
+    field = "at" if hasattr(row, "at") else "created_at"
+    model.objects.filter(pk=row.pk).update(**{field: when})
+    return row
+
+
+@pytest.mark.django_db
+def test_labour_is_priced_from_time_on_site_with_a_forgotten_check_out_reckoned(fault):
+    """Checked in on day 1 and never out; back on day 2 and out at noon.
+    Day 1 ends at the last work done that day, day 2 starts at the first,
+    and the reviewer prices those hours at their rate."""
+    from datetime import datetime, timedelta
+    from decimal import Decimal
+
+    from apps.attendance.models import AttendanceRecord
+    from apps.maintenance.models import MaintenanceActivity
+    from apps.sites.models import Site
+
+    visit = _to_review(fault)
+    job, tech = fault["job"], fault["tech"]
+    site = Site.objects.create(name="Labour Mall")
+    MaintenanceSchedule.objects.filter(pk=job.pk).update(site=site)
+    day1 = timezone.make_aware(datetime.combine(timezone.localdate() - timedelta(days=10), datetime.min.time()))
+    at = lambda d, h, m=0: day1 + timedelta(days=d, hours=h, minutes=m)  # noqa: E731
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(asset_verified_at=at(0, 9, 10), completed_at=at(1, 11, 30))
+    _stamp(AttendanceRecord, at(0, 9), user=tech, site=site, check_type="check_in")
+    for when in (at(0, 12, 30), at(1, 10), at(1, 11, 30)):
+        _stamp(MaintenanceActivity, when, schedule=job, visit=visit, action="photo", text="x", actor=tech)
+    _stamp(AttendanceRecord, at(1, 12), user=tech, site=site, check_type="check_out")
+
+    r = _client(fault["office"]).get(f"/api/maintenance/visits/{visit.id}/")
+    spent = r.data["time_on_site"]
+    assert spent["hours"] == 5.5 and spent["reckoned"], spent  # 09:00-12:30, then 10:00-12:00
+    assert [s["reckoned"] for s in spent["people"][0]["spells"]] == [True, True]
+
+    r = _client(fault["office"]).post(f"/api/maintenance/visits/{visit.id}/review/", {
+        "decision": "accepted", "labour": {"rate": "1000"},
+    }, format="json")
+    assert r.status_code == 200, r.content
+    work = [line for line in r.data["cost_lines"] if line["source"] == "labour"]
+    assert len(work) == 1 and Decimal(work[0]["amount"]) == Decimal("5500.00"), r.data["cost_lines"]
+    visit.refresh_from_db()
+    assert visit.record.cost == Decimal("5500.00")
+
+
+@pytest.mark.django_db
+def test_a_check_in_and_time_in_left_open_close_at_that_days_last_work(team):
+    from datetime import datetime, timedelta
+    from decimal import Decimal
+
+    from apps.attendance.models import AttendanceRecord, DutyRecord
+    from apps.attendance.tasks import close_forgotten_days
+    from apps.sites.models import Site
+
+    tech = team["tech"]
+    site = Site.objects.create(name="Forgot Mall")
+    day = timezone.make_aware(datetime.combine(timezone.localdate() - timedelta(days=1), datetime.min.time()))
+    _stamp(DutyRecord, day + timedelta(hours=8), user=tech, kind="time_in")
+    _stamp(AttendanceRecord, day + timedelta(hours=9), user=tech, site=site, check_type="check_in")
+    _stamp(AttendanceRecord, day + timedelta(hours=15), user=tech, site=site, check_type="check_in")
+
+    assert close_forgotten_days() == 2
+    out = AttendanceRecord.objects.filter(user=tech).order_by("-created_at").first()
+    assert out.check_type == "check_out" and out.created_at == day + timedelta(hours=15, seconds=1)
+    off = DutyRecord.objects.filter(user=tech).order_by("-at").first()
+    assert off.kind == "time_out" and off.automatic and off.at == day + timedelta(hours=15, seconds=1)
+    assert close_forgotten_days() == 0  # nothing left open

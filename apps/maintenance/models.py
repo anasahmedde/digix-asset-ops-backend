@@ -426,6 +426,7 @@ class MaintenanceCostLine(TimeStampedModel):
         COMPONENT = "component", "Component used"
         PURCHASE = "purchase", "Bought on site"
         MANUAL = "manual", "Added on review"
+        LABOUR = "labour", "Labour"
 
     record = models.ForeignKey(
         "maintenance.MaintenanceRecord", on_delete=models.CASCADE, related_name="cost_lines",
