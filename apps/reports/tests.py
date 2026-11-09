@@ -112,3 +112,35 @@ def test_the_project_workbook_has_every_sheet_and_hides_costs_without_the_right(
     assert load_workbook(BytesIO(r.content)).sheetnames == [
         "Summary", "Assets & installation", "Site visits", "Milestones", "Activity",
     ]
+
+
+@pytest.mark.django_db
+def test_asset_register_names_the_scoped_project_component_serials_and_cost_to_date():
+    """An asset put on a project from its scope still shows the project; the
+    serial column lists its components' serials; with prices, maintenance so
+    far is a column and the total adds the three up."""
+    from decimal import Decimal
+
+    from apps.assets.models import AssetComponent
+    from apps.maintenance.models import MaintenanceRecord
+    from apps.teams.models import Project, ProjectScopeItem
+
+    admin = User.objects.create_superuser(username="rep-admin", password="x")
+    kind = AssetType.objects.create(name="Rep Wall")
+    device = Device.objects.create(asset_type=kind, asset_code="AST-REP-2", status=Device.Status.ACTIVE)
+    ProjectScopeItem.objects.create(project=Project.objects.create(name="Mall launch"), device=device)
+    AssetComponent.objects.create(device=device, name="Cabinet", serial_number="CAB-1")
+    AssetComponent.objects.create(device=device, name="Cabinet", serial_number="CAB-2")
+    job = MaintenanceSchedule.objects.create(title="Fix", device=device, next_due=timezone.localdate(),
+                                             maintenance_type="corrective")
+    MaintenanceRecord.objects.create(schedule=job, performed_by=admin, performed_at=timezone.now(), cost=Decimal("1500"))
+    c = APIClient()
+    c.force_authenticate(admin)
+
+    r = c.get("/api/reports/generate/", {"type": "assets"})
+    assert r.status_code == 200, r.content
+    assert "model" not in [col["key"] for col in r.data["columns"]]
+    row = next(x for x in r.data["rows"] if x["asset_code"] == "AST-REP-2")
+    assert row["project"] == "Mall launch" and row["serial"] == "CAB-1, CAB-2", row
+    assert Decimal(row["maintenance"]) == Decimal("1500")
+    assert Decimal(row["total_cost"]) == Decimal(row["manufacturing"]) + Decimal(row["installation"]) + Decimal("1500")
