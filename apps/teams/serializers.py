@@ -312,7 +312,6 @@ class ProjectCostLineSerializer(HidesMoney, serializers.ModelSerializer):
             attrs["unit_cost"] = 0
         elif any(field in attrs for field in ("quantity", "unit_cost")):
             raise serializers.ValidationError(
-                f"The budget is {plan.get_status_display().lower()} — revise it to change the "
-                f"planned figures. Recording what it actually cost is always allowed."
+                f"{plan.locked_reason} Recording what it actually cost is always allowed."
             )
         return attrs

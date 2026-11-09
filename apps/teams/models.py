@@ -474,6 +474,13 @@ class ProjectBudget(TimeStampedModel):
     def is_editable(self):
         return self.status in (self.Status.DRAFT, self.Status.REJECTED)
 
+    @property
+    def locked_reason(self):
+        """Why the planned figures cannot be changed. Approved is final."""
+        if self.status == self.Status.SUBMITTED:
+            return "The budget is waiting for approval - it can be changed only if the approver sends it back."
+        return "The budget is approved - the planned figures can no longer be changed."
+
 
 class ProjectCostLine(TimeStampedModel):
     """An overhead on the project plan: travel, labour, transport, and so on.
