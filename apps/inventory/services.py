@@ -334,7 +334,7 @@ def stock_inspected_line(line, *, user, route, accepted_quantity, rejected_quant
             route = ordered_kind
         elif route != ordered_kind:
             how = "unique items" if ordered_kind == GoodsReceiptLine.Route.UNIQUE else "generic stock"
-            what = "the unique product" if ordered_kind == GoodsReceiptLine.Route.UNIQUE else "the stock item"
+            what = "the unique product" if ordered_kind == GoodsReceiptLine.Route.UNIQUE else "the generic item"
             raise serializers.ValidationError({
                 "route": f"This line was bought for {what} '{ordered_name}' — it is filed as {how}.",
             })

@@ -1063,11 +1063,11 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         self._refuse_if_locked(component.device)
         unique = component.inventory_unit_type_id is not None
         if not unique and component.inventory_item_id is None:
-            return Response({"detail": "This line is not tied to a stock item, so there is nothing to swap."}, status=400)
+            return Response({"detail": "This line is not tied to a generic item, so there is nothing to swap."}, status=400)
         key = "inventory_unit_type" if unique else "inventory_item"
         new = (InventoryUnitType if unique else InventoryItem).objects.filter(pk=request.data.get(key) or None).first()
         if new is None:
-            return Response({key: ["Pick the unique item to use instead." if unique else "Pick the stock item to use instead."]}, status=400)
+            return Response({key: ["Pick the unique item to use instead." if unique else "Pick the generic item to use instead."]}, status=400)
         if new.pk == getattr(component, f"{key}_id"):
             return Response({key: ["That is the part already on this line."]}, status=400)
         decided = component.fulfilment != AssetComponent.Fulfilment.PENDING or component.issuance_requests.exclude(
@@ -1197,7 +1197,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         if project is None:
             return Response({"detail": "This asset is on no project, so there is no pigeon hole to keep it in."}, status=400)
         if not (component.inventory_item_id or component.inventory_unit_type_id):
-            return Response({"detail": "This line is not tied to a stock item, so there is nothing to keep."}, status=400)
+            return Response({"detail": "This line is not tied to a generic item, so there is nothing to keep."}, status=400)
         try:
             quantity = int(request.data.get("quantity"))
         except (TypeError, ValueError):

@@ -1123,7 +1123,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
         item, unit_type = current("item"), current("unit_type")
         if bool(item) == bool(unit_type):
             raise serializers.ValidationError(
-                {"item": "Name either a stock item or a serialized product — one of the two."}
+                {"item": "Name either a generic item or a unique item - one of the two."}
             )
         quantity = current("quantity_requested")
         if quantity is not None and quantity < 1:
@@ -1186,7 +1186,7 @@ class ReorderRequestSerializer(serializers.ModelSerializer):
         item = attrs.get("item")
         unit_type = attrs.get("unit_type")
         if bool(item) == bool(unit_type):
-            raise serializers.ValidationError({"item": ["Name one stock item or one unique product."]})
+            raise serializers.ValidationError({"item": ["Name one generic item or one unique item."]})
         if (attrs.get("quantity") or 0) < 1:
             raise serializers.ValidationError({"quantity": ["Ask for at least one."]})
         if self.instance is None:
