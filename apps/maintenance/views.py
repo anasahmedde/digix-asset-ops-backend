@@ -862,6 +862,9 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                     technician=tech,
                     next_due=_as_date(request.data.get("next_due"), "next_due"),
                     note=request.data.get("note", "") or "",
+                    cost_lines=request.data.get("cost_lines") or None,
+                    component_prices=request.data.get("component_prices") or None,
+                    labour=request.data.get("labour") or None,
                 )
                 self._answer_review(visit, request.user, False, request.data.get("reason") or "")
                 return Response(self.get_serializer(nxt).data)
@@ -897,6 +900,9 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 technician=tech,
                 next_due=_as_date(request.data.get("next_due"), "next_due"),
                 note=request.data.get("note", "") or "",
+                cost_lines=request.data.get("cost_lines") or None,
+                component_prices=request.data.get("component_prices") or None,
+                labour=request.data.get("labour") or None,
             )
             self._answer_review(visit, request.user, False, request.data.get("reason") or "")
             return Response(self.get_serializer(nxt).data)
