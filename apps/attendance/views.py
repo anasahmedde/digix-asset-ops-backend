@@ -71,6 +71,12 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
                 created_at=when, recorded_offline=True, uploaded_at=arrived,
             )
             record.created_at, record.recorded_offline, record.uploaded_at = when, True, arrived
+        if record.check_type == AttendanceRecord.CheckType.CHECK_OUT:
+            # Leaving with work still going pauses it, so the night is not
+            # counted in the man-hours.
+            from apps.maintenance.lifecycle import pause_on_check_out
+
+            pause_on_check_out(user, record.created_at)
         if starts_day:
             DutyRecord.objects.create(
                 user=user, kind=DutyRecord.Kind.TIME_IN, at=record.created_at, automatic=True,

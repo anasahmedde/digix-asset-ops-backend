@@ -60,7 +60,6 @@ def spells(user_id, site_id, start, end):
             user_id=user_id, created_at__gte=start - timedelta(days=3), created_at__lte=end + timedelta(days=1),
         ).order_by("created_at").values_list("check_type", "site_id", "created_at")
     )
-    now = timezone.now()
     out = []
     for i, (kind, where, cin) in enumerate(recs):
         if kind != AttendanceRecord.CheckType.CHECK_IN or where != site_id:
@@ -68,25 +67,37 @@ def spells(user_id, site_id, start, end):
         # The next record of any kind ends it: a check-out, or a check-in
         # somewhere else, which means they had left.
         cout = recs[i + 1][2] if i + 1 < len(recs) else None
-        day_from, last_day = cin, cout or min(now, end)
-        while day_from <= last_day:
-            day_start, day_end = _day_bounds(day_from)
-            if day_from != cin:
-                # A later day with no check-in: from the first thing they did.
-                seen = _seen(user_id, day_start, min(day_end, last_day))
-                if not seen:
-                    day_from = day_end + timedelta(microseconds=1)
-                    continue
-                day_from = seen[0]
-            if cout is not None and cout <= day_end:
-                to, reckoned = cout, day_from != cin
-            elif cout is None and day_end >= now:
-                to, reckoned = now, day_from != cin  # still there
-            else:
-                to, reckoned = last_seen(user_id, day_from, day_end), True
-            if to >= start and day_from <= end and to > day_from:
-                out.append({"from": day_from, "to": to, "reckoned": reckoned})
-            day_from = day_end + timedelta(microseconds=1)
+        out += split_days(user_id, cin, cout, start, end)
+    return out
+
+
+def split_days(user_id, cin, cout, start, end):
+    """One stretch from `cin` to `cout` (None: still going), cut day by day.
+
+    A day it runs past ends at the last work recorded that day; a later day
+    starts at the first. Only the days touching [start, end] are kept.
+    """
+    now = timezone.now()
+    out = []
+    day_from, last_day = cin, cout or min(now, end)
+    while day_from <= last_day:
+        day_start, day_end = _day_bounds(day_from)
+        if day_from != cin:
+            # A later day with no check-in: from the first thing they did.
+            seen = _seen(user_id, day_start, min(day_end, last_day))
+            if not seen:
+                day_from = day_end + timedelta(microseconds=1)
+                continue
+            day_from = seen[0]
+        if cout is not None and cout <= day_end:
+            to, reckoned = cout, day_from != cin
+        elif cout is None and day_end >= now:
+            to, reckoned = now, day_from != cin  # still there
+        else:
+            to, reckoned = last_seen(user_id, day_from, day_end), True
+        if to >= start and day_from <= end and to > day_from:
+            out.append({"from": day_from, "to": to, "reckoned": reckoned})
+        day_from = day_end + timedelta(microseconds=1)
     return out
 
 

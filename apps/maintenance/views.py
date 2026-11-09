@@ -309,9 +309,13 @@ class MaintenancePartRequestViewSet(viewsets.ModelViewSet):
         )
         notices.resolve(f"part:{line.pk}")
         approved = ser.validated_data["approve"]
-        if line.requested_by_id:
+        # Whoever asked, and the technician doing the job - when the office
+        # asked on their behalf the technician still needs to know.
+        doing = line.visit.assigned_to if line.visit_id else line.schedule.assigned_to
+        told = list({u.pk: u for u in (line.requested_by, doing) if u is not None}.values())
+        if told:
             notices.tell(
-                [line.requested_by], exclude=[request.user], kind="request_answered",
+                told, exclude=[request.user], kind="request_answered",
                 title=f"Parts {'approved' if approved else 'turned down'}: {line.what}",
                 message=(f"{line.quantity_approved} released to the store's queue" if approved else (line.decision_note or "")),
                 link=f"/maintenance?schedule={line.schedule_id}", data={"part_request": str(line.pk)},
@@ -574,7 +578,7 @@ class CanPlanOrStartARound(BasePermission):
         # technician this visit was given to may photograph or finish it,
         # only the office may review it — and those need the visit itself
         # to decide, which a has_permission check cannot see.
-        if view.action in ("photos", "complete_visit", "review", "price", "verify_asset", "return_parts", "notes", "helpers"):
+        if view.action in ("photos", "complete_visit", "review", "price", "pause", "resume", "verify_asset", "return_parts", "notes", "helpers"):
             return True
         return False
 
@@ -830,6 +834,18 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 title=f"{job.title}: {'accepted' if accepted else 'another visit needed'}",
                 message=note or "", link=f"/maintenance?schedule={job.pk}", data={"schedule": str(job.pk)},
             )
+
+    @action(detail=True, methods=["post"])
+    def pause(self, request, pk=None):
+        """Stop the clock on the work - overnight, or waiting on something."""
+        visit = lifecycle.pause(self.get_object(), user=request.user, reason=request.data.get("reason") or "")
+        return Response(self.get_serializer(visit).data)
+
+    @action(detail=True, methods=["post"])
+    def resume(self, request, pk=None):
+        """Pick the work up again."""
+        visit = lifecycle.resume(self.get_object(), user=request.user)
+        return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"])
     def price(self, request, pk=None):

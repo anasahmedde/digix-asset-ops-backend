@@ -1092,9 +1092,9 @@ def _stamp(model, when, **kw):
 
 @pytest.mark.django_db
 def test_labour_is_priced_from_time_on_site_with_a_forgotten_check_out_reckoned(fault):
-    """Checked in on day 1 and never out; back on day 2 and out at noon.
-    Day 1 ends at the last work done that day, day 2 starts at the first,
-    and the reviewer prices those hours at their rate."""
+    """Work started at 09:00 on day 1 and was never paused; back on day 2
+    and done at 11:30. Day 1 ends at the last work done that day, day 2
+    starts at the first, and the reviewer prices those hours at their rate."""
     from datetime import datetime, timedelta
     from decimal import Decimal
 
@@ -1108,7 +1108,8 @@ def test_labour_is_priced_from_time_on_site_with_a_forgotten_check_out_reckoned(
     MaintenanceSchedule.objects.filter(pk=job.pk).update(site=site)
     day1 = timezone.make_aware(datetime.combine(timezone.localdate() - timedelta(days=10), datetime.min.time()))
     at = lambda d, h, m=0: day1 + timedelta(days=d, hours=h, minutes=m)  # noqa: E731
-    MaintenanceVisit.objects.filter(pk=visit.pk).update(asset_verified_at=at(0, 9, 10), completed_at=at(1, 11, 30))
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(
+        asset_verified_at=at(0, 9), started_at=at(0, 9), completed_at=at(1, 11, 30))
     _stamp(AttendanceRecord, at(0, 9), user=tech, site=site, check_type="check_in")
     for when in (at(0, 12, 30), at(1, 10), at(1, 11, 30)):
         _stamp(MaintenanceActivity, when, schedule=job, visit=visit, action="photo", text="x", actor=tech)
@@ -1116,7 +1117,7 @@ def test_labour_is_priced_from_time_on_site_with_a_forgotten_check_out_reckoned(
 
     r = _client(fault["office"]).get(f"/api/maintenance/visits/{visit.id}/")
     spent = r.data["time_on_site"]
-    assert spent["hours"] == 5.5 and spent["reckoned"], spent  # 09:00-12:30, then 10:00-12:00
+    assert spent["hours"] == 5.0 and spent["reckoned"], spent  # 09:00-12:30, then 10:00-11:30
     assert [s["reckoned"] for s in spent["people"][0]["spells"]] == [True, True]
 
     r = _client(fault["office"]).post(f"/api/maintenance/visits/{visit.id}/review/", {
@@ -1124,9 +1125,9 @@ def test_labour_is_priced_from_time_on_site_with_a_forgotten_check_out_reckoned(
     }, format="json")
     assert r.status_code == 200, r.content
     work = [line for line in r.data["cost_lines"] if line["source"] == "labour"]
-    assert len(work) == 1 and Decimal(work[0]["amount"]) == Decimal("5500.00"), r.data["cost_lines"]
+    assert len(work) == 1 and Decimal(work[0]["amount"]) == Decimal("5000.00"), r.data["cost_lines"]
     visit.refresh_from_db()
-    assert visit.record.cost == Decimal("5500.00")
+    assert visit.record.cost == Decimal("5000.00")
 
 
 @pytest.mark.django_db
@@ -1193,3 +1194,85 @@ def test_a_reviewed_visit_can_be_priced_afterwards(fault):
     visit.refresh_from_db()
     assert visit.record.status == MaintenanceRecord.Status.PARTIAL
     assert visit.record.cost == Decimal("2000.00")
+
+
+@pytest.mark.django_db
+def test_the_technician_hears_a_part_answer_even_when_the_office_asked(fault):
+    """The office asks for a part on the technician's job; when it is
+    approved, the technician is told, not only the person who asked."""
+    from apps.assets.models import MaterialType
+    from apps.inventory.models import InventoryItem
+    from apps.notifications.models import Notification
+
+    job, tech, office = fault["job"], fault["tech"], fault["office"]
+    _client(office).post(f"/api/maintenance/schedules/{job.id}/assign/",
+                         {"technician": str(tech.id), "due_date": str(timezone.localdate())}, format="json")
+    item = InventoryItem.objects.create(material_type=MaterialType.objects.get_or_create(name="CM Cable", unit="meter")[0], quantity=10)
+    asked = _client(office).post("/api/maintenance/part-requests/", {
+        "schedule": str(job.id), "quantity_requested": 1, "name": "Spare", "item": str(item.pk),
+    }, format="json")
+    assert asked.status_code == 201, asked.content
+    boss = User.objects.create_superuser(username="cm-boss", password="x")
+    r = _client(boss).post(f"/api/maintenance/part-requests/{asked.data['id']}/decide/", {"approve": True, "quantity": 1}, format="json")
+    assert r.status_code == 200, r.content
+    assert Notification.objects.filter(recipient=tech, notification_type="request_answered").exists()
+
+
+def _started(fault):
+    """Assigned, photographed and started by the technician."""
+    job, tech = fault["job"], fault["tech"]
+    _client(fault["office"]).post(f"/api/maintenance/schedules/{job.id}/assign/",
+                                  {"technician": str(tech.id), "due_date": str(timezone.localdate())}, format="json")
+    visit = job.visits.order_by("-sequence").first()
+    _client(tech).post(f"/api/maintenance/visits/{visit.id}/photos/", {"kind": "before", "image": _png()}, format="multipart")
+    r = _client(tech).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
+    assert r.status_code == 200, r.content
+    return visit
+
+
+@pytest.mark.django_db
+def test_the_technician_pauses_and_resumes_and_only_they_may(fault):
+    visit, tech = _started(fault), fault["tech"]
+    url = f"/api/maintenance/visits/{visit.id}"
+    assert _client(fault["other"]).post(f"{url}/pause/", {}, format="json").status_code == 403
+    r = _client(tech).post(f"{url}/pause/", {"reason": "Shop closed, back tomorrow"}, format="json")
+    assert r.status_code == 200 and r.data["paused_since"], r.content
+    assert _client(tech).post(f"{url}/pause/", {}, format="json").status_code == 400  # already paused
+    job = _client(tech).get(f"/api/maintenance/schedules/{fault['job'].id}/").data
+    assert "resume" in job["allowed_actions"] and "pause" not in job["allowed_actions"]
+    r = _client(tech).post(f"{url}/resume/", {}, format="json")
+    assert r.status_code == 200 and r.data["paused_since"] is None, r.content
+    assert len(r.data["pauses"]) == 1
+
+
+@pytest.mark.django_db
+def test_man_hours_leave_out_the_paused_night(fault):
+    """Started 09:00, paused 12:00, resumed 09:00 next day, done 11:00:
+    five hours of work, not twenty-six."""
+    from datetime import datetime, timedelta
+
+    from apps.maintenance import lifecycle
+    from apps.sites.models import Site
+
+    visit, tech = _started(fault), fault["tech"]
+    MaintenanceSchedule.objects.filter(pk=fault["job"].pk).update(site=Site.objects.create(name="Pause Mall"))
+    d = timezone.make_aware(datetime.combine(timezone.localdate() - timedelta(days=5), datetime.min.time()))
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(started_at=d + timedelta(hours=9))
+    visit.refresh_from_db()
+    lifecycle.pause(visit, user=tech, at=d + timedelta(hours=12))
+    lifecycle.resume(visit, user=tech, at=d + timedelta(days=1, hours=9))
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(completed_at=d + timedelta(days=1, hours=11))
+    visit.refresh_from_db()
+    spent = lifecycle.time_on_site(visit)
+    assert spent["people"][0]["hours"] == 5.0, spent
+    assert not spent["reckoned"]
+
+
+@pytest.mark.django_db
+def test_checking_out_with_work_going_pauses_it(fault):
+    visit, tech = _started(fault), fault["tech"]
+    r = _client(tech).post("/api/attendance/records/", {"check_type": "check_out"}, format="json")
+    assert r.status_code == 201, r.content
+    visit.refresh_from_db()
+    pause = visit.pauses.get()
+    assert pause.automatic and pause.resumed_at is None

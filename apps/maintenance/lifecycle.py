@@ -44,6 +44,9 @@ COMPLETE = "complete"
 ACCEPT = "accept"
 UNRESOLVED = "unresolved"
 CANCEL = "cancel"
+#: Work stopped for now and picked up later: the visit's own state, not the ticket's.
+PAUSE = "pause"
+RESUME = "resume"
 
 #: From which ticket status each move may be made. One map, read by the
 #: server to decide and by the clients to draw their buttons.
@@ -162,6 +165,8 @@ def allowed_actions(job: MaintenanceSchedule, user) -> list[str]:
             and not parts_not_yet_in_hand(visit)
         ):
             rounds.append(START)
+        if mine and visit.status == MaintenanceVisit.Status.IN_PROGRESS:
+            rounds.append(RESUME if paused_since(visit) else PAUSE)
         if (
             mine and visit.status == MaintenanceVisit.Status.IN_PROGRESS
             and visit.has_after_photo
@@ -187,6 +192,8 @@ def allowed_actions(job: MaintenanceSchedule, user) -> list[str]:
         and not parts_not_yet_in_hand(visit)
     ):
         out.append(START)
+    if mine and visit is not None and visit.status == MaintenanceVisit.Status.IN_PROGRESS:
+        out.append(RESUME if paused_since(visit) else PAUSE)
     if (
         mine and may(COMPLETE) and visit is not None
         and visit.status == MaintenanceVisit.Status.IN_PROGRESS
@@ -509,6 +516,8 @@ def complete(
     settlement=None,
 ) -> MaintenanceVisit:
     """The technician is done and says whether it is fixed. The office decides."""
+    # Handing in ends any pause: the work stopped when it was paused.
+    visit.pauses.filter(resumed_at__isnull=True).update(resumed_at=clock.now())
     job = visit.schedule
     ticket = _require(COMPLETE, job)
     if not theirs(visit, user):
@@ -697,6 +706,8 @@ def complete_round(
     visit: MaintenanceVisit, *, user, remarks: str = "", settlement=None,
 ) -> MaintenanceVisit:
     """The technician is done on site. The office still has to accept it."""
+    # Handing in ends any pause: the work stopped when it was paused.
+    visit.pauses.filter(resumed_at__isnull=True).update(resumed_at=clock.now())
     from .parts import settle
 
     if not theirs(visit, user):
@@ -914,6 +925,72 @@ def component_costs(visit: MaintenanceVisit, prices=None):
     return out
 
 
+def paused_since(visit: MaintenanceVisit):
+    """When the work on this visit was paused, or None while it is going."""
+    return visit.pauses.filter(resumed_at__isnull=True).values_list("paused_at", flat=True).first()
+
+
+@transaction.atomic
+def pause(visit: MaintenanceVisit, *, user, reason: str = "", at=None, automatic: bool = False):
+    """Stop the clock on the work: overnight, or waiting on something."""
+    from .models import MaintenanceVisitPause
+
+    if visit.status != MaintenanceVisit.Status.IN_PROGRESS:
+        raise ValidationError({"detail": "Only work that has started can be paused."})
+    if not automatic and not theirs(visit, user):
+        raise PermissionDenied("Only the technician this visit was given to can pause it.")
+    if paused_since(visit):
+        raise ValidationError({"detail": "The work is already paused."})
+    when = at or clock.now()
+    MaintenanceVisitPause.objects.create(
+        visit=visit, paused_at=when, paused_by=user, automatic=automatic, reason=(reason or "").strip()[:255],
+    )
+    activity.log(visit.schedule, "paused", (
+        f"{activity.visit_word(visit)} work paused" + (" on check-out" if automatic else "")
+        + (f": {reason.strip()}" if reason and reason.strip() else "")
+    ), user=user, visit=visit)
+    return visit
+
+
+@transaction.atomic
+def resume(visit: MaintenanceVisit, *, user, at=None):
+    """Pick the work up again: the clock runs from here."""
+    if not theirs(visit, user):
+        raise PermissionDenied("Only the technician this visit was given to can resume it.")
+    if visit.pauses.filter(resumed_at__isnull=True).update(resumed_at=at or clock.now()) == 0:
+        raise ValidationError({"detail": "The work is not paused."})
+    activity.log(visit.schedule, "resumed", f"{activity.visit_word(visit)} work resumed", user=user, visit=visit)
+    return visit
+
+
+def pause_on_check_out(user, when):
+    """Checking out with work still going pauses it, so the night is not
+    counted as work if nobody remembered to press Pause."""
+    for visit in MaintenanceVisit.objects.filter(assigned_to=user, status=MaintenanceVisit.Status.IN_PROGRESS):
+        if not paused_since(visit):
+            pause(visit, user=user, at=when, automatic=True, reason="Checked out")
+
+
+def work_spells(visit: MaintenanceVisit):
+    """Start work to Work done, less the pauses, cut day by day."""
+    from apps.attendance.sessions import split_days
+
+    if not visit.started_at or not visit.assigned_to_id:
+        return []
+    end = visit.completed_at
+    out, began = [], visit.started_at
+    for p in visit.pauses.order_by("paused_at"):
+        if p.paused_at > began:
+            out += split_days(visit.assigned_to_id, began, p.paused_at, began, p.paused_at)
+        if p.resumed_at is None:
+            return out
+        began = max(began, p.resumed_at)
+    stop = end or clock.now()
+    if stop > began:
+        out += split_days(visit.assigned_to_id, began, end, began, stop)
+    return out
+
+
 def time_on_site(visit: MaintenanceVisit):
     """How long the technician and helpers were at the site for this visit.
 
@@ -934,7 +1011,10 @@ def time_on_site(visit: MaintenanceVisit):
     for person in [visit.assigned_to, *visit.helpers.all()]:
         if person is None or any(p["id"] == str(person.pk) for p in people):
             continue
-        found = spells(person.pk, site, begin, end)
+        # The technician's are the work itself, start to done less pauses;
+        # a helper's are their time checked in at the site.
+        lead = person.pk == visit.assigned_to_id
+        found = work_spells(visit) if lead and visit.started_at else spells(person.pk, site, begin, end)
         people.append({
             "id": str(person.pk), "name": person.get_full_name() or person.username,
             "lead": person.pk == visit.assigned_to_id, "hours": hours(found), "spells": found,
