@@ -394,6 +394,8 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     cost_lines = serializers.SerializerMethodField()
     # When the technician arrived at and left the site for this visit.
     on_site = serializers.SerializerMethodField()
+    # Is the technician checked in at the site now: the work opens only then.
+    technician_here = serializers.SerializerMethodField()
     # Hours at the site for this visit, from check-ins, for pricing labour.
     time_on_site = serializers.SerializerMethodField()
     # Work stopped for now: since when, and every stop so far.
@@ -416,28 +418,51 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
 
         return lifecycle.time_on_site(obj)
 
+    def get_technician_here(self, obj):
+        from . import lifecycle
+
+        if obj.status not in (MaintenanceVisit.Status.PLANNED, MaintenanceVisit.Status.IN_PROGRESS):
+            return None
+        return lifecycle.technician_here(obj)
+
     def get_on_site(self, obj):
-        """The check-in this visit's work began under, and the check-out after it."""
+        """Every stay at the site over this visit's work: the check-in it
+        began under, each check-out and check-in again (overnight, a pause),
+        up to the check-out after Work done."""
         from apps.attendance.models import AttendanceRecord
 
+        site = obj.schedule.site_id
         acts = [t for t in (obj.asset_verified_at, obj.started_at, obj.completed_at) if t]
-        if not obj.assigned_to_id or not obj.schedule.site_id or not acts:
+        if not obj.assigned_to_id or not site or not acts:
             return None
-        # ponytail: two small queries per visit worked; a job has a handful.
         mine = AttendanceRecord.objects.filter(user_id=obj.assigned_to_id)
         came = mine.filter(
-            check_type=AttendanceRecord.CheckType.CHECK_IN, site_id=obj.schedule.site_id,
-            created_at__lte=min(acts),
+            check_type=AttendanceRecord.CheckType.CHECK_IN, site_id=site, created_at__lte=min(acts),
         ).order_by("-created_at").first()
         if came is None:
             return None
-        left = mine.filter(
-            check_type=AttendanceRecord.CheckType.CHECK_OUT, created_at__gte=came.created_at,
-        ).order_by("created_at").first()
+        done, stays, stay = obj.completed_at, [], None
+        # ponytail: capped read; a visit spans a few days of check-ins, not hundreds.
+        for r in mine.filter(created_at__gte=came.created_at).order_by("created_at")[:200]:
+            if r.check_type == AttendanceRecord.CheckType.CHECK_OUT:
+                if stay:
+                    stay["checked_out_at"], stay["offline"] = r.created_at, stay["offline"] or r.recorded_offline
+                    stay = None
+                if done and r.created_at >= done:
+                    break
+                continue
+            if done and r.created_at > done:
+                break
+            # Checked in again (here or elsewhere) without checking out: the last stay ends unclosed.
+            stay = None
+            if r.site_id == site:
+                stay = {"checked_in_at": r.created_at, "checked_out_at": None, "offline": r.recorded_offline}
+                stays.append(stay)
         return {
-            "checked_in_at": came.created_at,
-            "checked_out_at": left.created_at if left else None,
-            "offline": came.recorded_offline or bool(left and left.recorded_offline),
+            "checked_in_at": stays[0]["checked_in_at"],
+            "checked_out_at": stays[-1]["checked_out_at"],
+            "offline": any(s["offline"] for s in stays),
+            "stays": stays,
         }
 
     def get_component_costs(self, obj):
@@ -483,7 +508,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
             "review_note", "reviewed_by", "reviewed_by_name",
             "reviewed_at", "visit_photos", "purchases", "has_before_photo", "has_after_photo",
             "asset_verified_at", "asset_verified_by_name",
-            "component_costs", "cost_lines", "on_site", "time_on_site", "paused_since", "pauses",
+            "component_costs", "cost_lines", "on_site", "technician_here", "time_on_site", "paused_since", "pauses",
             "issue_side", "issue_side_display", "maintenance_type", "maintenance_type_display",
             "created_at", "updated_at",
         ]

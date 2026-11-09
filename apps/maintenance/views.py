@@ -121,13 +121,19 @@ def _acts_for_everyone(user) -> bool:
     return can_any(user, "review_maintenance", "manage_maintenance", "assign_maintenance", "act_across_teams")
 
 
-def _from_the_site(user, schedule):
-    """The field acts from the site it is clocked in at; the office from a desk."""
+def _from_the_site(user, visit):
+    """The field acts from the site it is clocked in at. The office may press
+    the button for the technician, but only while the technician is there:
+    the work happens between their check-in and check-out."""
     from apps.attendance.presence import require_on_site
 
-    if _acts_for_everyone(user):
-        return
-    require_on_site(user, schedule.site)
+    if not _acts_for_everyone(user):
+        require_on_site(user, visit.schedule.site)
+    elif visit.assigned_to_id and not lifecycle.technician_here(visit):
+        raise PermissionDenied(
+            f"{activity.name(visit.assigned_to)} is not checked in at {visit.schedule.site.name} - "
+            "the work opens once they check in."
+        )
 
 
 def _at_the_asset(user, visit):
@@ -701,7 +707,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         visit = self.get_object()
         if not _acts_for_everyone(request.user) and visit.assigned_to_id != request.user.id:
             return Response({"detail": "Only the technician on this visit verifies its asset."}, status=403)
-        _from_the_site(request.user, visit.schedule)
+        _from_the_site(request.user, visit)
         verify_asset(request.user, visit, visit.schedule.device, request.data.get("code"))
         activity.log(visit.schedule, "asset_scanned", (
             f"Asset {visit.schedule.device.asset_code} scanned on site" if visit.schedule.device_id
@@ -743,7 +749,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
         if not images:
             return Response({"images": ["Attach at least one photo."]}, status=400)
         if is_record:
-            _from_the_site(request.user, visit.schedule)
+            _from_the_site(request.user, visit)
             _at_the_asset(request.user, visit)
         # An After photo that is the Before photo again shows nothing changed:
         # the same bytes under any name are refused.
@@ -788,7 +794,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
     def complete_visit(self, request, pk=None):
         """The technician is done, and says whether the fault is fixed."""
         visit = self.get_object()
-        _from_the_site(request.user, visit.schedule)
+        _from_the_site(request.user, visit)
         if not self._corrective(visit):
             # A round has no ticket to move, but it is handed in and
             # accepted exactly as a breakdown is.
@@ -838,13 +844,18 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def pause(self, request, pk=None):
         """Stop the clock on the work - overnight, or waiting on something."""
-        visit = lifecycle.pause(self.get_object(), user=request.user, reason=request.data.get("reason") or "")
+        visit = self.get_object()
+        _from_the_site(request.user, visit)
+        visit = lifecycle.pause(visit, user=request.user, reason=request.data.get("reason") or "")
         return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"])
     def resume(self, request, pk=None):
         """Pick the work up again."""
-        visit = lifecycle.resume(self.get_object(), user=request.user)
+        # Checked out with the work paused: it goes on only once they are back.
+        visit = self.get_object()
+        _from_the_site(request.user, visit)
+        visit = lifecycle.resume(visit, user=request.user)
         return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"])
@@ -973,7 +984,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 {"detail": "You can only start a round assigned to you."},
                 status=403,
             )
-        _from_the_site(request.user, visit.schedule)
+        _from_the_site(request.user, visit)
         _at_the_asset(request.user, visit)
         # Where the phone says it is. Offered, never demanded: a basement
         # with no signal is still a place work gets done.
