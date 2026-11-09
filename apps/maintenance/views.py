@@ -1,6 +1,7 @@
 import hashlib
 
 from apps.notifications.service import inform_line, who as _who
+from django.db import transaction
 from django.db.models import DateField, Q
 from django.db.models.functions import Cast, Coalesce
 from django.core.files.uploadedfile import UploadedFile
@@ -573,7 +574,7 @@ class CanPlanOrStartARound(BasePermission):
         # technician this visit was given to may photograph or finish it,
         # only the office may review it — and those need the visit itself
         # to decide, which a has_permission check cannot see.
-        if view.action in ("photos", "complete_visit", "review", "verify_asset", "return_parts", "notes", "helpers"):
+        if view.action in ("photos", "complete_visit", "review", "price", "verify_asset", "return_parts", "notes", "helpers"):
             return True
         return False
 
@@ -829,6 +830,40 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 title=f"{job.title}: {'accepted' if accepted else 'another visit needed'}",
                 message=note or "", link=f"/maintenance?schedule={job.pk}", data={"schedule": str(job.pk)},
             )
+
+    @action(detail=True, methods=["post"])
+    def price(self, request, pk=None):
+        """Record, or record again, what a reviewed visit cost.
+
+        For a visit reviewed before its cost was asked for, or priced
+        without man-hours: the same lines as at review, written now.
+        """
+        from .models import MaintenanceRecord
+
+        visit = self.get_object()
+        if not decides_for(request.user, visit.assigned_to, "review_maintenance"):
+            return Response(
+                {"detail": "A visit's cost is set by whoever reviews it."},
+                status=drf_status.HTTP_403_FORBIDDEN,
+            )
+        if not visit.review_decision:
+            return Response(
+                {"detail": "Set the cost when you review the visit."},
+                status=drf_status.HTTP_400_BAD_REQUEST,
+            )
+        with transaction.atomic():
+            record = lifecycle._file_record(visit.schedule, visit, request.user, status=(
+                MaintenanceRecord.Status.PARTIAL if visit.review_decision == MaintenanceVisit.Review.UNRESOLVED
+                else MaintenanceRecord.Status.COMPLETED
+            ))
+            lifecycle.price_the_visit(
+                record, visit,
+                extra=request.data.get("cost_lines") or None,
+                prices=request.data.get("component_prices") or None,
+                labour=request.data.get("labour") or None,
+            )
+        visit.refresh_from_db()
+        return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"])
     def review(self, request, pk=None):

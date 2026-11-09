@@ -1172,3 +1172,24 @@ def test_an_unresolved_visit_still_records_what_it_cost(fault):
     assert visit.record.status == MaintenanceRecord.Status.PARTIAL
     assert visit.record.cost == Decimal("1000.00")
     assert maintenance_cost(fault["job"].device)["total"] == Decimal("1000.00")
+
+
+@pytest.mark.django_db
+def test_a_reviewed_visit_can_be_priced_afterwards(fault):
+    """Reviewed before its cost was asked for: the office records it later,
+    man-hours included; nobody else may, and an unreviewed visit is not priced."""
+    from decimal import Decimal
+
+    from apps.maintenance.models import MaintenanceRecord
+
+    visit = _to_review(fault)
+    url = f"/api/maintenance/visits/{visit.id}/price/"
+    assert _client(fault["office"]).post(url, {}, format="json").status_code == 400  # not reviewed yet
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(review_decision="unresolved", status="completed")
+    body = {"labour": {"hours": "1.5", "rate": "1000"}, "cost_lines": [{"description": "Ladder hire", "amount": "500"}]}
+    assert _client(fault["tech"]).post(url, body, format="json").status_code == 403
+    r = _client(fault["office"]).post(url, body, format="json")
+    assert r.status_code == 200, r.content
+    visit.refresh_from_db()
+    assert visit.record.status == MaintenanceRecord.Status.PARTIAL
+    assert visit.record.cost == Decimal("2000.00")
