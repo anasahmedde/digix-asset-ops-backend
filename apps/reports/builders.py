@@ -198,7 +198,7 @@ def installations_report(request, f):
 # ── Projects ─────────────────────────────────────────────────────────────
 
 @report("projects", title="Project Portfolio", group="Projects", capability="view_projects",
-        description="Every project with its phase, health, progress and dates — and budget against actual cost.",
+        description="Every project with its phase, status, progress and dates — and budget against actual cost.",
         filters=("date", "status"), date_label="Created",
         statuses="teams.Project")
 def projects_report(request, f):
@@ -237,7 +237,7 @@ def projects_report(request, f):
         rows.append(row)
     columns = [
         col("code", "Project ID"), col("name", "Project"), col("client", "Client"), col("sites", "Sites"),
-        col("manager", "Manager"), col("contract", "Contract"), col("phase", "Phase"), col("status", "Health"),
+        col("manager", "Manager"), col("contract", "Contract"), col("phase", "Phase"), col("status", "Status"),
         col("progress", "Progress", "percent"), col("start", "Start", "date"), col("closing", "Closing date", "date"),
         col("completed", "Completed", "date"), col("assets", "Assets", "int", total=True),
     ]
@@ -258,7 +258,7 @@ def projects_report(request, f):
             kpi("Approved budgets", sum((r["approved"] or 0) for r in rows), "money"),
             kpi("Actual cost", sum((r["actual"] or 0) for r in rows), "money"),
         ]
-    return {"columns": columns, "rows": rows, "kpis": kpis, "breakdown": breakdown("Projects by health", health)}
+    return {"columns": columns, "rows": rows, "kpis": kpis, "breakdown": breakdown("Projects by status", health)}
 
 
 # ── Maintenance & service ────────────────────────────────────────────────
