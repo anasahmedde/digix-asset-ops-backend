@@ -875,6 +875,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 note=request.data.get("note", "") or "",
                 cost_lines=request.data.get("cost_lines") or None,
                 component_prices=request.data.get("component_prices") or None,
+                labour=request.data.get("labour") or None,
             )
             self._answer_review(visit, request.user, True, request.data.get("note", "") or "")
             return Response(self.get_serializer(visit).data)
@@ -884,6 +885,7 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 visit, user=request.user, note=request.data.get("note", "") or "",
                 cost_lines=request.data.get("cost_lines") or None,
                 component_prices=request.data.get("component_prices") or None,
+                labour=request.data.get("labour") or None,
             )
             self._answer_review(visit, request.user, True, request.data.get("note", "") or "")
             return Response(self.get_serializer(visit).data)

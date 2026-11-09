@@ -394,6 +394,13 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     cost_lines = serializers.SerializerMethodField()
     # When the technician arrived at and left the site for this visit.
     on_site = serializers.SerializerMethodField()
+    # Hours at the site for this visit, from check-ins, for pricing labour.
+    time_on_site = serializers.SerializerMethodField()
+
+    def get_time_on_site(self, obj):
+        from . import lifecycle
+
+        return lifecycle.time_on_site(obj)
 
     def get_on_site(self, obj):
         """The check-in this visit's work began under, and the check-out after it."""
@@ -425,6 +432,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
         return [
             {
                 "part_request": row["part_request"],
+                "purchase": row.get("purchase"),
                 "description": row["description"],
                 "quantity": str(row["quantity"]),
                 "unit_cost": str(row["unit_cost"]) if row["unit_cost"] is not None else None,
@@ -461,7 +469,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
             "review_note", "reviewed_by", "reviewed_by_name",
             "reviewed_at", "visit_photos", "purchases", "has_before_photo", "has_after_photo",
             "asset_verified_at", "asset_verified_by_name",
-            "component_costs", "cost_lines", "on_site",
+            "component_costs", "cost_lines", "on_site", "time_on_site",
             "issue_side", "issue_side_display", "maintenance_type", "maintenance_type_display",
             "created_at", "updated_at",
         ]
