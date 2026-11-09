@@ -494,7 +494,8 @@ def test_a_round_the_office_is_not_happy_with_goes_back(team):
     visit.refresh_from_db(); job.refresh_from_db()
     assert visit.review_decision == MaintenanceVisit.Review.UNRESOLVED
     assert visit.review_reason == "Back of the panel was not touched"
-    assert visit.record_id is None, "nothing is written to the register until it is accepted"
+    # The trip still cost what it cost: a partial record, not a completed one.
+    assert visit.record.status == "partial", "a round sent back is recorded as partial, never as done"
     assert job.next_due == again and job.next_due != was_due, (
         "the cycle has not been served, so it has not rolled"
     )
@@ -1150,3 +1151,24 @@ def test_a_check_in_and_time_in_left_open_close_at_that_days_last_work(team):
     off = DutyRecord.objects.filter(user=tech).order_by("-at").first()
     assert off.kind == "time_out" and off.automatic and off.at == day + timedelta(hours=15, seconds=1)
     assert close_forgotten_days() == 0  # nothing left open
+
+
+@pytest.mark.django_db
+def test_an_unresolved_visit_still_records_what_it_cost(fault):
+    """Not fixed, but the trip was made: its man-hours are recorded on a
+    partial record and count in what the asset has cost."""
+    from decimal import Decimal
+
+    from apps.assets.costs import maintenance_cost
+    from apps.maintenance.models import MaintenanceRecord
+
+    visit = _to_review(fault)
+    r = _client(fault["office"]).post(f"/api/maintenance/visits/{visit.id}/review/", {
+        "decision": "unresolved", "reason": "Board still dead", "technician": str(fault["tech"].id),
+        "next_due": str(timezone.localdate()), "labour": {"hours": "2", "rate": "500"},
+    }, format="json")
+    assert r.status_code == 200, r.content
+    visit.refresh_from_db()
+    assert visit.record.status == MaintenanceRecord.Status.PARTIAL
+    assert visit.record.cost == Decimal("1000.00")
+    assert maintenance_cost(fault["job"].device)["total"] == Decimal("1000.00")
