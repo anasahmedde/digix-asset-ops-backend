@@ -37,13 +37,28 @@ def report(key, *, title, group, description, capability, filters=("date",), dat
     return register
 
 
+NEVER_SET = {
+    "assets.Device": {"in_transit", "lost_stolen", "rma"},
+    "tickets.Ticket": {
+        "on_hold", "blocked", "alignment_pending", "pending_ops_approval",
+        "pending_client_approval", "approved", "rejected",
+    },
+    "procurement.PurchaseOrder": {"ordered"},
+}
+
+
 def status_options(meta):
     from django.apps import apps
 
     if not meta["statuses"]:
         return []
     model = apps.get_model(meta["statuses"])
-    return [{"value": v, "label": str(label)} for v, label in model.Status.choices]
+    # Statuses nothing in the app moves a record to any more; offered only
+    # while some old record still carries one.
+    dead = NEVER_SET.get(meta["statuses"], set())
+    if dead:
+        dead = dead - set(model.objects.filter(status__in=dead).values_list("status", flat=True).distinct())
+    return [{"value": v, "label": str(label)} for v, label in model.Status.choices if v not in dead]
 
 
 def col(key, label, kind="text", total=None):
