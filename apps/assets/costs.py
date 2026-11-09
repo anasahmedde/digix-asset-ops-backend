@@ -76,7 +76,7 @@ def maintenance_cost(device):
         .filter(schedule__device=device, status__in=(
             MaintenanceRecord.Status.COMPLETED, MaintenanceRecord.Status.PARTIAL,
         ))
-        .select_related("schedule")
+        .select_related("schedule", "visit")
     )
     out = {}
     for kind in (MaintenanceSchedule.MaintenanceType.PREVENTIVE,
@@ -87,6 +87,16 @@ def maintenance_cost(device):
             "total": money(sum((r.cost or 0) for r in rows)),
         }
     out["total"] = money(out["preventive"]["total"] + out["corrective"]["total"])
+    # Each visit on its own line, newest first, to open its job from.
+    out["lines"] = [
+        {
+            "schedule": str(r.schedule_id), "title": r.schedule.title, "kind": r.schedule.maintenance_type,
+            "visit": getattr(getattr(r, "visit", None), "sequence", None),
+            "date": r.performed_at, "fixed": r.status == MaintenanceRecord.Status.COMPLETED,
+            "cost": money(r.cost or 0),
+        }
+        for r in sorted(done, key=lambda r: r.performed_at, reverse=True)
+    ]
     return out
 
 
