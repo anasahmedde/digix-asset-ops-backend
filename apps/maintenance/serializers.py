@@ -396,6 +396,20 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
     on_site = serializers.SerializerMethodField()
     # Hours at the site for this visit, from check-ins, for pricing labour.
     time_on_site = serializers.SerializerMethodField()
+    # Work stopped for now: since when, and every stop so far.
+    paused_since = serializers.SerializerMethodField()
+    pauses = serializers.SerializerMethodField()
+
+    def get_paused_since(self, obj):
+        from . import lifecycle
+
+        return lifecycle.paused_since(obj)
+
+    def get_pauses(self, obj):
+        return [
+            {"paused_at": p.paused_at, "resumed_at": p.resumed_at, "automatic": p.automatic, "reason": p.reason}
+            for p in obj.pauses.all()
+        ]
 
     def get_time_on_site(self, obj):
         from . import lifecycle
@@ -469,7 +483,7 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
             "review_note", "reviewed_by", "reviewed_by_name",
             "reviewed_at", "visit_photos", "purchases", "has_before_photo", "has_after_photo",
             "asset_verified_at", "asset_verified_by_name",
-            "component_costs", "cost_lines", "on_site", "time_on_site",
+            "component_costs", "cost_lines", "on_site", "time_on_site", "paused_since", "pauses",
             "issue_side", "issue_side_display", "maintenance_type", "maintenance_type_display",
             "created_at", "updated_at",
         ]

@@ -1215,3 +1215,63 @@ def test_the_technician_hears_a_part_answer_even_when_the_office_asked(fault):
     r = _client(boss).post(f"/api/maintenance/part-requests/{asked.data['id']}/decide/", {"approve": True, "quantity": 1}, format="json")
     assert r.status_code == 200, r.content
     assert Notification.objects.filter(recipient=tech, notification_type="request_answered").exists()
+
+
+def _started(fault):
+    """Assigned, photographed and started by the technician."""
+    job, tech = fault["job"], fault["tech"]
+    _client(fault["office"]).post(f"/api/maintenance/schedules/{job.id}/assign/",
+                                  {"technician": str(tech.id), "due_date": str(timezone.localdate())}, format="json")
+    visit = job.visits.order_by("-sequence").first()
+    _client(tech).post(f"/api/maintenance/visits/{visit.id}/photos/", {"kind": "before", "image": _png()}, format="multipart")
+    r = _client(tech).post(f"/api/maintenance/visits/{visit.id}/start/", {}, format="json")
+    assert r.status_code == 200, r.content
+    return visit
+
+
+@pytest.mark.django_db
+def test_the_technician_pauses_and_resumes_and_only_they_may(fault):
+    visit, tech = _started(fault), fault["tech"]
+    url = f"/api/maintenance/visits/{visit.id}"
+    assert _client(fault["other"]).post(f"{url}/pause/", {}, format="json").status_code == 403
+    r = _client(tech).post(f"{url}/pause/", {"reason": "Shop closed, back tomorrow"}, format="json")
+    assert r.status_code == 200 and r.data["paused_since"], r.content
+    assert _client(tech).post(f"{url}/pause/", {}, format="json").status_code == 400  # already paused
+    job = _client(tech).get(f"/api/maintenance/schedules/{fault['job'].id}/").data
+    assert "resume" in job["allowed_actions"] and "pause" not in job["allowed_actions"]
+    r = _client(tech).post(f"{url}/resume/", {}, format="json")
+    assert r.status_code == 200 and r.data["paused_since"] is None, r.content
+    assert len(r.data["pauses"]) == 1
+
+
+@pytest.mark.django_db
+def test_man_hours_leave_out_the_paused_night(fault):
+    """Started 09:00, paused 12:00, resumed 09:00 next day, done 11:00:
+    five hours of work, not twenty-six."""
+    from datetime import datetime, timedelta
+
+    from apps.maintenance import lifecycle
+    from apps.sites.models import Site
+
+    visit, tech = _started(fault), fault["tech"]
+    MaintenanceSchedule.objects.filter(pk=fault["job"].pk).update(site=Site.objects.create(name="Pause Mall"))
+    d = timezone.make_aware(datetime.combine(timezone.localdate() - timedelta(days=5), datetime.min.time()))
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(started_at=d + timedelta(hours=9))
+    visit.refresh_from_db()
+    lifecycle.pause(visit, user=tech, at=d + timedelta(hours=12))
+    lifecycle.resume(visit, user=tech, at=d + timedelta(days=1, hours=9))
+    MaintenanceVisit.objects.filter(pk=visit.pk).update(completed_at=d + timedelta(days=1, hours=11))
+    visit.refresh_from_db()
+    spent = lifecycle.time_on_site(visit)
+    assert spent["people"][0]["hours"] == 5.0, spent
+    assert not spent["reckoned"]
+
+
+@pytest.mark.django_db
+def test_checking_out_with_work_going_pauses_it(fault):
+    visit, tech = _started(fault), fault["tech"]
+    r = _client(tech).post("/api/attendance/records/", {"check_type": "check_out"}, format="json")
+    assert r.status_code == 201, r.content
+    visit.refresh_from_db()
+    pause = visit.pauses.get()
+    assert pause.automatic and pause.resumed_at is None

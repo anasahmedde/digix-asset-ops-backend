@@ -578,7 +578,7 @@ class CanPlanOrStartARound(BasePermission):
         # technician this visit was given to may photograph or finish it,
         # only the office may review it — and those need the visit itself
         # to decide, which a has_permission check cannot see.
-        if view.action in ("photos", "complete_visit", "review", "price", "verify_asset", "return_parts", "notes", "helpers"):
+        if view.action in ("photos", "complete_visit", "review", "price", "pause", "resume", "verify_asset", "return_parts", "notes", "helpers"):
             return True
         return False
 
@@ -834,6 +834,18 @@ class MaintenanceVisitViewSet(viewsets.ModelViewSet):
                 title=f"{job.title}: {'accepted' if accepted else 'another visit needed'}",
                 message=note or "", link=f"/maintenance?schedule={job.pk}", data={"schedule": str(job.pk)},
             )
+
+    @action(detail=True, methods=["post"])
+    def pause(self, request, pk=None):
+        """Stop the clock on the work - overnight, or waiting on something."""
+        visit = lifecycle.pause(self.get_object(), user=request.user, reason=request.data.get("reason") or "")
+        return Response(self.get_serializer(visit).data)
+
+    @action(detail=True, methods=["post"])
+    def resume(self, request, pk=None):
+        """Pick the work up again."""
+        visit = lifecycle.resume(self.get_object(), user=request.user)
+        return Response(self.get_serializer(visit).data)
 
     @action(detail=True, methods=["post"])
     def price(self, request, pk=None):
