@@ -413,7 +413,7 @@ def test_one_outage_raises_one_job(corrective_client):
 
 
 @_pytest.mark.django_db
-def test_leaving_maintenance_for_rma_also_closes_the_job(corrective_client):
+def test_leaving_maintenance_for_decommissioning_also_closes_the_job(corrective_client):
     c, _ = corrective_client
     asset = _Device.objects.create(
         asset_code="AST-CM-4", serial_number="CM-SN-4", status=_Device.Status.ACTIVE,
@@ -424,7 +424,7 @@ def test_leaving_maintenance_for_rma_also_closes_the_job(corrective_client):
     )
     r = c.post(
         f"/api/assets/devices/{asset.id}/transition/",
-        {"status": "rma", "reason": "Beyond on-site repair"}, format="json",
+        {"status": "decommissioned", "reason": "Beyond repair"}, format="json",
     )
     assert r.status_code == 200, r.content
     job = _Schedule.objects.get(device=asset)

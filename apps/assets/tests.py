@@ -340,7 +340,7 @@ def test_transition_writes_lifecycle_event_and_audit_log(admin_client, device):
     assert resp.status_code == 200, resp.content
     body = resp.json()
     assert body["status"] == "in_production"
-    assert set(body["allowed_transitions"]) == {"in_stock", "rma"}
+    assert set(body["allowed_transitions"]) == {"in_stock"}
 
     event = DeviceLifecycleEvent.objects.get(
         device=device, event_type="status_change", from_value="procured"
@@ -1308,7 +1308,7 @@ def test_technician_cannot_make_other_status_changes(installed_device):
     c = _tech_client(installed_device["tech"])
     r = c.post(
         f"/api/assets/devices/{installed_device['device'].id}/transition/",
-        {"status": "rma", "reason": "trying something else"}, format="json",
+        {"status": "decommissioned", "reason": "trying something else"}, format="json",
     )
     assert r.status_code == 403, r.content
     assert "Installation Tracker" in r.data["detail"]

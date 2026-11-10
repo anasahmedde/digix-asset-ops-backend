@@ -198,6 +198,13 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         flag = self.request.query_params.get("flag")
         if flag == "operational":
             qs = qs.filter(status__in=[Device.Status.ACTIVE, Device.Status.INSTALLED])
+        elif flag == "pipeline":
+            # In production, as the dashboard counts it: bought, being built,
+            # in stock or assigned - everything before it is installed.
+            qs = qs.filter(status__in=[
+                Device.Status.PROCURED, Device.Status.IN_TRANSIT, Device.Status.IN_PRODUCTION,
+                Device.Status.IN_STOCK, Device.Status.ASSIGNED,
+            ])
         elif flag == "warranty_expired":
             qs = (
                 qs.filter(warranties__isnull=False)
@@ -617,7 +624,7 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
             "total": total,
             "working": active_count,
             "installed": by_status.get("installed", 0) + by_status.get("active", 0),
-            "out_of_order": by_status.get("decommissioned", 0) + by_status.get("lost_stolen", 0),
+            "out_of_order": by_status.get("decommissioned", 0),
             "under_maintenance": by_status.get("under_maintenance", 0),
             "in_stock": by_status.get("in_stock", 0),
             "by_status": by_status,

@@ -673,7 +673,6 @@ class Command(BaseCommand):
             Device.Status.ASSIGNED,
             Device.Status.DECOMMISSIONED,
             Device.Status.IN_TRANSIT,
-            Device.Status.RMA,
         ]
 
         active_sites = [s for s in sites if s.is_active]
