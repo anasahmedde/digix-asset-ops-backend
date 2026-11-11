@@ -429,41 +429,10 @@ class MaintenanceVisitSerializer(DateOrder, HidesMoney, serializers.ModelSeriali
         """Every stay at the site over this visit's work: the check-in it
         began under, each check-out and check-in again (overnight, a pause),
         up to the check-out after Work done."""
-        from apps.attendance.models import AttendanceRecord
+        from apps.attendance.worktime import stays
 
-        site = obj.schedule.site_id
         acts = [t for t in (obj.asset_verified_at, obj.started_at, obj.completed_at) if t]
-        if not obj.assigned_to_id or not site or not acts:
-            return None
-        mine = AttendanceRecord.objects.filter(user_id=obj.assigned_to_id)
-        came = mine.filter(
-            check_type=AttendanceRecord.CheckType.CHECK_IN, site_id=site, created_at__lte=min(acts),
-        ).order_by("-created_at").first()
-        if came is None:
-            return None
-        done, stays, stay = obj.completed_at, [], None
-        # ponytail: capped read; a visit spans a few days of check-ins, not hundreds.
-        for r in mine.filter(created_at__gte=came.created_at).order_by("created_at")[:200]:
-            if r.check_type == AttendanceRecord.CheckType.CHECK_OUT:
-                if stay:
-                    stay["checked_out_at"], stay["offline"] = r.created_at, stay["offline"] or r.recorded_offline
-                    stay = None
-                if done and r.created_at >= done:
-                    break
-                continue
-            if done and r.created_at > done:
-                break
-            # Checked in again (here or elsewhere) without checking out: the last stay ends unclosed.
-            stay = None
-            if r.site_id == site:
-                stay = {"checked_in_at": r.created_at, "checked_out_at": None, "offline": r.recorded_offline}
-                stays.append(stay)
-        return {
-            "checked_in_at": stays[0]["checked_in_at"],
-            "checked_out_at": stays[-1]["checked_out_at"],
-            "offline": any(s["offline"] for s in stays),
-            "stays": stays,
-        }
+        return stays(obj.assigned_to_id, obj.schedule.site_id, min(acts) if acts else None, obj.completed_at)
 
     def get_component_costs(self, obj):
         from . import lifecycle

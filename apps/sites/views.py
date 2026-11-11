@@ -18,7 +18,7 @@ from common.permissions import CapabilityGate, can, can_for_project
 
 from common import clock
 
-from . import activity
+from . import activity, work
 
 
 def may_advance_installation(user, installation) -> bool:
@@ -71,6 +71,7 @@ from .models import (
     HandoverRecord,
     InstallationDelay,
     InstallationPhoto,
+    InstallationPurchase,
     InstallationStep,
     Site,
     SiteContact,
@@ -82,6 +83,7 @@ from .serializers import (
     HandoverCreateSerializer,
     InstallationDelaySerializer,
     InstallationPhotoSerializer,
+    InstallationPurchaseSerializer,
     InstallationStepSerializer,
     SiteContactSerializer,
     SiteDetailSerializer,
@@ -241,7 +243,10 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             "device__asset_type", "device__assigned_client", "device__project",
             "installed_by", "vendor", "site", "zone",
         )
-        .prefetch_related("photos", "steps__checks__done_by", "steps__photos", "delays", "device__clients", "helpers")
+        .prefetch_related(
+            "photos", "steps__checks__done_by", "steps__photos", "delays", "device__clients", "helpers",
+            "pauses", "purchases__bought_by", "cost_lines",
+        )
         .all()
     )
     permission_classes = [IsAuthenticated, CapabilityGate]
@@ -251,7 +256,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
     # are checked inside, against the installer and the capability.
     write_capability = "assign_installation"
     action_capabilities = {
-        "activate": None, "handover": None, "verify_asset": None,
+        "activate": None, "handover": None, "verify_asset": None, "pause": None, "resume": None, "price": None,
         "export": "view_installations", "handover_document": "view_installations",
         "activity": "view_installations",
         "reorder_steps": "edit_installation",
@@ -551,6 +556,49 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             ).data,
         })
 
+    def _at_work(self, installation):
+        """Pause and resume are the installer's (or whoever may move the job
+        along), and happen while the installer is checked in at the site."""
+        from apps.attendance.presence import require_on_site
+
+        user = self.request.user
+        if not may_advance_installation(user, installation):
+            raise PermissionDenied("Only the installer, or their supervisor, pauses or resumes this work.")
+        if installation.installed_by_id == user.id and not can(user, "act_across_teams"):
+            require_on_site(user, installation.site)
+        elif installation.installed_by_id and not work.technician_here(installation):
+            raise PermissionDenied(
+                f"{activity.name(installation.installed_by)} is not checked in at {installation.site.name} - "
+                "the work opens once they check in."
+            )
+
+    @action(detail=True, methods=["post"])
+    def pause(self, request, pk=None):
+        """Stop the clock on the work - overnight, or waiting on something."""
+        installation = self.get_object()
+        self._at_work(installation)
+        work.pause(installation, user=request.user, reason=request.data.get("reason") or "")
+        return Response(DeviceInstallationDetailSerializer(self.get_object(), context=self.get_serializer_context()).data)
+
+    @action(detail=True, methods=["post"])
+    def resume(self, request, pk=None):
+        """Pick the work up again."""
+        installation = self.get_object()
+        self._at_work(installation)
+        work.resume(installation, user=request.user)
+        return Response(DeviceInstallationDetailSerializer(self.get_object(), context=self.get_serializer_context()).data)
+
+    @action(detail=True, methods=["post"])
+    def price(self, request, pk=None):
+        """The installer's supervisor records what the installation cost:
+        {cost_lines: [{description, amount}], labour: {people: [{id, hours, rate}]}}."""
+        installation = self.get_object()
+        work.record_cost(
+            installation, user=request.user,
+            extra=request.data.get("cost_lines") or None, labour=request.data.get("labour") or None,
+        )
+        return Response(DeviceInstallationDetailSerializer(self.get_object(), context=self.get_serializer_context()).data)
+
     @action(detail=True, methods=["post"], url_path="verify-asset")
     def verify_asset(self, request, pk=None):
         """The phone scanned a label: is it the asset this installation is for?"""
@@ -578,6 +626,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         """
         installation = self.get_object()
         user = request.user
+        work.require_not_paused(installation)
         mine = user.id in (installation.installed_by_id, installation.device.assigned_technician_id)
         if not (mine and can(user, "activate_asset")) and not (
             can(user, "activate_asset") and can(user, "act_across_teams")
@@ -696,6 +745,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         the asset, complete the handover step and move the asset to Active."""
         installation = self.get_object()
         user = request.user
+        work.require_not_paused(installation)
         if not can(user, "close_installation") and installation.installed_by_id != user.id:
             return Response(
                 {"detail": "Only the assigned installer or operations management can hand over."},
@@ -913,6 +963,7 @@ class InstallationStepViewSet(viewsets.ModelViewSet):
         step = serializer.instance
         refuse_if_closed_out(step.installation)
         self._from_the_site(step.installation)
+        work.require_not_paused(step.installation)
 
         new_status = serializer.validated_data.get("status", step.status)
         if new_status == InstallationStep.StepStatus.SKIPPED and step.status != new_status:
@@ -1199,3 +1250,45 @@ class InstallationPhotoViewSet(viewsets.ModelViewSet):
             return
         photo = serializer.save(taken_by=user)
         activity.log(photo.installation, "photo", f"{photo.get_photo_type_display()} photo added", user=user)
+
+
+class InstallationPurchaseViewSet(viewsets.ModelViewSet):
+    """Paid by the crew for an installation: recorded with the receipt (and
+    a photo for a part) by the installer or whoever may move the job along,
+    and taken back until the installation's cost is recorded."""
+
+    queryset = InstallationPurchase.objects.select_related("installation", "bought_by").all()
+    serializer_class = InstallationPurchaseSerializer
+    permission_classes = [IsAuthenticated, CapabilityGate]
+    read_capability = "view_installations"
+    action_capabilities = {"create": None, "destroy": None}
+    http_method_names = ["get", "post", "delete", "head", "options"]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    filterset_fields = ["installation"]
+
+    def perform_create(self, serializer):
+        installation = serializer.validated_data["installation"]
+        user = self.request.user
+        if not may_advance_installation(user, installation):
+            raise PermissionDenied("Only the installer, or their supervisor, records what was paid for this installation.")
+        if installation.cost is not None:
+            from rest_framework.exceptions import ValidationError as _VE
+
+            raise _VE({"installation": "This installation's cost is recorded: its purchases are settled."})
+        bought = serializer.save(bought_by=user)
+        activity.log(installation, "purchase", (
+            (f"Bought on site: {bought.quantity} x {bought.description}" if bought.kind == bought.Kind.PART
+             else f"{bought.get_kind_display()}: {bought.description}")
+            + f" for PKR {bought.amount:,.2f}" + (f" at {bought.shop}" if bought.shop else "")
+        ), user=user)
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not (instance.bought_by_id == user.pk or may_advance_installation(user, instance.installation)):
+            raise PermissionDenied("Only whoever recorded it, or the installer's supervisor, takes a purchase back.")
+        if instance.installation.cost is not None:
+            from rest_framework.exceptions import ValidationError as _VE
+
+            raise _VE({"detail": "This installation's cost is recorded: its purchases are on the record."})
+        activity.log(instance.installation, "purchase_removed", f"Purchase taken back: {instance.description}", user=user)
+        instance.delete()
