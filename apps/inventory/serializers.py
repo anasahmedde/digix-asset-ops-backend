@@ -1035,6 +1035,20 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
             return None
         return obj.project.project_code or obj.project.name
 
+    # The rack the pigeon hole is on, for the store to put it on or take it from.
+    pigeon_rack = serializers.SerializerMethodField()
+
+    def get_pigeon_rack(self, obj):
+        from .models import PigeonHole
+
+        if obj.pigeon_hole_id:
+            return obj.pigeon_hole.rack or None
+        if not obj.into_pigeon_hole or obj.project_id is None:
+            return None
+        return PigeonHole.objects.filter(
+            project_id=obj.project_id, item_id=obj.item_id, unit_type_id=obj.unit_type_id,
+        ).values_list("rack", flat=True).first() or None
+
     def get_issued_units(self, obj):
         serials = obj.issued_serials or []
         if not serials:
@@ -1084,7 +1098,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = IssuanceRequest
-        fields = ["into_pigeon_hole", "pigeon_hole", "pigeon_project", 
+        fields = ["into_pigeon_hole", "pigeon_hole", "pigeon_project", "pigeon_rack", 
             "id", "request_number", "what",
             "item", "item_sku", "item_name", "unit_type", "unit_type_name", "unit",
             "quantity_requested", "quantity_issued", "outstanding_quantity", "available_quantity",
@@ -1246,7 +1260,7 @@ class PigeonHoleSerializer(serializers.ModelSerializer):
         model = PigeonHole
         fields = [
             "id", "project", "project_code", "project_name", "item", "unit_type", "what", "code", "kind", "unit",
-            "quantity", "serials", "kept", "issued", "pending_in", "pending_out", "updated_at",
+            "quantity", "rack", "serials", "kept", "issued", "pending_in", "pending_out", "updated_at",
         ]
         read_only_fields = fields
 

@@ -1211,6 +1211,19 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
             return Response({"quantity": ["Must be a whole number."]}, status=400)
         if quantity < 1:
             return Response({"quantity": ["Keep at least one."]}, status=400)
+        # The pigeon hole is a rack in the store: say which, so the store
+        # knows where to put it and anyone can find it later.
+        from apps.inventory.models import PigeonHole
+
+        rack = (request.data.get("rack") or "").strip()[:50]
+        hole, _ = PigeonHole.objects.get_or_create(
+            project=project, item=component.inventory_item, unit_type=component.inventory_unit_type,
+        )
+        if not rack and not hole.rack:
+            return Response({"rack": ["Say which rack it is kept on."]}, status=400)
+        if rack and rack != hole.rack:
+            hole.rack = rack
+            hole.save(update_fields=["rack", "updated_at"])
         asked = IssuanceRequest.objects.create(
             item=component.inventory_item, unit_type=component.inventory_unit_type,
             quantity_requested=quantity, source=IssuanceRequest.Source.PROJECT,
@@ -1220,7 +1233,7 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         notices.ask(
             "issue_stock", exclude=[request.user], kind="request_raised",
             title=f"Keep in pigeon hole: {component.name}",
-            message=f"{quantity} for {project.project_code or project.name} · {asked.request_number}",
+            message=f"{quantity} for {project.project_code or project.name} on rack {hole.rack} · {asked.request_number}",
             link="/inventory?tab=requests", ref=f"issue:{asked.pk}", data={"request": str(asked.pk)},
         )
         component = AssetComponent.objects.prefetch_related("pigeon_requests").get(pk=component.pk)

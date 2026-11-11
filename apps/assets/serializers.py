@@ -329,6 +329,19 @@ class AssetComponentSerializer(serializers.ModelSerializer):
     def get_pigeon_pending(self, obj):
         return sum(r.outstanding_quantity for r in self._pigeon(obj))
 
+    pigeon_rack = serializers.SerializerMethodField()
+
+    def get_pigeon_rack(self, obj):
+        """The rack this line's pigeon hole is on, once one was asked for."""
+        from apps.inventory.models import PigeonHole
+
+        if not self._pigeon(obj):
+            return None
+        project = obj.device.project_on
+        return PigeonHole.objects.filter(
+            project=project, item_id=obj.inventory_item_id, unit_type_id=obj.inventory_unit_type_id,
+        ).values_list("rack", flat=True).first() or None if project else None
+
     class Meta:
         model = AssetComponent
         fields = [
@@ -340,7 +353,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "returned_quantity", "returned_serials", "issued_serials",
             "purchase_order_item", "po_number", "po_stocked_quantity", "procure_requests", "planned_unit_price",
             "pending_increase", "increase_reason", "increase_notes",
-            "increase_requested_by_name", "increase_requested_at", "pigeon_kept", "pigeon_pending",
+            "increase_requested_by_name", "increase_requested_at", "pigeon_kept", "pigeon_pending", "pigeon_rack",
             "inventory_unit", "inventory_unit_code", "source_label",
             "active_warranty", "unit",
             "notes", "created_at",
@@ -384,11 +397,11 @@ class AssetComponentSerializer(serializers.ModelSerializer):
 
     def get_source_label(self, obj):
         if obj.inventory_unit_type_id:
-            return f"Unique · {obj.inventory_unit_type}"
+            return f"Unique item · {obj.inventory_unit_type}"
         if obj.inventory_unit_id:
-            return f"Unique · {obj.inventory_unit.serial_number}"
+            return f"Unique item · {obj.inventory_unit.serial_number}"
         if obj.inventory_item_id:
-            return f"Stock · {obj.inventory_item.sku}"
+            return f"Generic item · {obj.inventory_item.sku}"
         return None
 
     def get_active_warranty(self, obj):

@@ -785,7 +785,7 @@ def test_component_records_a_requirement_without_touching_stock(admin_client, de
     assert r.status_code == 201, r.content
     assert r.data["quantity"] == 3
     assert r.data["name"] == "Comp Cabinet"
-    assert r.data["source_label"].startswith("Stock ·")
+    assert r.data["source_label"].startswith("Generic item ·")
     # Availability is reported for information, never deducted.
     assert r.data["available_quantity"] == 10
     item.refresh_from_db()
@@ -820,7 +820,7 @@ def test_component_can_require_a_unique_product(admin_client, device, stock_refs
     assert r.status_code == 201, r.content
     assert r.data["quantity"] == 4, "a unique requirement can be for several units"
     assert r.data["inventory_unit_type_name"] == "Comp Media Player MP-9"
-    assert r.data["source_label"] == "Unique · Comp Media Player MP-9"
+    assert r.data["source_label"] == "Unique item · Comp Media Player MP-9"
     assert r.data["available_quantity"] == 0, "the product was opened with no stock"
 
 
@@ -3229,8 +3229,10 @@ def test_a_project_keeps_contingency_in_its_pigeon_hole_and_draws_on_it_through_
     on_shelf = item.quantity
 
     r = admin_client.post(f"/api/assets/components/{generic.id}/pigeon-hole/", {"quantity": 3}, format="json")
+    assert r.status_code == 400 and "rack" in r.data, "the pigeon hole is a rack: it asks which"
+    r = admin_client.post(f"/api/assets/components/{generic.id}/pigeon-hole/", {"quantity": 3, "rack": "R-12"}, format="json")
     assert r.status_code == 201, r.content
-    assert r.data["component"]["pigeon_pending"] == 3
+    assert r.data["component"]["pigeon_pending"] == 3 and r.data["component"]["pigeon_rack"] == "R-12"
     request_id = admin_client.get("/api/inventory/issuance-requests/", {"page_size": 50}).data["results"][0]["id"]
     r = admin_client.post(f"/api/inventory/issuance-requests/{request_id}/issue/", {"quantity": 3}, format="json")
     assert r.status_code == 200, r.content
@@ -3239,12 +3241,15 @@ def test_a_project_keeps_contingency_in_its_pigeon_hole_and_draws_on_it_through_
     assert item.quantity == on_shelf - 3, "set aside, it leaves general stock"
     hole = PigeonHole.objects.get(project=project_build["project"], item=item)
     assert hole.quantity == 3
+    assert hole.rack == "R-12"
+    listed = admin_client.get("/api/inventory/pigeon-holes/", {"held": "true"}).data
+    assert any(h["rack"] == "R-12" for h in listed.get("results", listed))
     generic.refresh_from_db()
     assert generic.issued_quantity == 0 and generic.stock_requested_quantity == 0, "the build line is untouched"
 
     # A unique part: the unit is held for the project, out of what the shelf offers.
     free = unique.inventory_unit_type.in_stock_count
-    r = admin_client.post(f"/api/assets/components/{unique.id}/pigeon-hole/", {"quantity": 1}, format="json")
+    r = admin_client.post(f"/api/assets/components/{unique.id}/pigeon-hole/", {"quantity": 1, "rack": "R-7"}, format="json")
     assert r.status_code == 201, r.content
     rid = r.data["request_number"]
     row = [x for x in admin_client.get("/api/inventory/issuance-requests/", {"page_size": 50}).data["results"] if x["request_number"] == rid][0]

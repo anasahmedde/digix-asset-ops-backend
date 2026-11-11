@@ -735,6 +735,8 @@ class PigeonHole(TimeStampedModel):
     )
     # On hand in the pigeon hole now (for a unique item: the units held).
     quantity = models.PositiveIntegerField(default=0)
+    # Where in the store it is kept: the rack location, e.g. "R-12".
+    rack = models.CharField(max_length=50, blank=True)
 
     class Meta:
         ordering = ["-updated_at"]
