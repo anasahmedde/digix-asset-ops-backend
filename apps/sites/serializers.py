@@ -9,11 +9,57 @@ from .models import (
     HandoverRecord,
     InstallationDelay,
     InstallationPhoto,
+    InstallationPurchase,
     InstallationStep,
     Site,
     SiteContact,
     SiteZone,
 )
+
+
+class InstallationPurchaseSerializer(serializers.ModelSerializer):
+    """A cost of the installation the crew paid: a part bought on site (what,
+    how many, the receipt and a photo), or travel, labour, hire or another
+    expense (what it came to, and the receipt where there is one)."""
+
+    bought_by_name = serializers.SerializerMethodField()
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+
+    class Meta:
+        model = InstallationPurchase
+        fields = [
+            "id", "installation", "kind", "kind_display", "description", "quantity", "amount", "shop",
+            "receipt", "photo", "bought_by", "bought_by_name", "created_at",
+        ]
+        read_only_fields = ["id", "bought_by", "bought_by_name", "created_at"]
+
+    def validate(self, attrs):
+        kind = attrs.get("kind", getattr(self.instance, "kind", InstallationPurchase.Kind.PART))
+        if self.instance is None and kind == InstallationPurchase.Kind.PART:
+            missing = {f: "Required for a part bought on site." for f in ("receipt", "photo") if not attrs.get(f)}
+            if missing:
+                raise serializers.ValidationError(missing)
+        return attrs
+
+    def get_bought_by_name(self, obj):
+        who = obj.bought_by
+        return (who.get_full_name() or who.username) if who else None
+
+    def validate_description(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Say what was bought.")
+        return value
+
+    def validate_amount(self, value):
+        if value is None or value <= 0:
+            raise serializers.ValidationError("Say what was paid, as the receipt shows.")
+        return value
+
+    def validate_quantity(self, value):
+        if not value or value < 1:
+            raise serializers.ValidationError("At least one.")
+        return value
 
 
 class SiteZoneSerializer(serializers.ModelSerializer):
@@ -516,6 +562,87 @@ class DeviceInstallationDetailSerializer(DateOrder, _InstallationCommonMixin, se
         user = getattr(request, "user", None)
         return bool(user and may_advance_installation(user, obj))
 
+    # The installation as a job of work, the same shape as a maintenance
+    # visit's so the screens read both alike: when it started, its pauses,
+    # every stay at the site, the man-hours, and what it cost.
+    started_at = serializers.SerializerMethodField()
+    paused_since = serializers.SerializerMethodField()
+    pauses = serializers.SerializerMethodField()
+    on_site = serializers.SerializerMethodField()
+    technician_here = serializers.SerializerMethodField()
+    time_on_site = serializers.SerializerMethodField()
+    purchases = InstallationPurchaseSerializer(many=True, read_only=True)
+    cost_lines = serializers.SerializerMethodField()
+    cost_recorded_by_name = serializers.SerializerMethodField()
+    can_record_cost = serializers.SerializerMethodField()
+    work_done = serializers.SerializerMethodField()
+
+    def get_started_at(self, obj):
+        from . import work
+
+        return work.started_at(obj)
+
+    def get_paused_since(self, obj):
+        from . import work
+
+        return work.paused_since(obj)
+
+    def get_pauses(self, obj):
+        return [
+            {"paused_at": p.paused_at, "resumed_at": p.resumed_at, "automatic": p.automatic, "reason": p.reason}
+            for p in sorted(obj.pauses.all(), key=lambda p: p.paused_at)
+        ]
+
+    def get_on_site(self, obj):
+        from . import work
+
+        return work.on_site(obj)
+
+    def get_technician_here(self, obj):
+        from . import work
+
+        return work.technician_here(obj) if work.in_progress(obj) or not work.started_at(obj) else None
+
+    def get_time_on_site(self, obj):
+        from . import work
+
+        return work.time_on_site(obj)
+
+    def get_cost_lines(self, obj):
+        return [
+            {"id": str(l.pk), "source": l.source, "description": l.description,
+             "quantity": l.quantity, "unit_cost": l.unit_cost, "amount": l.amount}
+            for l in obj.cost_lines.all()
+        ]
+
+    def get_cost_recorded_by_name(self, obj):
+        who = obj.cost_recorded_by
+        return (who.get_full_name() or who.username) if who else None
+
+    def get_can_record_cost(self, obj) -> bool:
+        from . import work
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        return bool(user and work.work_done(obj) and work.may_record_cost(user, obj))
+
+    def get_work_done(self, obj) -> bool:
+        from . import work
+
+        return work.work_done(obj)
+
+    def to_representation(self, instance):
+        from common.money import MONEY_FIELDS, viewer_sees_prices
+
+        data = super().to_representation(instance)
+        if not viewer_sees_prices(self.context):
+            data["cost"] = None
+            for key in ("cost_lines", "purchases"):
+                for line in data.get(key) or []:
+                    for name in MONEY_FIELDS & set(line):
+                        line[name] = None
+        return data
+
     class Meta:
         model = DeviceInstallation
         fields = [
@@ -531,8 +658,11 @@ class DeviceInstallationDetailSerializer(DateOrder, _InstallationCommonMixin, se
             "escalated", "escalation_state", "asset_verified_at", "asset_verified_by_name",
             "position_label", "notes", "photos", "steps", "delays", "step_types",
             "handover", "progress", "steps_done", "steps_total", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
+            "started_at", "paused_since", "pauses", "on_site", "technician_here", "time_on_site", "work_done",
+            "purchases", "cost", "cost_lines", "cost_recorded_by_name", "cost_recorded_at", "can_record_cost",
         ]
-        read_only_fields = ["id", "completed_at", "escalation_state", "asset_verified_at", "created_at"]
+        read_only_fields = ["id", "completed_at", "escalation_state", "asset_verified_at", "created_at",
+                            "cost", "cost_recorded_at"]
 
     def validate(self, attrs):
         """A vendor is either a registered supplier or a hand-entered one."""

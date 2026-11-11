@@ -67,17 +67,22 @@ INCREASE_RIGHT = "approve_quantity_increase"
 
 
 def increase_deciders(component):
-    """Who decides a requested quantity increase: whoever holds the right on
-    the asker's reporting line above them - never someone below. The top of
-    the line, with nobody above, decides their own. A line where nobody above
-    holds the right falls back to every holder but the asker, so the request
-    is never stranded."""
+    """Who decides a requested quantity increase."""
     from apps.assets.serializers import _project_of
+
+    return deciders_above(component.increase_requested_by, _project_of(component.device))
+
+
+def deciders_above(asker, project):
+    """Who approves what somebody asked for on a project (more of a part, or
+    stock kept in its pigeon hole): whoever holds the right on the asker's
+    reporting line above them - never someone below. The top of the line,
+    with nobody above, decides their own. A line where nobody above holds
+    the right falls back to every holder but the asker, so the request is
+    never stranded."""
     from apps.notifications.service import holders_of, line_above
     from common.permissions import can_for_project
 
-    project = _project_of(component.device)
-    asker = component.increase_requested_by
     if asker is None:
         return list(holders_of(INCREASE_RIGHT, project=project))
     above = [u for u in line_above(asker) if u.is_active and can_for_project(u, project, INCREASE_RIGHT)]
@@ -90,11 +95,20 @@ def increase_deciders(component):
 
 def may_decide_increase(user, component) -> bool:
     """The Administrator decides anything; anyone else must be a decider."""
+    return may_decide(user, increase_deciders(component))
+
+
+def may_decide(user, deciders) -> bool:
     from apps.accounts.models import User
 
     if user.is_superuser or user.role == User.Role.SUPER_ADMIN:
         return True
-    return any(u.pk == user.pk for u in increase_deciders(component))
+    return any(u.pk == user.pk for u in deciders)
+
+
+def pigeon_deciders(issuance_request):
+    """Who approves keeping stock in a project's pigeon hole: the asker's manager."""
+    return deciders_above(issuance_request.requested_by, issuance_request.project)
 
 
 def return_leftovers(device, *, user, rows):

@@ -100,7 +100,7 @@ def open_corrective_job(device, user=None, reason: str = "", details=None, ticke
 def close_corrective_jobs(device, user=None, reason: str = "", *, returned_to_service=True):
     """File the completion record(s) for an asset coming back out of maintenance.
 
-    Whether it returns to service or goes on to RMA, the maintenance visit is
+    Whether it returns to service or is decommissioned, the maintenance visit is
     over and the register should say so. Billability follows the asset's
     warranty state, exactly as a hand-entered record does.
     """
