@@ -3311,3 +3311,45 @@ def test_an_asset_counts_its_visits_and_whose_side_the_issues_were_on(admin_clie
     c.force_authenticate(viewer)
     r = c.get(f"/api/assets/devices/{device.id}/")
     assert r.status_code == 200 and r.data["cost_of_ownership"] is None
+
+
+@pytest.mark.django_db
+def test_keeping_stock_in_a_pigeon_hole_waits_for_the_askers_manager(project_build):
+    """Ahmer asks to keep 2 on rack R-3: the store cannot set it aside until
+    Awais, above him, approves. Turned down, it is cancelled."""
+    from apps.inventory.models import IssuanceRequest
+    from apps.notifications.models import Notification
+
+    awais = User.objects.create_user(username="ph-awais", password="x", role="group_head")
+    ahmer = User.objects.create_user(username="ph-ahmer", password="x", role="ops_manager", reports_to=awais)
+    store = User.objects.create_superuser(username="ph-store", password="x")
+    c = {u.username: APIClient() for u in (awais, ahmer, store)}
+    for u in (awais, ahmer, store):
+        c[u.username].force_authenticate(u)
+    generic, project = project_build["generic"], project_build["project"]
+    url = f"/api/assets/components/{generic.id}"
+
+    r = c["ph-ahmer"].post(f"{url}/pigeon-hole/", {"quantity": 2, "rack": "R-3"}, format="json")
+    assert r.status_code == 201 and r.data["approved"] is False, r.content
+    assert r.data["component"]["pigeon_awaiting"][0]["quantity"] == 2
+    asked = IssuanceRequest.objects.get(pigeon_component=generic)
+    assert asked.status == IssuanceRequest.Status.APPROVAL
+    assert set(Notification.objects.filter(ref=f"pigeon:{asked.pk}").values_list("recipient__username", flat=True)) == {"ph-awais"}
+    issue = c["ph-store"].post(f"/api/inventory/issuance-requests/{asked.pk}/issue/", {"quantity": 2}, format="json")
+    assert issue.status_code == 400 and "approved" in str(issue.data), issue.content
+
+    rows = c["ph-awais"].get(f"/api/teams/projects/{project.id}/requirements/").data["assets"][0]["components"]
+    waiting = next(x for x in rows if x["id"] == str(generic.id))["pigeon_awaiting"][0]
+    assert waiting["may_decide"] is True
+    assert c["ph-ahmer"].post(f"{url}/pigeon-decision/", {"request": str(asked.pk), "approve": True}, format="json").status_code == 403
+    r = c["ph-awais"].post(f"{url}/pigeon-decision/", {"request": str(asked.pk), "approve": True}, format="json")
+    assert r.status_code == 200 and r.data["pigeon_awaiting"] == [] and r.data["pigeon_pending"] == 2, r.content
+    asked.refresh_from_db()
+    assert asked.status == IssuanceRequest.Status.PENDING and asked.approved_by == awais
+
+    c["ph-ahmer"].post(f"{url}/pigeon-hole/", {"quantity": 1}, format="json")
+    second = IssuanceRequest.objects.filter(pigeon_component=generic).exclude(pk=asked.pk).get()
+    r = c["ph-awais"].post(f"{url}/pigeon-decision/", {"request": str(second.pk), "approve": False, "note": "Not needed"}, format="json")
+    assert r.status_code == 200, r.content
+    second.refresh_from_db()
+    assert second.status == IssuanceRequest.Status.CANCELLED and "Not needed" in second.notes

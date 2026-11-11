@@ -327,7 +327,17 @@ class AssetComponentSerializer(serializers.ModelSerializer):
         return sum(r.quantity_issued for r in self._pigeon(obj))
 
     def get_pigeon_pending(self, obj):
-        return sum(r.outstanding_quantity for r in self._pigeon(obj))
+        return sum(r.outstanding_quantity for r in self._pigeon(obj) if r.status != "approval")
+
+    # Asked for and waiting on the asker's manager, one entry per request.
+    pigeon_awaiting = serializers.SerializerMethodField()
+
+    def get_pigeon_awaiting(self, obj):
+        return [
+            {"id": str(r.pk), "request_number": r.request_number, "quantity": r.quantity_requested,
+             "requested_by_name": (r.requested_by.get_full_name() or r.requested_by.username) if r.requested_by_id else None}
+            for r in self._pigeon(obj) if r.status == "approval"
+        ]
 
     pigeon_rack = serializers.SerializerMethodField()
 
@@ -354,6 +364,7 @@ class AssetComponentSerializer(serializers.ModelSerializer):
             "purchase_order_item", "po_number", "po_stocked_quantity", "procure_requests", "planned_unit_price",
             "pending_increase", "increase_reason", "increase_notes",
             "increase_requested_by_name", "increase_requested_at", "pigeon_kept", "pigeon_pending", "pigeon_rack",
+            "pigeon_awaiting",
             "inventory_unit", "inventory_unit_code", "source_label",
             "active_warranty", "unit",
             "notes", "created_at",

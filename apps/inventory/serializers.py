@@ -1037,6 +1037,10 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
 
     # The rack the pigeon hole is on, for the store to put it on or take it from.
     pigeon_rack = serializers.SerializerMethodField()
+    approved_by_name = serializers.SerializerMethodField()
+
+    def get_approved_by_name(self, obj):
+        return (obj.approved_by.get_full_name() or obj.approved_by.username) if obj.approved_by_id else None
 
     def get_pigeon_rack(self, obj):
         from .models import PigeonHole
@@ -1098,7 +1102,7 @@ class IssuanceRequestSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = IssuanceRequest
-        fields = ["into_pigeon_hole", "pigeon_hole", "pigeon_project", "pigeon_rack", 
+        fields = ["into_pigeon_hole", "pigeon_hole", "pigeon_project", "pigeon_rack", "approved_by_name", 
             "id", "request_number", "what",
             "item", "item_sku", "item_name", "unit_type", "unit_type_name", "unit",
             "quantity_requested", "quantity_issued", "outstanding_quantity", "available_quantity",
@@ -1268,7 +1272,7 @@ class PigeonHoleSerializer(serializers.ModelSerializer):
         if into:
             return IssuanceRequest.objects.filter(
                 into_pigeon_hole=True, project_id=obj.project_id, item_id=obj.item_id, unit_type_id=obj.unit_type_id,
-            ).exclude(status=IssuanceRequest.Status.CANCELLED)
+            ).exclude(status__in=(IssuanceRequest.Status.CANCELLED, IssuanceRequest.Status.APPROVAL))
         return obj.requests.exclude(status=IssuanceRequest.Status.CANCELLED)
 
     def get_what(self, obj):

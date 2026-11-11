@@ -553,6 +553,9 @@ class IssuanceRequest(TimeStampedModel):
     """
 
     class Status(models.TextChoices):
+        # Keeping stock in a pigeon hole is a manager's call: the store does
+        # not see it to set aside until it is approved.
+        APPROVAL = "approval", "Awaiting Approval"
         PENDING = "pending", "Awaiting Issue"
         PARTIAL = "partial", "Partly Issued"
         FULFILLED = "fulfilled", "Issued"
@@ -634,6 +637,12 @@ class IssuanceRequest(TimeStampedModel):
         max_length=12, choices=Status.choices, default=Status.PENDING, db_index=True
     )
     notes = models.TextField(blank=True)
+    # Who approved it, where approval is asked for (a pigeon hole).
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="material_requests_approved",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -667,7 +676,7 @@ class IssuanceRequest(TimeStampedModel):
 
     def sync_status(self):
         """Status follows the quantities; a cancelled request stays cancelled."""
-        if self.status == self.Status.CANCELLED:
+        if self.status in (self.Status.CANCELLED, self.Status.APPROVAL):
             return
         if self.quantity_issued == 0:
             self.status = self.Status.PENDING

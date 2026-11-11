@@ -963,6 +963,8 @@ class IssuanceRequestViewSet(viewsets.ModelViewSet):
         row = self.get_object()
         if row.status in (IssuanceRequest.Status.FULFILLED, IssuanceRequest.Status.CANCELLED):
             return Response({"detail": "This request is settled."}, status=400)
+        if row.status == IssuanceRequest.Status.APPROVAL:
+            return Response({"detail": "A manager has not approved this yet."}, status=400)
         if row.awaiting_procurement:
             return Response({"detail": "Already on order for this request."}, status=400)
         try:

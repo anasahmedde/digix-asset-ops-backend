@@ -1224,23 +1224,104 @@ class AssetComponentViewSet(viewsets.ModelViewSet):
         if rack and rack != hole.rack:
             hole.rack = rack
             hole.save(update_fields=["rack", "updated_at"])
+        from .services import pigeon_deciders
+
+        # Holding stock back from general use is the asker's manager's call:
+        # the store is asked only once it is approved. Somebody at the top of
+        # their line approves their own.
         asked = IssuanceRequest.objects.create(
             item=component.inventory_item, unit_type=component.inventory_unit_type,
             quantity_requested=quantity, source=IssuanceRequest.Source.PROJECT,
             purpose=f"Pigeon hole · {component.device.asset_code} · {component.name}",
             project=project, into_pigeon_hole=True, pigeon_component=component, requested_by=request.user,
+            status=IssuanceRequest.Status.APPROVAL,
         )
-        notices.ask(
-            "issue_stock", exclude=[request.user], kind="request_raised",
-            title=f"Keep in pigeon hole: {component.name}",
-            message=f"{quantity} for {project.project_code or project.name} on rack {hole.rack} · {asked.request_number}",
-            link="/inventory?tab=requests", ref=f"issue:{asked.pk}", data={"request": str(asked.pk)},
-        )
+        deciders = pigeon_deciders(asked)
+        if [u.pk for u in deciders] == [request.user.pk]:
+            self._approve_pigeon(asked, request.user)
+        else:
+            notices.notify(
+                deciders, exclude=[request.user], kind="approval_requested", actionable=True, email=True,
+                title=f"Pigeon hole needs approval: {component.name}",
+                message=(f"{notices.who(request.user)} wants {quantity} kept on rack {hole.rack} for "
+                         f"{project.project_code or project.name} · {asked.request_number}"),
+                link=f"/projects?project={project.pk}&tab=execution", ref=f"pigeon:{asked.pk}",
+                data={"request": str(asked.pk)},
+            )
         component = AssetComponent.objects.prefetch_related("pigeon_requests").get(pk=component.pk)
         return Response({
             "component": AssetComponentSerializer(component).data,
             "requested": quantity, "request_number": asked.request_number,
+            "approved": asked.status != IssuanceRequest.Status.APPROVAL,
         }, status=201)
+
+    def _approve_pigeon(self, asked, user):
+        """Approved: now the store is asked to set it aside."""
+        from django.utils import timezone
+
+        from apps.inventory.models import IssuanceRequest, PigeonHole
+
+        asked.status = IssuanceRequest.Status.PENDING
+        asked.approved_by, asked.approved_at = user, timezone.now()
+        asked.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+        rack = PigeonHole.objects.filter(
+            project_id=asked.project_id, item_id=asked.item_id, unit_type_id=asked.unit_type_id,
+        ).values_list("rack", flat=True).first()
+        project = asked.project
+        notices.ask(
+            "issue_stock", exclude=[user], kind="request_raised",
+            title=f"Keep in pigeon hole: {asked.what}",
+            message=(f"{asked.quantity_requested} for {project.project_code or project.name}"
+                     + (f" on rack {rack}" if rack else "") + f" · {asked.request_number}"),
+            link="/inventory?tab=requests", ref=f"issue:{asked.pk}", data={"request": str(asked.pk)},
+        )
+
+    @action(detail=True, methods=["post"], url_path="pigeon-decision")
+    def pigeon_decision(self, request, pk=None):
+        """The asker's manager approves, or turns down, keeping stock in the
+        project's pigeon hole. Body: {"request": id, "approve": bool, "note"}."""
+        from apps.inventory.models import IssuanceRequest
+
+        from .services import may_decide, pigeon_deciders
+
+        component = self.get_object()
+        asked = IssuanceRequest.objects.filter(
+            pk=request.data.get("request"), pigeon_component=component, status=IssuanceRequest.Status.APPROVAL,
+        ).select_related("project", "requested_by").first()
+        if asked is None:
+            return Response({"detail": "Nothing is waiting for approval here."}, status=400)
+        deciders = pigeon_deciders(asked)
+        if not may_decide(request.user, deciders):
+            names = ", ".join(
+                u.get_full_name() or u.username for u in deciders
+                if u.role != u.Role.SUPER_ADMIN and not u.is_superuser
+            )
+            return Response(
+                {"detail": "Approved above the person who asked for it" + (f" — {names}." if names else ".")},
+                status=403,
+            )
+        approve = request.data.get("approve") in (True, "true", "1", 1)
+        note = (request.data.get("note") or "").strip()
+        notices.resolve(f"pigeon:{asked.pk}")
+        if approve:
+            self._approve_pigeon(asked, request.user)
+        else:
+            asked.status = IssuanceRequest.Status.CANCELLED
+            asked.notes = ((asked.notes + "\n") if asked.notes else "") + (
+                f"Turned down by {notices.who(request.user)}" + (f": {note}" if note else "")
+            )
+            asked.save(update_fields=["status", "notes", "updated_at"])
+        if asked.requested_by_id:
+            project = asked.project
+            notices.tell(
+                [asked.requested_by], exclude=[request.user], kind="approval_decided",
+                title=f"Pigeon hole {'approved' if approve else 'turned down'}: {component.name}",
+                message=f"{asked.quantity_requested} · {asked.request_number}" + (f" — {note}" if note else ""),
+                link=f"/projects?project={project.pk}&tab=execution" if project else "/inventory?tab=requests",
+                data={"request": str(asked.pk)},
+            )
+        component = AssetComponent.objects.prefetch_related("pigeon_requests").get(pk=component.pk)
+        return Response(AssetComponentSerializer(component).data)
 
     @action(detail=True, methods=["post"], url_path="mark-for-procurement")
     def mark_for_procurement(self, request, pk=None):
