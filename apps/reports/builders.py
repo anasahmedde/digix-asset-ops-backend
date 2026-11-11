@@ -39,7 +39,7 @@ def report(key, *, title, group, description, capability, filters=("date",), dat
 
 
 NEVER_SET = {
-    "assets.Device": {"in_transit", "lost_stolen", "rma"},
+    "assets.Device": {"in_transit"},
     "tickets.Ticket": {
         "on_hold", "blocked", "alignment_pending", "pending_ops_approval",
         "pending_client_approval", "approved", "rejected",

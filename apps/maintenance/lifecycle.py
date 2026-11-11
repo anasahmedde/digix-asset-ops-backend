@@ -989,113 +989,42 @@ def pause_on_check_out(user, when):
             pause(visit, user=user, at=when, automatic=True, reason="Checked out")
 
 
+def _pause_pairs(visit):
+    return [(p.paused_at, p.resumed_at) for p in visit.pauses.order_by("paused_at")]
+
+
 def work_spells(visit: MaintenanceVisit):
     """Start work to Work done, less the pauses, cut day by day."""
-    from apps.attendance.sessions import split_days
+    from apps.attendance.worktime import work_spells as spells_of
 
-    if not visit.started_at or not visit.assigned_to_id:
-        return []
-    end = visit.completed_at
-    out, began = [], visit.started_at
-    for p in visit.pauses.order_by("paused_at"):
-        if p.paused_at > began:
-            out += split_days(visit.assigned_to_id, began, p.paused_at, began, p.paused_at)
-        if p.resumed_at is None:
-            return out
-        began = max(began, p.resumed_at)
-    stop = end or clock.now()
-    if stop > began:
-        out += split_days(visit.assigned_to_id, began, end, began, stop)
-    return out
+    return spells_of(visit.assigned_to_id, visit.started_at, visit.completed_at, _pause_pairs(visit))
 
 
 def time_on_site(visit: MaintenanceVisit):
-    """How long the technician and helpers were at the site for this visit.
+    """How long the technician and helpers were at the site for this visit:
+    from the asset scan (or the start of work) to Work done (see
+    attendance.worktime.crew_hours for the rules)."""
+    from apps.attendance.worktime import crew_hours
 
-    From their check-ins there, day by day, between the asset scan (or the
-    start of work) and Work done. A day nobody checked out of ends at the
-    last work they recorded that day, and is marked reckoned.
-    """
-    from apps.attendance.sessions import hours, spells
-
-    site = visit.schedule.site_id
-    begin = visit.asset_verified_at or visit.started_at
-    if not site or not begin:
-        return None
-    end = visit.completed_at or timezone.now()
-    # ponytail: two visits at one site in the same hours would each count
-    # them; split by asset if crews start doing several at once.
-    people = []
-    work = work_spells(visit) if visit.started_at else None
-    for person in [visit.assigned_to, *visit.helpers.all()]:
-        if person is None or any(p["id"] == str(person.pk) for p in people):
-            continue
-        # The technician's are the work itself, start to done less pauses.
-        # A helper's are their time checked in at the site while that work
-        # ran: not before it started, not while it was paused, not after.
-        lead = person.pk == visit.assigned_to_id
-        mine = spells(person.pk, site, begin, end)
-        found = mine if work is None else work if lead else _overlap(mine, work)
-        people.append({
-            "id": str(person.pk), "name": person.get_full_name() or person.username,
-            "lead": person.pk == visit.assigned_to_id, "hours": hours(found), "spells": found,
-        })
-    return {
-        "hours": round(sum(p["hours"] for p in people), 2),
-        "reckoned": any(s["reckoned"] for p in people for s in p["spells"]),
-        "people": people,
-    }
-
-
-def _overlap(a, b):
-    """The stretches in both lists of spells."""
-    out = []
-    for x in a:
-        for y in b:
-            f, t = max(x["from"], y["from"]), min(x["to"], y["to"])
-            if t > f:
-                out.append({"from": f, "to": t, "reckoned": x["reckoned"] or y["reckoned"]})
-    return sorted(out, key=lambda s: s["from"])
+    return crew_hours(
+        visit.assigned_to, list(visit.helpers.all()), visit.schedule.site_id,
+        visit.asset_verified_at or visit.started_at, visit.started_at, visit.completed_at, _pause_pairs(visit),
+    )
 
 
 def _labour_lines(record, visit, labour):
     """Man-hours at the reviewer's rate per hour: a line per person, since
-    the technician and each helper are paid at their own rate.
+    the technician and each helper are paid at their own rate."""
+    from apps.attendance.worktime import labour_rows
 
-    ``labour`` is {"people": [{"id", "hours", "rate"}]}, or the older
-    {"hours", "rate"} for the visit as one line. Hours left out are the
-    hours counted from the visit's times.
-    """
     from .models import MaintenanceCostLine
 
     if not labour:
         return []
-    spent = time_on_site(visit) or {}
-    found = {p["id"]: p for p in spent.get("people", [])}
-    rows = labour.get("people")
-    if rows is None:
-        rows = [{"hours": labour.get("hours"), "rate": labour.get("rate")}]
-    out = []
-    for row in rows:
-        who = found.get(str(row.get("id"))) if row.get("id") else None
-        counted = who["hours"] if who else (0 if row.get("id") else spent.get("hours", 0))
-        try:
-            rate = Decimal(str(row.get("rate") or 0))
-            given = row.get("hours")
-            hrs = Decimal(str(given if given not in (None, "") else counted))
-        except (InvalidOperation, TypeError):
-            raise ValidationError({"labour": ["Hours and the rate per hour are numbers."]})
-        if rate < 0 or hrs < 0:
-            raise ValidationError({"labour": ["Hours and the rate per hour are not negative."]})
-        if not rate or not hrs:
-            continue
-        hrs = hrs.quantize(Decimal("0.01"))
-        out.append(MaintenanceCostLine(
-            record=record, source=MaintenanceCostLine.Source.LABOUR,
-            description=f"Man-hours: {who['name'] + ', ' if who else ''}{hrs.normalize():f} h on site",
-            quantity=hrs, unit_cost=rate, amount=(hrs * rate).quantize(Decimal("0.01")),
-        ))
-    return out
+    return [
+        MaintenanceCostLine(record=record, source=MaintenanceCostLine.Source.LABOUR, **row)
+        for row in labour_rows(time_on_site(visit), labour)
+    ]
 
 
 def price_the_visit(record, visit: MaintenanceVisit, extra=None, prices=None, labour=None):
@@ -1113,20 +1042,12 @@ def price_the_visit(record, visit: MaintenanceVisit, extra=None, prices=None, la
         )
         for row in component_costs(visit, prices)
     ]
-    for row in extra or []:
-        what = str(row.get("description") or "").strip()
-        if not what:
-            raise ValidationError({"cost_lines": ["Every cost line needs a description."]})
-        try:
-            amount = Decimal(str(row.get("amount")))
-        except (InvalidOperation, TypeError):
-            raise ValidationError({"cost_lines": [f"{what}: say what it cost."]})
-        if amount < 0:
-            raise ValidationError({"cost_lines": [f"{what}: a cost is not negative."]})
-        lines.append(MaintenanceCostLine(
-            record=record, source=MaintenanceCostLine.Source.MANUAL,
-            description=what, amount=amount.quantize(Decimal("0.01")),
-        ))
+    from apps.attendance.worktime import manual_rows
+
+    lines += [
+        MaintenanceCostLine(record=record, source=MaintenanceCostLine.Source.MANUAL, **row)
+        for row in manual_rows(extra)
+    ]
     lines += _labour_lines(record, visit, labour)
     MaintenanceCostLine.objects.bulk_create(lines)
     record.cost = sum((x.amount for x in lines), Decimal("0.00"))

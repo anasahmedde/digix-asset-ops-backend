@@ -34,9 +34,9 @@ def _unit_of(component) -> str:
 def _source_of(component) -> str:
     """Where the line is drawn from — the stock row or unique product it names."""
     if component.inventory_unit_type_id:
-        return f"Unique · {component.inventory_unit_type}"
+        return f"Unique item · {component.inventory_unit_type}"
     if component.inventory_item_id:
-        return f"Stock · {component.inventory_item.sku}"
+        return f"Generic item · {component.inventory_item.sku}"
     return "Not linked to inventory"
 
 

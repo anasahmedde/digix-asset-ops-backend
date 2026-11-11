@@ -103,8 +103,6 @@ class Device(TimeStampedModel):
         UNDER_MAINTENANCE = "under_maintenance", "Under Maintenance"
         CLIENT_PROPERTY = "client_property", "Client Property"
         DECOMMISSIONED = "decommissioned", "Decommissioned"
-        LOST_STOLEN = "lost_stolen", "Lost/Stolen"
-        RMA = "rma", "RMA"
         IN_TRANSIT = "in_transit", "In Transit"
 
     class Source(models.TextChoices):
@@ -128,27 +126,24 @@ class Device(TimeStampedModel):
         # Assets are built here from inventory components, so a procured asset
         # goes to the production floor or straight to stock — never "in transit"
         # (that is a movement state for assets that already exist).
-        Status.PROCURED: (Status.IN_PRODUCTION, Status.IN_STOCK, Status.RMA),
-        Status.IN_PRODUCTION: (Status.IN_STOCK, Status.RMA),
+        Status.PROCURED: (Status.IN_PRODUCTION, Status.IN_STOCK),
+        Status.IN_PRODUCTION: (Status.IN_STOCK,),
         Status.IN_TRANSIT: (Status.IN_STOCK, Status.IN_PRODUCTION),
         Status.IN_STOCK: (
-            Status.ASSIGNED, Status.IN_TRANSIT,
-            Status.DECOMMISSIONED, Status.LOST_STOLEN,
+            Status.ASSIGNED, Status.IN_TRANSIT, Status.DECOMMISSIONED,
         ),
         Status.ASSIGNED: (Status.INSTALLED, Status.IN_STOCK, Status.IN_TRANSIT),
-        Status.INSTALLED: (Status.ACTIVE, Status.UNDER_MAINTENANCE, Status.RMA),
+        Status.INSTALLED: (Status.ACTIVE, Status.UNDER_MAINTENANCE),
         Status.ACTIVE: (
-            Status.UNDER_MAINTENANCE, Status.RMA, Status.CLIENT_PROPERTY,
-            Status.IN_TRANSIT, Status.DECOMMISSIONED, Status.LOST_STOLEN,
+            Status.UNDER_MAINTENANCE, Status.CLIENT_PROPERTY,
+            Status.IN_TRANSIT, Status.DECOMMISSIONED,
         ),
         # Servicing can end in a handover as readily as in a return to
         # service: the asset is put right and given to the client.
         Status.UNDER_MAINTENANCE: (
-            Status.ACTIVE, Status.RMA, Status.CLIENT_PROPERTY, Status.DECOMMISSIONED,
+            Status.ACTIVE, Status.CLIENT_PROPERTY, Status.DECOMMISSIONED,
         ),
-        Status.RMA: (Status.IN_STOCK, Status.DECOMMISSIONED),
         Status.CLIENT_PROPERTY: (Status.DECOMMISSIONED,),
-        Status.LOST_STOLEN: (Status.IN_STOCK,),
         Status.DECOMMISSIONED: (),
     }
 

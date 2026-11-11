@@ -642,6 +642,8 @@ def issue_against_request(request_row, user, quantity, *, received_by="", notes=
 
     if request_row.status == IssuanceRequest.Status.CANCELLED:
         raise serializers.ValidationError({"detail": "This request was cancelled."})
+    if request_row.status == IssuanceRequest.Status.APPROVAL:
+        raise serializers.ValidationError({"detail": "A manager has not approved keeping this in the pigeon hole yet."})
     if quantity < 1:
         raise serializers.ValidationError({"quantity": "Issue at least one."})
     if quantity > request_row.outstanding_quantity:

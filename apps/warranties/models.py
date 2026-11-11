@@ -99,10 +99,8 @@ class Warranty(TimeStampedModel):
         if self.status in (self.Status.REISSUED, self.Status.VOID, self.Status.CLAIMED):
             return self.status
         device = self.device
-        if device.status in (Device.Status.DECOMMISSIONED, Device.Status.LOST_STOLEN):
+        if device.status == Device.Status.DECOMMISSIONED:
             return "ended"
-        if device.status == Device.Status.RMA and self.warranty_type != self.WarrantyType.CLIENT:
-            return "claimed"
         today = timezone.localdate()
         if today > self.end_date:
             return "expired"

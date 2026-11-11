@@ -2103,3 +2103,58 @@ def test_a_step_is_complete_only_with_its_checklist_ticked_and_a_photo_of_the_wo
     assert c.patch(f"/api/sites/installation-steps/{second.id}/", {"status": "in_progress"}, format="json").status_code == 200
     # A finished step's checklist is the record of the work.
     assert c.patch(url, {"done": False}, format="json").status_code == 400
+
+
+@pytest.mark.django_db
+def test_an_installation_is_paused_paid_for_and_costed_like_a_maintenance_visit(ops, tech, installation):
+    """The installer pauses (and checking out pauses), records what they paid;
+    once the work is done the supervisor records the cost - purchases,
+    man-hours at a rate, anything else - and it becomes the asset's actual
+    installation cost. The installer does not price their own job."""
+    from decimal import Decimal
+
+    c = _client(tech)
+    url = f"/api/sites/installations/{installation.id}"
+    first = installation.steps.order_by("step_number").first()
+    assert c.post(f"{url}/pause/", {}, format="json").status_code == 400, "nothing started yet"
+    assert c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "in_progress"}, format="json").status_code == 200
+
+    r = c.post(f"{url}/pause/", {"reason": "Waiting for the bracket"}, format="json")
+    assert r.status_code == 200 and r.data["paused_since"], r.content
+    blocked = c.patch(f"/api/sites/installation-steps/{first.id}/", {"status": "completed"}, format="json")
+    assert blocked.status_code == 400 and "resume" in str(blocked.data).lower(), blocked.content
+    assert c.post(f"{url}/resume/", {}, format="json").status_code == 200
+
+    assert c.post("/api/attendance/records/", {"check_type": "check_out"}, format="json").status_code == 201
+    installation.refresh_from_db()
+    assert installation.pauses.filter(automatic=True, resumed_at__isnull=True).exists(), "checking out pauses it"
+    assert c.post(f"{url}/resume/", {}, format="json").status_code == 200
+
+    r = c.post("/api/sites/installation-purchases/", {
+        "installation": str(installation.id), "kind": "travel", "description": "Rickshaw", "amount": "500",
+    }, format="json")
+    assert r.status_code == 201, r.content
+    part = c.post("/api/sites/installation-purchases/", {
+        "installation": str(installation.id), "kind": "part", "description": "Bracket", "amount": "900",
+    }, format="json")
+    assert part.status_code == 400 and "receipt" in part.data, "a part needs its receipt and photo"
+
+    body = {"cost_lines": [{"description": "Crane", "amount": "1000"}],
+            "labour": {"people": [{"id": str(tech.id), "hours": "2", "rate": "500"}]}}
+    early = _client(ops).post(f"{url}/price/", body, format="json")
+    assert early.status_code == 400 and "not done" in str(early.data), early.content
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+    assert c.post(f"{url}/price/", body, format="json").status_code == 403, "not their own job"
+    r = _client(ops).post(f"{url}/price/", body, format="json")
+    assert r.status_code == 200, r.content
+    assert Decimal(r.data["cost"]) == Decimal("2500.00")
+    assert {l["source"] for l in r.data["cost_lines"]} == {"purchase", "manual", "labour"}
+    installation.device.refresh_from_db()
+    assert installation.device.actual_installation_cost == Decimal("2500.00")
+    assert _client(tech).get(f"{url}/").data["cost"] is None, "no prices for the technician"
+    late = c.post("/api/sites/installation-purchases/", {
+        "installation": str(installation.id), "kind": "travel", "description": "Fuel", "amount": "100",
+    }, format="json")
+    assert late.status_code == 400, "settled once the cost is recorded"

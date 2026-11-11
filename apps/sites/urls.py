@@ -5,6 +5,7 @@ from .views import (
     DeviceInstallationViewSet,
     InstallationDelayViewSet,
     InstallationPhotoViewSet,
+    InstallationPurchaseViewSet,
     InstallationStepViewSet,
     SiteContactViewSet,
     SiteViewSet,
@@ -19,6 +20,7 @@ router.register("installations", DeviceInstallationViewSet)
 router.register("installation-steps", InstallationStepViewSet)
 router.register("installation-photos", InstallationPhotoViewSet)
 router.register("installation-delays", InstallationDelayViewSet)
+router.register("installation-purchases", InstallationPurchaseViewSet)
 
 urlpatterns = [
     path("", include(router.urls)),

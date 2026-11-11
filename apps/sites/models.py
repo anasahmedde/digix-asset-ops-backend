@@ -116,12 +116,86 @@ class DeviceInstallation(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="installations_verified",
     )
+    # What the installation cost, recorded by the installer's supervisor once
+    # the work is done: what the crew paid, man-hours, anything else. It is
+    # the asset's actual installation cost.
+    cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    cost_recorded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installation_costs_recorded",
+    )
+    cost_recorded_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-installed_at"]
 
     def __str__(self):
         return f"{self.device.asset_code} @ {self.site.name}"
+
+
+class InstallationPause(TimeStampedModel):
+    """Work on an installation stopped for now - overnight, waiting on
+    something. The paused time is not counted in the man-hours."""
+
+    installation = models.ForeignKey(DeviceInstallation, on_delete=models.CASCADE, related_name="pauses")
+    paused_at = models.DateTimeField()
+    resumed_at = models.DateTimeField(null=True, blank=True)
+    paused_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="+",
+    )
+    # Paused by checking out with the work still going, not by the button.
+    automatic = models.BooleanField(default=False)
+    reason = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ["paused_at"]
+
+
+class InstallationPurchase(TimeStampedModel):
+    """A cost of the installation the crew paid: a part bought on site (with
+    the receipt and a photo), or travel, labour, hire or another expense.
+    The same kinds as a maintenance visit."""
+
+    class Kind(models.TextChoices):
+        PART = "part", "Part bought"
+        TRAVEL = "travel", "Travel & fuel"
+        LABOUR = "labour", "Labour"
+        HIRE = "hire", "Equipment hire"
+        OTHER = "other", "Other expense"
+
+    installation = models.ForeignKey(DeviceInstallation, on_delete=models.CASCADE, related_name="purchases")
+    kind = models.CharField(max_length=10, choices=Kind.choices, default=Kind.PART)
+    description = models.CharField(max_length=255)
+    quantity = models.PositiveIntegerField(default=1)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    shop = models.CharField(max_length=200, blank=True)
+    receipt = models.FileField(upload_to="installations/purchases/receipts/", blank=True)
+    photo = models.ImageField(upload_to="installations/purchases/photos/", blank=True)
+    bought_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="installation_purchases",
+    )
+
+    class Meta:
+        ordering = ["created_at"]
+
+
+class InstallationCostLine(TimeStampedModel):
+    """One line of what an installation cost, as recorded."""
+
+    class Source(models.TextChoices):
+        PURCHASE = "purchase", "Paid by the technician"
+        MANUAL = "manual", "Added when recorded"
+        LABOUR = "labour", "Labour"
+
+    installation = models.ForeignKey(DeviceInstallation, on_delete=models.CASCADE, related_name="cost_lines")
+    source = models.CharField(max_length=10, choices=Source.choices)
+    description = models.CharField(max_length=255)
+    quantity = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    unit_cost = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+
+    class Meta:
+        ordering = ["source", "created_at"]
 
 
 class InstallationStep(TimeStampedModel):
