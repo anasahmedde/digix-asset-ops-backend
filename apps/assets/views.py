@@ -199,11 +199,10 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         if flag == "operational":
             qs = qs.filter(status__in=[Device.Status.ACTIVE, Device.Status.INSTALLED])
         elif flag == "pipeline":
-            # In production, as the dashboard counts it: bought, being built,
-            # in stock or assigned - everything before it is installed.
+            # In production, as the dashboard counts it: bought or being built -
+            # everything before it is in stock, ready to install.
             qs = qs.filter(status__in=[
                 Device.Status.PROCURED, Device.Status.IN_TRANSIT, Device.Status.IN_PRODUCTION,
-                Device.Status.IN_STOCK, Device.Status.ASSIGNED,
             ])
         elif flag == "warranty_expired":
             qs = (
