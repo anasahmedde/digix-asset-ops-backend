@@ -360,7 +360,7 @@ def build_actuals(project):
         "components__inventory_item__material_type",
         "components__inventory_unit_type",
         "components__purchase_order_item__purchase_order",
-        "production_steps", "work_orders",
+        "production_steps", "work_orders", "installations",
     )
     for device in devices:
         lines = []
@@ -480,6 +480,10 @@ def build_actuals(project):
             "source": device.source,
             "vendor_asset": vendor_asset,
             "installation_actual": install,
+            # The installation it is finalized on, to open from the project.
+            "installation_id": next((str(i.pk) for i in sorted(
+                device.installations.all(), key=lambda i: i.installed_at, reverse=True)), None),
+            "installation_finalized": any(i.cost is not None for i in device.installations.all()),
             "installation_planned": (
                 None if device.planned_installation_cost is None else money(device.planned_installation_cost)
             ),

@@ -2147,12 +2147,23 @@ def test_an_installation_is_paused_paid_for_and_costed_like_a_maintenance_visit(
         step.status = InstallationStep.StepStatus.COMPLETED
         step.save()
     assert c.post(f"{url}/price/", body, format="json").status_code == 403, "not their own job"
+    # The work done, whoever may hand installations over is asked to finalize
+    # the cost; the ask is cleared once it is.
+    from apps.notifications.models import Notification
+
+    waiting = Notification.objects.filter(ref=f"inst-cost:{installation.id}", resolved_at__isnull=True)
+    assert waiting.exists() and "Finalize installation cost" in waiting.first().title
     r = _client(ops).post(f"{url}/price/", body, format="json")
     assert r.status_code == 200, r.content
     assert Decimal(r.data["cost"]) == Decimal("2500.00")
     assert {l["source"] for l in r.data["cost_lines"]} == {"purchase", "manual", "labour"}
+    assert not waiting.exists()
     installation.device.refresh_from_db()
     assert installation.device.actual_installation_cost == Decimal("2500.00")
+    # It is the asset's installation cost on the project: nobody types it in.
+    typed = _client(ops).patch(f"/api/assets/devices/{installation.device_id}/", {"actual_installation_cost": "99"}, format="json")
+    installation.device.refresh_from_db()
+    assert typed.status_code == 200 and installation.device.actual_installation_cost == Decimal("2500.00"), typed.content
     assert _client(tech).get(f"{url}/").data["cost"] is None, "no prices for the technician"
     late = c.post("/api/sites/installation-purchases/", {
         "installation": str(installation.id), "kind": "travel", "description": "Fuel", "amount": "100",

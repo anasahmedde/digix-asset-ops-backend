@@ -157,5 +157,25 @@ def record_cost(inst, *, user, extra=None, labour=None):
     inst.cost, inst.cost_recorded_by, inst.cost_recorded_at = total, user, clock.now()
     inst.save(update_fields=["cost", "cost_recorded_by", "cost_recorded_at", "updated_at"])
     Device.objects.filter(pk=inst.device_id).update(actual_installation_cost=total)
-    activity.log(inst, "cost_recorded", f"Installation cost recorded: PKR {total:,.2f}", user=user)
+    activity.log(inst, "cost_recorded", f"Installation cost finalized: PKR {total:,.2f}", user=user)
+    from apps.notifications import service as notices
+
+    notices.resolve(f"inst-cost:{inst.pk}")
     return total
+
+
+def ask_to_finalize(inst, actor=None):
+    """The work is done: the installer's supervisor is asked to finalize the
+    cost - travel, transport, anything else - once, until it is done."""
+    from apps.notifications import service as notices
+    from apps.notifications.models import Notification
+
+    ref = f"inst-cost:{inst.pk}"
+    if inst.cost is not None or Notification.objects.filter(ref=ref, resolved_at__isnull=True).exists():
+        return
+    notices.ask(
+        "close_installation", scope_to=inst.installed_by, exclude=[actor] if actor else (),
+        title=f"Finalize installation cost: {inst.device.asset_code}",
+        message=f"{inst.site.name} · installed by {activity.name(inst.installed_by) if inst.installed_by else 'the vendor'}",
+        link=f"/installation-tracker?installation={inst.pk}", ref=ref, data={"installation": str(inst.pk)},
+    )

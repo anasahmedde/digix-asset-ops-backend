@@ -784,7 +784,9 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
             "route_template_available", "component_template_available",
             "notes", "lifecycle_events", "stage_dates", "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "asset_code", "status", "created_at", "updated_at"]
+        # The actual installation cost is what the supervisor finalized on the
+        # installation (sites.work.record_cost), never typed in by hand.
+        read_only_fields = ["id", "asset_code", "status", "created_at", "updated_at", "actual_installation_cost"]
 
     def create(self, validated_data):
         months = validated_data.pop("client_warranty_months", None)
