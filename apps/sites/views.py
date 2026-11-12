@@ -717,6 +717,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
         installation._prefetched_objects_cache = {}
         self._tell_the_project(installation, user, f"{device.asset_code} is live")
         activity.log(installation, "activated", f"{device.asset_code} marked Active, with a photo of it running", user=user)
+        work.ask_to_finalize(installation, user)
         return Response(
             DeviceInstallationDetailSerializer(installation, context=self.get_serializer_context()).data
         )
