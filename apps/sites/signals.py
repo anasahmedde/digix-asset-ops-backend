@@ -152,6 +152,9 @@ def stamp_installation_completion(sender, instance: InstallationStep, **kwargs):
         installation.save(update_fields=["completed_at", "updated_at"])
         _anchor_client_warranties(installation)
         _mark_device_installed(installation)
+        from .work import ask_to_finalize
+
+        ask_to_finalize(installation)
     elif not done and installation.completed_at is not None:
         installation.completed_at = None
         installation.save(update_fields=["completed_at", "updated_at"])
