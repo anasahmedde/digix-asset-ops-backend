@@ -18,17 +18,17 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     # The sidebar hid the link and nothing else did — typing the URL worked.
     read_capability = "view_finance"
     write_capability = "manage_finance"
-    action_capabilities = {"approve": "approve_invoice"}
+    action_capabilities = {"approve": "approve_invoice", "print_pdf": "view_finance"}
     queryset = (
         Invoice.objects.select_related(
-            "client", "supplier", "purchase_order", "created_by", "approved_by"
+            "client", "supplier", "purchase_order", "quotation", "created_by", "approved_by"
         )
         .prefetch_related("payments")
         .all()
     )
     serializer_class = InvoiceSerializer
     permission_classes = [IsAuthenticated, CapabilityGate]
-    filterset_fields = ["invoice_type", "status", "client", "supplier"]
+    filterset_fields = ["invoice_type", "status", "client", "supplier", "quotation"]
     search_fields = ["invoice_number"]
     ordering_fields = ["issue_date", "due_date", "total_amount"]
 
@@ -51,6 +51,17 @@ class InvoiceViewSet(viewsets.ModelViewSet):
         invoice.approved_at = timezone.now()
         invoice.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
         return Response(self.get_serializer(invoice).data)
+
+    @action(detail=True, methods=["get"], url_path="print")
+    def print_pdf(self, request, pk=None):
+        from django.http import HttpResponse
+
+        from .pdf import build_invoice_pdf
+
+        invoice = self.get_object()
+        response = HttpResponse(build_invoice_pdf(invoice), content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{invoice.invoice_number}.pdf"'
+        return response
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
@@ -138,7 +149,7 @@ class FinancialViewSet(viewsets.ViewSet):
 
     def receivables(self, request):
         rows = ledger.receivables()
-        return Response({"rows": rows, "totals": _plain(ledger.totals(rows))})
+        return Response({"rows": rows, "totals": _plain(ledger.totals(rows)), "uninvoiced": ledger.uninvoiced()})
 
     def inventory(self, request):
         return Response(ledger.inventory())

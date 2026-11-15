@@ -56,6 +56,7 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
     client_name = serializers.CharField(source="client.name", read_only=True, default=None)
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     approved_by_name = serializers.CharField(source="approved_by.get_full_name", read_only=True, default=None)
+    quote_number = serializers.CharField(source="quotation.quote_number", read_only=True, default=None)
     balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     payments = PaymentSerializer(many=True, read_only=True)
 
@@ -64,7 +65,8 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
         fields = [
             "id", "invoice_number", "invoice_type", "status", "currency",
             "client", "client_name", "supplier", "supplier_name",
-            "purchase_order", "amount", "tax_amount", "total_amount",
+            "purchase_order", "quotation", "quote_number", "description",
+            "amount", "tax_amount", "total_amount",
             "issue_date", "due_date", "paid_amount", "notes",
             "created_by", "approved_by", "approved_by_name", "approved_at",
             "balance_due", "payments",
@@ -76,6 +78,9 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
             "id", "status", "total_amount", "paid_amount", "created_by",
             "approved_by", "approved_at", "created_at", "updated_at",
         ]
+        # Client invoices are what is raised here; a supplier's bill is the
+        # purchase order it was ordered on.
+        extra_kwargs = {"invoice_type": {"required": False}}
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -83,6 +88,11 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
             changed = set(attrs) - {"notes"}
             if changed:
                 raise serializers.ValidationError({"detail": "An approved invoice can no longer be changed; only its notes."})
+        if self.instance is None:
+            attrs.setdefault("invoice_type", Invoice.InvoiceType.RECEIVABLE)
+        quotation = attrs.get("quotation", getattr(self.instance, "quotation", None))
+        if quotation is not None:
+            self._bill_quotation(quotation, attrs)
         kind = attrs.get("invoice_type", getattr(self.instance, "invoice_type", Invoice.InvoiceType.RECEIVABLE))
         if kind == Invoice.InvoiceType.RECEIVABLE and not attrs.get("client", getattr(self.instance, "client", None)):
             raise serializers.ValidationError({"client": "Choose the client this invoice is raised to."})
@@ -91,3 +101,20 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
         if amount is not None:
             attrs["total_amount"] = Decimal(amount) + Decimal(tax)
         return attrs
+
+    def _bill_quotation(self, quotation, attrs):
+        """An invoice raised from a quotation bills its client, in its
+        currency, and never more than is left of it to invoice."""
+        from apps.quotations.models import Quotation
+
+        from .ledger import quotation_billing
+
+        if quotation.status != Quotation.Status.ACCEPTED:
+            raise serializers.ValidationError({"quotation": "Invoices are raised only against an accepted quotation."})
+        attrs["invoice_type"] = Invoice.InvoiceType.RECEIVABLE
+        attrs["client"] = quotation.client
+        attrs["currency"] = quotation.currency
+        amount = attrs.get("amount", getattr(self.instance, "amount", None))
+        left = quotation_billing(quotation, exclude=self.instance)["to_invoice"]
+        if amount is not None and Decimal(amount) > left:
+            raise serializers.ValidationError({"amount": f"Only {quotation.currency} {left:,.2f} of this quotation is left to invoice."})

@@ -43,6 +43,14 @@ class Invoice(TimeStampedModel):
     purchase_order = models.ForeignKey(
         "procurement.PurchaseOrder", on_delete=models.SET_NULL, null=True, blank=True, related_name="invoices"
     )
+    # The accepted quotation this invoice bills. A client is invoiced for
+    # what was quoted, in parts (an advance, milestones, the final) or whole;
+    # the parts never add up to more than the quotation.
+    quotation = models.ForeignKey(
+        "quotations.Quotation", on_delete=models.PROTECT, null=True, blank=True, related_name="invoices"
+    )
+    # What this invoice is for, printed on it: "30% advance", "Final".
+    description = models.CharField(max_length=200, blank=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     tax_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     total_amount = models.DecimalField(max_digits=12, decimal_places=2)

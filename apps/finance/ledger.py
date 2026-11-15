@@ -122,15 +122,47 @@ def receivable_invoices():
     )
 
 
+def quotation_billing(quotation, exclude=None) -> dict:
+    """How much of an accepted quotation has been invoiced, received, and is
+    left to invoice. Cancelled invoices bill nothing; tax is on top."""
+    invoices = [
+        i for i in quotation.invoices.all()
+        if i.status != Invoice.Status.CANCELLED and (exclude is None or i.pk != exclude.pk)
+    ]
+    invoiced = money(sum((i.amount for i in invoices), ZERO))
+    received = money(sum((p.amount for i in invoices for p in i.payments.all()), ZERO))
+    total = money(quotation.total_amount)
+    return {
+        "quoted": total, "invoiced": invoiced, "received": received,
+        "to_invoice": max(total - invoiced, ZERO), "invoices": len(invoices),
+    }
+
+
+def uninvoiced() -> dict:
+    """Per currency: what accepted quotations are worth that has not been
+    invoiced yet. It becomes a receivable once invoiced and approved."""
+    from apps.quotations.models import Quotation
+
+    out = defaultdict(lambda: {"amount": ZERO, "quotations": 0})
+    for q in Quotation.objects.filter(status=Quotation.Status.ACCEPTED).prefetch_related("invoices__payments"):
+        left = quotation_billing(q)["to_invoice"]
+        if left > 0:
+            out[q.currency]["amount"] += left
+            out[q.currency]["quotations"] += 1
+    return dict(out)
+
+
 def receivables(today=None) -> list[dict]:
     today = today or timezone.localdate()
     rows = []
-    for inv in receivable_invoices():
+    for inv in receivable_invoices().select_related("quotation"):
         row = _row(inv.total_amount, inv.payments.all(), inv.due_date, today)
         row.update(
             id=str(inv.id), number=inv.invoice_number, party=inv.client.name if inv.client_id else "",
             currency=inv.currency, status=inv.status, status_display=inv.get_status_display(),
-            date=inv.issue_date, due_date_set=True, terms="",
+            date=inv.issue_date, due_date_set=True, terms="", description=inv.description,
+            quotation=str(inv.quotation_id) if inv.quotation_id else None,
+            quote_number=inv.quotation.quote_number if inv.quotation_id else None,
         )
         rows.append(row)
     return rows
