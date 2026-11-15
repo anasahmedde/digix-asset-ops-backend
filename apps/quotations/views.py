@@ -50,7 +50,7 @@ class QuotationViewSet(viewsets.ModelViewSet):
         Quotation.objects.select_related("client", "site", "created_by")
         .prefetch_related(
             "items", "items__asset_type", "items__device_model", "items__material_type",
-            "spawned_projects",
+            "spawned_projects", "invoices__payments",
         )
         .all()
     )

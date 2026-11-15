@@ -214,6 +214,8 @@ CAPABILITIES: tuple[Capability, ...] = (
        "Invoices raised and received, and what has been paid.", "view"),
     _c("manage_finance", "Record invoices and payments", "Finance",
        "Raise invoices and record payments against them."),
+    _c("approve_invoice", "Approve client invoices", "Finance",
+       "Sign a client invoice off - from then on it is money owed to the company.", "approve", True),
 
     # --- People --------------------------------------------------------------
     _c("view_attendance", "See attendance", "People",
@@ -297,7 +299,7 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
     # Runs assets, projects, sites, procurement and maintenance; the three
     # signatures (budget, PO, WO) and logins stay above.
     "ops_manager": ALL_KEYS - _keys(
-        "approve_budget", "approve_po", "approve_work_order", "manage_logins", "use_field_app",
+        "approve_budget", "approve_po", "approve_work_order", "approve_invoice", "manage_logins", "use_field_app",
         "manage_quotations", "view_client_warranties", "manage_client_warranties",
         "record_client_warranty", "inspect_goods", "receive_goods", "view_all_attendance",
     ),
@@ -405,6 +407,7 @@ REQUIRES: dict[str, tuple[str, ...]] = {
     "view_all_attendance": ("view_attendance",),
     "view_finance": ("view_prices",),
     "manage_finance": ("view_prices",),
+    "approve_invoice": ("view_finance", "view_prices"),
 }
 
 

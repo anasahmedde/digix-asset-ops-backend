@@ -196,6 +196,16 @@ class Device(TimeStampedModel):
     diagonal_inches = models.DecimalField(max_digits=5, decimal_places=1, null=True, blank=True)
 
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROCURED)
+
+    class HeldAs(models.TextChoices):
+        """What an asset in stock is being kept for. It is all inventory in
+        hand; Finance counts each kind under its own heading."""
+
+        STOCK = "stock", "Finished product"
+        OFFICE_DISPLAY = "office_display", "Office display"
+        FOC_SAMPLE = "foc_sample", "FOC sample"
+
+    held_as = models.CharField(max_length=20, choices=HeldAs.choices, default=HeldAs.STOCK)
     # Registration origin: built in-house or bought from a third party (WF-05).
     source = models.CharField(
         max_length=20, choices=Source.choices, default=Source.INHOUSE, db_index=True

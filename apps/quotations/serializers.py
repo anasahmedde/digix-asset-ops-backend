@@ -51,6 +51,7 @@ class QuotationSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     created_by_name = serializers.CharField(source="created_by.get_full_name", read_only=True, default=None)
     spawned_project = serializers.SerializerMethodField()
+    billing = serializers.SerializerMethodField()
 
     class Meta:
         model = Quotation
@@ -60,12 +61,23 @@ class QuotationSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
             "client", "client_name", "site", "site_name",
             "currency", "valid_until", "total_amount", "notes",
             "items", "created_by", "created_by_name",
-            "accepted_at", "spawned_project", "created_at", "updated_at",
+            "accepted_at", "spawned_project", "billing", "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "quote_number", "status", "total_amount", "created_by",
             "accepted_at", "created_at", "updated_at",
         ]
+
+    def get_billing(self, obj):
+        """How much of an accepted quotation is invoiced and received, for
+        whoever may see the finance figures."""
+        from apps.finance.ledger import quotation_billing
+        from common.permissions import can
+
+        request = self.context.get("request")
+        if obj.status != obj.Status.ACCEPTED or not (request and can(request.user, "view_finance")):
+            return None
+        return quotation_billing(obj)
 
     def get_spawned_project(self, obj):
         project = obj.spawned_projects.first()
