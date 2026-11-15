@@ -57,6 +57,9 @@ class PurchaseOrder(TimeStampedModel):
     # past. Printed on the order the supplier receives, where no catalogue term
     # is picked.
     payment_terms_note = models.CharField(max_length=200, blank=True)
+    # When the supplier is to be paid in full. Left blank, Finance reads it
+    # off the order date and the payment terms' days.
+    payment_due_date = models.DateField(null=True, blank=True)
     ordered_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="purchase_orders"
     )

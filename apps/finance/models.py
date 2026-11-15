@@ -12,6 +12,9 @@ class Invoice(TimeStampedModel):
 
     class Status(models.TextChoices):
         DRAFT = "draft", "Draft"
+        # Signed off: from here the invoice is money owed to the company and
+        # counts as a receivable.
+        APPROVED = "approved", "Approved"
         SENT = "sent", "Sent"
         PARTIALLY_PAID = "partially_paid", "Partially Paid"
         PAID = "paid", "Paid"
@@ -50,6 +53,10 @@ class Invoice(TimeStampedModel):
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="created_invoices"
     )
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="approved_invoices"
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-issue_date"]
@@ -68,6 +75,16 @@ class Invoice(TimeStampedModel):
 
 
 class Payment(TimeStampedModel):
+    """Money that moved against an invoice (received from a client) or a
+    purchase order (paid to a supplier). One ledger for both sides, so the
+    Financial dashboard adds up one table."""
+
+    class Kind(models.TextChoices):
+        # Paid ahead of the goods or the work; listed apart from the
+        # payments that follow it.
+        ADVANCE = "advance", "Advance"
+        PAYMENT = "payment", "Payment"
+
     class Method(models.TextChoices):
         BANK_TRANSFER = "bank_transfer", "Bank Transfer"
         CHEQUE = "cheque", "Cheque"
@@ -75,7 +92,11 @@ class Payment(TimeStampedModel):
         CREDIT_CARD = "credit_card", "Credit Card"
         OTHER = "other", "Other"
 
-    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="payments")
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, null=True, blank=True, related_name="payments")
+    purchase_order = models.ForeignKey(
+        "procurement.PurchaseOrder", on_delete=models.CASCADE, null=True, blank=True, related_name="payments"
+    )
+    kind = models.CharField(max_length=10, choices=Kind.choices, default=Kind.PAYMENT)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     payment_date = models.DateField()
     method = models.CharField(max_length=15, choices=Method.choices, default=Method.BANK_TRANSFER)
@@ -87,6 +108,16 @@ class Payment(TimeStampedModel):
 
     class Meta:
         ordering = ["-payment_date"]
+        constraints = [
+            models.CheckConstraint(
+                name="payment_against_one_document",
+                condition=(
+                    models.Q(invoice__isnull=False, purchase_order__isnull=True)
+                    | models.Q(invoice__isnull=True, purchase_order__isnull=False)
+                ),
+            ),
+        ]
 
     def __str__(self):
-        return f"Payment {self.amount} for {self.invoice.invoice_number}"
+        against = self.invoice.invoice_number if self.invoice_id else self.purchase_order.po_number
+        return f"Payment {self.amount} for {against}"
