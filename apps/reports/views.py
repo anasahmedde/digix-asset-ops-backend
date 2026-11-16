@@ -7,11 +7,12 @@ from rest_framework.views import APIView
 from common.exports import log_export
 from common.permissions import can, can_for_project
 
-from .builders import ALIASES, REPORTS, ROW_LIMIT, status_options
+from .builders import ALIASES, REPORTS, ROW_LIMIT, choice_options, status_options
 from .xlsx import ReportBook
 
 FILTER_KEYS = ("date_from", "date_to", "status", "priority", "category", "project", "site",
-               "technician", "group_by", "low_stock")
+               "technician", "group_by", "low_stock", "client", "vendor", "warranty", "install_status",
+               "project_type", "maintenance_type", "issue_type", "kind")
 
 
 def _allowed(user, meta) -> bool:
@@ -25,7 +26,8 @@ class ReportCatalogView(APIView):
 
     def get(self, request):
         reports = [
-            {k: v for k, v in meta.items() if k not in ("build", "capability")} | {"statuses": status_options(meta)}
+            {k: v for k, v in meta.items() if k not in ("build", "capability")}
+            | {"statuses": status_options(meta), "choices": choice_options(meta)}
             for meta in REPORTS.values() if _allowed(request.user, meta)
         ]
         return Response({
@@ -75,6 +77,18 @@ def _describe(meta, filters) -> str:
     for k in ("status", "priority", "group_by"):
         if filters.get(k):
             parts.append(f"{k.replace('_', ' ').capitalize()}: {filters[k].replace('_', ' ')}")
+    # The report's own drop-downs, by the label the person picked.
+    for c in choice_options(meta):
+        picked = filters.get(c["key"])
+        if picked:
+            label = next((o["label"] for o in c["options"] if o["value"] == picked), picked)
+            parts.append(f"{c['label']}: {label}")
+    for k, model in (("client", "clients.Client"), ("vendor", "suppliers.Supplier")):
+        if filters.get(k):
+            from django.apps import apps
+
+            found = apps.get_model(model).objects.filter(pk=filters[k]).values_list("name", flat=True).first()
+            parts.append(f"{k.capitalize()}: {found or filters[k]}")
     if filters.get("low_stock") == "true":
         parts.append("Low stock only")
     return " · ".join(parts) or "All records"
