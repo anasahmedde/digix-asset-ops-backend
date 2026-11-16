@@ -18,6 +18,9 @@ class Project(TimeStampedModel):
     class ContractType(models.TextChoices):
         SOLD = "sold", "Sold Outright"
         RENTAL = "rental", "Rental"
+        # Units sent out as samples: given free of charge, or sold to the client.
+        SAMPLE_FOC = "sample_foc", "Sample (FOC)"
+        SAMPLE_PAID = "sample_paid", "Sample (Paid)"
 
     class Phase(models.TextChoices):
         """How far a client order has got, in the steps the work actually takes.
@@ -53,8 +56,8 @@ class Project(TimeStampedModel):
     # primary for older screens; this is the full list.
     sites = models.ManyToManyField("sites.Site", blank=True, related_name="scoped_projects")
     contract_type = models.CharField(
-        max_length=10, choices=ContractType.choices, blank=True, default="",
-        help_text="Whether the project is sold outright or rented",
+        max_length=15, choices=ContractType.choices, blank=True, default="",
+        help_text="Whether the project is sold outright, rented, or a sample (FOC or paid)",
     )
     rental_end_date = models.DateField(null=True, blank=True)
     # The cover the contract promises the client on every asset, in months

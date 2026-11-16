@@ -26,16 +26,81 @@ ROW_LIMIT = 5000
 REPORTS: dict[str, dict] = {}
 
 
-def report(key, *, title, group, description, capability, filters=("date",), date_label="Created", statuses=()):
+def report(key, *, title, group, description, capability, filters=("date",), date_label="Created", statuses=(), choices=()):
     def register(fn):
         REPORTS[key] = {
             "key": key, "title": title, "group": group, "description": description,
             "capability": capability, "filters": list(filters), "date_label": date_label,
             # "app.Model": its Status choices, read when the catalogue is.
-            "statuses": statuses, "build": fn,
+            "statuses": statuses,
+            # Drop-down filters of the report's own, as (key, label, options):
+            # options is a list of (value, label) or a function returning one.
+            "choices": choices, "build": fn,
         }
         return fn
     return register
+
+
+def choice_options(meta):
+    """The report's own drop-downs, with their options read now."""
+    return [
+        {"key": k, "label": label, "options": [{"value": v, "label": str(t)} for v, t in (opts() if callable(opts) else opts)]}
+        for k, label, opts in meta["choices"]
+    ]
+
+
+def _client_q(f, *paths):
+    """Records belonging to the chosen client by any of the given routes."""
+    q = Q()
+    for p in paths:
+        q |= Q(**{f"{p}_id": f["client"]})
+    return q
+
+
+# ── Options for the drop-downs ─────────────────────────────────────────────
+
+WARRANTY_STATES = [("active", "Active"), ("reissued", "Reissued"), ("inactive", "Inactive (expired or void)"), ("none", "No warranty")]
+
+
+def _install_states():
+    from apps.sites.serializers import HEALTH_LABELS
+
+    return list(HEALTH_LABELS.items()) + [("removed", "Removed")]
+
+
+def _project_types():
+    from apps.teams.models import Project
+
+    types = list(Project.ContractType.choices)
+    # Both kinds of sample together, ahead of each one on its own.
+    return types[:2] + [("sample", "Sample (FOC and Paid)")] + types[2:]
+
+
+def _maintenance_types():
+    from apps.maintenance.models import MaintenanceSchedule
+
+    return MaintenanceSchedule.MaintenanceType.choices
+
+
+def _issue_types():
+    from apps.tickets.models import TicketIssueType
+
+    return [(str(i.id), i.name) for i in TicketIssueType.objects.order_by("sort_order", "name")]
+
+
+def _ticket_categories():
+    from apps.tickets.models import Ticket
+
+    return Ticket.Category.choices
+
+
+INVENTORY_KINDS = [("generic", "Generic components"), ("unique", "Unique components"), ("pigeon_hole", "Pigeon hole")]
+
+
+def _inventory_categories():
+    from apps.inventory.models import InventoryCategory
+
+    return [(str(c.id), c.name) for c in InventoryCategory.objects.order_by("name")]
 
 
 NEVER_SET = {
@@ -98,8 +163,8 @@ def _money(v):
 
 @report("assets", title="Asset Register", group="Assets", capability="view_assets",
         description="Every asset with its type, source, status, project and where it stands, when it went in, and what it has cost to date.",
-        filters=("date", "status", "project", "site"), date_label="Registered",
-        statuses="assets.Device")
+        filters=("date", "status", "client", "project", "site", "technician"), date_label="Registered",
+        statuses="assets.Device", choices=(("warranty", "Warranty", WARRANTY_STATES),))
 def assets_report(request, f):
     from apps.assets.models import Device
 
@@ -108,10 +173,21 @@ def assets_report(request, f):
     ).prefetch_related("project_scope_items__project", "components__inventory_unit"), f)
     if f.get("status"):
         qs = qs.filter(status=f["status"])
+    if f.get("client"):
+        qs = qs.filter(_client_q(f, "assigned_client", "project__client", "project_scope_items__project__client", "current_site__client")).distinct()
     if f.get("project"):
         qs = qs.filter(Q(project_id=f["project"]) | Q(project_scope_items__project_id=f["project"])).distinct()
     if f.get("site"):
         qs = qs.filter(current_site_id=f["site"])
+    if f.get("technician"):
+        qs = qs.filter(Q(installations__installed_by_id=f["technician"]) | Q(installations__helpers=f["technician"])).distinct()
+    warranty = f.get("warranty")
+    if warranty == "none":
+        qs = qs.filter(warranties__isnull=True)
+    elif warranty == "inactive":
+        qs = qs.filter(warranties__status__in=("expired", "void")).distinct()
+    elif warranty in ("active", "reissued"):
+        qs = qs.filter(warranties__status=warranty).distinct()
     prices = can(request.user, "view_prices")
     devices = list(qs.order_by("asset_code")[:ROW_LIMIT])
     rows = [{
@@ -198,7 +274,8 @@ def _asset_costs(devices, rows):
 
 @report("installations", title="Installation Register", group="Assets", capability="view_installations",
         description="Where each asset was installed: site, crew, booked and due dates, first check-in, completion and handover.",
-        filters=("date", "project", "site"), date_label="Booked")
+        filters=("date", "client", "project", "site", "technician"), date_label="Booked",
+        choices=(("install_status", "Status", _install_states),))
 def installations_report(request, f):
     from apps.sites.activity import presence_rows
     from apps.sites.models import DeviceInstallation
@@ -206,15 +283,24 @@ def installations_report(request, f):
 
     qs = _dated(DeviceInstallation.objects.select_related(
         "device", "device__project", "site", "zone", "installed_by", "vendor", "handover",
-    ).prefetch_related("helpers", "device__project_scope_items__project"), f, "installed_at")
+    ).prefetch_related("helpers", "device__project_scope_items__project", "steps", "delays"), f, "installed_at")
+    if f.get("client"):
+        qs = qs.filter(_client_q(f, "site__client", "device__project__client", "device__project_scope_items__project__client")).distinct()
     if f.get("project"):
         qs = qs.filter(Q(device__project_id=f["project"]) | Q(device__project_scope_items__project_id=f["project"])).distinct()
     if f.get("site"):
         qs = qs.filter(site_id=f["site"])
-    jobs = list(qs.order_by("-installed_at")[:ROW_LIMIT])
-    rows, health = [], Counter()
-    for inst in jobs:
+    if f.get("technician"):
+        qs = qs.filter(Q(installed_by_id=f["technician"]) | Q(helpers=f["technician"])).distinct()
+    jobs, rows, health = [], [], Counter()
+    for inst in qs.order_by("-installed_at")[:ROW_LIMIT]:
         key, label, _ = _health(inst)
+        if inst.removed_at:
+            key, label = "removed", "Removed"
+        # The status is worked out per job, so it is filtered here.
+        if f.get("install_status") and f["install_status"] != key:
+            continue
+        jobs.append(inst)
         health[label] += 1
         arrived = [p["_at"] for p in presence_rows(inst) if p["action"] == "checked_in"]
         record = getattr(inst, "handover", None)
@@ -233,7 +319,7 @@ def installations_report(request, f):
             "completed": inst.completed_at,
             "handover": record.handover_date if record else None,
             "accepted_by": record.accepted_by_name if record else "",
-            "status": "Removed" if inst.removed_at else label,
+            "status": label,
         })
     return {
         "columns": [
@@ -259,8 +345,8 @@ def installations_report(request, f):
 
 @report("projects", title="Project Portfolio", group="Projects", capability="view_projects",
         description="Every project with its phase, status, progress and dates — and budget against actual cost.",
-        filters=("date", "status"), date_label="Created",
-        statuses="teams.Project")
+        filters=("date", "status", "client"), date_label="Created",
+        statuses="teams.Project", choices=(("project_type", "Contract", _project_types),))
 def projects_report(request, f):
     from apps.teams.costing import build_actuals, project_devices
     from apps.teams.models import Project
@@ -268,6 +354,12 @@ def projects_report(request, f):
     qs = _dated(Project.objects.select_related("client", "manager").prefetch_related("sites"), f)
     if f.get("status"):
         qs = qs.filter(status=f["status"])
+    if f.get("client"):
+        qs = qs.filter(client_id=f["client"])
+    if f.get("project_type") == "sample":
+        qs = qs.filter(contract_type__startswith="sample")
+    elif f.get("project_type"):
+        qs = qs.filter(contract_type=f["project_type"])
     costs = can(request.user, "view_project_costs")
     labels = dict(Project.Status.choices)
     rows, health = [], Counter()
@@ -325,7 +417,8 @@ def projects_report(request, f):
 
 @report("visits", title="Maintenance Visits", group="Maintenance & Service", capability="view_maintenance",
         description="Each maintenance visit — who went, where, how long on site, and the outcome. Can be rolled up.",
-        filters=("date", "technician", "site", "project", "group_by"), date_label="Visit date")
+        filters=("date", "client", "technician", "site", "project", "group_by"), date_label="Visit date",
+        choices=(("maintenance_type", "Maintenance type", _maintenance_types), ("issue_type", "Issue type", _issue_types)))
 def visits_report(request, f):
     from apps.maintenance.models import MaintenanceVisit
 
@@ -345,6 +438,12 @@ def visits_report(request, f):
         qs = qs.filter(schedule__device__project_id=f["project"])
     if f.get("status"):
         qs = qs.filter(status=f["status"])
+    if f.get("client"):
+        qs = qs.filter(_client_q(f, "schedule__site__client", "schedule__device__project__client", "schedule__device__assigned_client")).distinct()
+    if f.get("maintenance_type"):
+        qs = qs.filter(schedule__maintenance_type=f["maintenance_type"])
+    if f.get("issue_type"):
+        qs = qs.filter(schedule__ticket__issue_type_id=f["issue_type"])
 
     def hours(v):
         if v.started_at and v.completed_at:
@@ -431,8 +530,8 @@ def visits_report(request, f):
 
 @report("tickets", title="Service Tickets", group="Maintenance & Service", capability="view_tickets",
         description="Tickets with priority, who has them, due dates, resolution time and whether they ran late.",
-        filters=("date", "status"), date_label="Reported",
-        statuses="tickets.Ticket")
+        filters=("date", "status", "client"), date_label="Reported",
+        statuses="tickets.Ticket", choices=(("category", "Category", _ticket_categories),))
 def tickets_report(request, f):
     from apps.tickets.models import Ticket
 
@@ -440,6 +539,8 @@ def tickets_report(request, f):
     for key in ("status", "priority", "category"):
         if f.get(key):
             qs = qs.filter(**{key: f[key]})
+    if f.get("client"):
+        qs = qs.filter(_client_q(f, "site__client", "device__assigned_client", "device__project__client")).distinct()
     today = timezone.localdate()
     done = ("closed", "cancelled", "approved", "rejected")
     rows = []
@@ -479,7 +580,7 @@ def tickets_report(request, f):
 
 @report("purchase_orders", title="Purchase Orders", group="Procurement & Stock", capability="view_procurement",
         description="Orders placed with suppliers: status, order and delivery dates, and value.",
-        filters=("date", "status"), date_label="Raised",
+        filters=("date", "status", "vendor"), date_label="Raised",
         statuses="procurement.PurchaseOrder")
 def purchase_orders_report(request, f):
     from apps.procurement.models import PurchaseOrder
@@ -487,6 +588,8 @@ def purchase_orders_report(request, f):
     qs = _dated(PurchaseOrder.objects.select_related("supplier"), f)
     if f.get("status"):
         qs = qs.filter(status=f["status"])
+    if f.get("vendor"):
+        qs = qs.filter(supplier_id=f["vendor"])
     prices = can(request.user, "view_prices")
     orders = list(qs.order_by("-created_at")[:ROW_LIMIT])
     today = timezone.localdate()
@@ -498,7 +601,7 @@ def purchase_orders_report(request, f):
         "currency": o.currency, "total": o.total_amount,
     } for o in orders]
     columns = [
-        col("po", "PO number"), col("supplier", "Supplier"), col("status", "Status"), col("raised", "Raised", "date"),
+        col("po", "PO number"), col("supplier", "Vendor"), col("status", "Status"), col("raised", "Raised", "date"),
         col("ordered", "Ordered", "date"), col("expected", "Expected delivery", "date"), col("late", "Overdue"),
     ]
     if prices:
@@ -515,7 +618,7 @@ def purchase_orders_report(request, f):
 
 @report("work_orders", title="Work Orders", group="Procurement & Stock", capability="view_work_orders",
         description="Work given to vendors and workshops: what, for which project, status, delivery and value.",
-        filters=("date", "status"), date_label="Raised",
+        filters=("date", "status", "vendor", "client"), date_label="Raised",
         statuses="workorders.WorkOrder")
 def work_orders_report(request, f):
     from apps.workorders.models import WorkOrder
@@ -523,6 +626,10 @@ def work_orders_report(request, f):
     qs = _dated(WorkOrder.objects.select_related("supplier", "project", "device"), f)
     if f.get("status"):
         qs = qs.filter(status=f["status"])
+    if f.get("vendor"):
+        qs = qs.filter(supplier_id=f["vendor"])
+    if f.get("client"):
+        qs = qs.filter(_client_q(f, "client", "project__client"))
     prices = can(request.user, "view_prices")
     orders = list(qs.order_by("-created_at")[:ROW_LIMIT])
     rows = [{
@@ -547,32 +654,71 @@ def work_orders_report(request, f):
     return {"columns": columns, "rows": rows, "kpis": kpis, "breakdown": breakdown("Work orders by status", Counter(r["status"] for r in rows))}
 
 
-@report("inventory", title="Stock on Hand", group="Procurement & Stock", capability="view_stock",
-        description="Generic stock by item: quantity against minimum level, where it is kept and what it is worth.",
-        filters=("low_stock",), date_label="")
+@report("inventory", title="Inventory Stock", group="Procurement & Stock", capability="view_stock",
+        description="Stock in the store: generic components by quantity, unique components by serial, and what is set aside in project pigeon holes — where it is kept and what it is worth.",
+        filters=("low_stock",), date_label="",
+        choices=(("kind", "Stock", INVENTORY_KINDS), ("category", "Category", _inventory_categories)))
 def inventory_report(request, f):
-    from apps.inventory.models import InventoryItem
+    from apps.inventory.models import InventoryItem, InventoryUnit, PigeonHole
 
-    qs = InventoryItem.objects.select_related("material_type", "category")
+    kind, category = f.get("kind"), f.get("category")
     prices = can(request.user, "view_prices")
-    items = list(qs.order_by("sku")[:ROW_LIMIT])
-    if f.get("low_stock") == "true":
-        items = [i for i in items if i.is_low_stock]
     rows = []
-    for i in items:
-        state = "Out of stock" if i.quantity <= 0 else "Low" if i.is_low_stock else "OK"
-        rows.append({
-            "sku": i.sku, "item": i.material_type.name if i.material_type_id else "",
-            "category": i.category.name if i.category_id else "",
-            "unit": (i.material_type.unit if i.material_type_id else "") or "piece",
-            "where": i.storage_location or i.get_location_display(),
-            "quantity": i.quantity, "min": i.min_stock_level, "state": state,
-            "unit_cost": i.unit_cost,
-            "value": None if i.unit_cost is None else Decimal(i.unit_cost) * i.quantity,
-        })
+    if kind in (None, "", "generic"):
+        qs = InventoryItem.objects.select_related("material_type", "category")
+        if category:
+            qs = qs.filter(category_id=category)
+        items = list(qs.order_by("sku")[:ROW_LIMIT])
+        if f.get("low_stock") == "true":
+            items = [i for i in items if i.is_low_stock]
+        for i in items:
+            rows.append({
+                "sku": i.sku, "item": i.material_type.name if i.material_type_id else "", "kind": "Generic",
+                "category": i.category.name if i.category_id else "",
+                "unit": (i.material_type.unit if i.material_type_id else "") or "piece",
+                "where": i.storage_location or i.get_location_display(),
+                "quantity": i.quantity, "min": i.min_stock_level,
+                "state": "Out of stock" if i.quantity <= 0 else "Low" if i.is_low_stock else "OK",
+                "unit_cost": i.unit_cost,
+                "value": None if i.unit_cost is None else Decimal(i.unit_cost) * i.quantity,
+            })
+    # Low stock is a generic-stock idea: a serial or a pigeon hole has no minimum.
+    if kind in (None, "", "unique") and f.get("low_stock") != "true":
+        held = (InventoryUnit.Status.IN_STOCK, InventoryUnit.Status.RESERVED, InventoryUnit.Status.RETURNED)
+        qs = InventoryUnit.objects.filter(status__in=held).select_related("unit_type", "category", "material_type", "pigeon_hole__project")
+        if category:
+            qs = qs.filter(Q(category_id=category) | Q(category__isnull=True, unit_type__category_id=category))
+        for u in qs.order_by("unit_code")[:ROW_LIMIT]:
+            name = u.unit_type.name if u.unit_type_id else (u.material_type.name if u.material_type_id else u.model_name)
+            rows.append({
+                "sku": u.unit_code, "item": f"{name} · {u.serial_number}", "kind": "Unique",
+                "category": u.category.name if u.category_id else "",
+                "unit": "piece",
+                "where": (f"Pigeon hole · {u.pigeon_hole.project.name}" if u.pigeon_hole_id else u.storage_location or u.get_location_display()),
+                "quantity": 1, "min": None, "state": u.get_status_display(),
+                "unit_cost": u.purchase_price, "value": u.purchase_price,
+            })
+    if kind in (None, "", "pigeon_hole") and f.get("low_stock") != "true":
+        from apps.inventory.serializers import InventoryItemSerializer
+
+        valuer = InventoryItemSerializer(context={})
+        qs = PigeonHole.objects.filter(quantity__gt=0, item__isnull=False).select_related("item__material_type", "item__category", "project")
+        if category:
+            qs = qs.filter(item__category_id=category)
+        for h in qs.order_by("project__name")[:ROW_LIMIT]:
+            cost = valuer.get_latest_cost(h.item)
+            rows.append({
+                "sku": h.item.sku, "item": h.item.material_type.name, "kind": "Pigeon hole",
+                "category": h.item.category.name if h.item.category_id else "",
+                "unit": h.item.material_type.unit or "piece",
+                "where": f"Pigeon hole · {h.project.name}" + (f" · {h.rack}" if h.rack else ""),
+                "quantity": h.quantity, "min": None, "state": "Set aside",
+                "unit_cost": cost, "value": None if cost is None else Decimal(str(cost)) * h.quantity,
+            })
+    rows = rows[:ROW_LIMIT]
     columns = [
-        col("sku", "SKU"), col("item", "Item"), col("category", "Category"), col("unit", "Unit"),
-        col("where", "Stored at"), col("quantity", "On hand", "int"), col("min", "Min level", "int"), col("state", "Stock"),
+        col("sku", "SKU / code"), col("item", "Item"), col("kind", "Stock"), col("category", "Category"), col("unit", "Unit"),
+        col("where", "Stored at"), col("quantity", "On hand", "int"), col("min", "Min level", "int"), col("state", "State"),
     ]
     if prices:
         columns += [col("unit_cost", "Unit cost", "money", False), col("value", "Stock value", "money")]
@@ -583,7 +729,7 @@ def inventory_report(request, f):
     ]
     if prices:
         kpis.append(kpi("Stock value", sum((r["value"] or 0) for r in rows), "money"))
-    return {"columns": columns, "rows": rows, "kpis": kpis, "breakdown": breakdown("Items by stock level", Counter(r["state"] for r in rows))}
+    return {"columns": columns, "rows": rows, "kpis": kpis, "breakdown": breakdown("Lines by stock", Counter(r["kind"] for r in rows))}
 
 
 # ── Partners ─────────────────────────────────────────────────────────────
