@@ -144,3 +144,59 @@ def test_asset_register_names_the_scoped_project_component_serials_and_cost_to_d
     assert row["project"] == "Mall launch" and row["serial"] == "CAB-1, CAB-2", row
     assert Decimal(row["maintenance"]) == Decimal("1500")
     assert Decimal(row["total_cost"]) == Decimal(row["manufacturing"]) + Decimal(row["installation"]) + Decimal("1500")
+
+
+@pytest.mark.django_db
+def test_report_filters_by_client_vendor_contract_type_and_stock_kind():
+    """The drop-downs the Reports page offers narrow each report as named."""
+    from apps.clients.models import Client
+    from apps.inventory.models import InventoryCategory, InventoryItem, InventoryUnit
+    from apps.procurement.models import PurchaseOrder
+    from apps.suppliers.models import Supplier
+    from apps.teams.models import Project
+    from apps.assets.models import MaterialType
+
+    admin = User.objects.create_user(username="rep-admin", password="x", role="super_admin")
+    c = APIClient()
+    c.force_authenticate(admin)
+    catalog = {r["key"]: r for r in c.get("/api/reports/catalog/").data["reports"]}
+    assert catalog["inventory"]["title"] == "Inventory Stock"
+    assert {ch["key"] for ch in catalog["inventory"]["choices"]} == {"kind", "category"}
+    assert "client" in catalog["installations"]["filters"] and "technician" in catalog["installations"]["filters"]
+    assert "vendor" in catalog["purchase_orders"]["filters"] and "vendor" in catalog["work_orders"]["filters"]
+    types = [o["value"] for o in catalog["projects"]["choices"][0]["options"]]
+    assert types == ["sold", "rental", "sample", "sample_foc", "sample_paid"]
+    assert {ch["key"] for ch in catalog["visits"]["choices"]} == {"maintenance_type", "issue_type"}
+
+    acme, other = Client.objects.create(name="Acme Rep"), Client.objects.create(name="Other Rep")
+    Project.objects.create(name="Free demo", client=acme, contract_type="sample_foc")
+    Project.objects.create(name="Paid demo", client=other, contract_type="sample_paid")
+    Project.objects.create(name="Big sale", client=acme, contract_type="sold")
+
+    def names(**params):
+        r = c.get("/api/reports/generate/", {"type": "projects", **params})
+        assert r.status_code == 200, r.content
+        return sorted(row["name"] for row in r.data["rows"])
+
+    assert names(project_type="sample") == ["Free demo", "Paid demo"]
+    assert names(project_type="sample_paid") == ["Paid demo"]
+    assert names(client=str(acme.id)) == ["Big sale", "Free demo"]
+
+    v1, v2 = Supplier.objects.create(name="Vend One"), Supplier.objects.create(name="Vend Two")
+    PurchaseOrder.objects.create(supplier=v1)
+    PurchaseOrder.objects.create(supplier=v2)
+    r = c.get("/api/reports/generate/", {"type": "purchase_orders", "vendor": str(v1.id)})
+    assert r.status_code == 200, r.content
+    assert [row["supplier"] for row in r.data["rows"]] == ["Vend One"]
+
+    cat = InventoryCategory.objects.create(name="Spares Rep")
+    mt = MaterialType.objects.create(name="Rep cable")
+    InventoryItem.objects.create(material_type=mt, category=cat, quantity=4)
+    InventoryUnit.objects.create(serial_number="SN-REP-1", material_type=mt)
+    r = c.get("/api/reports/generate/", {"type": "inventory", "category": str(cat.id)})
+    assert [row["kind"] for row in r.data["rows"]] == ["Generic"]
+    r = c.get("/api/reports/generate/", {"type": "inventory", "kind": "unique"})
+    assert [row["item"] for row in r.data["rows"]] == ["Rep cable · SN-REP-1"]
+
+    r = c.get("/api/reports/generate/", {"type": "projects", "project_type": "sample", "export": "xlsx"})
+    assert r.status_code == 200
