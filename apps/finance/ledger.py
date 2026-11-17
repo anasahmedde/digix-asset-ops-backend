@@ -60,15 +60,28 @@ def split_payments(payments) -> dict:
     }
 
 
+PAY_STATUS = {"unpaid": "Unpaid", "partially_paid": "Partially Paid", "paid": "Paid"}
+
+
 def _row(total, payments, due, today) -> dict:
     row = split_payments(payments)
     balance = max(money(total) - row["paid"], ZERO)
     overdue = (today - due).days if due and balance > 0 and today > due else 0
+    paid_state = "paid" if balance <= 0 else "partially_paid" if row["paid"] > 0 else "unpaid"
     row.update(
         total=money(total), balance=balance, due_date=due, overdue_days=overdue,
         aging=aging_bucket(overdue) if balance > 0 else None,
+        pay_status=paid_state, pay_status_display=PAY_STATUS[paid_state],
     )
     return row
+
+
+def _invoice_line(inv) -> dict:
+    return {
+        "id": str(inv.id), "number": inv.invoice_number, "reference": inv.reference,
+        "amount": money(inv.amount), "total": money(inv.total_amount), "issue_date": inv.issue_date,
+        "due_date": inv.due_date, "status": inv.status, "status_display": inv.get_status_display(),
+    }
 
 
 def po_due_date(po):
@@ -92,8 +105,18 @@ def payable_orders():
     return (
         PO.objects.filter(status__in=(PO.Status.APPROVED, PO.Status.ORDERED, PO.Status.PARTIALLY_RECEIVED, PO.Status.RECEIVED))
         .select_related("supplier", "payment_terms")
-        .prefetch_related("payments")
+        .prefetch_related("payments", "invoices", "items__bom_line__project")
     )
+
+
+def po_projects(po) -> list[dict]:
+    """The projects an order buys for: those whose requirements its lines cover."""
+    seen = {}
+    for item in po.items.all():
+        project = item.bom_line.project if item.bom_line_id else None
+        if project is not None:
+            seen[project.pk] = {"id": str(project.pk), "name": project.name}
+    return list(seen.values())
 
 
 def payables(today=None) -> list[dict]:
@@ -102,11 +125,17 @@ def payables(today=None) -> list[dict]:
     for po in payable_orders():
         due, due_set = po_due_date(po)
         row = _row(po.total_amount, po.payments.all(), due, today)
+        # The supplier's invoices against it, beside what was ordered.
+        bills = [i for i in po.invoices.all() if i.status != Invoice.Status.CANCELLED]
         row.update(
-            id=str(po.id), number=po.po_number, party=po.supplier.name, currency=po.currency,
-            status=po.status, status_display=po.get_status_display(), date=po.order_date,
+            id=str(po.id), number=po.po_number, party=po.supplier.name, party_id=str(po.supplier_id),
+            currency=po.currency, status=po.status, status_display=po.get_status_display(),
+            date=po.order_date or timezone.localtime(po.created_at).date(),
             due_date_set=due_set,
             terms=po.payment_terms.name if po.payment_terms_id else po.payment_terms_note,
+            projects=po_projects(po),
+            invoiced=money(sum((i.total_amount for i in bills), ZERO)),
+            invoices=[_invoice_line(i) for i in sorted(bills, key=lambda i: i.issue_date)],
         )
         rows.append(row)
     return rows
@@ -132,10 +161,32 @@ def quotation_billing(quotation, exclude=None) -> dict:
     invoiced = money(sum((i.amount for i in invoices), ZERO))
     received = money(sum((p.amount for i in invoices for p in i.payments.all()), ZERO))
     total = money(quotation.total_amount)
+    po = quotation.client_po_amount
     return {
         "quoted": total, "invoiced": invoiced, "received": received,
         "to_invoice": max(total - invoiced, ZERO), "invoices": len(invoices),
+        # The client's PO, and how much of it is not invoiced yet.
+        "client_po_number": quotation.client_po_number, "client_po_date": quotation.client_po_date,
+        "client_po_amount": money(po) if po is not None else None,
+        "po_left": max(money(po) - invoiced, ZERO) if po is not None else None,
     }
+
+
+def draft_full_invoice(quotation, user=None):
+    """On acceptance: the invoice for the whole quotation, drafted from it.
+
+    Client, currency and value come from the quotation and the PDF lists its
+    items. It stays a draft until approved, so it can be cut down to an
+    advance first, or deleted to bill in parts instead."""
+    if quotation.total_amount <= 0 or quotation.invoices.exists():
+        return None
+    today = timezone.localdate()
+    return Invoice.objects.create(
+        invoice_type=Invoice.InvoiceType.RECEIVABLE, quotation=quotation, client=quotation.client,
+        currency=quotation.currency, description="Full quotation value", amount=quotation.total_amount,
+        tax_amount=ZERO, total_amount=quotation.total_amount, issue_date=today, due_date=today + timedelta(days=30),
+        created_by=user,
+    )
 
 
 def uninvoiced() -> dict:
@@ -155,17 +206,61 @@ def uninvoiced() -> dict:
 def receivables(today=None) -> list[dict]:
     today = today or timezone.localdate()
     rows = []
-    for inv in receivable_invoices().select_related("quotation"):
+    for inv in receivable_invoices().select_related("quotation").prefetch_related("quotation__spawned_projects"):
         row = _row(inv.total_amount, inv.payments.all(), inv.due_date, today)
+        q = inv.quotation
         row.update(
             id=str(inv.id), number=inv.invoice_number, party=inv.client.name if inv.client_id else "",
+            party_id=str(inv.client_id) if inv.client_id else None,
             currency=inv.currency, status=inv.status, status_display=inv.get_status_display(),
             date=inv.issue_date, due_date_set=True, terms="", description=inv.description,
-            quotation=str(inv.quotation_id) if inv.quotation_id else None,
-            quote_number=inv.quotation.quote_number if inv.quotation_id else None,
+            quotation=str(inv.quotation_id) if q else None,
+            quote_number=q.quote_number if q else None,
+            client_po_number=q.client_po_number if q else "",
+            projects=[{"id": str(p.pk), "name": p.name} for p in q.spawned_projects.all()] if q else [],
         )
         rows.append(row)
     return rows
+
+
+STATUS_FILTERS = {
+    "outstanding": lambda r: r["balance"] > 0,
+    "overdue": lambda r: r["overdue_days"] > 0,
+    "unpaid": lambda r: r["pay_status"] == "unpaid",
+    "partially_paid": lambda r: r["pay_status"] == "partially_paid",
+    "paid": lambda r: r["pay_status"] == "paid",
+}
+
+
+def filter_rows(rows, params) -> list[dict]:
+    """Narrow a payable or receivable list the way the Finance tabs and their
+    exports do: by date, supplier or client, project, status and a search."""
+    from django.utils.dateparse import parse_date
+
+    start, end = parse_date(params.get("date_from") or ""), parse_date(params.get("date_to") or "")
+    party, project = params.get("party"), params.get("project")
+    status_test = STATUS_FILTERS.get(params.get("status") or "")
+    q = (params.get("q") or "").strip().lower()
+
+    def keep(r):
+        if start and (r["date"] is None or r["date"] < start):
+            return False
+        if end and (r["date"] is None or r["date"] > end):
+            return False
+        if party and r.get("party_id") != party:
+            return False
+        if project and project not in {p["id"] for p in r.get("projects", [])}:
+            return False
+        if status_test and not status_test(r):
+            return False
+        if q:
+            words = " ".join(str(r.get(k) or "") for k in ("number", "party", "description", "quote_number", "client_po_number", "terms"))
+            words += " " + " ".join(i["reference"] + " " + i["number"] for i in r.get("invoices", []))
+            if q not in words.lower():
+                return False
+        return True
+
+    return [r for r in rows if keep(r)]
 
 
 def totals(rows) -> dict:
@@ -245,7 +340,9 @@ def inventory() -> dict:
     _asset_costs(devices, costs)
     assets = {key: [] for key, _ in Device.HeldAs.choices}
     for d, c in zip(devices, costs):
-        assets[d.held_as].append({
+        # Rented or sold but not yet delivered: still a finished product in hand.
+        group = Device.HeldAs.STOCK if d.held_as in (Device.HeldAs.RENTED, Device.HeldAs.SOLD) else d.held_as
+        assets[group].append({
             "id": str(d.id), "name": d.display_name or d.asset_code, "asset_code": d.asset_code,
             "asset_type": d.asset_type.name if d.asset_type_id else "", "held_as": d.held_as,
             "value": c["manufacturing"],

@@ -93,7 +93,11 @@ class QuotationViewSet(viewsets.ModelViewSet):
         with transaction.atomic():
             quotation.save(update_fields=update_fields)
             if new_status == Quotation.Status.ACCEPTED:
+                from apps.finance.ledger import draft_full_invoice
+
                 _spawn_project_if_needed(quotation)
+                # Finance finds the invoice already drafted from the quotation.
+                draft_full_invoice(quotation, request.user)
 
         if new_status == Quotation.Status.ACCEPTED:
             # get_object() prefetched spawned_projects before the spawn —

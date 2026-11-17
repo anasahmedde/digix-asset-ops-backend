@@ -63,6 +63,8 @@ class QuotationSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
             "items", "created_by", "created_by_name",
             "accepted_at", "spawned_project", "billing", "created_at", "updated_at",
         ]
+        # The client's PO is recorded by Finance (/finance/client-po/), and
+        # shows here through billing.
         read_only_fields = [
             "id", "quote_number", "status", "total_amount", "created_by",
             "accepted_at", "created_at", "updated_at",
