@@ -114,3 +114,66 @@ def test_a_quotation_is_invoiced_in_parts_and_each_part_is_a_receivable_once_app
     assert (seen["invoiced"], seen["to_invoice"]) == (10000, 0)
     pdf = finance.get(f"/api/finance/invoices/{inv['id']}/print/")
     assert pdf.status_code == 200 and pdf["Content-Type"] == "application/pdf"
+
+
+@pytest.mark.django_db
+def test_supplier_invoices_client_pos_auto_draft_filters_and_exports():
+    from apps.assets.models import AssetType, Device
+    from apps.quotations.models import Quotation, QuotationItem
+
+    today = timezone.localdate()
+    admin = _client(User.objects.create_user(username="fin-adm", password="x", role="super_admin"))
+    supplier, other = Supplier.objects.create(name="Bill Supplier"), Supplier.objects.create(name="Other Supplier")
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED,
+                                      total_amount=Decimal("1000"), order_date=today)
+    old = PurchaseOrder.objects.create(supplier=other, status=PurchaseOrder.Status.RECEIVED,
+                                       total_amount=Decimal("500"), order_date=today - timedelta(days=90))
+
+    # A supplier's invoice against its PO: their number, recorded as it came.
+    bill = {"purchase_order": str(po.id), "amount": "600", "tax_amount": "0",
+            "issue_date": str(today), "due_date": str(today + timedelta(days=30))}
+    assert admin.post("/api/finance/invoices/", bill, format="json").status_code == 400, "needs their number"
+    r = admin.post("/api/finance/invoices/", bill | {"reference": "SUP-INV-77"}, format="json")
+    assert r.status_code == 201, r.content
+    body = r.json()
+    assert (body["invoice_type"], body["status"], body["supplier"], body["po_number"]) == ("payable", "approved", str(supplier.id), po.po_number)
+    admin.post("/api/finance/payments/", {"purchase_order": str(old.id), "amount": "500", "payment_date": str(today)}, format="json")
+
+    rows = {x["number"]: x for x in admin.get("/api/finance/payables/").json()["rows"]}
+    assert (rows[po.po_number]["invoiced"], rows[po.po_number]["invoices"][0]["reference"]) == (600, "SUP-INV-77")
+    assert (rows[po.po_number]["pay_status"], rows[old.po_number]["pay_status"]) == ("unpaid", "paid")
+
+    def numbers(**params):
+        data = admin.get("/api/finance/payables/", params).json()
+        return sorted(x["number"] for x in data["rows"]), data["totals"]
+
+    assert numbers(status="paid")[0] == [old.po_number]
+    assert numbers(party=str(supplier.id))[0] == [po.po_number]
+    assert numbers(date_from=str(today - timedelta(days=7)))[0] == [po.po_number]
+    found, totals = numbers(q="sup-inv-77")
+    assert found == [po.po_number] and totals["PKR"]["total"] == 1000, "the totals follow the filters"
+    for fmt, kind in (("xlsx", "spreadsheet"), ("csv", "text/csv"), ("pdf", "application/pdf")):
+        f = admin.get("/api/finance/payables/", {"status": "paid", "export": fmt})
+        assert f.status_code == 200 and kind in f["Content-Type"], fmt
+    assert old.po_number.encode() in admin.get("/api/finance/payables/", {"status": "paid", "export": "csv"}).content
+    assert admin.get("/api/finance/inventory/", {"export": "xlsx"}).status_code == 200
+
+    # Accepting a quotation drafts its invoice, items and all.
+    client = Client.objects.create(name="PO Client")
+    q = Quotation.objects.create(title="Wall", client=client, status=Quotation.Status.SENT)
+    QuotationItem.objects.create(quotation=q, description="LED wall", quantity=2, unit_price=Decimal("2500"))
+    q.recalc_total()
+    assert admin.post(f"/api/quotations/quotations/{q.id}/transition/", {"status": "accepted"}, format="json").status_code == 200
+    draft = Invoice.objects.get(quotation=q)
+    assert (draft.status, draft.amount, draft.client_id) == ("draft", Decimal("5000"), client.id)
+    r = admin.post(f"/api/finance/client-po/{q.id}/", {"client_po_number": "CPO-9", "client_po_amount": "4000"}, format="json")
+    assert r.status_code == 200, r.content
+    assert (r.json()["po_left"], r.json()["client_po_number"]) == (0, "CPO-9"), "the draft already bills 5000 of a 4000 PO"
+    assert admin.get(f"/api/finance/invoices/{draft.id}/print/").status_code == 200
+
+    # The asset's category is set at registration; rented stock is still in hand.
+    kind = AssetType.objects.create(name="Fin Screen")
+    d = Device.objects.create(asset_type=kind, asset_code="FIN-HELD-1", status=Device.Status.IN_STOCK, held_as="rented")
+    assert admin.get(f"/api/assets/devices/{d.id}/").json()["held_as_display"] == "Rented"
+    stock = next(g for g in admin.get("/api/finance/inventory/").json()["groups"] if g["key"] == "stock")
+    assert "FIN-HELD-1" in [line["asset_code"] for line in stock["lines"]]

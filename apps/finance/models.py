@@ -40,9 +40,12 @@ class Invoice(TimeStampedModel):
     supplier = models.ForeignKey(
         "suppliers.Supplier", on_delete=models.SET_NULL, null=True, blank=True, related_name="invoices"
     )
+    # A supplier's invoice is entered against the purchase order it bills.
     purchase_order = models.ForeignKey(
         "procurement.PurchaseOrder", on_delete=models.SET_NULL, null=True, blank=True, related_name="invoices"
     )
+    # The supplier's own number for their invoice, as printed on it.
+    reference = models.CharField(max_length=100, blank=True)
     # The accepted quotation this invoice bills. A client is invoiced for
     # what was quoted, in parts (an advance, milestones, the final) or whole;
     # the parts never add up to more than the quotation.

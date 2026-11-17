@@ -65,6 +65,8 @@ def build_invoice_pdf(invoice) -> bytes:
     ]
     if q:
         meta_right.insert(0, f"<b>Quotation:</b> {q.quote_number}")
+        if q.client_po_number:
+            meta_right.insert(1, f"<b>Your PO:</b> {q.client_po_number}")
     meta = Table(
         [[Paragraph("BILL TO", label), Paragraph("DETAILS", label)],
          [Paragraph("<br/>".join(client_block) or "—", body), Paragraph("<br/>".join(meta_right), body)]],
@@ -72,6 +74,21 @@ def build_invoice_pdf(invoice) -> bytes:
     )
     meta.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("BOTTOMPADDING", (0, 0), (-1, 0), 2)]))
     elements += [meta, Spacer(1, 10)]
+
+    # The items carried over from the quotation the invoice bills.
+    items = list(q.items.all()) if q else []
+    if items:
+        rows = [["Item", "Qty", f"Unit price ({cur})", f"Line total ({cur})"]] + [
+            [Paragraph(i.description, body), str(i.quantity), f"{i.unit_price:,.2f}", f"{i.line_total:,.2f}"]
+            for i in items
+        ]
+        quoted = Table(rows, colWidths=[94 * mm, 16 * mm, 32 * mm, 32 * mm], repeatRows=1)
+        quoted.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eef2")),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#d1d5db")), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        elements += [Paragraph("Items quoted", label), Spacer(1, 3), quoted, Spacer(1, 10)]
 
     what = invoice.description or (f"Against quotation {q.quote_number}" if q else "Services")
     if q:

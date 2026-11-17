@@ -149,7 +149,7 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         "transition": None, "reassign": None,
     }
     filterset_fields = [
-        "status", "source", "asset_type", "device_model", "current_site",
+        "status", "source", "held_as", "asset_type", "device_model", "current_site",
         "assigned_client", "assigned_technician", "project",
     ]
     search_fields = [

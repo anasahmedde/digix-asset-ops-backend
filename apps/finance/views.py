@@ -28,15 +28,19 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     )
     serializer_class = InvoiceSerializer
     permission_classes = [IsAuthenticated, CapabilityGate]
-    filterset_fields = ["invoice_type", "status", "client", "supplier", "quotation"]
-    search_fields = ["invoice_number"]
+    filterset_fields = ["invoice_type", "status", "client", "supplier", "quotation", "purchase_order"]
+    search_fields = ["invoice_number", "reference"]
     ordering_fields = ["issue_date", "due_date", "total_amount"]
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        extra = {}
+        # A supplier's bill is a fact once it arrives: nothing to approve.
+        if serializer.validated_data.get("invoice_type") == Invoice.InvoiceType.PAYABLE:
+            extra["status"] = Invoice.Status.APPROVED
+        serializer.save(created_by=self.request.user, **extra)
 
     def perform_destroy(self, instance):
-        if instance.status != Invoice.Status.DRAFT:
+        if instance.status != Invoice.Status.DRAFT and instance.invoice_type != Invoice.InvoiceType.PAYABLE:
             raise serializers.ValidationError({"detail": "Only a draft invoice is deleted; cancel an approved one instead."})
         instance.delete()
 
@@ -105,6 +109,28 @@ class PaymentViewSet(viewsets.ModelViewSet):
             ledger.sync_invoice(invoice)
 
 
+def _describe(params) -> str:
+    """The filters behind an export, in words, for the top of the file."""
+    from apps.clients.models import Client
+    from apps.suppliers.models import Supplier
+    from apps.teams.models import Project
+
+    parts = []
+    if params.get("date_from") or params.get("date_to"):
+        parts.append(f"Dated {params.get('date_from') or 'the start'} to {params.get('date_to') or 'today'}")
+    if params.get("party"):
+        name = (Supplier.objects.filter(pk=params["party"]).values_list("name", flat=True).first()
+                or Client.objects.filter(pk=params["party"]).values_list("name", flat=True).first())
+        parts.append(name or "One party")
+    if params.get("project"):
+        parts.append("Project: " + (Project.objects.filter(pk=params["project"]).values_list("name", flat=True).first() or ""))
+    if params.get("status"):
+        parts.append(params["status"].replace("_", " ").capitalize())
+    if params.get("q"):
+        parts.append(f"Search: {params['q']}")
+    return f"As of {timezone.localdate():%d %b %Y} · " + (" · ".join(parts) or "All records")
+
+
 def _plain(totals):
     return {
         cur: {**t, "aging": [{"key": k, "label": label, "amount": t["aging"][k]} for k, label in ledger.AGING]}
@@ -143,16 +169,37 @@ class FinancialViewSet(viewsets.ViewSet):
             },
         })
 
+    def _listing(self, request, key, title, rows, columns, extra=None):
+        """A Payable or Receivable list as the filters narrow it, or the same
+        rows as an Excel, PDF or CSV file."""
+        from . import exports
+
+        rows = ledger.filter_rows(rows, request.query_params)
+        fmt = request.query_params.get("export")
+        if fmt in exports.FORMATS:
+            return exports.respond(request, fmt, key, title, columns, exports.flat(rows), _describe(request.query_params))
+        return Response({"rows": rows, "totals": _plain(ledger.totals(rows))} | (extra or {}))
+
     def payables(self, request):
-        rows = ledger.payables()
-        return Response({"rows": rows, "totals": _plain(ledger.totals(rows))})
+        from .exports import PAYABLE_COLUMNS
+
+        return self._listing(request, "payables", "Payables", ledger.payables(), PAYABLE_COLUMNS)
 
     def receivables(self, request):
-        rows = ledger.receivables()
-        return Response({"rows": rows, "totals": _plain(ledger.totals(rows)), "uninvoiced": ledger.uninvoiced()})
+        from .exports import RECEIVABLE_COLUMNS
+
+        return self._listing(request, "receivables", "Receivables", ledger.receivables(), RECEIVABLE_COLUMNS,
+                             {"uninvoiced": ledger.uninvoiced()})
 
     def inventory(self, request):
-        return Response(ledger.inventory())
+        from . import exports
+
+        data = ledger.inventory()
+        fmt = request.query_params.get("export")
+        if fmt in exports.FORMATS:
+            return exports.respond(request, fmt, "inventory-in-hand", "Inventory in hand", exports.INVENTORY_COLUMNS,
+                                   exports.inventory_rows(data), f"As of {timezone.localdate():%d %b %Y} · at cost")
+        return Response(data)
 
     def due_date(self, request, pk=None):
         """Set (or clear) when a supplier is to be paid on an order."""
@@ -167,6 +214,33 @@ class FinancialViewSet(viewsets.ViewSet):
         order.save(update_fields=["payment_due_date", "updated_at"])
         return Response({"payment_due_date": due})
 
+    def client_po(self, request, pk=None):
+        """Record the purchase order the client issued against an accepted
+        quotation: its number, amount and date."""
+        from decimal import Decimal, InvalidOperation
+
+        from apps.quotations.models import Quotation
+
+        q = Quotation.objects.filter(pk=pk, status=Quotation.Status.ACCEPTED).first()
+        if q is None:
+            return Response({"detail": "Not an accepted quotation."}, status=status.HTTP_404_NOT_FOUND)
+        number = (request.data.get("client_po_number") or "").strip()
+        raw_amount, raw_date = request.data.get("client_po_amount"), request.data.get("client_po_date")
+        try:
+            amount = Decimal(str(raw_amount)) if raw_amount not in (None, "") else None
+        except InvalidOperation:
+            raise serializers.ValidationError({"client_po_amount": "Enter an amount."})
+        if amount is not None and amount <= 0:
+            raise serializers.ValidationError({"client_po_amount": "Enter an amount above zero."})
+        when = parse_date(raw_date) if raw_date else None
+        if raw_date and when is None:
+            raise serializers.ValidationError({"client_po_date": "Enter a date."})
+        if amount is not None and not number:
+            raise serializers.ValidationError({"client_po_number": "Enter the client's PO number."})
+        q.client_po_number, q.client_po_amount, q.client_po_date = number, amount, when
+        q.save(update_fields=["client_po_number", "client_po_amount", "client_po_date", "updated_at"])
+        return Response(ledger.quotation_billing(q))
+
     def hold(self, request):
         """Mark an asset in stock as a finished product, office display or
         FOC sample."""
@@ -174,7 +248,7 @@ class FinancialViewSet(viewsets.ViewSet):
 
         held_as = request.data.get("held_as")
         if held_as not in Device.HeldAs.values:
-            raise serializers.ValidationError({"held_as": "Choose finished product, office display or FOC sample."})
+            raise serializers.ValidationError({"held_as": "Choose finished product, rented, sold, office display or FOC sample."})
         device = Device.objects.filter(pk=request.data.get("device"), status=Device.Status.IN_STOCK).first()
         if device is None:
             return Response({"detail": "Only an asset in stock is held."}, status=status.HTTP_404_NOT_FOUND)
