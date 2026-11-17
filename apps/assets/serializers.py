@@ -543,6 +543,7 @@ class DeviceListSerializer(serializers.ModelSerializer):
     warranty_status = serializers.SerializerMethodField()
 
     status_display = serializers.CharField(source="get_status_display", read_only=True)
+    held_as_display = serializers.CharField(source="get_held_as_display", read_only=True)
     class Meta:
         model = Device
         fields = [
@@ -551,7 +552,7 @@ class DeviceListSerializer(serializers.ModelSerializer):
             "device_model", "device_model_name",
             "status", "status_display", "source", "image", "display_image", "current_site", "site_name",
             "assigned_client", "client_name", "client_names",
-            "installation_date", "warranty_status", "created_at",
+            "held_as", "held_as_display", "installation_date", "warranty_status", "created_at",
         ]
 
     def get_client_names(self, obj):
@@ -729,6 +730,7 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
     )
 
     status_display = serializers.CharField(source="get_status_display", read_only=True)
+    held_as_display = serializers.CharField(source="get_held_as_display", read_only=True)
     def validate(self, attrs):
         """A registered asset has a size.
 
@@ -758,7 +760,7 @@ class DeviceDetailSerializer(HidesMoney, serializers.ModelSerializer):
             "device_model", "device_model_name", "brand_name",
             "length_in", "width_in", "depth_in", "diagonal_inches", "dimension_unit",
             "hardware_revision",
-            "status", "status_display", "source", "source_display", "allowed_transitions",
+            "status", "status_display", "source", "source_display", "held_as", "held_as_display", "allowed_transitions",
             "image", "display_image", "images",
             "purchase_date", "purchase_price", "supplier", "supplier_name",
             "planned_installation_cost", "actual_installation_cost",

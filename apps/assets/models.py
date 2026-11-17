@@ -198,12 +198,16 @@ class Device(TimeStampedModel):
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PROCURED)
 
     class HeldAs(models.TextChoices):
-        """What an asset in stock is being kept for. It is all inventory in
-        hand; Finance counts each kind under its own heading."""
+        """The asset's category, set once when it is registered: kept for
+        sale or rent (a finished product), rented out, sold, on display at
+        the office, or given as a free sample. While it is in stock Finance
+        counts it as inventory in hand under its own heading."""
 
-        STOCK = "stock", "Finished product"
-        OFFICE_DISPLAY = "office_display", "Office display"
-        FOC_SAMPLE = "foc_sample", "FOC sample"
+        STOCK = "stock", "Finished Product"
+        RENTED = "rented", "Rented"
+        SOLD = "sold", "Sold"
+        OFFICE_DISPLAY = "office_display", "Office Display"
+        FOC_SAMPLE = "foc_sample", "FOC Sample"
 
     held_as = models.CharField(max_length=20, choices=HeldAs.choices, default=HeldAs.STOCK)
     # Registration origin: built in-house or bought from a third party (WF-05).

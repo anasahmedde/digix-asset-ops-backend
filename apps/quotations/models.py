@@ -58,6 +58,11 @@ class Quotation(TimeStampedModel):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="created_quotations"
     )
     accepted_at = models.DateTimeField(null=True, blank=True)
+    # The purchase order the client issued against this quotation: what the
+    # client has committed to pay, and so what is invoiced against.
+    client_po_number = models.CharField(max_length=100, blank=True)
+    client_po_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    client_po_date = models.DateField(null=True, blank=True)
 
     VALID_TRANSITIONS = {
         Status.DRAFT: (Status.SENT,),

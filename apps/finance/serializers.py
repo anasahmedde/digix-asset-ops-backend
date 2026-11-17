@@ -57,6 +57,7 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, default=None)
     approved_by_name = serializers.CharField(source="approved_by.get_full_name", read_only=True, default=None)
     quote_number = serializers.CharField(source="quotation.quote_number", read_only=True, default=None)
+    po_number = serializers.CharField(source="purchase_order.po_number", read_only=True, default=None)
     balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     payments = PaymentSerializer(many=True, read_only=True)
 
@@ -65,7 +66,7 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
         fields = [
             "id", "invoice_number", "invoice_type", "status", "currency",
             "client", "client_name", "supplier", "supplier_name",
-            "purchase_order", "quotation", "quote_number", "description",
+            "purchase_order", "po_number", "reference", "quotation", "quote_number", "description",
             "amount", "tax_amount", "total_amount",
             "issue_date", "due_date", "paid_amount", "notes",
             "created_by", "approved_by", "approved_by_name", "approved_at",
@@ -78,18 +79,28 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
             "id", "status", "total_amount", "paid_amount", "created_by",
             "approved_by", "approved_at", "created_at", "updated_at",
         ]
-        # Client invoices are what is raised here; a supplier's bill is the
-        # purchase order it was ordered on.
+        # A client invoice unless it is entered against a purchase order,
+        # which makes it the supplier's.
         extra_kwargs = {"invoice_type": {"required": False}}
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
-        if self.instance and self.instance.status != Invoice.Status.DRAFT:
+        order = attrs.get("purchase_order", getattr(self.instance, "purchase_order", None))
+        # A supplier's invoice is a record of their bill, not ours to approve,
+        # so it can be corrected; a client invoice is fixed once approved.
+        if self.instance and self.instance.status != Invoice.Status.DRAFT and order is None:
             changed = set(attrs) - {"notes"}
             if changed:
                 raise serializers.ValidationError({"detail": "An approved invoice can no longer be changed; only its notes."})
         if self.instance is None:
             attrs.setdefault("invoice_type", Invoice.InvoiceType.RECEIVABLE)
+        if order is not None:
+            self._bill_order(order, attrs)
+            amount = attrs.get("amount", getattr(self.instance, "amount", None))
+            tax = attrs.get("tax_amount", getattr(self.instance, "tax_amount", None)) or Decimal("0")
+            if amount is not None:
+                attrs["total_amount"] = Decimal(amount) + Decimal(tax)
+            return attrs
         quotation = attrs.get("quotation", getattr(self.instance, "quotation", None))
         if quotation is not None:
             self._bill_quotation(quotation, attrs)
@@ -101,6 +112,24 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
         if amount is not None:
             attrs["total_amount"] = Decimal(amount) + Decimal(tax)
         return attrs
+
+    def _bill_order(self, order, attrs):
+        """A supplier's invoice bills the purchase order it is entered
+        against: that supplier, in its currency. Going over what is left on
+        the order is warned about on screen, not refused - the bill is the
+        supplier's and is recorded as it came."""
+        from .ledger import payable_orders
+
+        if not payable_orders().filter(pk=order.pk).exists():
+            raise serializers.ValidationError({"purchase_order": "Invoices are entered only against an approved purchase order."})
+        if attrs.get("quotation"):
+            raise serializers.ValidationError({"detail": "An invoice bills a purchase order or a quotation, not both."})
+        attrs["invoice_type"] = Invoice.InvoiceType.PAYABLE
+        attrs["supplier"] = order.supplier
+        attrs["client"] = None
+        attrs["currency"] = order.currency
+        if not (attrs.get("reference", getattr(self.instance, "reference", "")) or "").strip():
+            raise serializers.ValidationError({"reference": "Enter the supplier's invoice number."})
 
     def _bill_quotation(self, quotation, attrs):
         """An invoice raised from a quotation bills its client, in its

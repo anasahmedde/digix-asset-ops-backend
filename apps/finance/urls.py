@@ -14,5 +14,6 @@ urlpatterns = [
     path("receivables/", FinancialViewSet.as_view({"get": "receivables"}), name="finance-receivables"),
     path("inventory/", FinancialViewSet.as_view({"get": "inventory"}), name="finance-inventory"),
     path("inventory/hold/", FinancialViewSet.as_view({"post": "hold"}), name="finance-inventory-hold"),
+    path("client-po/<uuid:pk>/", FinancialViewSet.as_view({"post": "client_po"}), name="finance-client-po"),
     path("", include(router.urls)),
 ]
