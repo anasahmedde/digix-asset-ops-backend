@@ -71,7 +71,7 @@ def test_payables_receivables_and_net_worth_on_the_financial_dashboard():
     o = finance.get("/api/finance/overview/").json()
     assert o["receivable"]["PKR"]["balance"] == 1000 and o["payable"]["PKR"]["balance"] == 400
     assert o["net_worth"]["PKR"] == 600
-    assert [g["key"] for g in o["inventory"]["groups"]] == ["material", "stock", "office_display", "foc_sample"]
+    assert [g["key"] for g in o["inventory"]["groups"]] == ["material", "stock", "rented", "foc_sample", "sample_paid", "office_display"]
 
     # It is for management: the field does not read it.
     assert tech.get("/api/finance/overview/").status_code == 403
@@ -177,3 +177,91 @@ def test_supplier_invoices_client_pos_auto_draft_filters_and_exports():
     assert admin.get(f"/api/assets/devices/{d.id}/").json()["held_as_display"] == "Rented"
     stock = next(g for g in admin.get("/api/finance/inventory/").json()["groups"] if g["key"] == "stock")
     assert "FIN-HELD-1" in [line["asset_code"] for line in stock["lines"]]
+
+
+@pytest.mark.django_db
+def test_bugs_18_nov_discount_due_terms_selected_export_projects_and_placed_assets():
+    """Bugs and Fixes 18-Nov: a discounted supplier invoice paid in full
+    settles its PO; the PO's terms days for the due date; exporting ticked
+    rows; the project column; rented and sample assets out at a site still
+    count in inventory, sold ones do not."""
+    from apps.assets.models import AssetType, Device
+    from apps.setup.models import PaymentTerms
+    from apps.teams.models import Project
+
+    today = timezone.localdate()
+    admin = _client(User.objects.create_user(username="fin-bug", password="x", role="super_admin"))
+    supplier = Supplier.objects.create(name="Discount Supplier")
+    terms = PaymentTerms.objects.create(name="Net 30", days=30)
+    po = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED, payment_terms=terms,
+                                      total_amount=Decimal("1000"), order_date=today - timedelta(days=40))
+    other = PurchaseOrder.objects.create(supplier=supplier, status=PurchaseOrder.Status.ORDERED,
+                                         total_amount=Decimal("300"), order_date=today)
+
+    bill = {"purchase_order": str(po.id), "reference": "D-1", "amount": "1000", "discount_amount": "100",
+            "issue_date": str(today), "due_date": str(today - timedelta(days=1))}
+    assert admin.post("/api/finance/invoices/", bill, format="json").status_code == 400, "due before issue"
+    too_much = admin.post("/api/finance/invoices/", bill | {"discount_amount": "1001", "due_date": str(today)}, format="json")
+    assert too_much.status_code == 400
+    r = admin.post("/api/finance/invoices/", bill | {"due_date": str(today + timedelta(days=30))}, format="json")
+    assert r.status_code == 201 and Decimal(r.json()["total_amount"]) == Decimal("900"), r.content
+    row = next(x for x in admin.get("/api/finance/payables/").json()["rows"] if x["id"] == str(po.id))
+    assert (row["discount"], row["balance"], row["terms_days"]) == (100, 900, 30)
+    assert admin.post("/api/finance/payments/", {"purchase_order": str(po.id), "amount": "901", "payment_date": str(today)},
+                      format="json").status_code == 400
+    assert admin.post("/api/finance/payments/", {"purchase_order": str(po.id), "amount": "900", "payment_date": str(today)},
+                      format="json").status_code == 201
+    row = next(x for x in admin.get("/api/finance/payables/", {"status": ""}).json()["rows"] if x["id"] == str(po.id))
+    assert (row["pay_status"], row["balance"]) == ("paid", 0), "paid in full once the discounted invoice is"
+
+    # Export only the ticked rows; an order for no project says what it was for.
+    picked = admin.get("/api/finance/payables/", {"status": "", "ids": str(other.id), "export": "csv"}).content.decode("utf-8-sig")
+    assert other.po_number in picked and po.po_number not in picked
+    assert "Project" in picked.splitlines()[0] and "Discount" in picked.splitlines()[0]
+
+    kind = AssetType.objects.create(name="Bug Screen")
+    rental = Project.objects.create(name="Rent Proj", contract_type="rental")
+    sold = Project.objects.create(name="Sold Proj", contract_type="sold")
+    Device.objects.create(asset_type=kind, asset_code="BUG-RENT", status=Device.Status.ACTIVE, project=rental)
+    Device.objects.create(asset_type=kind, asset_code="BUG-FOC", status=Device.Status.INSTALLED, held_as="foc_sample")
+    Device.objects.create(asset_type=kind, asset_code="BUG-SOLD", status=Device.Status.ACTIVE, project=sold)
+    groups = {g["key"]: [l["asset_code"] for l in g["lines"]] for g in admin.get("/api/finance/inventory/").json()["groups"]}
+    assert "BUG-RENT" in groups["rented"] and "BUG-FOC" in groups["foc_sample"]
+    assert "BUG-SOLD" not in sum((v for k, v in groups.items() if k != "material"), [])
+
+
+@pytest.mark.django_db
+def test_qa_18_nov_markup_pdfs_bad_amounts_due_dates_moved_payments_and_bad_filters():
+    """API QA 18-Nov: markup in text never breaks a PDF; no zero, negative or
+    PO-less supplier invoices; a payable is not due before it was ordered; a
+    payment moved off an invoice re-syncs it; bad filter ids answer 400."""
+    today = timezone.localdate()
+    admin = _client(User.objects.create_user(username="fin-qa", password="x", role="super_admin"))
+    head = _client(User.objects.create_user(username="fin-qa-gh", password="x", role="group_head"))
+    client = Client.objects.create(name="Panel <b> & Co")
+    base = {"client": str(client.id), "issue_date": str(today), "due_date": str(today), "description": "Unclosed <b> tag"}
+    for bad in ({"amount": "-50"}, {"amount": "0"}, {"amount": "100", "tax_amount": "-150"}):
+        assert admin.post("/api/finance/invoices/", base | bad, format="json").status_code == 400, bad
+    assert admin.post("/api/finance/invoices/", base | {"amount": "777", "invoice_type": "payable"}, format="json").status_code == 400
+    ids = []
+    for n in range(2):
+        r = admin.post("/api/finance/invoices/", base | {"amount": "100", "notes": "a < b"}, format="json")
+        assert r.status_code == 201, r.content
+        ids.append(r.json()["id"])
+        assert head.post(f"/api/finance/invoices/{ids[-1]}/approve/").status_code == 200
+    assert admin.get(f"/api/finance/invoices/{ids[0]}/print/").status_code == 200
+    assert admin.get("/api/finance/receivables/", {"export": "pdf"}).status_code == 200
+
+    pay = admin.post("/api/finance/payments/", {"invoice": ids[0], "amount": "60", "payment_date": str(today)}, format="json").json()
+    assert admin.patch(f"/api/finance/payments/{pay['id']}/", {"invoice": ids[1]}, format="json").status_code == 200
+    left = Invoice.objects.get(pk=ids[0])
+    assert (left.status, left.paid_amount) == ("approved", 0), "the invoice it left is re-synced"
+
+    po = PurchaseOrder.objects.create(supplier=Supplier.objects.create(name="Due Sup"), status=PurchaseOrder.Status.ORDERED,
+                                      total_amount=Decimal("10"), order_date=today)
+    early = admin.post(f"/api/finance/payables/{po.id}/due-date/", {"payment_due_date": str(today - timedelta(days=1))}, format="json")
+    assert early.status_code == 400
+    assert admin.get("/api/finance/payables/", {"party": "not-a-uuid", "export": "csv"}).status_code == 200
+    assert admin.post("/api/finance/inventory/hold/", {"device": "abc", "held_as": "stock"}, format="json").status_code == 404
+    for bad in ({"type": "assets", "client": "x"}, {"type": "visits", "date_from": "garbage"}, {"type": "assets", "warranty": "bogus"}):
+        assert admin.get("/api/reports/generate/", bad).status_code == 400, bad

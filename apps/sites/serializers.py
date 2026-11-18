@@ -575,6 +575,9 @@ class DeviceInstallationDetailSerializer(DateOrder, _InstallationCommonMixin, se
     cost_lines = serializers.SerializerMethodField()
     cost_recorded_by_name = serializers.SerializerMethodField()
     can_record_cost = serializers.SerializerMethodField()
+    cost_review_display = serializers.CharField(source="get_cost_review_display", read_only=True)
+    cost_reviewed_by_name = serializers.SerializerMethodField()
+    can_review_cost = serializers.SerializerMethodField()
     work_done = serializers.SerializerMethodField()
 
     def get_started_at(self, obj):
@@ -624,7 +627,20 @@ class DeviceInstallationDetailSerializer(DateOrder, _InstallationCommonMixin, se
 
         request = self.context.get("request")
         user = getattr(request, "user", None)
-        return bool(user and work.work_done(obj) and work.may_record_cost(user, obj))
+        return bool(
+            user and work.work_done(obj) and work.may_record_cost(user, obj)
+            and obj.cost_review != obj.CostReview.ACCEPTED
+        )
+
+    def get_cost_reviewed_by_name(self, obj):
+        who = obj.cost_reviewed_by
+        return (who.get_full_name() or who.username) if who else None
+
+    def get_can_review_cost(self, obj) -> bool:
+        from . import work
+
+        request = self.context.get("request")
+        return bool(request and work.may_review_cost(request.user, obj))
 
     def get_work_done(self, obj) -> bool:
         from . import work
@@ -660,9 +676,11 @@ class DeviceInstallationDetailSerializer(DateOrder, _InstallationCommonMixin, se
             "handover", "progress", "steps_done", "steps_total", "client_delays", "on_hold_steps", "health", "health_display", "health_reason", "step_template_available", "created_at",
             "started_at", "paused_since", "pauses", "on_site", "technician_here", "time_on_site", "work_done",
             "purchases", "cost", "cost_lines", "cost_recorded_by_name", "cost_recorded_at", "can_record_cost",
+            "cost_review", "cost_review_display", "cost_review_note", "cost_reviewed_by_name", "cost_reviewed_at",
+            "can_review_cost",
         ]
         read_only_fields = ["id", "completed_at", "escalation_state", "asset_verified_at", "created_at",
-                            "cost", "cost_recorded_at"]
+                            "cost", "cost_recorded_at", "cost_review", "cost_review_note", "cost_reviewed_at"]
 
     def validate(self, attrs):
         """A vendor is either a registered supplier or a hand-entered one."""
