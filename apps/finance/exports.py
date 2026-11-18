@@ -18,7 +18,7 @@ def col(key, label, kind="text"):
 
 
 PAYABLE_COLUMNS = [
-    col("number", "PO number"), col("party", "Vendor"), col("project", "Project"), col("status_display", "PO status"),
+    col("number", "PO number"), col("party", "Supplier"), col("project", "Project"), col("status_display", "PO status"),
     col("date", "Order date", "date"), col("currency", "Currency"), col("total", "PO value", "money"),
     col("invoiced", "Invoiced", "money"), col("discount", "Discount", "money"), col("advance", "Advance", "money"),
     col("first", "1st payment", "money"),
