@@ -63,13 +63,13 @@ def split_payments(payments) -> dict:
 PAY_STATUS = {"unpaid": "Unpaid", "partially_paid": "Partially Paid", "paid": "Paid"}
 
 
-def _row(total, payments, due, today) -> dict:
+def _row(total, payments, due, today, discount=ZERO) -> dict:
     row = split_payments(payments)
-    balance = max(money(total) - row["paid"], ZERO)
+    balance = max(money(total) - money(discount) - row["paid"], ZERO)
     overdue = (today - due).days if due and balance > 0 and today > due else 0
     paid_state = "paid" if balance <= 0 else "partially_paid" if row["paid"] > 0 else "unpaid"
     row.update(
-        total=money(total), balance=balance, due_date=due, overdue_days=overdue,
+        total=money(total), discount=money(discount), balance=balance, due_date=due, overdue_days=overdue,
         aging=aging_bucket(overdue) if balance > 0 else None,
         pay_status=paid_state, pay_status_display=PAY_STATUS[paid_state],
     )
@@ -79,7 +79,8 @@ def _row(total, payments, due, today) -> dict:
 def _invoice_line(inv) -> dict:
     return {
         "id": str(inv.id), "number": inv.invoice_number, "reference": inv.reference,
-        "amount": money(inv.amount), "total": money(inv.total_amount), "issue_date": inv.issue_date,
+        "amount": money(inv.amount), "discount": money(inv.discount_amount), "total": money(inv.total_amount),
+        "issue_date": inv.issue_date,
         "due_date": inv.due_date, "status": inv.status, "status_display": inv.get_status_display(),
     }
 
@@ -105,35 +106,57 @@ def payable_orders():
     return (
         PO.objects.filter(status__in=(PO.Status.APPROVED, PO.Status.ORDERED, PO.Status.PARTIALLY_RECEIVED, PO.Status.RECEIVED))
         .select_related("supplier", "payment_terms")
-        .prefetch_related("payments", "invoices", "items__bom_line__project")
+        .prefetch_related(
+            "payments", "invoices", "items__bom_line__project",
+            "items__asset_components__device__project", "items__procured_devices__project",
+        )
     )
 
 
 def po_projects(po) -> list[dict]:
-    """The projects an order buys for: those whose requirements its lines cover."""
+    """The projects an order buys for: the requirement a line covers, or the
+    asset a line's goods went into (read the same way as the order's purpose)."""
     seen = {}
     for item in po.items.all():
-        project = item.bom_line.project if item.bom_line_id else None
-        if project is not None:
-            seen[project.pk] = {"id": str(project.pk), "name": project.name}
+        found = [item.bom_line.project if item.bom_line_id else None]
+        found += [c.device.project_on for c in item.asset_components.all()]
+        found += [d.project_on for d in item.procured_devices.all()]
+        for project in found:
+            if project is not None:
+                seen[project.pk] = {"id": str(project.pk), "name": project.name}
     return list(seen.values())
 
 
+def po_discount(po):
+    """What the supplier knocked off the order on their invoices."""
+    return money(sum(
+        (i.discount_amount for i in po.invoices.all() if i.status != Invoice.Status.CANCELLED), ZERO,
+    ))
+
+
 def payables(today=None) -> list[dict]:
+    from apps.procurement.purpose import describe_purpose
+
     today = today or timezone.localdate()
     rows = []
     for po in payable_orders():
         due, due_set = po_due_date(po)
-        row = _row(po.total_amount, po.payments.all(), due, today)
+        # A discount on the supplier's invoice lowers what is owed, so paying
+        # the discounted invoice in full settles the order.
+        row = _row(po.total_amount, po.payments.all(), due, today, po_discount(po))
         # The supplier's invoices against it, beside what was ordered.
         bills = [i for i in po.invoices.all() if i.status != Invoice.Status.CANCELLED]
+        projects = po_projects(po)
         row.update(
             id=str(po.id), number=po.po_number, party=po.supplier.name, party_id=str(po.supplier_id),
             currency=po.currency, status=po.status, status_display=po.get_status_display(),
             date=po.order_date or timezone.localtime(po.created_at).date(),
             due_date_set=due_set,
             terms=po.payment_terms.name if po.payment_terms_id else po.payment_terms_note,
-            projects=po_projects(po),
+            terms_days=po.payment_terms.days if po.payment_terms_id else 0,
+            projects=projects,
+            # Bought for no project: what it was for instead ("Stock purchase").
+            purpose="" if projects else describe_purpose(po)["label"],
             invoiced=money(sum((i.total_amount for i in bills), ZERO)),
             invoices=[_invoice_line(i) for i in sorted(bills, key=lambda i: i.issue_date)],
         )
@@ -241,8 +264,12 @@ def filter_rows(rows, params) -> list[dict]:
     party, project = params.get("party"), params.get("project")
     status_test = STATUS_FILTERS.get(params.get("status") or "")
     q = (params.get("q") or "").strip().lower()
+    # Rows ticked on screen: an export of just those.
+    ids = {i for i in (params.get("ids") or "").split(",") if i}
 
     def keep(r):
+        if ids and r["id"] not in ids:
+            return False
         if start and (r["date"] is None or r["date"] < start):
             return False
         if end and (r["date"] is None or r["date"] > end):
@@ -267,12 +294,13 @@ def totals(rows) -> dict:
     """Per currency: the value, paid, outstanding, overdue and aging. Amounts
     in different currencies are never added together."""
     out = defaultdict(lambda: {
-        "total": ZERO, "paid": ZERO, "balance": ZERO, "overdue": ZERO, "open": 0, "overdue_count": 0,
+        "total": ZERO, "discount": ZERO, "paid": ZERO, "balance": ZERO, "overdue": ZERO, "open": 0, "overdue_count": 0,
         "aging": {key: ZERO for key, _ in AGING},
     })
     for r in rows:
         t = out[r["currency"]]
         t["total"] += r["total"]
+        t["discount"] += r.get("discount") or ZERO
         t["paid"] += r["paid"]
         t["balance"] += r["balance"]
         if r["balance"] > 0:
@@ -299,6 +327,24 @@ def sync_invoice(invoice):
 
 
 # --- Inventory in hand -------------------------------------------------------
+
+def asset_group(device):
+    """Where an asset counts in inventory, or None once it is the client's.
+
+    The asset's own category wins; one left as a finished product takes its
+    project's contract (a rental or sample project). In stock, a rented or
+    sold asset not yet delivered is still a finished product in hand; out at a
+    site, a sold one is the client's."""
+    H = device.HeldAs
+    kind = device.held_as
+    if kind == H.STOCK:
+        project = device.project_on
+        kind = {"rental": H.RENTED, "sold": H.SOLD, "sample_foc": H.FOC_SAMPLE, "sample_paid": "sample_paid"}.get(
+            getattr(project, "contract_type", ""), H.STOCK)
+    if device.status == device.Status.IN_STOCK:
+        return "stock" if kind in (H.RENTED, H.SOLD) else kind
+    return None if kind == H.SOLD else kind
+
 
 def inventory() -> dict:
     """What the company holds, at cost: material in the store (shelf stock,
@@ -335,16 +381,30 @@ def inventory() -> dict:
             "value": money(unit.purchase_price) if unit.purchase_price is not None else None,
         })
 
-    devices = list(Device.objects.filter(status=Device.Status.IN_STOCK).select_related("asset_type").order_by("asset_code"))
+    # Every asset built or bought, wherever it is, until it is sold or
+    # written off: in stock, or out at a site but still ours (rented, a
+    # sample, on display).
+    S = Device.Status
+    gone = (S.PROCURED, S.IN_PRODUCTION, S.CLIENT_PROPERTY, S.DECOMMISSIONED)
+    devices = list(
+        Device.objects.exclude(status__in=gone).select_related("asset_type", "current_site", "project")
+        .order_by("asset_code")
+    )
     costs = [{} for _ in devices]
     _asset_costs(devices, costs)
-    assets = {key: [] for key, _ in Device.HeldAs.choices}
+    assets = {key: [] for key in ("stock", "rented", "foc_sample", "sample_paid", "office_display")}
     for d, c in zip(devices, costs):
-        # Rented or sold but not yet delivered: still a finished product in hand.
-        group = Device.HeldAs.STOCK if d.held_as in (Device.HeldAs.RENTED, Device.HeldAs.SOLD) else d.held_as
+        group = asset_group(d)
+        if group is None:
+            continue
+        held = d.status == S.IN_STOCK
+        site = d.current_site.name if d.current_site_id else ""
         assets[group].append({
             "id": str(d.id), "name": d.display_name or d.asset_code, "asset_code": d.asset_code,
             "asset_type": d.asset_type.name if d.asset_type_id else "", "held_as": d.held_as,
+            "held_as_display": d.get_held_as_display(),
+            "status": d.status, "status_display": d.get_status_display(),
+            "where": "In stock" if held else " · ".join(x for x in (d.get_status_display(), site) if x),
             "value": c["manufacturing"],
         })
 
@@ -354,8 +414,10 @@ def inventory() -> dict:
     groups = [
         {"key": "material", "label": "Material", "lines": materials},
         {"key": "stock", "label": "Finished products", "lines": assets["stock"]},
-        {"key": "office_display", "label": "Assets on office display", "lines": assets["office_display"]},
+        {"key": "rented", "label": "Rented out", "lines": assets["rented"]},
         {"key": "foc_sample", "label": "FOC samples", "lines": assets["foc_sample"]},
+        {"key": "sample_paid", "label": "Paid samples", "lines": assets["sample_paid"]},
+        {"key": "office_display", "label": "Assets on office display", "lines": assets["office_display"]},
     ]
     for g in groups:
         g["total"] = total(g["lines"])

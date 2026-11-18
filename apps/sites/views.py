@@ -257,6 +257,7 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
     write_capability = "assign_installation"
     action_capabilities = {
         "activate": None, "handover": None, "verify_asset": None, "pause": None, "resume": None, "price": None,
+        "review_cost": None,
         "export": "view_installations", "handover_document": "view_installations",
         "activity": "view_installations",
         "reorder_steps": "edit_installation",
@@ -597,6 +598,18 @@ class DeviceInstallationViewSet(viewsets.ModelViewSet):
             installation, user=request.user,
             extra=request.data.get("cost_lines") or None, labour=request.data.get("labour") or None,
         )
+        return Response(DeviceInstallationDetailSerializer(self.get_object(), context=self.get_serializer_context()).data)
+
+    @action(detail=True, methods=["post"], url_path="review-cost")
+    def review_cost(self, request, pk=None):
+        """Finance on the finalized cost: {decision: "accept" | "reject", note}."""
+        installation = self.get_object()
+        decision = request.data.get("decision")
+        if decision not in ("accept", "reject"):
+            from rest_framework.exceptions import ValidationError as _VE
+
+            raise _VE({"decision": "Accept or reject."})
+        work.review_cost(installation, user=request.user, accept=decision == "accept", note=request.data.get("note") or "")
         return Response(DeviceInstallationDetailSerializer(self.get_object(), context=self.get_serializer_context()).data)
 
     @action(detail=True, methods=["post"], url_path="verify-asset")

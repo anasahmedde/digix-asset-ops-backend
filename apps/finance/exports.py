@@ -3,6 +3,7 @@ filters on screen show."""
 import csv
 import datetime
 import io
+from xml.sax.saxutils import escape
 from decimal import Decimal
 
 from django.http import HttpResponse
@@ -17,9 +18,10 @@ def col(key, label, kind="text"):
 
 
 PAYABLE_COLUMNS = [
-    col("number", "PO number"), col("party", "Vendor"), col("project", "Project"), col("status_display", "PO status"),
+    col("number", "PO number"), col("party", "Supplier"), col("project", "Project"), col("status_display", "PO status"),
     col("date", "Order date", "date"), col("currency", "Currency"), col("total", "PO value", "money"),
-    col("invoiced", "Invoiced", "money"), col("advance", "Advance", "money"), col("first", "1st payment", "money"),
+    col("invoiced", "Invoiced", "money"), col("discount", "Discount", "money"), col("advance", "Advance", "money"),
+    col("first", "1st payment", "money"),
     col("second", "2nd payment", "money"), col("third", "3rd payment", "money"), col("paid", "Paid", "money"),
     col("balance", "Balance pending", "money"), col("pay_status_display", "Payment status"),
     col("due_date", "Due date", "date"), col("overdue_days", "Overdue days", "int"), col("terms", "Terms"),
@@ -36,14 +38,15 @@ RECEIVABLE_COLUMNS = [
 ]
 
 INVENTORY_COLUMNS = [
-    col("group", "Counted as"), col("name", "Item"), col("where", "Where / code"),
+    col("group", "Counted as"), col("name", "Item"), col("code", "Code"), col("type", "Type"), col("where", "Where"),
     col("quantity", "Quantity", "int"), col("value", "Value at cost", "money"),
 ]
 
 
 def flat(rows):
-    """Ledger rows ready for a file: projects as names."""
-    return [r | {"project": ", ".join(p["name"] for p in r.get("projects", []))} for r in rows]
+    """Ledger rows ready for a file: projects as names, or what an order
+    with no project was bought for."""
+    return [r | {"project": ", ".join(p["name"] for p in r.get("projects", [])) or r.get("purpose", "")} for r in rows]
 
 
 def inventory_rows(data):
@@ -51,8 +54,8 @@ def inventory_rows(data):
     for g in data["groups"]:
         for line in g["lines"]:
             out.append({
-                "group": g["label"], "name": line["name"],
-                "where": line.get("where") or line.get("asset_code") or "",
+                "group": g["label"], "name": line["name"], "code": line.get("asset_code", ""),
+                "type": line.get("asset_type", ""), "where": line.get("where") or "",
                 "quantity": line.get("quantity", 1), "value": line["value"],
             })
     return out
@@ -118,7 +121,7 @@ def _pdf(name, title, columns, rows, describe):
     data = [[Paragraph(c["label"], head) for c in columns]]
     for r in rows:
         data.append([
-            Paragraph(_text(r.get(c["key"]), c["kind"]), right if c["kind"] in ("money", "int") else cell)
+            Paragraph(escape(_text(r.get(c["key"]), c["kind"])), right if c["kind"] in ("money", "int") else cell)
             for c in columns
         ])
     table = Table(data, repeatRows=1)
@@ -129,7 +132,7 @@ def _pdf(name, title, columns, rows, describe):
     ]))
     story = [
         Paragraph(title, ParagraphStyle("t", fontName="Helvetica-Bold", fontSize=14, textColor=ink, leading=18)),
-        Paragraph(describe, ParagraphStyle("d", fontName="Helvetica", fontSize=8.5, textColor=colors.grey)),
+        Paragraph(escape(describe), ParagraphStyle("d", fontName="Helvetica", fontSize=8.5, textColor=colors.grey)),
         Spacer(1, 6),
         table if rows else Paragraph("Nothing matches these filters.", cell),
     ]

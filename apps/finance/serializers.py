@@ -24,7 +24,7 @@ class PaymentSerializer(HidesMoney, serializers.ModelSerializer):
         read_only_fields = ["id", "recorded_by", "created_at"]
 
     def validate(self, attrs):
-        from .ledger import ZERO, payable_orders, split_payments
+        from .ledger import ZERO, payable_orders, po_discount, split_payments
 
         invoice = attrs.get("invoice", getattr(self.instance, "invoice", None))
         order = attrs.get("purchase_order", getattr(self.instance, "purchase_order", None))
@@ -42,7 +42,7 @@ class PaymentSerializer(HidesMoney, serializers.ModelSerializer):
         else:
             if not payable_orders().filter(pk=order.pk).exists():
                 raise serializers.ValidationError({"purchase_order": "Only an approved purchase order is paid."})
-            total, others = order.total_amount, order.payments.all()
+            total, others = order.total_amount - po_discount(order), order.payments.all()
         if self.instance:
             others = others.exclude(pk=self.instance.pk)
         balance = Decimal(total) - split_payments(others)["paid"]
@@ -67,7 +67,7 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
             "id", "invoice_number", "invoice_type", "status", "currency",
             "client", "client_name", "supplier", "supplier_name",
             "purchase_order", "po_number", "reference", "quotation", "quote_number", "description",
-            "amount", "tax_amount", "total_amount",
+            "amount", "discount_amount", "tax_amount", "total_amount",
             "issue_date", "due_date", "paid_amount", "notes",
             "created_by", "approved_by", "approved_by_name", "approved_at",
             "balance_due", "payments",
@@ -98,17 +98,31 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
             self._bill_order(order, attrs)
             amount = attrs.get("amount", getattr(self.instance, "amount", None))
             tax = attrs.get("tax_amount", getattr(self.instance, "tax_amount", None)) or Decimal("0")
+            discount = attrs.get("discount_amount", getattr(self.instance, "discount_amount", None)) or Decimal("0")
+            if amount is not None and Decimal(amount) <= 0:
+                raise serializers.ValidationError({"amount": "Enter an amount above zero."})
+            if Decimal(tax) < 0:
+                raise serializers.ValidationError({"tax_amount": "Tax cannot be negative."})
+            if discount < 0 or (amount is not None and discount > Decimal(amount)):
+                raise serializers.ValidationError({"discount_amount": "The discount is between zero and the amount."})
             if amount is not None:
-                attrs["total_amount"] = Decimal(amount) + Decimal(tax)
+                attrs["total_amount"] = Decimal(amount) - Decimal(discount) + Decimal(tax)
             return attrs
+        attrs.pop("discount_amount", None)
         quotation = attrs.get("quotation", getattr(self.instance, "quotation", None))
         if quotation is not None:
             self._bill_quotation(quotation, attrs)
         kind = attrs.get("invoice_type", getattr(self.instance, "invoice_type", Invoice.InvoiceType.RECEIVABLE))
+        if kind == Invoice.InvoiceType.PAYABLE:
+            raise serializers.ValidationError({"purchase_order": "A supplier's invoice is entered against its purchase order."})
         if kind == Invoice.InvoiceType.RECEIVABLE and not attrs.get("client", getattr(self.instance, "client", None)):
             raise serializers.ValidationError({"client": "Choose the client this invoice is raised to."})
         amount = attrs.get("amount", getattr(self.instance, "amount", None))
         tax = attrs.get("tax_amount", getattr(self.instance, "tax_amount", None)) or Decimal("0")
+        if amount is not None and Decimal(amount) <= 0:
+            raise serializers.ValidationError({"amount": "Enter an amount above zero."})
+        if Decimal(tax) < 0:
+            raise serializers.ValidationError({"tax_amount": "Tax cannot be negative."})
         if amount is not None:
             attrs["total_amount"] = Decimal(amount) + Decimal(tax)
         return attrs

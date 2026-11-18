@@ -698,7 +698,7 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
         qs = qs[:EXPORT_MAX_ROWS]
         columns = [
             "Asset Code", "Serial Number", "Name", "Model", "Asset Type",
-            "Status", "Source", "Batch Number", "Client", "Site", "Project",
+            "Status", "Category", "Source", "Batch Number", "Client", "Site", "Project",
             "Purchase Date", "Purchase Price", "Warranty Status",
         ]
         rows = []
@@ -710,6 +710,7 @@ class DeviceViewSet(RefusesSilentNoOps, viewsets.ModelViewSet):
                 str(d.device_model) if d.device_model_id else "",
                 d.asset_type.name if d.asset_type_id else "",
                 d.get_status_display(),
+                d.get_held_as_display(),
                 d.get_source_display(),
                 d.batch_number,
                 d.assigned_client.name if d.assigned_client_id else "",

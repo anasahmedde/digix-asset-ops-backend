@@ -99,7 +99,11 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
     @transaction.atomic
     def perform_update(self, serializer):
-        self._sync(serializer.save())
+        before = serializer.instance.invoice
+        payment = serializer.save()
+        self._sync(payment)
+        if before is not None and before.pk != payment.invoice_id:
+            ledger.sync_invoice(before)
 
     @transaction.atomic
     def perform_destroy(self, instance):
@@ -107,6 +111,15 @@ class PaymentViewSet(viewsets.ModelViewSet):
         instance.delete()
         if invoice:
             ledger.sync_invoice(invoice)
+
+
+def _uuid(value):
+    import uuid
+
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _describe(params) -> str:
@@ -119,15 +132,19 @@ def _describe(params) -> str:
     if params.get("date_from") or params.get("date_to"):
         parts.append(f"Dated {params.get('date_from') or 'the start'} to {params.get('date_to') or 'today'}")
     if params.get("party"):
-        name = (Supplier.objects.filter(pk=params["party"]).values_list("name", flat=True).first()
-                or Client.objects.filter(pk=params["party"]).values_list("name", flat=True).first())
+        pid = _uuid(params["party"])
+        name = pid and (Supplier.objects.filter(pk=pid).values_list("name", flat=True).first()
+                or Client.objects.filter(pk=pid).values_list("name", flat=True).first())
         parts.append(name or "One party")
     if params.get("project"):
-        parts.append("Project: " + (Project.objects.filter(pk=params["project"]).values_list("name", flat=True).first() or ""))
+        pid = _uuid(params["project"])
+        parts.append("Project: " + ((pid and Project.objects.filter(pk=pid).values_list("name", flat=True).first()) or "none"))
     if params.get("status"):
         parts.append(params["status"].replace("_", " ").capitalize())
     if params.get("q"):
         parts.append(f"Search: {params['q']}")
+    if params.get("ids"):
+        parts.append(f"{len([i for i in params['ids'].split(',') if i])} selected rows")
     return f"As of {timezone.localdate():%d %b %Y} · " + (" · ".join(parts) or "All records")
 
 
@@ -210,6 +227,9 @@ class FinancialViewSet(viewsets.ViewSet):
         due = parse_date(raw) if raw else None
         if raw and due is None:
             raise serializers.ValidationError({"payment_due_date": "Enter a date."})
+        ordered = order.order_date or timezone.localtime(order.created_at).date()
+        if due and due < ordered:
+            raise serializers.ValidationError({"payment_due_date": f"The due date cannot be before the order date ({ordered:%d %b %Y})."})
         order.payment_due_date = due
         order.save(update_fields=["payment_due_date", "updated_at"])
         return Response({"payment_due_date": due})
@@ -249,7 +269,8 @@ class FinancialViewSet(viewsets.ViewSet):
         held_as = request.data.get("held_as")
         if held_as not in Device.HeldAs.values:
             raise serializers.ValidationError({"held_as": "Choose finished product, rented, sold, office display or FOC sample."})
-        device = Device.objects.filter(pk=request.data.get("device"), status=Device.Status.IN_STOCK).first()
+        pk = _uuid(request.data.get("device"))
+        device = pk and Device.objects.filter(pk=pk, status=Device.Status.IN_STOCK).first()
         if device is None:
             return Response({"detail": "Only an asset in stock is held."}, status=status.HTTP_404_NOT_FOUND)
         device.held_as = held_as
