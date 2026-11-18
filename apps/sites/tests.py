@@ -2169,3 +2169,41 @@ def test_an_installation_is_paused_paid_for_and_costed_like_a_maintenance_visit(
         "installation": str(installation.id), "kind": "travel", "description": "Fuel", "amount": "100",
     }, format="json")
     assert late.status_code == 400, "settled once the cost is recorded"
+
+
+@pytest.mark.django_db
+def test_finance_accepts_or_rejects_a_finalized_installation_cost(ops, tech, installation):
+    """Bugs and Fixes 18-Nov, #5: a rejected cost goes back to the supervisor
+    with the reason, is corrected and resubmitted, then accepted and final -
+    each step in the installation's activity."""
+    from decimal import Decimal
+
+    from apps.sites.models import InstallationActivity
+
+    fin = User.objects.create_user(username="site-fin", password="x", role="finance")
+    url = f"/api/sites/installations/{installation.id}"
+    for step in installation.steps.all():
+        step.status = InstallationStep.StepStatus.COMPLETED
+        step.save()
+    body = {"cost_lines": [{"description": "Crane", "amount": "1000"}]}
+    r = _client(ops).post(f"{url}/price/", body, format="json")
+    assert r.status_code == 200 and r.data["cost_review"] == "pending", r.content
+    assert _client(ops).post(f"{url}/review-cost/", {"decision": "accept"}, format="json").status_code == 403
+    assert _client(fin).get(f"{url}/").data["can_review_cost"] is True
+    no_reason = _client(fin).post(f"{url}/review-cost/", {"decision": "reject"}, format="json")
+    assert no_reason.status_code == 400 and "note" in no_reason.data
+    r = _client(fin).post(f"{url}/review-cost/", {"decision": "reject", "note": "Crane was 800"}, format="json")
+    assert (r.data["cost_review"], r.data["cost_review_note"]) == ("rejected", "Crane was 800"), r.content
+    assert r.data["can_record_cost"] is False, "finance is not the installer's supervisor"
+    assert _client(ops).get(f"{url}/").data["can_record_cost"] is True
+
+    r = _client(ops).post(f"{url}/price/", {"cost_lines": [{"description": "Crane", "amount": "800"}]}, format="json")
+    assert (r.data["cost_review"], Decimal(r.data["cost"])) == ("pending", Decimal("800.00")), r.content
+    r = _client(fin).post(f"{url}/review-cost/", {"decision": "accept"}, format="json")
+    assert r.data["cost_review"] == "accepted" and r.data["cost_reviewed_by_name"]
+    final = _client(ops).post(f"{url}/price/", body, format="json")
+    assert final.status_code == 400 and "final" in str(final.data)
+    texts = list(InstallationActivity.objects.filter(installation=installation).values_list("text", flat=True))
+    assert any("rejected" in t and "Crane was 800" in t for t in texts)
+    assert any("corrected and resubmitted" in t for t in texts)
+    assert any("accepted" in t for t in texts)

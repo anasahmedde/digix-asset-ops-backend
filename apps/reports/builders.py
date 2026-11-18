@@ -185,7 +185,9 @@ def assets_report(request, f):
     if warranty == "none":
         qs = qs.filter(warranties__isnull=True)
     elif warranty == "inactive":
-        qs = qs.filter(warranties__status__in=("expired", "void")).distinct()
+        # Every warranty it has run out: one still running makes it active.
+        qs = qs.filter(warranties__status__in=("expired", "void")).exclude(
+            warranties__status__in=("active", "reissued")).distinct()
     elif warranty in ("active", "reissued"):
         qs = qs.filter(warranties__status=warranty).distinct()
     prices = can(request.user, "view_prices")
@@ -435,7 +437,9 @@ def visits_report(request, f):
     if f.get("site"):
         qs = qs.filter(schedule__site_id=f["site"])
     if f.get("project"):
-        qs = qs.filter(schedule__device__project_id=f["project"])
+        # The asset's own project or one it was scoped into, as the asset report reads it.
+        qs = qs.filter(Q(schedule__device__project_id=f["project"])
+                       | Q(schedule__device__project_scope_items__project_id=f["project"])).distinct()
     if f.get("status"):
         qs = qs.filter(status=f["status"])
     if f.get("client"):

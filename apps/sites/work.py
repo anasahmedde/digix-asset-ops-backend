@@ -140,6 +140,10 @@ def record_cost(inst, *, user, extra=None, labour=None):
         raise PermissionDenied("The installer's supervisor records what the installation cost.")
     if not work_done(inst):
         raise ValidationError({"detail": "The installation is not done yet: its cost is recorded once the work is."})
+    Review = DeviceInstallation.CostReview
+    if inst.cost_review == Review.ACCEPTED:
+        raise ValidationError({"detail": "Finance has accepted this installation's cost: it is final."})
+    before, rejected, reason = inst.cost, inst.cost_review == Review.REJECTED, inst.cost_review_note
     inst.cost_lines.all().delete()
     Line = InstallationCostLine
     lines = [
@@ -155,13 +159,74 @@ def record_cost(inst, *, user, extra=None, labour=None):
     Line.objects.bulk_create(lines)
     total = sum((x.amount for x in lines), Decimal("0.00"))
     inst.cost, inst.cost_recorded_by, inst.cost_recorded_at = total, user, clock.now()
-    inst.save(update_fields=["cost", "cost_recorded_by", "cost_recorded_at", "updated_at"])
+    inst.cost_review, inst.cost_reviewed_by, inst.cost_reviewed_at = Review.PENDING, None, None
+    inst.save(update_fields=[
+        "cost", "cost_recorded_by", "cost_recorded_at",
+        "cost_review", "cost_reviewed_by", "cost_reviewed_at", "updated_at",
+    ])
     Device.objects.filter(pk=inst.device_id).update(actual_installation_cost=total)
-    activity.log(inst, "cost_recorded", f"Installation cost finalized: PKR {total:,.2f}", user=user)
+    if rejected:
+        text = f"Installation cost corrected and resubmitted: PKR {total:,.2f} (rejected at PKR {before:,.2f}: {reason})"
+    elif before is not None:
+        text = f"Installation cost finalized again: PKR {total:,.2f} (was PKR {before:,.2f})"
+    else:
+        text = f"Installation cost finalized: PKR {total:,.2f}"
+    activity.log(inst, "cost_recorded", text, user=user)
     from apps.notifications import service as notices
 
     notices.resolve(f"inst-cost:{inst.pk}")
+    notices.resolve(f"inst-cost-review:{inst.pk}")
+    notices.ask(
+        "manage_finance", exclude=[user],
+        title=f"Review installation cost: {inst.device.asset_code}",
+        message=f"PKR {total:,.2f} · {inst.site.name}",
+        link=f"/installation-tracker?installation={inst.pk}", ref=f"inst-cost-review:{inst.pk}",
+        data={"installation": str(inst.pk)},
+    )
     return total
+
+
+def may_review_cost(user, inst) -> bool:
+    """Finance accepts or rejects a finalized cost - never the one who finalized it."""
+    if not getattr(user, "is_authenticated", False) or inst.cost is None:
+        return False
+    if inst.cost_review != DeviceInstallation.CostReview.PENDING:
+        return False
+    if user.is_superuser or getattr(user, "role", None) == "super_admin":
+        return True
+    return can(user, "manage_finance") and inst.cost_recorded_by_id != user.pk
+
+
+@transaction.atomic
+def review_cost(inst, *, user, accept: bool, note=""):
+    """Accept the finalized cost, or reject it back to the supervisor with the reason."""
+    from apps.notifications import service as notices
+
+    note = (note or "").strip()
+    if inst.cost is None or inst.cost_review != DeviceInstallation.CostReview.PENDING:
+        raise ValidationError({"detail": "There is no finalized cost waiting for review."})
+    if not may_review_cost(user, inst):
+        raise PermissionDenied("Finance reviews the installation cost, not whoever finalized it.")
+    if not accept and not note:
+        raise ValidationError({"note": "Say why the cost is rejected, so it can be corrected."})
+    Review = DeviceInstallation.CostReview
+    inst.cost_review = Review.ACCEPTED if accept else Review.REJECTED
+    inst.cost_review_note, inst.cost_reviewed_by, inst.cost_reviewed_at = note, user, clock.now()
+    inst.save(update_fields=["cost_review", "cost_review_note", "cost_reviewed_by", "cost_reviewed_at", "updated_at"])
+    if accept:
+        activity.log(inst, "cost_accepted", f"Installation cost accepted: PKR {inst.cost:,.2f}"
+                     + (f" ({note})" if note else ""), user=user)
+    else:
+        activity.log(inst, "cost_rejected", f"Installation cost rejected: PKR {inst.cost:,.2f}. Reason: {note}", user=user)
+    notices.resolve(f"inst-cost-review:{inst.pk}")
+    if inst.cost_recorded_by_id:
+        notices.tell(
+            [inst.cost_recorded_by],
+            title=f"Installation cost {'accepted' if accept else 'rejected'}: {inst.device.asset_code}",
+            message=note or f"PKR {inst.cost:,.2f}",
+            link=f"/installation-tracker?installation={inst.pk}", ref=f"inst-cost-reviewed:{inst.pk}",
+            email=not accept,
+        )
 
 
 def ask_to_finalize(inst, actor=None):

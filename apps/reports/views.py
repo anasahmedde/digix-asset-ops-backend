@@ -54,6 +54,9 @@ class ReportView(APIView):
         if not _allowed(request.user, meta):
             raise PermissionDenied(f"Running the {meta['title']} report is not one of your rights.")
         filters = {k: request.query_params.get(k) for k in FILTER_KEYS if request.query_params.get(k)}
+        bad = _bad_filters(meta, filters)
+        if bad:
+            return Response(bad, status=400)
         data = meta["build"](request, filters)
         rows = data["rows"]
         if request.query_params.get("export") == "xlsx":
@@ -68,6 +71,38 @@ class ReportView(APIView):
             "count": len(rows), "truncated": len(rows) >= ROW_LIMIT,
             "kpis": data.get("kpis", []), "breakdown": data.get("breakdown"),
         })
+
+
+ID_KEYS = ("project", "site", "technician", "client", "vendor")
+
+
+def _bad_filters(meta, filters) -> dict:
+    """Filter values the report cannot read: a malformed id or date, or an
+    option the report does not offer. Answered as 400, never a 500."""
+    import uuid
+
+    from django.utils.dateparse import parse_date
+
+    bad = {}
+    for k in ID_KEYS:
+        if k in filters:
+            try:
+                uuid.UUID(filters[k])
+            except ValueError:
+                bad[k] = "Not a known record."
+    for k in ("date_from", "date_to"):
+        if k in filters:
+            try:
+                ok = parse_date(filters[k]) is not None
+            except ValueError:
+                ok = False
+            if not ok:
+                bad[k] = "Enter a date as YYYY-MM-DD."
+    for choice in choice_options(meta):
+        value = filters.get(choice["key"])
+        if value and value not in {o["value"] for o in choice["options"]}:
+            bad[choice["key"]] = f"Choose one of the {choice['label'].lower()} options."
+    return bad
 
 
 def _describe(meta, filters) -> str:

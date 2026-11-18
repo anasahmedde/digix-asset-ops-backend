@@ -126,6 +126,22 @@ class DeviceInstallation(TimeStampedModel):
     )
     cost_recorded_at = models.DateTimeField(null=True, blank=True)
 
+    class CostReview(models.TextChoices):
+        PENDING = "pending", "Awaiting Finance"
+        ACCEPTED = "accepted", "Accepted"
+        REJECTED = "rejected", "Rejected"
+
+    # Finance checks the finalized cost. A rejected one goes back to the
+    # supervisor with the reason, is corrected and resubmitted; an accepted one
+    # is final. Each step is in the installation's activity.
+    cost_review = models.CharField(max_length=10, choices=CostReview.choices, blank=True)
+    cost_review_note = models.TextField(blank=True)
+    cost_reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="installation_costs_reviewed",
+    )
+    cost_reviewed_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         ordering = ["-installed_at"]
 

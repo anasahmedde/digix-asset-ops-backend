@@ -56,6 +56,9 @@ class Invoice(TimeStampedModel):
     description = models.CharField(max_length=200, blank=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     tax_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    # A supplier's discount off the order: their invoice bills the PO's price
+    # less this, and the order is settled once the discounted figure is paid.
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     total_amount = models.DecimalField(max_digits=12, decimal_places=2)
     issue_date = models.DateField()
     due_date = models.DateField()

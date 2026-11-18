@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from xml.sax.saxutils import escape as esc
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -33,15 +34,15 @@ def build_invoice_pdf(invoice) -> bytes:
 
     elements = [letterhead()]
     company = _company()
-    company_lines = [company.name] if company else []
+    company_lines = [esc(company.name)] if company else []
     if company:
         if company.address:
-            company_lines.append(company.address)
-        contact = " · ".join([p for p in [company.phone, company.email] if p])
+            company_lines.append(esc(company.address))
+        contact = " · ".join([esc(p) for p in [company.phone, company.email] if p])
         if contact:
             company_lines.append(contact)
         if company.tax_id:
-            company_lines.append(f"Tax ID: {company.tax_id}")
+            company_lines.append(f"Tax ID: {esc(company.tax_id)}")
     title = "INVOICE" if invoice.status != invoice.Status.DRAFT else "INVOICE (DRAFT)"
     header = Table(
         [[Paragraph("<br/>".join(company_lines), body), Paragraph(f"<b>{title}</b><br/>{invoice.invoice_number}", h_style)]],
@@ -53,10 +54,10 @@ def build_invoice_pdf(invoice) -> bytes:
     client = invoice.client
     client_block = []
     if client:
-        client_block.append(f"<b>{client.name}</b>")
+        client_block.append(f"<b>{esc(client.name)}</b>")
         for v in [client.contact_person, client.contact_phone, client.contact_email, client.address]:
             if v:
-                client_block.append(v)
+                client_block.append(esc(v))
     q = invoice.quotation
     meta_right = [
         f"<b>Issue date:</b> {invoice.issue_date}",
@@ -66,7 +67,7 @@ def build_invoice_pdf(invoice) -> bytes:
     if q:
         meta_right.insert(0, f"<b>Quotation:</b> {q.quote_number}")
         if q.client_po_number:
-            meta_right.insert(1, f"<b>Your PO:</b> {q.client_po_number}")
+            meta_right.insert(1, f"<b>Your PO:</b> {esc(q.client_po_number)}")
     meta = Table(
         [[Paragraph("BILL TO", label), Paragraph("DETAILS", label)],
          [Paragraph("<br/>".join(client_block) or "—", body), Paragraph("<br/>".join(meta_right), body)]],
@@ -79,7 +80,7 @@ def build_invoice_pdf(invoice) -> bytes:
     items = list(q.items.all()) if q else []
     if items:
         rows = [["Item", "Qty", f"Unit price ({cur})", f"Line total ({cur})"]] + [
-            [Paragraph(i.description, body), str(i.quantity), f"{i.unit_price:,.2f}", f"{i.line_total:,.2f}"]
+            [Paragraph(esc(i.description), body), str(i.quantity), f"{i.unit_price:,.2f}", f"{i.line_total:,.2f}"]
             for i in items
         ]
         quoted = Table(rows, colWidths=[94 * mm, 16 * mm, 32 * mm, 32 * mm], repeatRows=1)
@@ -90,9 +91,9 @@ def build_invoice_pdf(invoice) -> bytes:
         ]))
         elements += [Paragraph("Items quoted", label), Spacer(1, 3), quoted, Spacer(1, 10)]
 
-    what = invoice.description or (f"Against quotation {q.quote_number}" if q else "Services")
+    what = esc(invoice.description or (f"Against quotation {q.quote_number}" if q else "Services"))
     if q:
-        what = f"{what}<br/><font size=7 color='grey'>{q.quote_number} · {q.title}</font>"
+        what = f"{what}<br/><font size=7 color='grey'>{q.quote_number} · {esc(q.title)}</font>"
     data = [["Description", f"Amount ({cur})"], [Paragraph(what, body), f"{invoice.amount:,.2f}"]]
     if invoice.tax_amount:
         data.append(["Tax", f"{invoice.tax_amount:,.2f}"])
@@ -120,7 +121,7 @@ def build_invoice_pdf(invoice) -> bytes:
             f"Quotation value {cur} {b['quoted']:,.2f} · invoiced to date {cur} {b['invoiced']:,.2f} · "
             f"left to invoice {cur} {b['to_invoice']:,.2f}", small))
     if invoice.notes:
-        elements += [Spacer(1, 8), Paragraph("Notes", styles["Heading4"]), Paragraph(invoice.notes.replace("\n", "<br/>"), body)]
+        elements += [Spacer(1, 8), Paragraph("Notes", styles["Heading4"]), Paragraph(esc(invoice.notes).replace("\n", "<br/>"), body)]
 
     from common.signatures import signature_of
 
