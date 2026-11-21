@@ -79,6 +79,8 @@ INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 # Middleware
 # ---------------------------------------------------------------------------
 MIDDLEWARE = [
+    # First: the load balancer's check, before the allowed-hosts check (common/health.py).
+    "common.health.HealthCheckMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -217,6 +219,8 @@ SIMPLE_JWT = {
 # CORS
 # ---------------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=["http://localhost:3000"])
+# Behind a load balancer the admin's forms post from the public https address.
+CSRF_TRUSTED_ORIGINS = env.list("CSRF_TRUSTED_ORIGINS", default=[])
 from corsheaders.defaults import default_headers  # noqa: E402
 
 CORS_ALLOW_HEADERS = (*default_headers, "x-recorded-at", "x-idempotency-key", "x-client")
@@ -286,6 +290,21 @@ AWS_S3_FILE_OVERWRITE = False
 AWS_DEFAULT_ACL = None
 AWS_QUERYSTRING_AUTH = True
 AWS_S3_SIGNATURE_VERSION = "s3v4"
+# Links on the bucket's regional address (bucket.s3.us-east-2...): the global
+# one redirects (307) for a new bucket, and signed links do not follow that.
+AWS_S3_ADDRESSING_STYLE = "virtual"
+# On AWS, uploads and the admin's static files live in the S3 bucket (no shared
+# disk between containers); links to them are signed per request. Credentials
+# come from the ECS task's role, so the key settings above stay empty there.
+if env.bool("USE_S3", default=False):
+    STORAGES = {
+        "default": {"BACKEND": "storages.backends.s3.S3Storage", "OPTIONS": {"location": "media"}},
+        "staticfiles": {"BACKEND": "storages.backends.s3.S3Storage", "OPTIONS": {"location": "static"}},
+    }
+
+# Phone notifications through Expo. Off for a rehearsal on copied data, so
+# real phones are not woken by it.
+PUSH_ENABLED = env.bool("PUSH_ENABLED", default=True)
 
 # ---------------------------------------------------------------------------
 # DRF Spectacular (API Docs)
