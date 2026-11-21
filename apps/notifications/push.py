@@ -47,9 +47,11 @@ def _deliver(tokens: list[str], title: str, body: str, data: dict) -> None:
 def send_push_to_user(user_id, title: str, body: str, data: dict | None = None) -> None:
     """Fire-and-forget: push to every device registered for ``user_id``."""
     # Imported here to avoid app-loading order issues.
+    from django.conf import settings
+
     from .models import PushToken
 
-    if not user_id:
+    if not user_id or not settings.PUSH_ENABLED:
         return
     tokens = list(
         PushToken.objects.filter(user_id=user_id).values_list("token", flat=True)
