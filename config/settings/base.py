@@ -290,6 +290,9 @@ AWS_S3_FILE_OVERWRITE = False
 AWS_DEFAULT_ACL = None
 AWS_QUERYSTRING_AUTH = True
 AWS_S3_SIGNATURE_VERSION = "s3v4"
+# Links on the bucket's regional address (bucket.s3.us-east-2...): the global
+# one redirects (307) for a new bucket, and signed links do not follow that.
+AWS_S3_ADDRESSING_STYLE = "virtual"
 # On AWS, uploads and the admin's static files live in the S3 bucket (no shared
 # disk between containers); links to them are signed per request. Credentials
 # come from the ECS task's role, so the key settings above stay empty there.
