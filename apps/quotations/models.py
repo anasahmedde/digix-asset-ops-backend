@@ -64,6 +64,17 @@ class Quotation(TimeStampedModel):
     client_po_amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
     client_po_date = models.DateField(null=True, blank=True)
 
+    # Set when the quotation came from a DIGIX Suite Production Go-Ahead (see
+    # suite.py): which Suite job it is, and how far the Suite job has been
+    # moved to match the project made here.
+    suite_record_id = models.CharField(max_length=100, unique=True, null=True, blank=True)
+    suite_job_number = models.CharField(max_length=50, blank=True)
+    suite_version = models.PositiveIntegerField(null=True, blank=True)
+    suite_client_name = models.CharField(max_length=300, blank=True)
+    suite_acknowledged_at = models.DateTimeField(null=True, blank=True)
+    suite_completed_at = models.DateTimeField(null=True, blank=True)
+    suite_sync_error = models.TextField(blank=True)
+
     VALID_TRANSITIONS = {
         Status.DRAFT: (Status.SENT,),
         Status.SENT: (Status.UNDER_NEGOTIATION, Status.ACCEPTED, Status.REJECTED, Status.EXPIRED),
