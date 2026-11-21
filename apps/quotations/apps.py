@@ -6,3 +6,6 @@ class QuotationsConfig(AppConfig):
     name = "apps.quotations"
     label = "quotations"
     verbose_name = "Quotations"
+
+    def ready(self):
+        from . import suite  # noqa: F401  (completed projects move their Suite job)

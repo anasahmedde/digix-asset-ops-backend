@@ -117,6 +117,68 @@ class QuotationViewSet(viewsets.ModelViewSet):
 
         return Response(QuotationSerializer(quotation).data)
 
+    @action(detail=False, methods=["get"], url_path="suite")
+    def suite_jobs(self, request):
+        """DIGIX Suite jobs at Production Go-Ahead, and what was made from each."""
+        from . import suite
+
+        if not suite.enabled():
+            return Response({"enabled": False, "jobs": []})
+        from common.permissions import can
+
+        try:
+            jobs = suite.jobs()
+        except suite.SuiteError as e:
+            return Response({"enabled": True, "jobs": [], "error": str(e)})
+        if not can(request.user, "view_prices"):
+            # Blank, not zero: a figure this person may not see.
+            for job in jobs:
+                job.update(po_amount=None, net=None, gross=None, discount=None)
+                for line in job["lines"]:
+                    line["unit_price"] = None
+        return Response({"enabled": True, "jobs": jobs})
+
+    @action(detail=False, methods=["post"], url_path="suite/create-project")
+    def suite_create_project(self, request):
+        """Make the quotation, project and assets for one Suite job; the
+        client is chosen from this app's clients."""
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        from apps.clients.models import Client
+
+        from . import suite
+
+        if not suite.enabled():
+            return Response({"detail": "The Suite link is not set up."}, status=400)
+        try:
+            client = Client.objects.filter(pk=request.data.get("client") or None).first()
+        except (DjangoValidationError, ValueError):
+            client = None
+        if client is None:
+            return Response({"client": ["Choose the client."]}, status=400)
+        try:
+            quotation, project, assets = suite.create_project(str(request.data.get("record_id") or ""), client, request.user)
+        except suite.SuiteError as e:
+            return Response({"detail": str(e)}, status=400)
+        suite.push(quotation)  # the Suite job moves to Execution
+        return Response({
+            "quotation": str(quotation.pk), "quote_number": quotation.quote_number,
+            "project": str(project.pk), "project_code": project.project_code,
+            "assets": len(assets), "suite_sync_error": quotation.suite_sync_error,
+        }, status=201)
+
+    @action(detail=True, methods=["post"], url_path="suite-sync")
+    def suite_sync(self, request, pk=None):
+        """Try again to move the Suite job to where the project is."""
+        from . import suite
+
+        quotation = self.get_object()
+        if not quotation.suite_record_id:
+            return Response({"detail": "This quotation did not come from Suite."}, status=400)
+        suite.push(quotation)
+        quotation._prefetched_objects_cache = {}
+        return Response(QuotationSerializer(quotation, context={"request": request}).data)
+
     @action(detail=True, methods=["get"], url_path="print")
     def print_pdf(self, request, pk=None):
         quotation = self.get_object()

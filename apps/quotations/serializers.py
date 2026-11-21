@@ -62,12 +62,16 @@ class QuotationSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
             "currency", "valid_until", "total_amount", "notes",
             "items", "created_by", "created_by_name",
             "accepted_at", "spawned_project", "billing", "created_at", "updated_at",
+            "suite_record_id", "suite_job_number", "suite_version", "suite_client_name",
+            "suite_acknowledged_at", "suite_completed_at", "suite_sync_error",
         ]
         # The client's PO is recorded by Finance (/finance/client-po/), and
         # shows here through billing.
         read_only_fields = [
             "id", "quote_number", "status", "total_amount", "created_by",
             "accepted_at", "created_at", "updated_at",
+            "suite_record_id", "suite_job_number", "suite_version", "suite_client_name",
+            "suite_acknowledged_at", "suite_completed_at", "suite_sync_error",
         ]
 
     def get_billing(self, obj):

@@ -157,6 +157,14 @@ MEDIA_ROOT = BASE_DIR / "media"
 # is done from the site the technician is clocked in at. Off for a suite.
 FIELD_WORK_NEEDS_CHECK_IN = env.bool("FIELD_WORK_NEEDS_CHECK_IN", default=True)
 
+# DIGIX Suite, the quotation builder. Its Production Go-Ahead jobs show on the
+# Quotations page, and the Suite job follows the project made from it. The
+# account is a Suite Operations Manager (or Super Admin) kept for this link.
+# No address: the link is off.
+SUITE_URL = env("SUITE_URL", default="")
+SUITE_EMAIL = env("SUITE_EMAIL", default="")
+SUITE_PASSWORD = env("SUITE_PASSWORD", default="")
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # ---------------------------------------------------------------------------
