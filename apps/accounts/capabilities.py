@@ -208,6 +208,9 @@ CAPABILITIES: tuple[Capability, ...] = (
        "Quotations given to clients, their prices, and what became of them.", "view"),
     _c("manage_quotations", "Work client quotations", "Commercial",
        "Draft, revise, send and accept quotations to clients."),
+    _c("use_suite", "Sign in to DIGIX Suite", "Commercial",
+       "Open DIGIX Suite from the Quotations page, signed in as themselves (the Suite account with "
+       "the same email, made the first time). What they may do in Suite is set in Suite."),
 
     # --- Finance -------------------------------------------------------------
     _c("view_finance", "See invoices and payments", "Finance",
@@ -294,14 +297,14 @@ ROLE_DEFAULTS: dict[str, frozenset[str]] = {
     "group_head": ALL_KEYS - _keys(
         "manage_logins", "raise_po", "raise_work_order", "use_field_app", "plan_budget",
         "inspect_goods", "receive_goods", "manage_quotations", "manage_client_warranties",
-        "manage_vendor_warranties", "view_all_attendance",
+        "manage_vendor_warranties", "view_all_attendance", "use_suite",
     ),
     # Runs assets, projects, sites, procurement and maintenance; the three
     # signatures (budget, PO, WO) and logins stay above.
     "ops_manager": ALL_KEYS - _keys(
         "approve_budget", "approve_po", "approve_work_order", "approve_invoice", "manage_logins", "use_field_app",
         "manage_quotations", "view_client_warranties", "manage_client_warranties",
-        "record_client_warranty", "inspect_goods", "receive_goods", "view_all_attendance",
+        "record_client_warranty", "inspect_goods", "receive_goods", "view_all_attendance", "use_suite",
     ),
     "marketing_head": (_VIEW_ALL - _keys("view_vendor_warranties")) | _keys(
         "edit_prices", "raise_ticket", "work_tickets", "relay_client_decision", "close_ticket",

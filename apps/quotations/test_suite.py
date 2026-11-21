@@ -158,3 +158,35 @@ def test_suite_link_refuses_bad_input_and_closed_jobs(fake, api, unilever):
 @pytest.mark.django_db
 def test_suite_link_off_without_an_address(api):
     assert api.get("/api/quotations/quotations/suite/").json() == {"enabled": False, "jobs": []}
+
+
+@pytest.mark.django_db
+def test_suite_sign_in_is_only_for_people_given_the_right(settings):
+    import jwt
+
+    from apps.accounts.models import UserCapability
+    from apps.accounts.roles import defaults_for
+
+    settings.SUITE_SSO_SECRET = "s" * 40
+    # Nobody but the Super Admin holds it until it is ticked on Roles & Rights.
+    assert "use_suite" in defaults_for("super_admin")
+    assert not any("use_suite" in defaults_for(r) for r in ("group_head", "ops_manager", "marketing_head", "marketing"))
+
+    person = User.objects.create_user(username="st-sso", password="x", role="marketing", email="Sana@Digix.PK",
+                                      first_name="Sana", last_name="Khan")
+    c = APIClient()
+    c.force_authenticate(person)
+    url = "/api/quotations/quotations/suite/sign-in/"
+    assert c.get(url).status_code == 403
+
+    UserCapability.objects.create(user=person, capability="use_suite", allowed=True)
+    r = c.get(url)
+    assert r.status_code == 200, r.content
+    claims = jwt.decode(r.data["token"], settings.SUITE_SSO_SECRET, algorithms=["HS256"], audience="digix-suite")
+    assert (claims["email"], claims["name"], claims["iss"]) == ("sana@digix.pk", "Sana Khan", "digix-asset-ops")
+    assert claims["exp"] - claims["iat"] == 60
+    assert c.get(url).data["token"] != r.data["token"]  # a fresh one each time
+
+    person.email = ""
+    person.save(update_fields=["email"])
+    assert c.get(url).status_code == 400

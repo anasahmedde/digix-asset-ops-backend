@@ -89,6 +89,22 @@ def call(channel: str, arg=None):
                 raise
 
 
+def sign_in_token(user) -> str:
+    """What Suite's /sso checks (HS256 with the shared SUITE_SSO_SECRET):
+    who it is, by email, for one minute, once."""
+    import time
+    import uuid
+
+    import jwt
+
+    now = int(time.time())
+    return jwt.encode({
+        "iss": "digix-asset-ops", "aud": "digix-suite",
+        "email": user.email.strip().lower(), "name": user.get_full_name() or user.username,
+        "iat": now, "exp": now + 60, "jti": uuid.uuid4().hex,
+    }, settings.SUITE_SSO_SECRET, algorithm="HS256")
+
+
 def _money(value) -> Decimal:
     try:
         return Decimal(str(value or 0)).quantize(Decimal("0.01"))

@@ -1,4 +1,5 @@
 from apps.notifications.service import inform_line, who as _who
+from django.conf import settings
 from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
@@ -58,7 +59,7 @@ class QuotationViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, CapabilityGate]
     read_capability = "view_quotations"
     write_capability = "manage_quotations"
-    action_capabilities = {"print_pdf": "view_quotations"}
+    action_capabilities = {"print_pdf": "view_quotations", "suite_sign_in": "use_suite"}
     filterset_fields = ["status", "client", "site", "currency"]
     search_fields = ["quote_number", "title", "description"]
     ordering_fields = ["created_at", "valid_until", "total_amount"]
@@ -137,6 +138,18 @@ class QuotationViewSet(viewsets.ModelViewSet):
                 for line in job["lines"]:
                     line["unit_price"] = None
         return Response({"enabled": True, "jobs": jobs})
+
+    @action(detail=False, methods=["get"], url_path="suite/sign-in")
+    def suite_sign_in(self, request):
+        """A one-minute, single-use token Suite's /sso takes to sign this
+        person in as the Suite account with their email."""
+        from . import suite
+
+        if not settings.SUITE_SSO_SECRET:
+            return Response({"detail": "Signing in to Suite from here is not set up."}, status=400)
+        if not (request.user.email or "").strip():
+            return Response({"detail": "Your account has no email; Suite knows people by email. Ask an administrator to add it."}, status=400)
+        return Response({"token": suite.sign_in_token(request.user)})
 
     @action(detail=False, methods=["post"], url_path="suite/create-project")
     def suite_create_project(self, request):

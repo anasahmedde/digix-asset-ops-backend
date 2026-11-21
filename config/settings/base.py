@@ -164,6 +164,9 @@ FIELD_WORK_NEEDS_CHECK_IN = env.bool("FIELD_WORK_NEEDS_CHECK_IN", default=True)
 SUITE_URL = env("SUITE_URL", default="")
 SUITE_EMAIL = env("SUITE_EMAIL", default="")
 SUITE_PASSWORD = env("SUITE_PASSWORD", default="")
+# Shared with Suite (its DIGIX_SSO_SECRET): people holding use_suite open Suite
+# signed in as themselves. No secret: Suite asks them to sign in.
+SUITE_SSO_SECRET = env("SUITE_SSO_SECRET", default="")
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
