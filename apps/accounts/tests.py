@@ -709,3 +709,18 @@ def test_a_signature_is_uploaded_once_and_printed_on_the_documents_signed(tmp_pa
 
     r = c.delete(f"/api/accounts/users/{head.id}/signature/")
     assert r.status_code == 200 and not r.data["signature"]
+
+
+@pytest.mark.django_db
+def test_top_role_is_named_administrator_everywhere():
+    """Seeded as "Super Admin", renamed in code; migration 0022 renames the record."""
+    from importlib import import_module
+
+    from django.apps import apps as global_apps
+
+    from .models import RoleDefinition
+
+    RoleDefinition.objects.update_or_create(key="super_admin", defaults={"label": "Super Admin", "is_builtin": True})
+    import_module("apps.accounts.migrations.0022_administrator_name").rename(global_apps, None)
+    assert RoleDefinition.objects.get(key="super_admin").label == "Administrator"
+    assert User.Role.SUPER_ADMIN.label == "Administrator"
