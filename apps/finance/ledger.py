@@ -176,7 +176,8 @@ def receivable_invoices():
 
 def quotation_billing(quotation, exclude=None) -> dict:
     """How much of an accepted quotation has been invoiced, received, and is
-    left to invoice. Cancelled invoices bill nothing; tax is on top."""
+    left to invoice. Cancelled invoices bill nothing. Tax is on top, except
+    on a quotation whose value already includes it (one from Suite)."""
     invoices = [
         i for i in quotation.invoices.all()
         if i.status != Invoice.Status.CANCELLED and (exclude is None or i.pk != exclude.pk)
@@ -186,7 +187,7 @@ def quotation_billing(quotation, exclude=None) -> dict:
     total = money(quotation.total_amount)
     po = quotation.client_po_amount
     return {
-        "quoted": total, "invoiced": invoiced, "received": received,
+        "quoted": total, "invoiced": invoiced, "received": received, "tax_included": quotation.tax_included,
         "to_invoice": max(total - invoiced, ZERO), "invoices": len(invoices),
         # The client's PO, and how much of it is not invoiced yet.
         "client_po_number": quotation.client_po_number, "client_po_date": quotation.client_po_date,
@@ -206,7 +207,8 @@ def draft_full_invoice(quotation, user=None):
     today = timezone.localdate()
     return Invoice.objects.create(
         invoice_type=Invoice.InvoiceType.RECEIVABLE, quotation=quotation, client=quotation.client,
-        currency=quotation.currency, description="Full quotation value", amount=quotation.total_amount,
+        currency=quotation.currency, description="Full quotation value incl. GST" if quotation.tax_included else "Full quotation value",
+        amount=quotation.total_amount,
         tax_amount=ZERO, total_amount=quotation.total_amount, issue_date=today, due_date=today + timedelta(days=30),
         created_by=user,
     )

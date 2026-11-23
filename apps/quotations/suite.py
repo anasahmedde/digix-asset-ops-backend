@@ -1,8 +1,9 @@
 """The link to DIGIX Suite, the quotation builder.
 
 A Suite quotation that reaches Production Go-Ahead shows on the Quotations
-page. Making a project from it creates the quotation here (accepted), its
-project with the BOM, and one asset per product unit. From then on the Suite
+page. Making a project from it creates the quotation here (accepted, its
+value including Suite's GST, like the client's PO), its project with the
+BOM, and one asset per product unit. From then on the Suite
 job follows the project: it moves to Execution when the project is made here,
 and to Sales check (completion requested, Sales to provide the JVC) when the
 project is completed.
@@ -141,6 +142,7 @@ def _job(row: dict) -> dict:
         lines.append({"title": str(x.get("name") or x.get("title") or "Additional item")[:300], "qty": qty,
                       "unit_price": _money(x.get("rate")), "asset": False})
     po_amount = ex.get("poAmount") if ex.get("poAmount") is not None else ex.get("goAheadAmount")
+    net, gross = _money(ex.get("quotationNet")), _money(ex.get("quotationGrand"))
     return {
         "record_id": str(row.get("id") or row.get("recordId") or ""),
         "quote_number": str(q.get("number") or ctx.get("quotationNo") or ""),
@@ -154,9 +156,10 @@ def _job(row: dict) -> dict:
         "target_date": ex.get("targetClosingDate") or None,
         "stage": str(workflow.get("stage") or ""),
         "stage_display": str(workflow.get("label") or ""),
-        "net": _money(ex.get("quotationNet")),
+        "net": net,
         "gst_pct": ex.get("quotationGstPct") or q.get("gstPct") or 0,
-        "gross": _money(ex.get("quotationGrand")),
+        "gst": max(gross - net, Decimal("0.00")),
+        "gross": gross,
         "discount": _money(q.get("discount")),
         "financials_hidden": bool(row.get("financialsRedacted")),
         "lines": lines,
@@ -235,8 +238,6 @@ def create_project(record_id: str, client, user):
             status=Quotation.Status.ACCEPTED, accepted_at=timezone.now(),
             client=client, created_by=user,
             client_po_number=job["po_number"][:100], client_po_amount=job["po_amount"],
-            notes=(f"Suite GST {job['gst_pct']}% (gross {job['gross']}) is not in the lines; "
-                   "set the tax on the invoice." if job["gst_pct"] else ""),
             suite_record_id=record_id, suite_job_number=job["job_number"][:50],
             suite_version=job["version"], suite_client_name=job["client"][:300],
         )
@@ -265,6 +266,10 @@ def create_project(record_id: str, client, user):
         if job["discount"]:
             QuotationItem.objects.create(quotation=quotation, description="Discount (Suite)",
                                          quantity=1, unit_price=-job["discount"])
+        if job["gst"]:
+            # The value here includes Suite's GST, as the client's PO does.
+            QuotationItem.objects.create(quotation=quotation, description=f"GST {job['gst_pct']}% (Suite)",
+                                         quantity=1, unit_price=job["gst"])
         quotation.recalc_total()
         draft_full_invoice(quotation, user)
         project_log.log(project, "created", (
