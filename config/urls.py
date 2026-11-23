@@ -6,12 +6,15 @@ from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 from rest_framework_simplejwt.views import TokenRefreshView
 
 from apps.accounts.views import CustomTokenObtainPairView
+from apps.quotations.views import suite_access
 
 urlpatterns = [
     path("admin/", admin.site.urls),
     # JWT Auth
     path("api/auth/token/", CustomTokenObtainPairView.as_view(), name="token_obtain_pair"),
     path("api/auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
+    # Suite asks who may sign in to it (Roles & Rights, "Sign in to DIGIX Suite").
+    path("api/auth/suite-access/", suite_access, name="suite_access"),
     # API modules
     path("api/setup/", include("apps.setup.urls")),
     path("api/accounts/", include("apps.accounts.urls")),

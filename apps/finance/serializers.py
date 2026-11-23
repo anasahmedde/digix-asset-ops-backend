@@ -158,6 +158,10 @@ class InvoiceSerializer(DateOrder, HidesMoney, serializers.ModelSerializer):
         attrs["client"] = quotation.client
         attrs["currency"] = quotation.currency
         amount = attrs.get("amount", getattr(self.instance, "amount", None))
+        tax = attrs.get("tax_amount", getattr(self.instance, "tax_amount", None)) or Decimal("0")
+        if quotation.tax_included and Decimal(tax) > 0:
+            raise serializers.ValidationError({"tax_amount": (
+                "This quotation's value already includes GST. Enter the amount including tax, with no tax on top.")})
         left = quotation_billing(quotation, exclude=self.instance)["to_invoice"]
         if amount is not None and Decimal(amount) > left:
             raise serializers.ValidationError({"amount": f"Only {quotation.currency} {left:,.2f} of this quotation is left to invoice."})

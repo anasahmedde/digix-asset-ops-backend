@@ -8,6 +8,8 @@ from rest_framework.test import APIClient
 from apps.accounts.models import User
 from apps.assets.models import Device
 from apps.clients.models import Client
+from apps.finance.ledger import quotation_billing as suite_billing
+from apps.finance.serializers import InvoiceSerializer
 from apps.quotations import suite
 from apps.quotations.models import Quotation
 from apps.teams.models import BOMAllocation, Project, ProjectBOMLine
@@ -99,9 +101,17 @@ def test_suite_go_ahead_makes_quotation_project_and_one_asset_per_product_unit(f
     q = Quotation.objects.get(suite_record_id=RID)
     assert q.quote_number == "DIGIX 2026 001"  # the same number as in Suite
     assert (q.status, q.client, q.suite_client_name, q.suite_job_number) == ("accepted", unilever, "Unilever", "JO-001")
-    assert q.total_amount == Decimal("460000.00")  # net; GST goes on the invoice
+    # The value includes Suite's GST, as a line of its own, and so matches the client's PO.
+    assert q.total_amount == Decimal("542800.00") and q.tax_included
+    assert q.items.get(description="GST 18% (Suite)").unit_price == Decimal("82800.00")
     assert q.client_po_number == "PO-UNI-001" and q.client_po_amount == Decimal("542800.00")
-    assert q.invoices.count() == 1  # Finance finds it drafted, as for any accepted quotation
+    # Finance finds it drafted, as for any accepted quotation: the whole value, GST in it.
+    inv = q.invoices.get()
+    assert (inv.amount, inv.tax_amount, inv.total_amount) == (Decimal("542800.00"), 0, Decimal("542800.00"))
+    assert inv.description == "Full quotation value incl. GST"
+    billing = suite_billing(q)
+    assert (billing["quoted"], billing["po_left"], billing["tax_included"]) == (Decimal("542800.00"), 0, True)
+    assert not ProjectBOMLine.objects.filter(description__startswith="GST").exists()  # not something to build
 
     project = Project.objects.get(source_quotation=q)
     assert (project.name, project.client, str(project.target_date)) == ("Project: DMC NSO Axe Category", unilever, "2026-12-05")
@@ -190,3 +200,65 @@ def test_suite_sign_in_is_only_for_people_given_the_right(settings):
     person.email = ""
     person.save(update_fields=["email"])
     assert c.get(url).status_code == 400
+
+
+@pytest.mark.django_db
+def test_no_tax_goes_on_top_of_a_suite_value_that_includes_gst(fake, api, unilever):
+    api.post("/api/quotations/quotations/suite/create-project/", {"record_id": RID, "client": str(unilever.pk)}, format="json")
+    q = Quotation.objects.get(suite_record_id=RID)
+    q.invoices.all().delete()
+    data = {"quotation": str(q.pk), "description": "Advance", "amount": "100000", "tax_amount": "18000",
+            "issue_date": "2026-11-23", "due_date": "2026-12-23"}
+    s = InvoiceSerializer(data=data)
+    assert not s.is_valid() and "already includes GST" in str(s.errors["tax_amount"])
+    assert InvoiceSerializer(data={**data, "tax_amount": "0"}).is_valid()
+
+
+@pytest.mark.django_db
+def test_a_suite_quotation_made_before_gets_its_gst_and_its_draft_follows(unilever):
+    import importlib
+
+    from django.apps import apps
+
+    from apps.finance.ledger import draft_full_invoice
+
+    q = Quotation.objects.create(title="JO-001", client=unilever, status="accepted", suite_record_id=RID,
+                                 notes="Suite GST 18% (gross 236000.00) is not in the lines; set the tax on the invoice.")
+    q.items.create(description="P3 Outdoor screen", quantity=1, unit_price=Decimal("200000.00"))
+    q.recalc_total()
+    draft_full_invoice(q)
+    importlib.import_module("apps.quotations.migrations.0004_suite_value_includes_gst").add_gst(apps, None)
+    q.refresh_from_db()
+    assert (q.total_amount, q.notes) == (Decimal("236000.00"), "")
+    assert q.items.get(description="GST 18% (Suite)").unit_price == Decimal("36000.00")
+    inv = q.invoices.get()
+    assert (inv.amount, inv.total_amount, inv.description) == (Decimal("236000.00"), Decimal("236000.00"), "Full quotation value incl. GST")
+
+
+@pytest.mark.django_db
+def test_suite_lets_in_only_people_given_the_right_here(settings):
+    import time
+
+    import jwt
+
+    from apps.accounts.models import UserCapability
+
+    settings.SUITE_SSO_SECRET, settings.SUITE_EMAIL = "s" * 40, "asset-link@digix.com"
+
+    def ask(email, secret=settings.SUITE_SSO_SECRET):
+        now = int(time.time())
+        token = jwt.encode({"iss": "digix-suite", "aud": "digix-asset-ops", "email": email, "iat": now, "exp": now + 60},
+                           secret, algorithm="HS256")
+        return APIClient().post("/api/auth/suite-access/", HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    person = User.objects.create_user(username="hamza.rasheed@adsells.biz", email="hamza.rasheed@adsells.biz",
+                                      password="x", role="marketing")
+    assert ask("hamza.rasheed@adsells.biz", secret="x" * 40).status_code == 403  # only Suite may ask
+    assert ask("Hamza.Rasheed@adsells.biz").data == {"allowed": False}
+    UserCapability.objects.create(user=person, capability="use_suite", allowed=True)
+    assert ask("Hamza.Rasheed@adsells.biz").data == {"allowed": True}
+    assert ask("asset-link@digix.com").data == {"allowed": True}  # the link's own account
+    assert ask("someone@else.com").data == {"allowed": False}
+    person.is_active = False
+    person.save(update_fields=["is_active"])
+    assert ask("hamza.rasheed@adsells.biz").data == {"allowed": False}

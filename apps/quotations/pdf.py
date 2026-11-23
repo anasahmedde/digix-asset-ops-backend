@@ -108,7 +108,8 @@ def build_quotation_pdf(quotation) -> bytes:
             f"{item.unit_price:,.2f}",
             f"{item.line_total:,.2f}",
         ])
-    data.append(["", "", "", f"Total ({quotation.currency})", f"{quotation.total_amount:,.2f}"])
+    total = f"Total incl. GST ({quotation.currency})" if quotation.tax_included else f"Total ({quotation.currency})"
+    data.append(["", "", "", total, f"{quotation.total_amount:,.2f}"])
 
     items_table = Table(data, colWidths=[10 * mm, 96 * mm, 16 * mm, 26 * mm, 26 * mm])
     items_table.setStyle(TableStyle([

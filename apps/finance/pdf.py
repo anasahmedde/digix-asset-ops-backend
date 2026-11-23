@@ -97,7 +97,7 @@ def build_invoice_pdf(invoice) -> bytes:
     data = [["Description", f"Amount ({cur})"], [Paragraph(what, body), f"{invoice.amount:,.2f}"]]
     if invoice.tax_amount:
         data.append(["Tax", f"{invoice.tax_amount:,.2f}"])
-    data.append([f"Total ({cur})", f"{invoice.total_amount:,.2f}"])
+    data.append([f"Total incl. tax ({cur})", f"{invoice.total_amount:,.2f}"])
     paid = sum((p.amount for p in invoice.payments.all()), 0)
     if paid:
         data += [["Received", f"{paid:,.2f}"], ["Balance due", f"{invoice.total_amount - paid:,.2f}"]]
@@ -118,7 +118,8 @@ def build_invoice_pdf(invoice) -> bytes:
     if q:
         b = quotation_billing(q)
         elements.append(Paragraph(
-            f"Quotation value {cur} {b['quoted']:,.2f} · invoiced to date {cur} {b['invoiced']:,.2f} · "
+            f"Quotation value{' incl. GST' if q.tax_included else ''} {cur} {b['quoted']:,.2f} · "
+            f"invoiced to date {cur} {b['invoiced']:,.2f} · "
             f"left to invoice {cur} {b['to_invoice']:,.2f}", small))
     if invoice.notes:
         elements += [Spacer(1, 8), Paragraph("Notes", styles["Heading4"]), Paragraph(esc(invoice.notes).replace("\n", "<br/>"), body)]
