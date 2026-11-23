@@ -106,6 +106,23 @@ def sign_in_token(user) -> str:
     }, settings.SUITE_SSO_SECRET, algorithm="HS256")
 
 
+def may_sign_in(email: str) -> bool:
+    """Whether Suite may let this email in: an active person here holding
+    "Sign in to DIGIX Suite" (Roles & Rights), or this link's own account."""
+    from django.contrib.auth import get_user_model
+    from django.db.models import Q
+
+    from common.permissions import can
+
+    email = (email or "").strip().lower()
+    if not email:
+        return False
+    if email == settings.SUITE_EMAIL.strip().lower():
+        return True
+    people = get_user_model().objects.filter(is_active=True).filter(Q(email__iexact=email) | Q(username__iexact=email))
+    return any(can(u, "use_suite") for u in people)
+
+
 def _money(value) -> Decimal:
     try:
         return Decimal(str(value or 0)).quantize(Decimal("0.01"))

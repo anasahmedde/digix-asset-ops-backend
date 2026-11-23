@@ -233,3 +233,32 @@ def test_a_suite_quotation_made_before_gets_its_gst_and_its_draft_follows(unilev
     assert q.items.get(description="GST 18% (Suite)").unit_price == Decimal("36000.00")
     inv = q.invoices.get()
     assert (inv.amount, inv.total_amount, inv.description) == (Decimal("236000.00"), Decimal("236000.00"), "Full quotation value incl. GST")
+
+
+@pytest.mark.django_db
+def test_suite_lets_in_only_people_given_the_right_here(settings):
+    import time
+
+    import jwt
+
+    from apps.accounts.models import UserCapability
+
+    settings.SUITE_SSO_SECRET, settings.SUITE_EMAIL = "s" * 40, "asset-link@digix.com"
+
+    def ask(email, secret=settings.SUITE_SSO_SECRET):
+        now = int(time.time())
+        token = jwt.encode({"iss": "digix-suite", "aud": "digix-asset-ops", "email": email, "iat": now, "exp": now + 60},
+                           secret, algorithm="HS256")
+        return APIClient().post("/api/auth/suite-access/", HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    person = User.objects.create_user(username="hamza.rasheed@adsells.biz", email="hamza.rasheed@adsells.biz",
+                                      password="x", role="marketing")
+    assert ask("hamza.rasheed@adsells.biz", secret="x" * 40).status_code == 403  # only Suite may ask
+    assert ask("Hamza.Rasheed@adsells.biz").data == {"allowed": False}
+    UserCapability.objects.create(user=person, capability="use_suite", allowed=True)
+    assert ask("Hamza.Rasheed@adsells.biz").data == {"allowed": True}
+    assert ask("asset-link@digix.com").data == {"allowed": True}  # the link's own account
+    assert ask("someone@else.com").data == {"allowed": False}
+    person.is_active = False
+    person.save(update_fields=["is_active"])
+    assert ask("hamza.rasheed@adsells.biz").data == {"allowed": False}
