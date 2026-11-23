@@ -4,8 +4,8 @@ from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import viewsets
-from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.decorators import action, api_view, authentication_classes, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from apps.notifications import service as notices
@@ -199,3 +199,25 @@ class QuotationViewSet(viewsets.ModelViewSet):
         response = HttpResponse(pdf_bytes, content_type="application/pdf")
         response["Content-Disposition"] = f'inline; filename="{quotation.quote_number}.pdf"'
         return response
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def suite_access(request):
+    """Suite asks this at every password sign-in: may this email use Suite?
+    Only Suite can ask: it sends a one-minute token signed with the shared
+    SSO secret, naming the email."""
+    import jwt
+
+    from . import suite
+
+    if not settings.SUITE_SSO_SECRET:
+        return Response({"detail": "Not set up."}, status=404)
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    try:
+        claims = jwt.decode(token, settings.SUITE_SSO_SECRET, algorithms=["HS256"], audience="digix-asset-ops",
+                            issuer="digix-suite", options={"require": ["exp", "iat", "email"]})
+    except jwt.PyJWTError:
+        return Response({"detail": "Not signed by Suite."}, status=403)
+    return Response({"allowed": suite.may_sign_in(claims["email"])})

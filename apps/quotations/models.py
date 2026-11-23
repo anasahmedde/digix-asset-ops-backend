@@ -102,6 +102,13 @@ class Quotation(TimeStampedModel):
     def can_transition_to(self, new_status: str) -> bool:
         return new_status in self.VALID_TRANSITIONS.get(self.status, ())
 
+    @property
+    def tax_included(self) -> bool:
+        """A Suite quotation's value includes its GST, as a line of its own,
+        so it matches the client's PO. Any other quotation is priced before
+        tax, and the tax goes on top on the invoice."""
+        return bool(self.suite_record_id)
+
     def recalc_total(self, save: bool = True):
         total = sum((item.line_total for item in self.items.all()), Decimal("0"))
         self.total_amount = total
